@@ -203,9 +203,11 @@ await check('SOURCE snapshot file name agrees across processes and clears with t
 await check('SOURCE generator gates http rule-provider on local file readiness', () => {
   assert.match(gen, /ruleProviderReady: boolean = true/, 'opt-in param with safe default');
   // provider 声明与 RULE-SET 引用必须同受该开关约束，否则仍会引用未声明的 provider
-  const decl = gen.indexOf("lines.push('rule-providers:')");
+  // （2026-10-16 起声明段为单一合并段：hyper-adrules 条目在去重后、声明头前追加）
+  const decl = gen.indexOf("finalProviderLines.push('  hyper-adrules:')");
   const ref = gen.indexOf('RULE-SET,hyper-adrules,REJECT');
-  assert.ok(decl > 0 && ref > decl, 'both sites present');
+  const header = gen.indexOf("lines.push('rule-providers:')") ;
+  assert.ok(decl > 0 && ref > 0 && header > decl, 'both sites present');
   assert.match(gen.slice(Math.max(0, decl - 260), decl), /hyperAdRulesEnabled && ruleProviderReady/,
     'provider declaration gated');
   assert.match(gen.slice(Math.max(0, ref - 200), ref), /hyperAdRulesEnabled && ruleProviderReady/,

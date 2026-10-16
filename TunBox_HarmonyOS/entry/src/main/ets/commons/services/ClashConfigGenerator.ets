@@ -585,15 +585,6 @@ export class ClashConfigGenerator {
     // 报「did not find expected key」。所以这里统一收集、按键去重、逐条重缩进，
     // 最后只发一个 rule-providers: 头。
     const providerEntryLines: string[] = [];
-    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
-      providerEntryLines.push('  hyper-adrules:');
-      providerEntryLines.push('    type: http');
-      providerEntryLines.push('    behavior: domain');
-      providerEntryLines.push('    format: mrs');
-      providerEntryLines.push('    interval: 86400');
-      providerEntryLines.push('    path: ./ruleset/hyper_adrules_ads.mrs');
-      providerEntryLines.push('    url: "https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs"');
-    }
     if (settings.rulesEnabled && settings.customRuleSets.length > 0) {
       for (const ruleSet of settings.customRuleSets) {
         providerEntryLines.push(`  rs-${ruleSet.name}:`);
@@ -632,6 +623,17 @@ export class ClashConfigGenerator {
         emittedProviderNames.add(m[1]);
       }
       finalProviderLines.push(line);
+    }
+    // hyper-adrules 声明（去广告）与下方 RULE-SET 引用同受该闸门约束：
+    // 本地 path 文件缺失（ruleProviderReady=false）时不声明、不引用，避免内核启动期联网下载阻塞。
+    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
+      finalProviderLines.push('  hyper-adrules:');
+      finalProviderLines.push('    type: http');
+      finalProviderLines.push('    behavior: domain');
+      finalProviderLines.push('    format: mrs');
+      finalProviderLines.push('    interval: 86400');
+      finalProviderLines.push('    path: ./ruleset/hyper_adrules_ads.mrs');
+      finalProviderLines.push('    url: "https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs"');
     }
     if (finalProviderLines.length > 0) {
       lines.push('');
@@ -792,27 +794,23 @@ export class ClashConfigGenerator {
    * yaml.v3 报「did not find expected key」整份拒载（真机实证 2026-10-16），
    * 所以这里逐条重缩进，字段值原样保留。tab 归一为 2 空格，注释/空行剔除。
    */
-  static normalizeProviderBlock(rawLines: string[]): string[] {
+    static normalizeProviderBlock(rawLines: string[]): string[] {
     const out: string[] = [];
-    let keyIndent = -1;
     for (const raw of rawLines) {
       const line = raw.replace(/\t/g, '  ').replace(/\r$/, '');
       const t = line.trim();
       if (t.length === 0 || t.startsWith('#')) {
         continue;
       }
-      const indent = line.length - line.trimStart().length;
-      if (keyIndent < 0) {
-        keyIndent = indent;
+      // provider 声明是平铺结构：键行（name: 无值）规范 2 空格，其余字段行规范 4 空格。
+      // 不依赖源缩进 —— 真机实证 2026-10-16：extractSection 对某些段的归一化会产出
+      // 键 0/字段 4 的错位行，原样回写让 yaml.v3 报「did not find expected key」拒载。
+      const m = t.match(/^([A-Za-z0-9_-]+):\s*$/);
+      if (m !== null) {
+        out.push('  ' + t);
+      } else {
+        out.push('    ' + t);
       }
-      const m = t.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
-      const isKeyLine = m !== null && m[2].length === 0 && indent === keyIndent;
-      if (isKeyLine) {
-        out.push(`  ${m[1]}:`);
-        continue;
-      }
-      const rel = Math.max(0, indent - keyIndent);
-      out.push(' '.repeat(rel + 2) + t);
     }
     return out;
   }
