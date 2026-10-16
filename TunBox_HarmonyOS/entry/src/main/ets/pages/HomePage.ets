@@ -80,8 +80,7 @@ struct NetworkRulesDialog {
     Column({ space: 10 }) {
       Text('规则模式设置').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
       this.OptionRow('☷', '广告与隐私拦截规则', this.rulesSummary, 'rules')
-      this.OptionRow('↗', '强制代理网站名单', `代理 ${this.proxyCount} 个域名`, 'proxy')
-      this.OptionRow('↘', '强制直连网站名单', `直连 ${this.directCount} 个域名`, 'direct')
+      this.OptionRow('⇄', '网站分流策略设置', `代理 ${this.proxyCount} · 直连 ${this.directCount}`, 'sites')
       this.OptionRow('▦', '应用分流策略设置', this.appSummary, 'app')
       Button('关闭')
         .width('100%')
@@ -300,7 +299,7 @@ export struct HomePage {
           }, 120);
         } else {
           setTimeout((): void => {
-            router.pushUrl({ url: 'pages/SiteRoutingPage', params: { kind: kind === 'direct' ? 'direct' : 'proxy' } });
+            router.pushUrl({ url: 'pages/SiteRoutingPage' });
           }, 120);
         }
       }
