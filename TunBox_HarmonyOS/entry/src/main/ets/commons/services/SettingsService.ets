@@ -1,0 +1,410 @@
+/**
+ * 设置持久化服务
+ * 移植自 upstream: SSRVPN_Android/lib/services/settings_service.dart
+ * - apiSecret：@ohos.security.asset（系统级加密存储，对应 Keystore AES-GCM / NativeApiSecretResolver）
+ * - 连接快照：重启后恢复上次连接意图（对应 NativeConnectionSnapshotStore）
+ */
+import { preferences } from '@kit.ArkData';
+import { asset } from '@kit.AssetStoreKit';
+import { util } from '@kit.ArkTS';
+import { AppSettings, AppSettingsJson } from '../models/AppSettings';
+import { AppLogger } from '../utils/AppLogger';
+import { RawSubscriptionStore } from './RawSubscriptionStore';
+
+const TAG = 'SettingsService';
+const PREF_NAME = 'ssrvpn_settings';
+const KEY_SETTINGS = 'app_settings_json';
+const ASSET_SERVICE = 'ssrvpn_service';
+const ASSET_SECRET_KEY = 'api_secret';
+const KEY_SNAPSHOT = 'connection_snapshot_json';
+const KEY_DOH_PINS = 'doh_pins_json';
+const KEY_ROUTING_SNAPSHOT = 'app_routing_snapshot_json';
+const KEY_SUBSCRIPTION_FAB_X = 'subscription_fab_x';
+const KEY_SUBSCRIPTION_FAB_Y = 'subscription_fab_y';
+/** 订阅页节点排布列数（1=单列 2=双列），用户手动切换后持久化 */
+const KEY_NODE_COLUMNS = 'node_columns';
+
+/** 连接快照（对应 NativeConnectionSnapshot：重启恢复连接意图） */
+export class ConnectionSnapshot {
+  desiredConnected: boolean = false;
+  nodeName: string = '';
+  savedAt: number = 0;
+  /** 本次真实 VPN 会话开始时刻；旧快照缺少此字段时按 0 兼容。 */
+  startedAt: number = 0;
+  /**
+   * 持久化连接相位：connecting | connected | disconnecting | disconnected | failed。
+   * Extension 只把 desiredConnected=true 且 generation 匹配的 connecting/connected
+   * 会话视为可恢复，避免旧异步结果或用户停止后的 timer 重新拉起 Core。
+   */
+  phase: string = 'disconnected';
+  /**
+   * 持久化会话代次。每次用户发起连接或主动停止时递增；Extension 的恢复、重建及
+   * 异步完成回调必须同时校验 desiredConnected 和 generation，防止旧定时器在用户
+   * 已停止后重新拉起 Core，也防止旧连接结果覆盖新会话状态。
+   */
+  sessionGeneration: number = 0;
+}
+
+/**
+ * 应用分流三元组的**跨进程持久化副本**（mode / packagesJson / needsReview + 归属配置路径）。
+ *
+ * 存在的理由：VpnExtensionAbility 在 want.parameters 被系统丢弃时，靠 cacheDir 里的
+ * vpn_start_params.json 回退，但那份文件只接受"3 分钟内、且 configPath 逐字相等"。
+ * 进程被系统回收后由 OS 重新拉起扩展时往往已超过 3 分钟 → 扩展硬拒绝恢复，
+ * 隧道再也起不来（用户表现为"连着连着就断了，之后再也连不上"）。
+ *
+ * 把同一份三元组也写进 preferences（同 App 同沙箱，扩展进程读得到），并附带
+ * configPath：扩展据此可在文件之外找到**本次**会话的参数，仍然不猜任何默认值，
+ * 防泄漏红线不变。
+ */
+export class AppRoutingSnapshot {
+  appRoutingMode: string = '';
+  appRoutingPackagesJson: string = '';
+  appRoutingNeedsReview: boolean = false;
+  /** 本次连接实际使用的配置文件路径：只有逐字相等才允许复用，防止串用别的会话 */
+  configPath: string = '';
+  ts: number = 0;
+}
+
+export class SettingsService {
+  private static store: preferences.Preferences | null = null;
+  /** 本进程内「双轨 provider」开关的上一次生效值：用于识别 true → false 的关闭动作 */
+  private static lastRawProviderFlag: boolean = false;
+  /** 关闭状态下是否已清理过落盘原文（避免每次加载/保存都扫描目录） */
+  private static rawProviderPurgedWhileDisabled: boolean = false;
+
+  static async init(context: Context): Promise<void> {
+    SettingsService.store = await preferences.getPreferences(context, PREF_NAME);
+  }
+
+  static async load(): Promise<AppSettings> {
+    if (SettingsService.store === null) {
+      throw new Error('设置服务尚未初始化，已拒绝使用默认应用分流');
+    }
+    const raw = await SettingsService.store.get(KEY_SETTINGS, '') as string;
+    if (raw.length === 0) {
+      return new AppSettings();
+    }
+    try {
+      const j = JSON.parse(raw) as AppSettingsJson;
+      if (j === null || typeof j !== 'object' || Array.isArray(j)) {
+        throw new Error('设置格式无效');
+      }
+      const settings = AppSettings.fromJson(j);
+      // 双轨开关是全局闸门：任何一次加载都把持久化值同步给落盘仓，
+      // 持久化为关闭 → 顺带清掉历史落盘原文（含进程被杀后残留）。
+      SettingsService.syncRawProviderGate(settings.useRawProviderConfig);
+      return settings;
+    } catch (e) {
+      // 损坏数据不等同首次安装：保持需要确认，禁止退回 all 自动接管。
+      const invalid = new AppSettings();
+      invalid.appRoutingMode = '';
+      invalid.appRoutingNeedsReview = true;
+      return invalid;
+    }
+  }
+
+  static async save(settings: AppSettings): Promise<void> {
+    if (SettingsService.store === null) {
+      throw new Error('设置服务尚未初始化，未保存配置');
+    }
+    // 保存前经 fromJson(toJson()) 归一化：非法值夹取、缺字段补默认，
+    // 保证「保存两次 = 同一 JSON」（幂等），且不回写脏值。
+    const normalized = AppSettings.fromJson(settings.toJson());
+    await SettingsService.store.put(KEY_SETTINGS, JSON.stringify(normalized.toJson()));
+    await SettingsService.store.flush();
+    SettingsService.syncRawProviderGate(normalized.useRawProviderConfig);
+  }
+
+  /**
+   * 双轨开关的一键切换（设置页/诊断面板调用）：写盘 + 同步落盘仓闸门。
+   * 关闭时落盘原文会被删除（凭据不再需要即删干净），返回删除的文件数。
+   */
+  static async setUseRawProviderConfig(value: boolean): Promise<number> {
+    const settings = await SettingsService.load();
+    settings.useRawProviderConfig = value;
+    await SettingsService.save(settings);
+    const removed = RawSubscriptionStore.setEnabled(value);
+    AppLogger.info(TAG, `useRawProviderConfig=${value} (raw files removed=${removed})`);
+    return removed;
+  }
+
+  /**
+   * 闸门同步：开启时只设置标记（保留文件）；关闭时清理落盘原文（凭据不再需要即删干净），
+   * 且每个进程只在首次观察到「关闭」时清理一次，避免反复扫描目录。
+   */
+  private static syncRawProviderGate(enabled: boolean): void {
+    if (enabled) {
+      RawSubscriptionStore.setEnabled(true, false);
+      SettingsService.lastRawProviderFlag = true;
+      SettingsService.rawProviderPurgedWhileDisabled = false;
+      return;
+    }
+    RawSubscriptionStore.setEnabled(false, false);
+    SettingsService.lastRawProviderFlag = false;
+    if (SettingsService.rawProviderPurgedWhileDisabled || !RawSubscriptionStore.isReady()) {
+      return;
+    }
+    SettingsService.rawProviderPurgedWhileDisabled = true;
+    const removed = RawSubscriptionStore.removeAll();
+    if (removed > 0) {
+      AppLogger.info(TAG, `purged ${removed} raw subscription file(s): raw provider disabled`);
+    }
+  }
+
+  /** apiSecret 只允许存入系统加密 AssetStore，禁止降级到明文 Preferences。 */
+  static async setApiSecret(secret: string): Promise<void> {
+    const attr: asset.AssetMap = new Map<asset.Tag, asset.Value>();
+    attr.set(asset.Tag.SECRET, stringToUint8(secret));
+    attr.set(asset.Tag.ALIAS, stringToUint8(ASSET_SECRET_KEY));
+    attr.set(asset.Tag.ACCESSIBILITY, asset.Accessibility.DEVICE_FIRST_UNLOCKED);
+    // remove 只带 ALIAS：携带 SECRET 等多余 tag 的 remove 在部分版本会参数校验失败且异常被吞，
+    // 导致旧值残留、下一次 add 抛 already exists（与 CredentialStore.writeAsset 同口径修复）。
+    const removeAttr: asset.AssetMap = new Map<asset.Tag, asset.Value>();
+    removeAttr.set(asset.Tag.ALIAS, stringToUint8(ASSET_SECRET_KEY));
+    try {
+      await asset.remove(removeAttr);
+    } catch (e) {
+      // 首次写入前不存在属正常
+    }
+    await asset.add(attr);
+
+    // 清除旧版本可能遗留的明文回退值。
+    if (SettingsService.store !== null) {
+      try {
+        await SettingsService.store.delete('api_secret_fallback');
+        await SettingsService.store.flush();
+      } catch (cleanupError) {
+        AppLogger.warn(TAG, `failed to remove legacy api secret fallback: ${AppLogger.errText(cleanupError)}`);
+      }
+    }
+    AppLogger.info(TAG, 'apiSecret stored in asset store');
+  }
+
+  static async getApiSecret(): Promise<string> {
+    try {
+      const query: asset.AssetMap = new Map<asset.Tag, asset.Value>();
+      query.set(asset.Tag.ALIAS, stringToUint8(ASSET_SECRET_KEY));
+      query.set(asset.Tag.RETURN_TYPE, asset.ReturnType.ALL);
+      const results: asset.AssetMap[] = await asset.query(query);
+      if (results.length === 0) {
+        return '';
+      }
+      const secretVal = results[0].get(asset.Tag.SECRET);
+      if (secretVal !== undefined && secretVal instanceof Uint8Array) {
+        return uint8ToString(secretVal as Uint8Array);
+      }
+      return '';
+    } catch (e) {
+      AppLogger.warn(TAG, `asset store query failed: ${AppLogger.errText(e)}`);
+      return '';
+    }
+  }
+
+  // 本进程快照提交串行化；不是跨进程 CAS，跨进程权威仍由 Extension 生命周期负责。
+  private static snapshotWrites: Promise<void> = Promise.resolve();
+
+  /** 仅更新仍属同代、仍有连接意图的运行快照，不重置 phase/generation。 */
+  static patchActiveSnapshot(generation: number, nodeName: string, startedAt: number,
+    connected: boolean = false): Promise<boolean> {
+    const task = SettingsService.snapshotWrites.then(async (): Promise<boolean> => {
+      const snap = await SettingsService.loadSnapshot();
+      if (snap.sessionGeneration !== generation || !snap.desiredConnected
+        || !['connecting', 'connected', 'recovering'].includes(snap.phase)) {
+        return false;
+      }
+      snap.nodeName = nodeName;
+      snap.startedAt = startedAt;
+      snap.savedAt = Date.now();
+      if (connected) { snap.phase = 'connected'; }
+      await SettingsService.writeSnapshot(snap);
+      return true;
+    });
+    SettingsService.snapshotWrites = task.then((): void => {}, (): void => {});
+    return task;
+  }
+
+  /** 连接快照读写（重启恢复） */
+  static saveSnapshot(snap: ConnectionSnapshot): Promise<void> {
+    const task = SettingsService.snapshotWrites.then((): Promise<void> => SettingsService.writeSnapshot(snap));
+    SettingsService.snapshotWrites = task.then((): void => {}, (): void => {});
+    return task;
+  }
+
+  private static async writeSnapshot(snap: ConnectionSnapshot): Promise<void> {
+    if (SettingsService.store === null) {
+      return;
+    }
+    await SettingsService.store.put(KEY_SNAPSHOT, JSON.stringify(snap));
+    await SettingsService.store.flush();
+  }
+
+  static async loadSnapshot(): Promise<ConnectionSnapshot> {
+    const snap = new ConnectionSnapshot();
+    if (SettingsService.store === null) {
+      return snap;
+    }
+    const raw = await SettingsService.store.get(KEY_SNAPSHOT, '') as string;
+    if (raw.length === 0) {
+      return snap;
+    }
+    try {
+      const j = JSON.parse(raw) as ConnectionSnapshot;
+      snap.desiredConnected = j.desiredConnected;
+      snap.nodeName = j.nodeName;
+      snap.savedAt = j.savedAt;
+      snap.startedAt = typeof j.startedAt === 'number' && j.startedAt > 0 ? j.startedAt : 0;
+      // 兼容旧快照：没有 phase 时由 desiredConnected 推导等价相位。
+      snap.phase = typeof j.phase === 'string' && j.phase.length > 0
+        ? j.phase : (snap.desiredConnected ? 'connected' : 'disconnected');
+      // 旧版本快照没有会话代次，按 0 兼容；非法值同样归零，避免陈旧异步任务
+      // 利用异常 generation 绕过用户主动停止门禁。
+      snap.sessionGeneration = typeof j.sessionGeneration === 'number' && j.sessionGeneration >= 0
+        ? Math.floor(j.sessionGeneration) : 0;
+    } catch (e) {
+      // 快照损坏则视为空
+    }
+    return snap;
+  }
+
+  /**
+   * DoH 防投毒固定解析结果的**跨进程持久化缓存**。
+   *
+   * 动机：DoH 预解析原本只有进程内 Map，应用每次被回收/冷启动都要重新走一遍 DoH
+   * （并发 16、预算 6s），这段时间隧道还没建 —— 直接表现为"每次连接都要多等几秒"。
+   * 落盘后冷启动可零网络命中，只有真正过期的条目才在后台刷新。
+   *
+   * 存储格式为 `Record<domain, "ip|timestampMs">`，用扁平字符串规避 ArkTS 严格模式下
+   * 的嵌套 JSON 反序列化问题。
+   */
+  static async loadDohPins(): Promise<Record<string, string>> {
+    const empty: Record<string, string> = {};
+    if (SettingsService.store === null) {
+      return empty;
+    }
+    try {
+      const raw = await SettingsService.store.get(KEY_DOH_PINS, '') as string;
+      if (raw.length === 0) {
+        return empty;
+      }
+      const parsed = JSON.parse(raw) as Record<string, string>;
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return empty;
+      }
+      return parsed;
+    } catch (e) {
+      // 缓存损坏 = 当作没有缓存：宁可慢一次，也不给内核写错的 hosts
+      return empty;
+    }
+  }
+
+  static async saveDohPins(pins: Record<string, string>): Promise<void> {
+    if (SettingsService.store === null) {
+      return;
+    }
+    try {
+      await SettingsService.store.put(KEY_DOH_PINS, JSON.stringify(pins));
+      await SettingsService.store.flush();
+    } catch (e) {
+      AppLogger.warn(TAG, `save doh pins failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /** 应用分流快照读写（扩展进程被杀后重启时的第三道恢复来源） */
+  static async saveAppRoutingSnapshot(snap: AppRoutingSnapshot): Promise<void> {
+    if (SettingsService.store === null) {
+      return;
+    }
+    try {
+      await SettingsService.store.put(KEY_ROUTING_SNAPSHOT, JSON.stringify(snap));
+      await SettingsService.store.flush();
+    } catch (e) {
+      AppLogger.warn(TAG, `save app routing snapshot failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /** 读不到/脏数据一律返回 null（调用方据此维持拒绝，绝不回退默认值）。 */
+  static async loadAppRoutingSnapshot(): Promise<AppRoutingSnapshot | null> {
+    const snap = new AppRoutingSnapshot();
+    if (SettingsService.store === null) {
+      return null;
+    }
+    try {
+      const raw = await SettingsService.store.get(KEY_ROUTING_SNAPSHOT, '') as string;
+      if (raw.length === 0) {
+        return null;
+      }
+      const j = JSON.parse(raw) as AppRoutingSnapshot;
+      if (j === null || typeof j !== 'object') {
+        return null;
+      }
+      if (typeof j.appRoutingMode !== 'string' || typeof j.appRoutingPackagesJson !== 'string'
+        || typeof j.appRoutingNeedsReview !== 'boolean' || typeof j.configPath !== 'string'
+        || typeof j.ts !== 'number') {
+        return null;
+      }
+      snap.appRoutingMode = j.appRoutingMode;
+      snap.appRoutingPackagesJson = j.appRoutingPackagesJson;
+      snap.appRoutingNeedsReview = j.appRoutingNeedsReview;
+      snap.configPath = j.configPath;
+      snap.ts = j.ts;
+      return snap;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  static async loadSubscriptionFabPosition(): Promise<number[]> {
+    if (SettingsService.store === null) {
+      return [-1, -1];
+    }
+    const x = await SettingsService.store.get(KEY_SUBSCRIPTION_FAB_X, -1) as number;
+    const y = await SettingsService.store.get(KEY_SUBSCRIPTION_FAB_Y, -1) as number;
+    return [x, y];
+  }
+
+  static async saveSubscriptionFabPosition(x: number, y: number): Promise<void> {
+    if (SettingsService.store === null) {
+      return;
+    }
+    await SettingsService.store.put(KEY_SUBSCRIPTION_FAB_X, x);
+    await SettingsService.store.put(KEY_SUBSCRIPTION_FAB_Y, y);
+    await SettingsService.store.flush();
+  }
+
+  static async loadNodeColumns(): Promise<number> {
+    if (SettingsService.store === null) {
+      return 1;
+    }
+    const n = await SettingsService.store.get(KEY_NODE_COLUMNS, 1) as number;
+    return n === 2 ? 2 : 1;
+  }
+
+  static async saveNodeColumns(n: number): Promise<void> {
+    if (SettingsService.store === null) {
+      return;
+    }
+    await SettingsService.store.put(KEY_NODE_COLUMNS, n === 2 ? 2 : 1);
+    await SettingsService.store.flush();
+  }
+}
+
+function stringToUint8(s: string): Uint8Array {
+  if (typeof s !== 'string') {
+    s = s === null || s === undefined ? '' : String(s);
+  }
+  try {
+    // 用最稳定的 encode() 而非较新的单参 encodeInto() 重载，且保证恒返回 Uint8Array
+    const out = util.TextEncoder.create('utf-8').encode(s);
+    if (out instanceof Uint8Array) {
+      return out;
+    }
+  } catch (e) {
+    // 落入兜底
+  }
+  return new Uint8Array(0);
+}
+
+function uint8ToString(bytes: Uint8Array): string {
+  return util.TextDecoder.create('utf-8').decodeToString(bytes);
+}

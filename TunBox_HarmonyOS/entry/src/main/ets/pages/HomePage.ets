@@ -1,0 +1,1137 @@
+/**
+ * HomePage —— Nexus VPN 主页（对齐 Nexus_VPN_完整UI设计_index.html + Ultimate 开发文档 §3/§4/§5/§8/§9）
+ * 布局：顶部备份入口+Nexus品牌 → 状态环(172) → 速率卡(含折线+微字号流量/时长) → 双卡片(分流/规则) → 液态玻璃Dock
+ * 后端：复用 ConnectionOrchestrator / SubscriptionService / SettingsService / LatencyController 全量逻辑。
+ */
+import { router, promptAction } from '@kit.ArkUI';
+import { picker, fileIo as fs } from '@kit.CoreFileKit';
+import { util } from '@kit.ArkTS';
+import { window } from '@kit.ArkUI';
+import { Nx, NexusSizes } from '../theme/NexusTokens';
+import { Ui } from '../theme/UiTokens';
+import { StatusRing } from '../components/StatusRing';
+import { RateChart } from '../components/RateChart';
+import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
+import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
+import { SubscriptionService } from '../commons/services/SubscriptionService';
+import { SettingsService } from '../commons/services/SettingsService';
+import { PublicIpService } from '../commons/services/PublicIpService';
+import { PublicIpInfo, AppDiagnostics } from '../commons/models/PublicIpInfo';
+import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
+import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
+import { LatencyController } from '../commons/services/LatencyController';
+import { FormStateSync } from '../commons/services/FormStateSync';
+import { UiGuardian } from '../commons/services/UiGuardian';
+import { DiagnosticsSheet } from '../widgets/DiagnosticsSheet';
+import { AppLogger } from '../commons/utils/AppLogger';
+import { ThemeService } from '../theme/ThemeService';
+import { ProxyNode } from '../commons/models/ProxyNode';
+import { NodeSortSnapshot } from '../commons/services/NodeSortPersistence';
+import { BackupRestoreService, RestoreOutcome } from '../commons/services/BackupRestoreService';
+import { BackupCrypto } from '../commons/services/BackupCrypto';
+
+const TAG = 'HomePage';
+
+/** 网络规则 4 选项弹窗：规则 / 强制代理 / 强制直连 / 应用分流 */
+@CustomDialog
+struct NetworkRulesDialog {
+  controller?: CustomDialogController;
+  getProxyCount: () => number = (): number => 0;
+  getDirectCount: () => number = (): number => 0;
+  getAppSummary: () => string = (): string => '';
+  getRulesSummary: () => string = (): string => '';
+  onPick: (kind: string) => void = () => {};
+  @State proxyCount: number = 0;
+  @State directCount: number = 0;
+  @State appSummary: string = '';
+  @State rulesSummary: string = '';
+
+  aboutToAppear(): void {
+    this.proxyCount = this.getProxyCount();
+    this.directCount = this.getDirectCount();
+    this.appSummary = this.getAppSummary();
+    this.rulesSummary = this.getRulesSummary();
+  }
+
+  @Builder
+  OptionRow(icon: string, title: string, detail: string, kind: string) {
+    Row({ space: 12 }) {
+      Text(icon).fontSize(20).fontColor(Nx.accent())
+        .width(40).height(40).textAlign(TextAlign.Center)
+        .borderRadius(12).backgroundColor(Nx.accentSoft())
+      Column({ space: 3 }) {
+        Text(title).fontSize(15).fontWeight(FontWeight.Medium).fontColor(Nx.fg())
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(detail).fontSize(11).fontColor(Nx.muted())
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+      Text('›').fontSize(20).fontColor(Nx.faint())
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+    .borderRadius(15)
+    .backgroundColor(Nx.surface())
+    .borderWidth(1)
+    .borderColor(Nx.border())
+    .onClick(() => this.onPick(kind))
+  }
+
+  build() {
+    Column({ space: 10 }) {
+      Text('规则模式设置').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+      this.OptionRow('☷', '广告与隐私拦截规则', this.rulesSummary, 'rules')
+      this.OptionRow('↗', '强制代理网站名单', `代理 ${this.proxyCount} 个域名`, 'proxy')
+      this.OptionRow('↘', '强制直连网站名单', `直连 ${this.directCount} 个域名`, 'direct')
+      this.OptionRow('▦', '应用分流策略设置', this.appSummary, 'app')
+      Button('关闭')
+        .width('100%')
+        .backgroundColor(Nx.fgSoft())
+        .fontColor(Nx.fg())
+        .borderRadius(8)
+        .onClick(() => {
+          if (this.controller !== undefined) {
+            this.controller.close();
+          }
+        })
+    }
+    .padding(20)
+    .borderRadius(20)
+    // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
+    // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
+    // 不透明背景色、背景模糊与自定义 shadow 都会遮挡材质（官方反模式），根容器不再设置，
+    // 视觉交给系统材质统一接管；内容层（行卡片/输入框/按钮）样式保持不动。
+  }
+}
+
+/** 配置备份与恢复弹窗（Nexus §9）：导出/导入订阅+自定义规则 JSON */
+@CustomDialog
+struct BackupDialog {
+  controller?: CustomDialogController;
+  @State toastMsg: string = '';
+  onExport: () => void = () => {};
+  onImport: () => void = () => {};
+  getToast: () => string = (): string => '';
+
+  aboutToAppear(): void {
+    this.toastMsg = '';
+  }
+
+  build() {
+    Column({ space: 10 }) {
+      Row({ space: 8 }) {
+        Text('▣').fontSize(20).fontColor(Nx.accent())
+        Text('配置备份与恢复').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).layoutWeight(1)
+        Text('✕').fontSize(16).fontColor(Nx.muted()).padding(6)
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+          })
+      }.width('100%')
+      Text('备份范围包括当前全部已导入的订阅、节点以及自定义规则配置。')
+        .fontSize(12).fontColor(Nx.muted()).width('100%')
+      Column({ space: 4 }) {
+        Text('📤 导出当前配置备份').fontSize(13).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).width('100%')
+        Text('生成包含所有订阅和规则的 .json 备份文件，便于多设备同步或留存。')
+          .fontSize(11).fontColor(Nx.muted()).width('100%')
+        Button('导出备份文件 (.json)')
+          .width('100%').borderRadius(8)
+          .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(12.5)
+          .onClick(() => this.onExport())
+      }
+      .width('100%').padding(12).borderRadius(12)
+      .backgroundColor(Nx.bg())
+      .borderWidth(1).borderColor(Nx.border())
+      Column({ space: 4 }) {
+        Text('📥 导入恢复配置').fontSize(13).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).width('100%')
+        Text('上传备份的 .json 配置文件，一键恢复所有订阅及自定义规则。')
+          .fontSize(11).fontColor(Nx.muted()).width('100%')
+        Button('选择备份文件并恢复')
+          .width('100%').borderRadius(8)
+          .backgroundColor(Nx.surface()).fontColor(Nx.fg()).fontSize(12.5)
+          .borderWidth(1.5).borderColor(Nx.border())
+          .onClick(() => this.onImport())
+      }
+      .width('100%').padding(12).borderRadius(12)
+      .backgroundColor(Nx.bg())
+      .borderWidth(1).borderColor(Nx.border())
+      if (this.getToast().length > 0) {
+        Text(this.getToast())
+          .fontSize(11.5).fontWeight(FontWeight.Bold).fontColor(Color.White)
+          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+          .borderRadius(9999).backgroundColor(Nx.success())
+      }
+    }
+    .padding(20)
+    .borderRadius(20)
+    // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
+    // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
+    // 不透明背景色、背景模糊与自定义 shadow 都会遮挡材质（官方反模式），根容器不再设置，
+    // 视觉交给系统材质统一接管；内容层（行卡片/输入框/按钮）样式保持不动。
+  }
+}
+
+/**
+ * 备份密码输入弹窗（P0-4 收尾）：导出/导入加密备份时收集密码。
+ * mode: 'export'（确认导出，可选留空=明文）| 'import'（必填密码解密，失败可重试）
+ * 结果通过 onSubmit(password) 回传，取消通过 onCancel() 回传。
+ */
+@CustomDialog
+struct BackupPasswordDialog {
+  controller?: CustomDialogController;
+  @State mode: string = 'export';
+  @State attemptHint: string = '';
+  @State password: string = '';
+  onSubmit: (password: string) => void = (_password: string) => {};
+  onCancel: () => void = () => {};
+
+  build() {
+    Column({ space: 12 }) {
+      Row({ space: 8 }) {
+        Text('🔒').fontSize(18).fontColor(Nx.accent())
+        Text(this.mode === 'export' ? '设置备份密码' : '输入备份密码')
+          .fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).layoutWeight(1)
+      }.width('100%')
+      if (this.mode === 'export') {
+        Text('使用 AES-256-GCM 加密备份。留空则导出明文；密码至少 4 个字符，遗忘后无法恢复。')
+          .fontSize(11.5).fontColor(Nx.muted()).width('100%')
+      } else {
+        Text(this.attemptHint.length > 0 ? this.attemptHint : '此备份已加密，请输入导出时设置的密码。')
+          .fontSize(11.5).fontColor(Nx.muted()).width('100%')
+      }
+      TextInput({ placeholder: this.mode === 'export' ? '密码（留空=明文备份）' : '备份密码', text: this.password })
+        .type(InputType.Password)
+        .width('100%').height(42).borderRadius(8)
+        .fontSize(13)
+        .onChange((value: string) => {
+          this.password = value;
+        })
+      Row({ space: 10 }) {
+        Button('取消')
+          .layoutWeight(1).height(38).borderRadius(8)
+          .backgroundColor(Nx.surface()).fontColor(Nx.muted()).fontSize(13)
+          .borderWidth(1).borderColor(Nx.border())
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+            this.onCancel();
+          })
+        Button(this.mode === 'export' ? '确认导出' : '解密恢复')
+          .layoutWeight(1).height(38).borderRadius(8)
+          .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(13)
+          .onClick(() => {
+            if (this.mode === 'import' && this.password.length < 4) {
+              this.attemptHint = '密码至少 4 个字符，请重新输入。';
+              return;
+            }
+            const pw = this.password;
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+            this.onSubmit(pw);
+          })
+      }.width('100%')
+    }
+    .padding(20)
+    .borderRadius(20)
+    // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
+    // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
+    // 不透明背景色、背景模糊与自定义 shadow 都会遮挡材质（官方反模式），根容器不再设置，
+    // 视觉交给系统材质统一接管；内容层（行卡片/输入框/按钮）样式保持不动。
+  }
+}
+
+@Component
+export struct HomePage {
+  @State isConnected: boolean = false;
+  @State isConnecting: boolean = false;
+  @State errorMessage: string = '';
+  @State publicIp: string = '';
+  @State publicIpRefreshing: boolean = false;
+  @State publicIpError: string = '';
+  @State currentNodeName: string = '';
+  @State currentLatencyTick: number = 0;
+  @State showDiagnostics: boolean = false;
+  @State diagData: AppDiagnostics | null = null;
+  @State upSpeed: number = 0;
+  @State downSpeed: number = 0;
+  @State upTotal: number = 0;
+  @State downTotal: number = 0;
+  @State connectionDuration: number = 0;
+  @State proxyMode: string = 'rule';
+  @State rulesSummary: string = '加载中…';
+  @State networkRulesSummary: string = '加载中…';
+  @State ratePoints: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  @State backupToast: string = '';
+  @StorageLink('theme_revision') themeRevision: number = 0;
+  @StorageLink('public_ip_revision') @Watch('onPublicIpRevision') publicIpRevision: number = 0;
+  @StorageLink('vpn_request_seq') @Watch('onVpnRequest') vpnRequestSeq: number = 0;
+  private pageReady: boolean = false;
+  /** 宿主（MainPage）「重新展示」通知桥：替代 @Entry 页面的 onPageShow（见 TabLifecycleBridge） */
+  shownBridge?: TabLifecycleBridge;
+  private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
+  private subs: SubscriptionService = SubscriptionService.instance();
+  private settings: AppSettings = new AppSettings();
+  private readonly connectionListener: () => void = (): void => {
+    this.applyOrchestratorState();
+  };
+  private readonly latencyListener: () => void = (): void => {
+    this.currentLatencyTick = this.currentLatencyTick + 1;
+  };
+  private listenerBound: boolean = false;
+  private latencyListenerBound: boolean = false;
+  private connectionTimer: number = -1;
+  private networkRulesDialog: CustomDialogController = new CustomDialogController({
+    builder: NetworkRulesDialog({
+      getProxyCount: (): number => this.settings.forceProxySites.length,
+      getDirectCount: (): number => this.settings.forceDirectSites.length,
+      getAppSummary: (): string => this.networkRulesSummary.split('\n')[1] ?? '',
+      getRulesSummary: (): string => this.rulesSummary,
+      onPick: (kind: string): void => {
+        this.networkRulesDialog.close();
+        if (kind === 'rules') {
+          setTimeout((): void => {
+            router.pushUrl({ url: 'pages/RulesPage' });
+          }, 120);
+        } else if (kind === 'app') {
+          setTimeout((): void => {
+            router.pushUrl({ url: 'pages/AppRoutingPage' });
+          }, 120);
+        } else {
+          setTimeout((): void => {
+            router.pushUrl({ url: 'pages/SiteRoutingPage', params: { kind: kind === 'direct' ? 'direct' : 'proxy' } });
+          }, 120);
+        }
+      }
+    }),
+    autoCancel: true
+  });
+  private backupDialog: CustomDialogController = new CustomDialogController({
+    builder: BackupDialog({
+      getToast: (): string => this.backupToast,
+      onExport: (): void => {
+        this.exportBackup();
+      },
+      onImport: (): void => {
+        this.importBackup();
+      }
+    }),
+    autoCancel: true
+  });
+  private exportPassword: string = '';
+  private exportPending: boolean = false;
+  private exportPasswordAsked: boolean = false;
+  private importPendingText: string = '';
+  private importAttempt: number = 0;
+  @State private importDialogMode: string = 'import';
+  @State private importHint: string = '';
+  private backupPasswordDialog: CustomDialogController = new CustomDialogController({
+    builder: BackupPasswordDialog({
+      mode: this.importDialogMode,
+      attemptHint: this.importHint,
+      onSubmit: (password: string): void => {
+        if (this.exportPending) {
+          this.exportPending = false;
+          this.exportPassword = password;
+          this.exportBackup();
+        } else if (this.importPendingText.length > 0) {
+          this.decryptImportedBackup(this.importPendingText, password);
+        }
+      },
+      onCancel: (): void => {
+        this.exportPending = false;
+        this.exportPassword = '';
+        this.importPendingText = '';
+      }
+    }),
+    autoCancel: true
+  });
+
+  /** 对导入文本尝试解密：成功→继续导入；失败→重开密码弹窗（最多 3 次） */
+  private decryptImportedBackup(text: string, password: string): void {
+    const dec = BackupCrypto.decrypt(text, password);
+    if (dec.ok) {
+      this.importPendingText = '';
+      this.importAttempt = 0;
+      this.finishImport(dec.text);
+      return;
+    }
+    promptAction.showToast({ message: dec.message });
+    this.importAttempt += 1;
+    if (this.importAttempt >= 3) {
+      this.importAttempt = 0;
+      this.importPendingText = '';
+      return;
+    }
+    this.openImportPasswordDialog(text, `密码错误，还可尝试 ${2 - this.importAttempt} 次。`);
+  }
+
+  private openImportPasswordDialog(text: string, hint: string): void {
+    this.importPendingText = text;
+    // BackupPasswordDialog 按 exportPending 判定模式；导入前先确保非导出态
+    this.exportPending = false;
+    this.importHint = hint;
+    this.importDialogMode = 'import';
+    this.backupPasswordDialog.open();
+  }
+
+  /** 导入结果应用：恢复成功则重载设置并提示 */
+  private applyImportOutcome(outcome: RestoreOutcome): void {
+    if (outcome.ok) {
+      SettingsService.load().then((loaded: AppSettings): void => {
+        this.settings = loaded;
+        this.proxyMode = this.settings.proxyMode === 'global' ? 'global' : 'rule';
+        this.refreshDisplayNode();
+      });
+      this.backupToast = `✓ 恢复成功！已导入 ${outcome.subCount} 个订阅及自定义规则`;
+      promptAction.showToast({ message: this.backupToast });
+    } else {
+      promptAction.showToast({ message: outcome.message });
+    }
+  }
+
+  /** finishImport：解密成功后的导入入口（复用 importBackup 的恢复逻辑） */
+  private finishImport(text: string): void {
+    BackupRestoreService.importJsonText(text).then((outcome: RestoreOutcome): void => {
+      this.applyImportOutcome(outcome);
+    }).catch((): void => {
+      promptAction.showToast({ message: '导入失败，请重试' });
+    });
+  }
+
+  aboutToAppear(): void {
+    // 作为 HdsTabs 页签内容组件（非 @Entry 页）后：页签「重新展示」由宿主经桥通知，
+    // 语义等价于原 onPageShow（从子页返回 / 切回页签时刷新）。
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler((): void => { this.refreshForShown(); });
+    }
+  }
+
+  /** 宿主通知的「重新展示」：执行原 onPageShow 的刷新 */
+  refreshForShown(): void {
+    this.bootstrap();
+  }
+
+  aboutToDisappear(): void {
+    this.pageReady = false;
+    this.stopConnectionTimer();
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler(null);
+    }
+    if (this.listenerBound) {
+      this.orchestrator.removeListener(this.connectionListener);
+      this.listenerBound = false;
+    }
+    if (this.latencyListenerBound) {
+      LatencyController.removeListener(this.latencyListener);
+      this.latencyListenerBound = false;
+    }
+  }
+
+  private applyOrchestratorState(): void {
+    this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
+    // App 内手动连接路径的会话守护：连接成功注册 dataTransfer 连续任务（防杀），
+    // 断开/失败释放。幂等，状态重复同步不会重复注册/释放。
+    if (this.isConnected && !UiGuardian.isRegistered()) {
+      UiGuardian.engage(getContext(this) as Context).catch((): void => {});
+    } else if (!this.isConnected && UiGuardian.isRegistered()
+      && this.orchestrator.state !== ConnState.CONNECTING
+      && this.orchestrator.state !== ConnState.DISCONNECTING
+      && this.orchestrator.state !== ConnState.RECOVERING) {
+      UiGuardian.release(getContext(this) as Context).catch((): void => {});
+    }
+    this.isConnecting = this.orchestrator.state === ConnState.CONNECTING
+      || this.orchestrator.state === ConnState.DISCONNECTING
+      || this.orchestrator.state === ConnState.RECOVERING;
+    // miniBar（P1-3a）宿主信号：AppStorage 键供 MainPage 的 @StorageLink 消费
+    AppStorage.setOrCreate('mini_conn_connected', this.isConnected);
+    AppStorage.setOrCreate('mini_conn_connecting', this.isConnecting);
+    AppStorage.setOrCreate('mini_conn_node', this.orchestrator.currentNodeName());
+    this.errorMessage = this.orchestrator.lastError;
+    this.upSpeed = this.orchestrator.traffic.uploadSpeed;
+    this.downSpeed = this.orchestrator.traffic.downloadSpeed;
+    this.upTotal = this.orchestrator.traffic.uploadBytes;
+    this.downTotal = this.orchestrator.traffic.downloadBytes;
+    if (!this.isConnected) {
+      this.ratePoints = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    }
+    if (this.pageReady) {
+      this.syncConnectionTimer();
+    }
+    this.refreshDisplayNode();
+  }
+
+  private syncConnectionTimer(): void {
+    if (this.orchestrator.state !== ConnState.CONNECTED || this.orchestrator.startedAt <= 0) {
+      this.connectionDuration = 0;
+      this.stopConnectionTimer();
+      return;
+    }
+    this.connectionDuration = Math.max(0,
+      Math.floor((Date.now() - this.orchestrator.startedAt) / 1000));
+    if (this.connectionTimer >= 0) {
+      return;
+    }
+    this.connectionTimer = setInterval(() => {
+      if (this.orchestrator.state !== ConnState.CONNECTED || this.orchestrator.startedAt <= 0) {
+        this.connectionDuration = 0;
+        this.stopConnectionTimer();
+        return;
+      }
+      this.connectionDuration = Math.max(0,
+        Math.floor((Date.now() - this.orchestrator.startedAt) / 1000));
+      // Nexus 速率采样：滑动窗口 26 点，量程 1500KB/s
+      const speed = this.orchestrator.traffic.uploadSpeed + this.orchestrator.traffic.downloadSpeed;
+      const ratio = Math.min(1, Math.max(0, speed / (1500 * 1024)));
+      const next = this.ratePoints.slice();
+      next.push(ratio);
+      if (next.length > NexusSizes.ratePoints) {
+        next.splice(0, next.length - NexusSizes.ratePoints);
+      }
+      this.ratePoints = next;
+      this.upSpeed = this.orchestrator.traffic.uploadSpeed;
+      this.downSpeed = this.orchestrator.traffic.downloadSpeed;
+      this.upTotal = this.orchestrator.traffic.uploadBytes;
+      this.downTotal = this.orchestrator.traffic.downloadBytes;
+    }, 1000);
+  }
+
+  private stopConnectionTimer(): void {
+    if (this.connectionTimer >= 0) {
+      clearInterval(this.connectionTimer);
+      this.connectionTimer = -1;
+    }
+  }
+
+  private async toggleTheme(): Promise<void> {
+    await ThemeService.toggle();
+    const mainWindow = AppStorage.get<window.Window>('main_window');
+    if (mainWindow !== undefined) {
+      await ThemeService.syncSystemBars(mainWindow);
+    }
+  }
+
+  private async bootstrap(): Promise<void> {
+    const ctx = getContext(this) as Context;
+    this.orchestrator.init(ctx);
+    await SettingsService.init(ctx);
+    await this.subs.init(ctx);
+    this.settings = await SettingsService.load();
+    this.rulesSummary = this.settings.rulesEnabled
+      ? `${this.settings.hyperAdRulesEnabled ? '去广告已开' : '去广告已关'} · 自定义 ${this.settings.customRules.length} 条`
+      : '规则已关闭';
+    const appSummary = this.settings.appRoutingMode === 'exclude'
+      ? `绕过 ${this.settings.excludedApps.length} 个应用`
+      : (this.settings.appRoutingMode === 'include'
+        ? `仅 ${this.settings.includedApps.length} 个应用` : '全部应用');
+    this.networkRulesSummary = `代理 ${this.settings.forceProxySites.length} · 直连 ${this.settings.forceDirectSites.length}`
+      + `\n${appSummary}${this.settings.appRoutingNeedsReview ? ' · 待确认' : ''}`;
+    const latencySnapshot = NodeSortSnapshot.fromJsonText(this.settings.nodeSortSnapshot);
+    if (latencySnapshot !== null) {
+      for (const rec of latencySnapshot.records) {
+        if (rec.latency !== -2) {
+          LatencyController.set(rec.name, rec.latency);
+        }
+      }
+      LatencyController.flushNow();
+    }
+    this.proxyMode = this.settings.proxyMode === 'global' ? 'global' : 'rule';
+    const authority = await this.orchestrator.authorityState();
+    const snapshot = await SettingsService.loadSnapshot();
+    if (authority.connected) {
+      this.orchestrator.state = ConnState.CONNECTED;
+      if (this.orchestrator.startedAt <= 0 && snapshot.startedAt > 0) {
+        this.orchestrator.startedAt = snapshot.startedAt;
+      }
+    }
+    if (!this.listenerBound) {
+      this.listenerBound = true;
+      this.orchestrator.addListener(this.connectionListener);
+    }
+    if (!this.latencyListenerBound) {
+      this.latencyListenerBound = true;
+      LatencyController.addListener(this.latencyListener);
+    }
+    if (this.publicIp.length === 0) {
+      setTimeout((): void => {
+        this.refreshPublicIp().catch((): void => {});
+      }, 0);
+    }
+    this.applyOrchestratorState();
+    this.pageReady = true;
+    this.syncConnectionTimer();
+    this.consumeVpnRequest();
+  }
+
+  onPublicIpRevision(): void {
+    if (!this.pageReady || this.publicIpRefreshing) {
+      return;
+    }
+    this.publicIp = '';
+    this.refreshPublicIp().catch((): void => {});
+  }
+
+  onVpnRequest(): void {
+    this.consumeVpnRequest();
+  }
+
+  private consumeVpnRequest(): void {
+    if (!this.pageReady) {
+      return;
+    }
+    const mode = AppStorage.get<string>('vpn_request_mode') ?? '';
+    if (mode.length === 0) {
+      return;
+    }
+    AppStorage.setOrCreate('vpn_request_mode', '');
+    // 外部请求（卡片/快捷方式）= 显式用户操作：清除"用户主动停止后台任务"的抑制态
+    UiGuardian.clearExternalCancelSuppression();
+    if (mode === 'start') {
+      this.startConnectionIfNeeded();
+    } else if (mode === 'toggle') {
+      this.toggleConnection();
+    }
+  }
+
+  private async startConnectionIfNeeded(): Promise<void> {
+    // 显式用户操作（快捷方式 start）：清除长时任务抑制态
+    UiGuardian.clearExternalCancelSuppression();
+    if (this.isConnecting || this.isConnected) {
+      return;
+    }
+    const node = this.selectedNode();
+    if (node === null) {
+      promptAction.showToast({ message: '暂无可用节点，请先在「订阅」页添加并刷新' });
+      return;
+    }
+    const ok = await this.orchestrator.connect(node, this.subs);
+    if (ok) {
+      this.refreshPublicIp();
+    }
+  }
+
+  private selectedNode(): ProxyNode | null {
+    const preferred: ProxyNode | null = this.subs.findNode(this.settings.preferredNodeId);
+    if (preferred !== null) {
+      return preferred;
+    }
+    if (this.subs.nodes.length > 0) {
+      return this.subs.nodes[0];
+    }
+    return null;
+  }
+
+  private refreshDisplayNode(): void {
+    if (this.settings.autoSelectMode === AutoSelectModes.AUTO
+      && this.orchestrator.ensureSmartModelReady()) {
+      this.currentNodeName = ClashConfigGenerator.SMART_GROUP_NAME;
+      return;
+    }
+    const preferred = this.subs.findNode(this.settings.preferredNodeId);
+    if (preferred !== null) {
+      this.currentNodeName = preferred.name;
+      return;
+    }
+    if (this.subs.nodes.length > 0) {
+      this.currentNodeName = this.subs.nodes[0].name;
+      return;
+    }
+    this.currentNodeName = '';
+  }
+
+  private statusText(): string {
+    if (this.isConnecting) {
+      return this.isConnected ? '正在断开' : '正在连接';
+    }
+    if (this.errorMessage.length > 0) {
+      return '连接异常';
+    }
+    if (this.isConnected) {
+      return '已连接';
+    }
+    return '未连接';
+  }
+
+  private refreshDiagnostics(): void {
+    this.orchestrator.diagnostics().then((d: AppDiagnostics) => {
+      this.diagData = d;
+    }).catch(() => {
+      this.diagData = null;
+    });
+  }
+
+  private async refreshPublicIp(): Promise<void> {
+    this.publicIpRefreshing = true;
+    this.publicIpError = '';
+    const info: PublicIpInfo = await PublicIpService.query();
+    if (info.ip.length > 0) {
+      this.publicIp = info.ip;
+    } else {
+      this.publicIp = '';
+      this.publicIpError = '获取公网 IPv4 失败，点击重试';
+    }
+    this.publicIpRefreshing = false;
+  }
+
+  private async toggleConnection(): Promise<void> {
+    // 显式用户操作（电源按钮/卡片 toggle）：清除长时任务抑制态
+    UiGuardian.clearExternalCancelSuppression();
+    const context = getContext(this) as Context;
+    const node = this.selectedNode();
+    const nodeName = node === null ? '' : node.name;
+    if (this.isConnecting) {
+      return;
+    }
+    if (this.isConnected) {
+      await FormStateSync.publish(context, FormStateSync.disconnecting(nodeName));
+      await this.orchestrator.disconnect();
+      await FormStateSync.publish(context,
+        node === null ? FormStateSync.noNode() : FormStateSync.disconnected(nodeName));
+      this.refreshPublicIp();
+      return;
+    }
+    if (node === null) {
+      await FormStateSync.publish(context, FormStateSync.noNode());
+      promptAction.showToast({ message: '暂无可用节点，请先在「订阅」页添加并刷新' });
+      return;
+    }
+    await FormStateSync.publish(context, FormStateSync.connecting(node.name));
+    const ok = await this.orchestrator.connect(node, this.subs);
+    await FormStateSync.publish(context,
+      ok ? FormStateSync.connected(node.name) : FormStateSync.failed(node.name));
+    if (ok) {
+      this.refreshPublicIp();
+    }
+  }
+
+  private async applyProxyMode(mode: string): Promise<void> {
+    if (mode === this.proxyMode) {
+      return;
+    }
+    this.proxyMode = mode;
+    this.settings.proxyMode = mode;
+    await SettingsService.save(this.settings);
+    const label = mode === 'global' ? '全局模式' : '智能模式';
+    await this.orchestrator.applyProxyMode(mode);
+    promptAction.showToast({
+      message: this.orchestrator.state === ConnState.CONNECTED
+        ? `已切换${label}` : `已切换${label}，下次连接生效`
+    });
+  }
+
+  /** Nexus §9 导出：快照 → JSON → 可选密码加密 → 系统文件选择器另存（用户自选导出位置） */
+  private async exportBackup(): Promise<void> {
+    try {
+      // P0-4：先经密码弹窗收集可选密码（留空=明文），确认后再走文件选择器
+      if (!this.exportPasswordAsked) {
+        this.exportPasswordAsked = true;
+        this.exportPending = true;
+        this.importDialogMode = 'export';
+        this.importHint = '';
+        this.exportPassword = '';
+        this.backupPasswordDialog.open();
+        return;
+      }
+      this.exportPasswordAsked = false;
+      const password = this.exportPassword;
+      const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
+      const opts = new picker.DocumentSaveOptions();
+      opts.newFileNames = [BackupRestoreService.defaultFileName()];
+      opts.fileSuffixChoices = ['JSON 备份|.json'];
+      const uris = await docPicker.save(opts);
+      if (uris.length === 0) {
+        return;
+      }
+      let json = BackupRestoreService.exportJsonWithSettings(this.settings);
+      if (password.length >= 4) {
+        const enc = BackupCrypto.encrypt(json, password);
+        if (!enc.ok) {
+          promptAction.showToast({ message: enc.message });
+          return;
+        }
+        json = enc.text;
+      }
+      const f = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(f.fd, json);
+      } finally {
+        fs.closeSync(f);
+      }
+      const slash = uris[0].lastIndexOf('/');
+      const savedName = slash >= 0 ? uris[0].substring(slash + 1) : '备份文件';
+      this.backupToast = '✓ 备份文件已成功导出！';
+      promptAction.showToast({ message: `备份已导出：${savedName}` });
+      AppLogger.info(TAG, `backup exported: ${uris[0]}`);
+    } catch (e) {
+      this.backupToast = '';
+      promptAction.showToast({ message: '导出备份失败，请重试' });
+      AppLogger.error(TAG, `backup export failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /** Nexus §9 导入：系统文件选择器挑 .json → 校验恢复 */
+  private async importBackup(): Promise<void> {
+    try {
+      const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
+      const opts = new picker.DocumentSelectOptions();
+      opts.maxSelectNumber = 1;
+      opts.fileSuffixFilters = ['.json'];
+      const uris = await docPicker.select(opts);
+      if (uris.length === 0) {
+        return;
+      }
+      const uri = uris[0];
+      const file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      let text = '';
+      try {
+        const stat = fs.statSync(file.fd);
+        if (stat.size <= 0 || stat.size > 4 * 1024 * 1024) {
+          promptAction.showToast({ message: '文件大小需在 4MB 以内' });
+          return;
+        }
+        const buf = new ArrayBuffer(Number(stat.size));
+        let readLen = 0;
+        while (readLen < Number(stat.size)) {
+          const chunk = fs.readSync(file.fd, buf, { offset: readLen, length: Number(stat.size) - readLen });
+          if (chunk <= 0) {
+            break;
+          }
+          readLen += chunk;
+        }
+        text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, readLen));
+      } finally {
+        fs.closeSync(file);
+      }
+      // 加密备份探测与解密：TunBox-Encrypted 信封 → 密码弹窗（decryptImportedBackup 内可重试 3 次）
+      if (BackupCrypto.isEncrypted(text)) {
+        this.importAttempt = 0;
+        this.openImportPasswordDialog(text, '');
+        return;
+      }
+      const outcome = await BackupRestoreService.importJsonText(text);
+      this.applyImportOutcome(outcome);
+    } catch (e) {
+      AppLogger.warn(TAG, `backup import failed: ${AppLogger.errText(e)}`);
+      promptAction.showToast({ message: '导入失败，请重试' });
+    }
+  }
+
+  private formatSpeedValue(bytesPerSecond: number): string {
+    if (bytesPerSecond < 1024) {
+      return `${Math.round(bytesPerSecond)} B/s`;
+    }
+    const kb = bytesPerSecond / 1024;
+    if (kb < 1024) {
+      return `${kb.toFixed(1)} KB/s`;
+    }
+    return `${(kb / 1024).toFixed(1)} MB/s`;
+  }
+
+  private formatRealtimeRate(): string {
+    return this.formatSpeedValue(this.upSpeed + this.downSpeed);
+  }
+
+  private formatTotalMB(): string {
+    const total = this.upTotal + this.downTotal;
+    if (total < 1024) {
+      return `${Math.round(total)} B`;
+    }
+    const kb = total / 1024;
+    if (kb < 1024) {
+      return `${kb.toFixed(1)} KB`;
+    }
+    const mb = kb / 1024;
+    if (mb < 1024) {
+      return `${mb.toFixed(1)} MB`;
+    }
+    return `${(mb / 1024).toFixed(2)} GB`;
+  }
+
+  private formatDuration(): string {
+    const s = Math.max(0, Math.floor(this.connectionDuration));
+    const hh = `0${Math.floor(s / 3600)}`.slice(-2);
+    const mm = `0${Math.floor((s % 3600) / 60)}`.slice(-2);
+    const ss = `0${s % 60}`.slice(-2);
+    return this.connectionDuration > 0 ? `${hh}:${mm}:${ss}` : '--:--:--';
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      // 沉浸光感需要底色有色相才能透出材质（官方：材质透出底层内容）。
+      // 浅色用与配置页同一套蓝→薄荷渐变（Ui.backdropColors），深色保持纯色画布。
+      Column().width('100%').height('100%')
+        .backgroundColor(Nx.bg())
+        .linearGradient(ThemeService.isDark() ? undefined : { angle: 135, colors: Ui.backdropColors })
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+
+      Column() {
+        Scroll() {
+          Column({ space: 0 }) {
+            // ── 顶部操作行：左备份 / 右深浅主题切换 ──
+            Row() {
+              Row() {
+                Text('备份').fontSize(12).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+              }
+              .padding({ left: 11, right: 11, top: 5, bottom: 5 })
+              .borderRadius(9999)
+              .backgroundColor(Nx.glassFill())
+              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+              .borderWidth(1).borderColor(Nx.glassEdge())
+              .shadow({ radius: 3, color: 'rgba(15, 23, 42, 0.05)', offsetY: 1 })
+              .onClick(() => {
+                this.backupToast = '';
+                this.backupDialog.open();
+              })
+              Blank()
+              Button() {
+                SymbolGlyph($r('sys.symbol.sun_max'))
+                  .fontSize(20)
+                  .fontColor([Nx.muted()])
+              }
+              .width(40)
+              .height(40)
+              .borderRadius(20)
+              .backgroundColor(Color.Transparent)
+              .accessibilityText('切换浅色或深色主题')
+              .onClick(() => this.toggleTheme())
+            }.width('100%').margin({ bottom: 4 })
+
+            // ── 品牌（启动按钮正上方，间隔 16） ──
+            Row({ space: 8 }) {
+              Text('TunBox')
+                .fontSize(13).fontWeight(FontWeight.Bold)
+                .fontColor(Nx.accent())
+                .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+                .borderRadius(9999)
+                .backgroundColor(Nx.accentSoft())
+                .borderWidth(1).borderColor(Nx.accentEdge())
+            }.width('100%').justifyContent(FlexAlign.Center).margin({ top: 8, bottom: 16 })
+
+            // ── 状态环 ──
+            Row() {
+              Blank()
+              StatusRing({
+                isConnected: this.isConnected,
+                isConnecting: this.isConnecting,
+                statusText: this.statusText(),
+                nodeName: this.currentNodeName,
+                onToggle: () => {
+                  this.toggleConnection();
+                }
+              })
+              Blank()
+            }.width('100%').padding({ top: 8, bottom: 12 })
+
+            // ── 公网 IP 胶囊：状态环（电源按钮）正下方，水平居中（对齐 SSRVPN 上游最终布局）──
+            // 仅连接后显示：此时查询到的是所选节点的出口公网 IP；未连接时隐藏，避免误导为本机宽带 IP。
+            // 数据链路复用既有 PublicIpService（连接成功/断开/节点页重连 revision 均已触发刷新），此处只补展示。
+            if (this.isConnected) {
+              Row() {
+                Row({ space: 6 }) {
+                  if (this.publicIpRefreshing) {
+                    LoadingProgress().width(15).height(15).color(Nx.accent())
+                  } else {
+                    Text('🌐').fontSize(14)
+                  }
+                  Text(this.publicIpRefreshing ? '正在获取公网 IP…'
+                    : (this.publicIp.length > 0 ? this.publicIp : this.publicIpError))
+                    .fontSize(12.5).fontWeight(FontWeight.Medium)
+                    .fontColor(this.publicIpRefreshing ? Nx.muted()
+                      : (this.publicIp.length > 0 ? Nx.darkText() : Nx.danger()))
+                    .fontFamily('monospace')
+                    .wordBreak(WordBreak.BREAK_ALL)
+                    .textAlign(TextAlign.Center)
+                    .constraintSize({ maxWidth: 300 })
+                }
+                .alignItems(VerticalAlign.Center)
+                .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+                .borderRadius(9999)
+                .backgroundColor(Nx.glassFill())
+                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+                .borderWidth(1).borderColor(Nx.glassEdge())
+                .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
+                .onClick(() => {
+                  if (!this.publicIpRefreshing) {
+                    this.refreshPublicIp();
+                  }
+                })
+              }
+              .width('100%')
+              .justifyContent(FlexAlign.Center)
+              .alignItems(VerticalAlign.Center)
+              .margin({ bottom: 12 })
+            }
+
+            // ── 实时速率卡 ──
+            Column({ space: 6 }) {
+              Row() {
+                Column({ space: 2 }) {
+                  Text('实时速率')
+                    .fontSize(11).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                    .width('100%')
+                  Text(this.isConnected ? this.formatRealtimeRate() : '0.0 KB/s')
+                    .fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+                    .fontFamily('monospace')
+                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                Row({ space: 10 }) {
+                  Row({ space: 3 }) {
+                    Text('流量').fontSize(10).fontColor(Nx.faint())
+                    Text(this.formatTotalMB()).fontSize(10.5).fontWeight(FontWeight.Medium)
+                      .fontColor(Nx.darkText()).fontFamily('monospace')
+                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }.alignItems(VerticalAlign.Center)
+                  Row({ space: 3 }) {
+                    Text('时长').fontSize(10).fontColor(Nx.faint())
+                    Text(this.formatDuration()).fontSize(10.5).fontWeight(FontWeight.Medium)
+                      .fontColor(Nx.darkText()).fontFamily('monospace')
+                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }.alignItems(VerticalAlign.Center)
+                  // 活跃连接入口：对齐主流客户端的连接查看器（Clash Verge / NekoBox）
+                  Text('连接 ›')
+                    .fontSize(10.5).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                    .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+                    .borderRadius(9999)
+                    .backgroundColor(Nx.accentSoft())
+                    .borderWidth(1).borderColor(Nx.accentEdge())
+                    .onClick(() => router.pushUrl({ url: 'pages/ConnectionsPage' }))
+                }.alignItems(VerticalAlign.Center).flexShrink(0)
+              }.width('100%')
+              RateChart({ points: this.ratePoints, isConnected: this.isConnected })
+            }
+            .width('100%')
+            .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+            .borderRadius(NexusSizes.cardRadius)
+            .backgroundColor(Nx.glassFill())
+            .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+            .backgroundEffect(Nx.glassEffect())
+            .borderWidth(1).borderColor(Nx.glassEdge())
+            .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
+            .margin({ bottom: 12 })
+
+            // ── 错误条 ──
+            if (this.errorMessage.length > 0) {
+              Row({ space: 6 }) {
+                Text('⚠').fontSize(14).fontColor(Nx.danger())
+                Text(this.errorMessage).fontSize(12).fontColor(Nx.danger())
+                  .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+              }
+              .width('100%').padding(12).borderRadius(NexusSizes.cardRadius)
+              .backgroundColor(Nx.glassFill())
+              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+              .borderWidth(1).borderColor(Nx.glassEdge())
+              .margin({ bottom: 12 })
+              .onClick(() => {
+                this.showDiagnostics = true;
+                this.refreshDiagnostics();
+              })
+            }
+
+            // ── 严格双卡片：分流模式 + 规则管理 ──
+            Row({ space: 12 }) {
+              // 卡片1：代理模式
+              Column({ space: 5 }) {
+                Row() {
+                  Text('分流模式').fontSize(11).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                }.width('100%')
+                Text('代理模式').fontSize(13.5).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).width('100%')
+                Text('智能分流大陆与境外').fontSize(11).fontColor(Nx.muted()).width('100%')
+                Row({ space: 2 }) {
+                  Text('智能')
+                    .fontSize(11.5)
+                    .fontWeight(this.proxyMode !== 'global' ? FontWeight.Bold : FontWeight.Medium)
+                    .fontColor(this.proxyMode !== 'global' ? Nx.fg() : Nx.muted())
+                    .layoutWeight(1).textAlign(TextAlign.Center)
+                    .padding(4).borderRadius(9999)
+                    .backgroundColor(this.proxyMode !== 'global' ? Nx.surface() : Color.Transparent)
+                    .shadow(this.proxyMode !== 'global' ?
+                      { radius: 4, color: 'rgba(15, 23, 42, 0.08)', offsetY: 1 } :
+                      { radius: 0, color: Color.Transparent, offsetY: 0 })
+                    .onClick(() => this.applyProxyMode('rule'))
+                  Text('全局')
+                    .fontSize(11.5)
+                    .fontWeight(this.proxyMode === 'global' ? FontWeight.Bold : FontWeight.Medium)
+                    .fontColor(this.proxyMode === 'global' ? Nx.fg() : Nx.muted())
+                    .layoutWeight(1).textAlign(TextAlign.Center)
+                    .padding(4).borderRadius(9999)
+                    .backgroundColor(this.proxyMode === 'global' ? Nx.surface() : Color.Transparent)
+                    .shadow(this.proxyMode === 'global' ?
+                      { radius: 4, color: 'rgba(15, 23, 42, 0.08)', offsetY: 1 } :
+                      { radius: 0, color: Color.Transparent, offsetY: 0 })
+                    .onClick(() => this.applyProxyMode('global'))
+                }
+                .width('100%')
+                .padding(2.5).borderRadius(9999)
+                .backgroundColor(Nx.fgSoft())
+              }
+              .layoutWeight(1)
+              .constraintSize({ minHeight: 100 })
+              .alignItems(HorizontalAlign.Start)
+              .padding(13).borderRadius(NexusSizes.cardRadius)
+              .backgroundColor(Nx.glassFill())
+              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+              .backgroundEffect(Nx.glassEffect())
+              .borderWidth(1).borderColor(Nx.glassEdge())
+              .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
+
+              // 卡片2：规则管理
+              Column({ space: 5 }) {
+                Row() {
+                  Text('规则管理').fontSize(11).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                }.width('100%')
+                Text('规则模式').fontSize(13.5).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).width('100%')
+                Text('广告拦截与直连规则').fontSize(11).fontColor(Nx.muted()).width('100%')
+                Blank()
+                Row() {
+                  Text('点击配置').fontSize(11).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                  Blank()
+                  Text('→').fontSize(11).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                }.width('100%')
+              }
+              .layoutWeight(1)
+              .constraintSize({ minHeight: 100 })
+              .alignItems(HorizontalAlign.Start)
+              .justifyContent(FlexAlign.Start)
+              .padding(13).borderRadius(NexusSizes.cardRadius)
+              .backgroundColor(Nx.glassFill())
+              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+              .backgroundEffect(Nx.glassEffect())
+              .borderWidth(1).borderColor(Nx.glassEdge())
+              .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
+              .onClick(() => this.networkRulesDialog.open())
+            }.width('100%')
+          }
+          .width('100%')
+          // 底部仅留页签栏高度（bar 64 + barBottomMargin 18）：
+          // barOverlap(true) 的官方语义是「内容自然延伸到页签栏之下」。
+          // 若这里留出大片空白，内容滚到底时栏体下方仍是无内容的页面底色，
+          // 系统 IMMERSIVE 材质没有东西可透，悬浮栏会退化成一块实色圆角片。
+          // 缩到栏体高度后，滚动过程中卡片会进入栏体下方，毛玻璃才有可透内容。
+          .padding({ left: 18, right: 18, top: 10, bottom: 100 })
+        }
+        .width('100%').height('100%')
+        .scrollBar(BarState.Off)
+        .align(Alignment.Top)
+      }
+      .width('100%').height('100%')
+
+      if (this.showDiagnostics) {
+        Column() {
+          Blank()
+          DiagnosticsSheet({
+            diag: this.diagData,
+            onRefresh: () => {
+              this.refreshDiagnostics();
+            },
+            onClose: () => { this.showDiagnostics = false; }
+          })
+            .height('78%')
+        }
+        .width('100%').height('100%')
+        .backgroundColor('rgba(15, 23, 42, 0.55)')
+        .onClick(() => { this.showDiagnostics = false; })
+      }
+    }
+    .width('100%').height('100%')
+  }
+}

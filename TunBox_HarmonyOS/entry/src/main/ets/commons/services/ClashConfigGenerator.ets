@@ -1,0 +1,1564 @@
+/**
+ * Clash / Mihomo 配置生成器
+ * 移植自 upstream: packages/ssrvpn_shared/lib/services/clash_config_generator.dart
+ *
+ * 关键约束（与 upstream 行为一致）：
+ * - IPv4-only：DNS 不解析 AAAA，ipv6: false
+ * - external-controller 仅绑定 127.0.0.1，secret 由调用方注入
+ * - TUN 通过 VpnExtensionAbility 的 fd 注入，配置仅声明 tun.enable
+ * - 国内直连规则 + 强制代理站点规则
+ */
+import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
+import { ProxyGroup } from '../models/ProxyGroup';
+import { AppSettings, AutoSelectModes, CustomRuleSet } from '../models/AppSettings';
+import { YamlMerger } from './YamlMerger';
+import { AppLogger } from '../utils/AppLogger';
+import {
+  RawProviderEntry, RawProviderPlan, RawProviderStats, RawSubscriptionStore,
+  RAW_PROVIDER_HEALTH_CHECK_ENABLED, RAW_PROVIDER_HEALTH_CHECK_INTERVAL,
+  RAW_PROVIDER_HEALTH_CHECK_URL, RAW_PROVIDER_PATH_MODE
+} from './RawSubscriptionStore';
+
+const TAG = 'ClashConfigGenerator';
+
+/** 节点无法写入内核配置的原因（判定顺序与 proxyYamlLine 完全一致） */
+export enum ProxyDropReason {
+  NONE = 'none',
+  /** 协议不在白名单（ss/ssr/vless/vmess/trojan/hysteria2/中继协议之外） */
+  UNSUPPORTED_PROTOCOL = 'unsupportedProtocol',
+  /** 字段含换行/NUL/超长：写进 YAML 会破坏配置结构 */
+  UNSAFE_TEXT = 'unsafeText',
+  /** 缺 name/server 或协议级必需字段（如 vless 的 uuid、ss 的 cipher） */
+  MISSING_FIELD = 'missingField',
+  /** 缺的正是凭据字段（password/uuid）—— 典型为加密层未回填 */
+  MISSING_CREDENTIAL = 'missingCredential',
+  /** 端口 <=0 或 >65535 */
+  INVALID_PORT = 'invalidPort'
+}
+
+/**
+ * 「列表有、内核无」的显式账本：生成配置时被 proxyYamlLine 判定为不可写入的
+ * 节点数与原因分类。调用方（服务层/UI）据此提示用户，禁止静默丢成空行。
+ */
+export class ProxyDropStats {
+  total: number = 0;
+  kept: number = 0;
+  unsupportedProtocol: number = 0;
+  unsafeText: number = 0;
+  /** 缺必需字段（含缺凭据） */
+  missingFields: number = 0;
+  invalidPort: number = 0;
+  /** missingFields 中因 password/uuid 为空导致的数量（凭据未回填信号） */
+  missingCredential: number = 0;
+  /** 被丢弃节点名示例（最多 3 个，便于定位） */
+  samples: string = '';
+
+  dropped(): number {
+    return this.unsupportedProtocol + this.unsafeText + this.missingFields + this.invalidPort;
+  }
+
+  hasDrop(): boolean {
+    return this.dropped() > 0;
+  }
+
+  /** 原因分类明细（始终列出四项，0 也显示，避免「看起来没丢」的误判） */
+  reasons(): string {
+    let text = `协议不支持 ${this.unsupportedProtocol}，文本不安全 ${this.unsafeText}`
+      + `，缺必需字段 ${this.missingFields}`;
+    if (this.missingCredential > 0) {
+      text += `（其中凭据缺失 ${this.missingCredential}）`;
+    }
+    text += `，端口非法 ${this.invalidPort}`;
+    if (this.samples.length > 0) {
+      text += `；示例：${this.samples}`;
+    }
+    return text;
+  }
+
+  summary(): string {
+    return `列表 ${this.total} 个节点，可写入内核 ${this.kept} 个，丢弃 ${this.dropped()} 个（${this.reasons()}）`;
+  }
+}
+
+export class ClashConfigGenerator {
+  /**
+   * 内核 smart 组（自动选择）的固定组名。
+   * 集成层要用它在 PROXY 里选中该组（connect 时不再把 PROXY 钉到具体节点）。
+   */
+  static readonly SMART_GROUP_NAME: string = '♻️ 自动选择';
+
+  /**
+   * smart 组的 `exclude-filter`：排除机场塞进 proxies 列表里的「信息条」伪节点。
+   *
+   * 真机实证（2026-09-20）：某机场把 `剩余流量：965.99 GB`、`套餐到期：长期有效`
+   * 当成节点写进 proxies，它们与真实节点 `🇯🇵日本•移联01` 的
+   * server/port/uuid/servername/reality-opts **完全一致**，是纯重复噪音。
+   * 若不过滤，内核会拿它们参与 LightGBM 评分并可能选成出口 ——
+   * 真机 `/connections` 的 chains[0] 确实出现过 `套餐到期：长期有效`。
+   *
+   * 内核侧 `GroupBase` 对**显式 proxies 列表同样应用** exclude-filter
+   * （`groupbase.go:196`，在合并 provider 之后统一过滤），因此这里无需改可见节点列表：
+   * 用户在「全部」里仍能看到并手动选这些条目，只是自动选点不会再用它们。
+   *
+   * 刻意保守：只匹配明确的信息条措辞，避免误伤真实节点名（真实节点名通常是
+   * 「国家+编号」形式）。误伤的代价也必须可控 —— 它只影响自动选点的候选池，
+   * 不影响手动选择。
+   */
+  static readonly SMART_INFO_NODE_FILTER: string =
+    '(剩余流量|剩余|套餐到期|到期时间|到期|流量重置|距离下次|重置|官网|客服|订阅地址|更新订阅|Expire|Traffic|Reset|Website)';
+
+  /** 最近一次生成的丢弃账本（UI/诊断可读取，即使调用方忽略返回值也不丢信息） */
+  static lastDropStats: ProxyDropStats = new ProxyDropStats();
+  /** 最近一次生成的「双轨 provider」账本（开关关闭时 enabled=false 且 emitted=0） */
+  static lastProviderStats: RawProviderStats = new RawProviderStats();
+  /** 丢弃告警回调：UI 侧注册后，连接/测速生成配置时的丢弃会以提示形式触达用户 */
+  private static dropReporter: ((text: string) => void) | null = null;
+
+  static setDropReporter(reporter: ((text: string) => void) | null): void {
+    ClashConfigGenerator.dropReporter = reporter;
+  }
+
+  /** 记录并上报丢弃：日志必定写，UI 回调存在时同步提示 */
+  static notifyDroppedNodes(stats: ProxyDropStats, stage: string): void {
+    const text = `${stage}丢弃 ${stats.dropped()} / ${stats.total} 个节点：${stats.reasons()}`;
+    AppLogger.warn(TAG, text);
+    if (ClashConfigGenerator.dropReporter !== null) {
+      ClashConfigGenerator.dropReporter(text);
+    }
+  }
+
+  static generate(selectedNode: ProxyNode, allNodes: ProxyNode[], settings: AppSettings,
+    mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
+    ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
+    tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = [],
+    ruleProviderReady: boolean = true, useSmart: boolean = false): string {
+    const lines: string[] = [];
+
+    lines.push('mixed-port: ' + mixedPort);
+    lines.push('external-controller: 127.0.0.1:' + apiPort);
+    lines.push('secret: "' + apiSecret + '"');
+    // 代理模式（upstream settings.proxyMode）：rule=规则 / global=全局
+    lines.push('mode: ' + (settings.proxyMode === 'global' ? 'global' : 'rule'));
+    // 内核日志级别可调（诊断排查时临时调到 debug/info；默认 warning 减少稳态 I/O）。
+    // 白名单外的值一律回落 warning，防止脏设置写出非法 YAML。
+    const level = (settings.coreLogLevel ?? '').trim().toLowerCase();
+    lines.push('log-level: ' + (level === 'debug' || level === 'info' || level === 'error'
+      || level === 'silent' ? level : 'warning'));
+    // 项目规格统一为 IPv4-only：同时关闭 mihomo 全局 IPv6 与 DNS AAAA，
+    // 配合 VpnExtensionAbility 的 IPv4-only TUN，消除 IPv6 绕过及泄漏通道。
+    lines.push('ipv6: false');
+    lines.push('disable-ipv6: true');
+    lines.push('unified-delay: true');
+    lines.push('tcp-concurrent: true');
+    // 长连接与会话复用参数：降低频繁握手、弱网切换后的僵尸连接和后台功耗。
+    lines.push('keep-alive-idle: 30');
+    lines.push('keep-alive-interval: 15');
+    lines.push('udp-timeout: 300');
+    lines.push('find-process-mode: off');
+    lines.push('');
+    lines.push('dns:');
+    lines.push('  enable: true');
+    lines.push(`  listen: 127.0.0.1:${dnsPort}`);
+    lines.push('  ipv6: false');
+    lines.push('  enhanced-mode: fake-ip');
+    lines.push('  cache-algorithm: arc');
+    lines.push('  fake-ip-range: 198.18.0.1/16');
+    // DNS 上游必须用裸 IP(不走引导解析): 用域名会引发解析死锁 ——
+    // 解析 DoH 域名 → DoH 请求 → 又需要域名 → 回环超时(真机 core.log 实证)。
+    // 这里只承担"引导"职责(给需要按域名寻址的上游解析地址)，不承担业务解析。
+    lines.push('  default-nameserver:');
+    lines.push('    - 223.5.5.5');
+    lines.push('    - 119.29.29.29');
+    // ── 防泄露核心：业务解析全部走**加密**上游，且**不**强制走代理链 ──
+    //
+    // 【为什么业务解析必须加密】
+    // 改前 nameserver 是 223.5.5.5/119.29.29.29 的明文 UDP/53。内核
+    // config.Parse 时 respect-rules=false → dns_dialer 裸 dial，于是用户访问的
+    // **每一个域名**都以明文 QNAME 走物理网卡发出去，连 fallback 已用加密 DoT
+    // 答过的境外域名也一样（nameserver 与 fallback 竞速，明文包早已发出）。
+    //
+    // 【为什么 primary 必须是国内解析器，且绝不能开 respect-rules】
+    // 这两条是 5.8.0 反馈「全局模式下华为应用商店加载失败」的根因，写死勿动：
+    //  1) 国内 CDN 的调度依赖**境内解析器返回的境内边缘节点**。若把海外解析器
+    //     设为 primary，appmarket.huawei.com / *.hicloud.com 这类**非 .cn 后缀**
+    //     的国内服务会被解析到境外边缘，应用商店自然加载不出来。
+    //  2) respect-rules: true 让 DNS 查询遵从分流规则；全局模式下所有流量走
+    //     GLOBAL 代理，于是连国内域名的 DNS 都被推到境外节点上问 —— 又慢又 geo 错。
+    // 正确做法是**只加密、不改路由**：DNS 仍然直连，只是不再用明文 UDP。
+    //
+    // 实测可达性与证书（2026-10 国内网络，本机逐个握手验签）：
+    //   tls://223.5.5.5:853   AliDNS  DoT  证书含 IP SAN=223.5.5.5  ✅ 直连可达
+    //   tls://1.12.12.12:853  DNSPod  DoT  证书含 IP SAN=1.12.12.12 ✅ 直连可达
+    //   https://1.1.1.1:443   Cloudflare DoH ❌ TCP 超时（国内不可直连）
+    //   https://8.8.8.8:443   Google    DoH ❌ TCP 超时（国内不可直连）
+    // 所以 primary 一律用国内 DoT；境外解析器只作 fallback，且必须走 853（853 实测可达）。
+    lines.push('  nameserver:');
+    lines.push('    - tls://223.5.5.5:853');
+    lines.push('    - tls://1.12.12.12:853');
+    // DIRECT 命中的域名专用上游：内核按 respectRules=false 单独构造 DirectResolver，
+    // 永远直连、永远不进 fake-ip，因此不存在"直连分支也走代理"的回环。
+    lines.push('  direct-nameserver:');
+    lines.push('    - tls://223.5.5.5:853');
+    lines.push('    - tls://1.12.12.12:853');
+    // direct-nameserver 不再套用下面的 nameserver-policy，避免策略把直连域名
+    // 又拽回代理侧解析。
+    lines.push('  direct-nameserver-follow-policy: false');
+    // ── fallback 与 geoip.metadb 强绑定（坑 40）──
+    // mihomo 的 `fallback` 一旦非空、且没有显式 `fallback-filter` 时，会套用默认
+    // `fallback-filter: {geoip: true, geoip-code: CN}`，于是在 config.Parse 阶段就
+    // 同步调用 RC.NewGEOIP → geodata.InitGeoIP() 去加载 MMDB。全新安装时
+    // geoip.metadb 不存在，内核会**在启动路径里**联网下载（github.com，国内直连
+    // 不可达），结果是启动静默阻塞到超时后直接
+    // `load GeoIP dns fallback filter error, can't download MMDB` → 配置解析失败、
+    // 内核永远起不来（真机 core.log 停在 "Can't find MMDB, start download"）。
+    // 注意这条路与 GEOIP 规则无关：即使已经按 useGeoip 去掉了 GEOIP 规则，
+    // 只要 fallback 还在，MMDB 依然会被加载 —— 所以 fallback 必须同受 useGeoip 约束。
+    // 降级语义：未就绪就整块不声明（内核走 nameserver 单路解析），后台补齐
+    // geoip.metadb 后下次连接自动恢复完整分流。
+    //
+    // fallback 只在「nameserver 的应答被判定为非 CN」时才采用（默认
+    // fallback-filter: geoip/cn），所以境外域名仍能拿到境外解析，不会被国内解析器
+    // 污染成假地址；国内域名走 primary，拿到的仍是境内边缘。
+    // 端点只留 1.1.1.1:853 一个，**刻意不加冗余**：2026-10 国内网络实测，
+    // 境外加密解析器里只有 Cloudflare 的 853 可直连（证书含 IP SAN=1.1.1.1）；
+    // 8.8.8.8 / 8.8.4.4 / 9.9.9.9 / 149.112.112.112 / 208.67.222.222 /
+    // 64.6.64.6 / 185.228.168.9 的 853 全部 TCP 超时，Cloudflare/Google 的
+    // 443(DoH) 同样超时。写多个不可达条目不是"冗余保险"，而是让**每个境外域名
+    // 解析都要多付一次连接超时**，反而拖慢首次打开。宁可单点但可达。
+    if (useGeoip) {
+      lines.push('  fallback:');
+      lines.push('    - tls://1.1.1.1:853');
+    }
+    // fallback 与 nameserver 竞速（命中国内即返回，避免 fallback 拖慢国内解析）。
+    lines.push('  strategy: prefer_ipv4');
+    lines.push('  disable-cache: false');
+    // 代理服务器域名的专用解析: 不走 fake-ip(否则内核拿 198.18.x.x 假地址拨号
+    // 代理服务器, 全部 i/o timeout —— 真机 core.log 实证), 用真实 DNS 直出。
+    // 内核以 respectRules=false 解析本项，且永不套 fake-ip，所以这是防
+    // 「解析代理域名 → 又需要代理解析代理域名」回环的关键，**不可删**。
+    // 这里保留明文 UDP 是刻意的取舍：这些域名在 UI 进程已被 DoH 预解析并写进
+    // YAML hosts:（见 pinProxyServerHosts），运行期几乎不会被真的问到；
+    // 若改成 DoT，一旦该 DoT 端点抖动，所有节点域名同时不可解析 = 全面断线。
+    lines.push('  proxy-server-nameserver:');
+    lines.push('    - 223.5.5.5');
+    lines.push('    - 119.29.29.29');
+    // ── 国内域名显式钉到国内加密 DoT ──
+    // direct-nameserver 已覆盖 DIRECT 分支，这里再加一层是为了让意图可审计、
+    // 且不依赖内核对 direct-nameserver 的适用面判断。
+    // 刻意只用**纯后缀**，不用 `geosite:` —— geosite/geodata 会在 config.Parse
+    // 阶段触发同步下载，正是坑 40 那个 90s 启动阻塞的同类。
+    lines.push('  nameserver-policy:');
+    lines.push('    "+.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.com.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.net.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.org.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.gov.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    // ── P0-3 DNS 层 REJECT 预匹配 ──
+    // 强制拦截网站在 nameserver-policy 里直接拒绝（rcode://refused）：DNS 查询
+    // 在解析层就拿到 NXDOMAIN/REFUSED，不建立 TCP 连接、不发出明文 QNAME、
+    // 不进入 fake-ip —— 比仅路由层 REJECT 少一次完整连接尝试（省电省流量）。
+    // mihomo nameserver-policy 值支持 rcode:// 协议（与 upstream 同位置解析）。
+    const blockSites = ClashConfigGenerator.normalizeDomains(settings.forceBlockSites);
+    for (const site of blockSites) {
+      lines.push(`    "+.${site}": rcode://refused`);
+    }
+    // fake-ip 过滤：局域网/系统/直连目标不返回假 IP，避免误伤本地发现与测速。
+    // STUN / NTP / 反向解析 / 门户探活这一类必须给真实地址：给假地址会让它们
+    // 退化成一次无意义的明文 nameserver 查询，同时破坏连通性探测。
+    lines.push('  fake-ip-filter:');
+    lines.push('    - "*.lan"');
+    lines.push('    - "*.local"');
+    lines.push('    - "localhost"');
+    lines.push('    - "*.localhost"');
+    lines.push('    - "+.home.arpa"');
+    lines.push('    - "*.msftconnecttest.com"');
+    lines.push('    - "*.msftncsi.com"');
+    lines.push('    - "+.captive.apple.com"');
+    lines.push('    - "localhost.ptlogin2.qq.com"');
+    lines.push('    - "+.market.xiaomi.com"');
+    lines.push('    - "+.srv.nintendo.net"');
+    lines.push('    - "stun.*.*"');
+    lines.push('    - "+.stun.*.*"');
+    lines.push('    - "stun.l.google.com"');
+    lines.push('    - "+.pool.ntp.org"');
+    lines.push('    - "time.*"');
+    lines.push('    - "+.time.*"');
+    lines.push('    - "+.arpa"');
+    lines.push('    - "+.in-addr.arpa"');
+    lines.push('    - "+.ip6.arpa"');
+    lines.push('');
+    // ── 域名嗅探（对齐 Clash Verge / FlClash 默认开启的 sniffer）──────────────
+    // fake-ip 模式下内核拿到的目标地址是 198.18.x.x，DOMAIN 类规则依赖 DNS 映射反查；
+    // TLS ClientHello SNI 与 DNS 记录不一致（CDN、直连 IP、QUIC）时必须靠嗅探还原
+    // 真实域名才能正确命中 DOMAIN/GEOIP 规则。键位以本仓库内核源码 config.go 的
+    // RawSniffer 为准：顶层 sniffer 键，sniff 为「协议名 → 配置」map（键必须是大写
+    // 规范名 HTTP/TLS/QUIC，见 parseSniffer 的大小写匹配逻辑），空值 {} = 继承全局
+    // override-destination；parse-pure-ip 让纯 IP 直连流量同样被嗅探。
+    if (settings.sniffingEnabled !== false) {
+      lines.push('sniffer:');
+      lines.push('  enable: true');
+      lines.push('  override-destination: true');
+      lines.push('  parse-pure-ip: true');
+      lines.push('  force-dns-mapping: true');
+      lines.push('  sniff:');
+      lines.push('    HTTP: {}');
+      lines.push('    TLS: {}');
+      lines.push('    QUIC: {}');
+      lines.push('');
+    }
+    lines.push('profile:');
+    // 连接复用：存储已选策略，减少重连后的重复握手与选点抖动。
+    lines.push('  store-selections: true');
+    lines.push('  store-fake-ip: true');
+    lines.push('');
+    lines.push('tun:');
+    // headless 测速模式: tun.enable=false, 内核只开 mixed/API 端口, 不建隧道不碰 VPN 权限
+    lines.push('  enable: ' + (tunEnabled ? 'true' : 'false'));
+    lines.push('  stack: gvisor');  // fd 注入 + 沙箱无 iptables, 只有 gvisor 可用
+    // DNS 覆写(TUN 层): 所有目标端口 53 的 DNS 请求一律劫持进内核解析。
+    lines.push('  dns-hijack:');
+    lines.push('    - any:53');
+    lines.push('  auto-route: false');   // 路由由 VpnExtensionAbility 安装（默认路由 = 系统级 Kill Switch）
+    lines.push('  auto-detect-interface: false');
+    // 说明：strict-route 依赖 nftables/iptables，OHOS gvisor+fd 注入沙箱不可用，
+    // 故不启用；Kill Switch 由 Extension 的 IPv4-only 默认路由 + 内核存活监控保证。
+    lines.push('  mtu: 1400');          // 缺省值；Extension 按物理承载改写并下发 VpnConfig.mtu
+    lines.push('');
+    // ── hosts: 代理服务器域名的防投毒固定解析(UI 进程 DoH 预解析结果) ──
+    // 内核拨号代理服务器时直接命中这些真实 IP, 不再走运行期(可能被污染的)DNS。
+    const normalizedHosts = new Map<string, string>();
+    for (const rawHost of Object.keys(proxyHosts)) {
+      const host = ClashConfigGenerator.normalizeDomain(rawHost);
+      const address = proxyHosts[rawHost].trim();
+      if (host.length === 0 || !ClashConfigGenerator.isValidIpAddress(address)) {
+        continue;
+      }
+      normalizedHosts.set(host, address.toLowerCase());
+    }
+    if (normalizedHosts.size > 0) {
+      lines.push('hosts:');
+      for (const h of Array.from(normalizedHosts.keys()).sort()) {
+        lines.push(`  "${ClashConfigGenerator.escapeYaml(h)}": "${ClashConfigGenerator.escapeYaml(normalizedHosts.get(h) ?? '')}"`);
+      }
+      lines.push('');
+    }
+    lines.push('proxies:');
+    // 只从白名单结构化字段生成合法配置，任何协议均不透传 rawYaml。
+    // 同时把不可写入的节点按原因计数（漏洞 A：此前 validNodes 过滤是静默的，
+    // 列表显示 N 个而内核只有 0 个，界面无任何提示）。
+    //
+    // 性能：dropReasonFor 会为每个节点分配一个 22 元素数组并跑 22 次 isSafeText，
+    // 是本文件里最贵的纯 CPU 判定。原先一次 generate() 里它被跑三遍
+    // （countDroppedNodes + 过滤 + proxyYamlLine 内部），这里**只算一遍**
+    // 并把结果同时供统计与过滤使用。
+    const dropReasons: Map<ProxyNode, string> = new Map<ProxyNode, string>();
+    for (const n of allNodes) {
+      dropReasons.set(n, ClashConfigGenerator.dropReasonFor(n));
+    }
+    const dropStats = ClashConfigGenerator.countDroppedNodes(allNodes, dropReasons);
+    ClashConfigGenerator.lastDropStats = dropStats;
+    const validNodes: ProxyNode[] = [];
+    for (const n of allNodes) {
+      if (dropReasons.get(n) === ProxyDropReason.NONE) {
+        validNodes.push(n);
+      }
+    }
+    if (dropStats.hasDrop()) {
+      // 存活数少于列表节点数：日志 + UI 回调（不阻止连接，但绝不静默）
+      ClashConfigGenerator.notifyDroppedNodes(dropStats, '生成配置');
+    }
+    if (validNodes.length === 0) {
+      // 零有效节点时生成空 proxies + 空组会让内核解析失败，直接抛出可读错误。
+      // 错误文案必须带丢弃数量与原因，否则用户只看到「没有可用的节点配置」而无从下手。
+      throw new Error(`没有可用的节点配置：${dropStats.summary()}。`
+        + (dropStats.missingCredential > 0
+          ? '其中多个节点缺少 password/uuid：本机加密存储未能回填凭据，请到「订阅」页刷新订阅后重连。'
+          : '请到「订阅」页刷新订阅后重连。'));
+    }
+    // 全局代理名唯一化 —— **必须在写 proxies 之前**完成，因为：
+    //   proxies[i].name、proxy-groups 的 proxies 成员、PROXY 组的内容全部按名字引用，
+    //   只改其中一处会造成悬空引用（组里引用了一个不存在的名字）。
+    // 一起改完，后续所有引用自然指向新名字。
+    ClashConfigGenerator.ensureUniqueProxyNames(validNodes);
+    // 用户在 UI 里选中的那个节点必须跟着改名，否则 PROXY 组首个成员会引用旧名字
+    // （validNodes.includes 是对象身份比较，所以改名前取到的引用仍然有效）。
+    for (const n of validNodes) {
+      lines.push(ClashConfigGenerator.proxyYamlLine(n));
+    }
+    // ── 双轨（settings.useRawProviderConfig，默认关闭）────────────────────
+    // 开关关闭：计划为空、不追加任何一行 → 输出与现状（HEAD）完全一致。
+    // 开关开启：每个已落盘的订阅原文作为 `type: file` provider 交给内核自行解析，
+    // 与 Mihomo/Clash Verge 对齐；文件缺失的 provider 绝不写入（避免 use: 悬空引用）。
+    const providerPlan: RawProviderPlan = ClashConfigGenerator.planRawProviders(settings, allNodes);
+    ClashConfigGenerator.lastProviderStats = providerPlan.stats;
+    if (providerPlan.entries.length > 0) {
+      lines.push('');
+      lines.push('proxy-providers:');
+      for (const entry of providerPlan.entries) {
+        lines.push(`  "${ClashConfigGenerator.escapeYaml(entry.providerName)}":`);
+        lines.push('    type: file');
+        // path 语义见 RawSubscriptionStore 顶部注释：默认相对内核 HomeDir(=cacheDir)
+        lines.push(`    path: "${ClashConfigGenerator.escapeYaml(entry.providerPath)}"`);
+        if (RAW_PROVIDER_HEALTH_CHECK_ENABLED) {
+          lines.push('    health-check:');
+          lines.push('      enable: true');
+          lines.push(`      url: "${RAW_PROVIDER_HEALTH_CHECK_URL}"`);
+          lines.push(`      interval: ${RAW_PROVIDER_HEALTH_CHECK_INTERVAL}`);
+        }
+      }
+    }
+    const groupSelected: ProxyNode = validNodes.includes(selectedNode) ? selectedNode : validNodes[0];
+    const emittedGroups = ClashConfigGenerator.planProxyGroups(proxyGroups, validNodes);
+    const selections = ClashConfigGenerator.parseProxyGroupSelections(settings.proxyGroupSelections);
+    // ── ♻️ 自动选择（内核 smart 组 / LightGBM）──────────────────────────────
+    // 仅在「自动选择模式 + Model.bin 已就绪」时声明（见 isSmartModelReady）。
+    // 必须满足三个前提，否则整块不写：
+    //   1) useSmart：应用侧确认 Model.bin 已落盘。内核 GetModel() 在缺文件时会
+    //      **同步联网下载**（github 直连不可达 → 实测阻塞 90s，然后软失败降级）。
+    //      与坑 24/40 同源的启动期阻塞，必须在应用侧拦住。
+    //   2) validNodes.length >= 2：只有一个节点时 smart 无意义，且会平白多一层跳转。
+    //   3) 名称不与任何节点/PROXY 冲突（组名与节点名同名会造成引用二义性）。
+    const SMART_GROUP_NAME = ClashConfigGenerator.SMART_GROUP_NAME;
+    const emitSmart = useSmart && validNodes.length >= 2
+      && !ClashConfigGenerator.usesName(validNodes, emittedGroups, SMART_GROUP_NAME);
+    lines.push('');
+    lines.push('proxy-groups:');
+    lines.push('  - name: "PROXY"');
+    lines.push('    type: select');
+    lines.push('    proxies:');
+    if (emitSmart) {
+      // 自动模式下 PROXY 默认指向 smart 组：内核按每条连接的目标特征（ASN/GeoIP/
+      // 端口/域名类型）在组内动态选点，而不是整条隧道钉死在一个节点上。
+      const smartFirst = settings.autoSelectMode === AutoSelectModes.AUTO;
+      lines.push(`      - "${smartFirst ? SMART_GROUP_NAME : ClashConfigGenerator.escapeYaml(groupSelected.name)}"`);
+      if (!smartFirst) {
+        lines.push(`      - "${SMART_GROUP_NAME}"`);
+      }
+    } else {
+      lines.push(`      - "${ClashConfigGenerator.escapeYaml(groupSelected.name)}"`);
+    }
+    for (const group of emittedGroups) {
+      lines.push(`      - "${ClashConfigGenerator.escapeYaml(group.name)}"`);
+    }
+    for (const n of validNodes) {
+      if (n.id !== groupSelected.id) {
+        lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
+      }
+    }
+    // 代理组通过 use: 引用原始订阅 provider：解析链节点 + provider 节点同时可用，
+    // 任一路径失效都不会让「组内为空」导致内核启动失败（双轨过渡的核心保障）。
+    if (providerPlan.entries.length > 0) {
+      lines.push('    use:');
+      for (const entry of providerPlan.entries) {
+        lines.push(`      - "${ClashConfigGenerator.escapeYaml(entry.providerName)}"`);
+      }
+    }
+    for (const group of emittedGroups) {
+      const members = group.members.slice();
+      const selected = selections.get(ClashConfigGenerator.proxyGroupKey(group));
+      if (selected !== undefined && members.includes(selected)) {
+        members.splice(members.indexOf(selected), 1);
+        members.unshift(selected);
+      }
+      lines.push(`  - name: "${ClashConfigGenerator.escapeYaml(group.name)}"`);
+      lines.push(`    type: ${group.groupType}`);
+      // 组测速参数保真：订阅声明的 url/interval/tolerance/expected-status 优先，
+      // 未声明（或非法）回退内核默认口径（gstatic / 300s），行为与旧版一致。
+      // select 组无测速语义；relay 链式中继不支持测速键，两者均不发射。
+      if (group.groupType === 'url-test' || group.groupType === 'fallback'
+        || group.groupType === 'load-balance') {
+        lines.push(`    url: "${ClashConfigGenerator.safeGroupUrl(group.url)}"`);
+        lines.push(`    interval: ${ClashConfigGenerator.clampGroupInterval(group.intervalSec)}`);
+        if ((group.groupType === 'url-test' || group.groupType === 'load-balance')
+          && group.toleranceMs > 0) {
+          lines.push(`    tolerance: ${Math.min(Math.floor(group.toleranceMs), 60000)}`);
+        }
+        if (group.expectedStatus.length > 0
+          && /^[0-9]{3}([ ]*,[ ]*[0-9]{3})*$/.test(group.expectedStatus.trim())) {
+          lines.push(`    expected-status: "${ClashConfigGenerator.escapeYaml(group.expectedStatus.trim())}"`);
+        }
+        if (group.groupType === 'load-balance') {
+          lines.push('    strategy: consistent-hashing');
+        }
+      }
+      lines.push('    proxies:');
+      for (const member of members) {
+        lines.push(`      - "${ClashConfigGenerator.escapeYaml(member)}"`);
+      }
+    }
+    if (emitSmart) {
+      // 内核 smart 组：LightGBM 综合评分（延迟 / 建连时间 / 成功率 / 历史吞吐 /
+      // 丢包 / ASN / GeoIP / 端口 / 域名类型），按连接粒度选点。
+      //   uselightgbm: true → 用学习模型；collectdata 仅在你愿意上传样本时才开，
+      //     默认 false（本地隐私优先，且不影响本地推理）。
+      //   prefer-asn 必须为 false：开启后 smart.go 会同步调 geodata.InitASN() 拉
+      //     ASN.mmdb，实测 **90s 阻塞**（同 MMDB 坑），而设备上并没有 ASN.mmdb。
+      //   url 用用户配置的测速地址，而不是内核默认的 gstatic —— 否则「测速设置」
+      //     对自动选点不生效，两处延迟口径不一致（真机发现的遗漏）。
+      lines.push(`  - name: "${SMART_GROUP_NAME}"`);
+      lines.push('    type: smart');
+      lines.push('    uselightgbm: true');
+      lines.push('    collectdata: false');
+      lines.push('    prefer-asn: false');
+      const smartUrl: string = (settings.testLatencyUrl ?? '').trim();
+      if (smartUrl.length > 0) {
+        lines.push(`    url: "${ClashConfigGenerator.escapeYaml(smartUrl)}"`);
+      }
+      // 机场常把「剩余流量/套餐到期」这类**信息条**塞进 proxies 列表，它们和真实节点
+      // 共用同一个 server/uuid（真机实证：4 条信息条与 🇯🇵日本•移联01 端点完全相同），
+      // 纯属重复噪音。不排除的话内核会把它们当真节点参与评分，甚至选成出口 ——
+      // 真机 /connections 里就出现过 chains[0] = "套餐到期：长期有效"。
+      // 交给内核自己的 exclude-filter 过滤（GroupBase 对显式 proxies 同样生效），
+      // 不改可见节点列表，用户仍可在「全部」里看到并手动选它们。
+      lines.push(`    exclude-filter: "${ClashConfigGenerator.SMART_INFO_NODE_FILTER}"`);
+      // fork 独有：policy-priority 是**高于** LightGBM 评分的排序键（因子不同则按因子
+      // 降序，分数再高也翻不过来）。默认不写该键 = 完全交给模型评分。
+      const priority: string = (settings.smartPolicyPriority ?? '').trim();
+      if (priority.length > 0) {
+        lines.push(`    policy-priority: "${ClashConfigGenerator.escapeYaml(priority)}"`);
+      }
+      lines.push('    proxies:');
+      for (const n of validNodes) {
+        lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
+      }
+    }
+    // hyper-adrules 是 type: http 的 rule-provider：本地 path 文件缺失时，mihomo 会在
+    // SsrvpnStart() 内部同步拉取远端 URL 并阻塞在启动协程里（不返回、不报错），
+    // 表现为扩展 30s 静默无结果（真机实证 2026-09-19 全新安装首连）。
+    // 与下方 GEOIP 同策略：文件未就绪就不声明 provider、不引用 RULE-SET，
+    // 后台补齐后下次连接生效，绝不把"联网下载"塞进内核启动路径。
+    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
+      lines.push('');
+      lines.push('rule-providers:');
+      lines.push('  hyper-adrules:');
+      lines.push('    type: http');
+      lines.push('    behavior: domain');
+      lines.push('    format: mrs');
+      lines.push('    interval: 86400');
+      lines.push('    path: ./ruleset/hyper_adrules_ads.mrs');
+      lines.push('    url: "https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs"');
+    }
+    // 用户自定义远程规则集（P1-2）：mihomo 自带 type: http 惰性拉取 + interval 自动更新；
+    // 拉取失败时内核保留上一版缓存文件（上游行为），失败回退无需我们额外实现。
+    if (settings.rulesEnabled && settings.customRuleSets.length > 0) {
+      lines.push('');
+      lines.push('rule-providers:');
+      for (const ruleSet of settings.customRuleSets) {
+        lines.push(`  rs-${ruleSet.name}:`);
+        lines.push('    type: http');
+        lines.push(`    behavior: ${ruleSet.behavior}`);
+        lines.push(`    format: ${ruleSet.format}`);
+        lines.push(`    interval: ${ruleSet.interval}`);
+        lines.push(`    path: ./ruleset/custom_rs_${ClashConfigGenerator.sanitizeFileKey(ruleSet.name)}`);
+        lines.push(`    url: "${ClashConfigGenerator.escapeYaml(ruleSet.url)}"`);
+      }
+    }
+    lines.push('');
+    lines.push('rules:');
+    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
+      lines.push('  - RULE-SET,hyper-adrules,REJECT');
+    }
+    // 用户自定义远程规则集（P1-2）：与 hyper-adrules 同策略——provider 声明放 rule-providers
+    // 段，规则引用放在自定义单条规则之前（RULE-SET 精确度高于逐条扫描，mihomo 按序匹配）。
+    if (settings.rulesEnabled) {
+      for (const ruleSet of settings.customRuleSets) {
+        lines.push(`  - RULE-SET,rs-${ruleSet.name},${ruleSet.policy}`);
+      }
+      for (const customRule of ClashConfigGenerator.normalizeCustomRules(settings.customRules)) {
+        lines.push(`  - ${customRule}`);
+      }
+    }
+    // 强制站点规则统一做域名规范化、格式验证和去重，避免规则/YAML 注入。
+    const directSites = ClashConfigGenerator.normalizeDomains(settings.forceDirectSites);
+    const proxySites = ClashConfigGenerator.normalizeDomains(settings.forceProxySites);
+    for (const site of directSites) {
+      lines.push(`  - DOMAIN-SUFFIX,${site},DIRECT`);
+    }
+    for (const site of proxySites) {
+      // DIRECT 优先，避免同一域名生成互相冲突的规则。
+      if (!directSites.includes(site)) {
+        lines.push(`  - DOMAIN-SUFFIX,${site},PROXY`);
+      }
+    }
+    // P0-3 路由层兜底：SNI 嗅探/纯 IP 直连等不经过 DNS 解析的路径仍可能到达
+    // 被拦截域名（fake-ip 被绕过时），这里再拦一次。与 DNS 层条目同源
+    // （settings.forceBlockSites），DIRECT 域名优先级更高（不生成冲突规则）。
+    for (const site of blockSites) {
+      if (!directSites.includes(site)) {
+        lines.push(`  - DOMAIN-SUFFIX,${site},REJECT`);
+      }
+    }
+    // 国内直连：GEOIP 需要 geoip.metadb（内核 home 目录）; 缺失时降级跳过,
+    // 否则 config.Parse 阶段就会联网下载 MMDB, 国内网络不可达直接导致启动失败。
+    // DOMAIN-SUFFIX,cn 直连不受影响, MMDB 由编排器后台补齐后下次连接生效。
+    if (useGeoip) {
+      lines.push('  - GEOIP,CN,DIRECT');
+    }
+    lines.push('  - DOMAIN-SUFFIX,cn,DIRECT');
+    // 兜底规则: 上面的国内规则已放行国内流量, 剩余(YouTube/Google 等国外站点)
+    // 必须走代理。此前 bypassDomesticApps=true 会生成 MATCH,DIRECT, 导致
+    // 国外流量也直连、无法访问被墙站点(真机 core.log: youtube:443 using DIRECT)。
+    // bypassDomesticApps 的语义收敛为"国内直连分流是否启用"(见上方 GEOIP/cn 规则),
+    // 不再影响兜底 —— 兜底永远是 PROXY, 否则 VPN 没有意义。
+    lines.push('  - MATCH,PROXY');
+    // YAML 覆盖层（P2，对标 Stash JS Override 的无脚本形态）：用户 YAML 原文
+    // 追加在配置尾部。mihomo 解析语义：重复键后者覆盖前者 —— 用户可覆盖
+    // dns/rules/proxies 之外的任何顶层键（覆盖 rules/proxies 由 UI 白名单拦截）。
+    // 覆盖层本身经过控制字符净化，脏输入不会导致整份配置拒载。
+    const override = (settings.yamlOverride ?? '').trim();
+    if (override.length > 0 && ClashConfigGenerator.validateYamlOverride(override)) {
+      lines.push('');
+      lines.push('# ---- user override (P2) ----');
+      lines.push(override);
+    }
+    // 最终出口净化：无论上游哪条路径漏进控制字符（rawTemplate/逐字 ws 值/持久化脏数据），
+    // 落盘配置必然 YAML-printable，内核不会因 "control characters are not allowed" 拒载。
+    return ClashConfigGenerator.sanitizeControlChars(lines.join('\n') + '\n');
+  }
+
+  /**
+   * YAML 覆盖层白名单（P2）：拦截危险顶层键。rules/proxies/proxy-groups 三键
+   * 由生成器程序化生成（用户覆盖会绕过 UI 校验与去重），external-controller/
+   * secret/tun 三个键控制内核管理面，同样拦截。返回 true = 允许追加。
+   */
+  static validateYamlOverride(text: string): boolean {
+    if (text.length > 8 * 1024) {
+      return false;
+    }
+    const blocked = /^(rules|proxies|proxy-groups|external-controller|secret|tun)\s*:/;
+    for (const line of text.split('\n')) {
+      if (blocked.test(line.trim())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** 与节点页持久化键保持一致：订阅 ID + NUL + 原始组名。 */
+  static proxyGroupKey(group: ProxyGroup): string {
+    return group.subscriptionId + '\u0000' + group.name;
+  }
+
+  /**
+   * 组测速 URL 安全化：仅接受 http(s) 明文链接且不含 YAML 破坏字符；
+   * 非法/未声明回退内核默认口径 gstatic generate_204（与旧版行为一致）。
+   */
+  static safeGroupUrl(raw: string): string {
+    const url = raw.trim();
+    if (url.length === 0 || url.length > 2048 || !ClashConfigGenerator.isSafeText(url)
+      || !(url.startsWith('http://') || url.startsWith('https://'))) {
+      return 'https://www.gstatic.com/generate_204';
+    }
+    return ClashConfigGenerator.escapeYaml(url);
+  }
+
+  /** 组测速间隔夹取：30..86400 秒；未声明（0/负数）回退 300（旧版硬编码值）。 */
+  static clampGroupInterval(intervalSec: number): number {
+    if (!Number.isFinite(intervalSec) || intervalSec <= 0) {
+      return 300;
+    }
+    return Math.min(Math.max(Math.floor(intervalSec), 30), 86400);
+  }
+
+  /** 容错读取代理组选择；旧版本、损坏 JSON 或非字符串值均按空选择处理。 */
+  static parseProxyGroupSelections(raw: string): Map<string, string> {
+    const out = new Map<string, string>();
+    if (raw.length === 0) {
+      return out;
+    }
+    try {
+      const parsed = JSON.parse(raw) as Record<string, Object>;
+      for (const key of Object.keys(parsed)) {
+        const value = parsed[key];
+        // 键是节点页稳定键（subscriptionId + '\u0000' + 组名），含 NUL 属预期格式，
+        // 仅用于内存查找、从不写入 YAML，故不套用 isSafeText；值会进入配置，必须安全。
+        if (typeof value === 'string' && key.length > 0 && key.length <= 64 * 1024
+          && ClashConfigGenerator.isSafeText(value)) {
+          out.set(key, value);
+        }
+      }
+    } catch (_) {
+      // 设置损坏不能阻止连接，回退到订阅声明顺序。
+    }
+    return out;
+  }
+
+  /**
+   * 名称是否已被任何节点或订阅组占用。
+   * 组名与节点名同名会让 `proxies:` 成员产生「解析为节点还是组」的二义性
+   * （与 planProxyGroups 里 reservedNames 的约束同源），因此 smart 组名必须避开。
+   */
+  static usesName(nodes: ProxyNode[], groups: ProxyGroup[], name: string): boolean {
+    for (const n of nodes) {
+      if (n.name === name) {
+        return true;
+      }
+    }
+    for (const g of groups) {
+      if (g.name === name) {
+        return true;
+      }
+    }
+    return name === 'PROXY';
+  }
+
+  /**
+   * 生成可安全写入 Mihomo 的代理组计划。
+   * 仅保留支持类型、名称唯一且成员最终可解析的组，并通过迭代消除悬空引用与纯循环组。
+   */
+  static planProxyGroups(groups: ProxyGroup[], validNodes: ProxyNode[]): ProxyGroup[] {
+    // relay（链式中继）成员只能经节点链拨号；mihomo 原生支持该类型，此前被白名单
+    // 丢弃导致含 relay 的订阅整组失效。url-test/fallback/load-balance 同为原生类型。
+    const supported = new Set<string>(['select', 'url-test', 'fallback', 'load-balance', 'relay']);
+    const nodeNames = new Set<string>();
+    const originalToDisplay = new Map<string, string[]>();
+    for (const node of validNodes) {
+      nodeNames.add(node.name);
+      const original = node.originalName.length > 0 ? node.originalName : node.name;
+      const displays = originalToDisplay.get(original);
+      if (displays === undefined) {
+        originalToDisplay.set(original, [node.name]);
+      } else if (!displays.includes(node.name)) {
+        displays.push(node.name);
+      }
+    }
+    // 组名保留字：任何节点显示名/原始名（含 NUL 分隔的订阅键无关）都不能被组占用，
+    // 否则成员引用存在「解析为节点还是组」的二义性。
+    const reservedNames = new Set<string>();
+    for (const node of validNodes) {
+      reservedNames.add(node.name);
+      reservedNames.add(node.originalName.length > 0 ? node.originalName : node.name);
+    }
+
+    const candidates: ProxyGroup[] = [];
+    const acceptedNames = new Set<string>();
+    for (const source of groups) {
+      const type = source.groupType.trim().toLowerCase();
+      const name = source.name.trim();
+      if (!supported.has(type) || name.length === 0 || name === 'PROXY'
+        || !ClashConfigGenerator.isSafeText(name) || reservedNames.has(name)
+        || acceptedNames.has(name)) {
+        continue;
+      }
+      const item = new ProxyGroup();
+      item.subscriptionId = source.subscriptionId;
+      item.name = name;
+      item.groupType = type;
+      item.members = source.members.slice();
+      // 组测速参数语义保真：url/interval/tolerance/expected-status 原样带出，
+      // 由 generate() 按类型决定是否发射（select/relay 不发射测速键）。
+      item.url = source.url;
+      item.intervalSec = source.intervalSec;
+      item.toleranceMs = source.toleranceMs;
+      item.expectedStatus = source.expectedStatus;
+      candidates.push(item);
+      acceptedNames.add(name);
+    }
+
+    // 落地性迭代：组必须能经成员引用最终到达真实节点才可写入配置。
+    // 纯循环组（互相引用但无节点出口）永远不会落地 → 整组丢弃；
+    // 带真实出口的循环由直接引用节点的组先落地，再逐轮向外传播保留。
+    const groundedNames = new Set<string>();
+    const groundedOrder = new Map<string, number>();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const group of candidates) {
+        if (groundedNames.has(group.name)) {
+          continue;
+        }
+        // relay 组只接受真实节点成员（中继链内嵌套组引用的拨号语义不可控，保守丢弃）
+        const isRelay = group.groupType === 'relay';
+        for (const rawMember of group.members) {
+          const displays = originalToDisplay.get(rawMember);
+          const reachesNode = nodeNames.has(rawMember)
+            || (displays !== undefined && displays.length > 0);
+          const reachesGroundedGroup = !isRelay && groundedNames.has(rawMember)
+            && rawMember !== group.name;
+          if (reachesNode || reachesGroundedGroup) {
+            groundedOrder.set(group.name, groundedOrder.size);
+            groundedNames.add(group.name);
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+
+    const out: ProxyGroup[] = [];
+    for (const group of candidates) {
+      if (!groundedNames.has(group.name)) {
+        continue;
+      }
+      const isRelay = group.groupType === 'relay';
+      const members: string[] = [];
+      for (const rawMember of group.members) {
+        const displays = originalToDisplay.get(rawMember);
+        if (displays !== undefined) {
+          for (const display of displays) {
+            if (!members.includes(display)) {
+              members.push(display);
+            }
+          }
+        } else if (nodeNames.has(rawMember) && !members.includes(rawMember)) {
+          members.push(rawMember);
+        } else if (!isRelay && groundedNames.has(rawMember) && rawMember !== group.name
+          && (groundedOrder.get(rawMember) ?? 0) < (groundedOrder.get(group.name) ?? 0)
+          && !members.includes(rawMember)) {
+          // 组引用只指向更早落地的组：严格偏序天然消除配置内循环引用，
+          // 也绝不引用被丢弃的组（无悬空引用），内核可安全加载。
+          members.push(rawMember);
+        }
+      }
+      if (members.length === 0) {
+        continue;
+      }
+      group.members = members;
+      out.push(group);
+    }
+    return out;
+  }
+
+  static normalizeCustomRules(values: string[]): string[] {
+    const out: string[] = [];
+    for (const raw of values) {
+      const rule = raw.trim();
+      if (rule.length === 0) {
+        continue;
+      }
+      const error = ClashConfigGenerator.validateCustomRuleDetailed(rule);
+      if (error.length > 0) {
+        continue;
+      }
+      const parts = rule.split(',').map((v: string) => v.trim());
+      const normalized = parts.join(',');
+      if (!out.includes(normalized)) {
+        out.push(normalized);
+      }
+    }
+    return out.slice(0, 500);
+  }
+
+  /**
+   * 自定义规则逐行校验（M8）：返回空串 = 合法；否则返回用户可读原因。
+   * 与 normalizeCustomRules 共用同一套判定，保证「所见校验 = 实际落盘」。
+   *
+   * 范围刻意保守（相对 mihomo 全量规则类型）：
+   *  - 不开放 GEOSITE / RULE-SET：二者会在 config.Parse 阶段触发 geosite/规则文件
+   *    联网下载（与 MMDB 90s 阻塞坑同源），没有文件就绪门控前绝不放进用户输入；
+   *  - 不开放 DOMAIN-REGEX：payload 可含逗号，与逗号切分模型冲突；
+   *  - 策略白名单：DIRECT / PROXY / REJECT / PASS / REJECT-DROP（mihomo 内建策略）。
+   */
+  static validateCustomRuleDetailed(rule: string): string {
+    const trimmed = rule.trim();
+    if (trimmed.length === 0) {
+      return '规则为空';
+    }
+    if (trimmed.length > 512) {
+      return '规则超过 512 字符';
+    }
+    if (trimmed.includes('\n') || trimmed.includes('\r')) {
+      return '规则不能包含换行';
+    }
+    if (trimmed.includes('#')) {
+      return '规则不能包含注释符 #';
+    }
+    const parts = trimmed.split(',').map((v: string) => v.trim());
+    if (parts.length !== 3 && parts.length !== 4) {
+      return '格式应为 类型,值,策略[,no-resolve]';
+    }
+    const allowedTypes: string[] = ['DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD',
+      'IP-CIDR', 'IP-CIDR6', 'GEOIP'];
+    const type = parts[0].toUpperCase();
+    if (!allowedTypes.includes(type)) {
+      return `不支持的规则类型 ${parts[0]}（支持：${allowedTypes.join(' / ')}）`;
+    }
+    const value = parts[1];
+    if (value.length === 0) {
+      return '匹配值为空';
+    }
+    if (type === 'DOMAIN' || type === 'DOMAIN-SUFFIX' || type === 'DOMAIN-KEYWORD') {
+      // 域名类值：拒绝空白与规则元字符（逗号已在切分时消费）
+      if (/\s/.test(value) || value.includes('"') || value.includes("'")) {
+        return '域名值不能包含空白或引号';
+      }
+      if (type !== 'DOMAIN-KEYWORD' && value.includes('..')) {
+        return '域名不能包含连续点号';
+      }
+    } else if (type === 'IP-CIDR') {
+      const m = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
+      if (m === null) {
+        return 'IPv4 CIDR 应为 a.b.c.d/掩码';
+      }
+      for (let i = 1; i <= 4; i++) {
+        if (parseInt(m[i]) > 255) {
+          return 'IPv4 地址段超出 0-255';
+        }
+      }
+      if (parseInt(m[5]) > 32) {
+        return 'IPv4 掩码超出 0-32';
+      }
+    } else if (type === 'IP-CIDR6') {
+      if (!/^[0-9A-Fa-f:]+\/\d{1,3}$/.test(value)) {
+        return 'IPv6 CIDR 应为 地址/前缀长度';
+      }
+      if (parseInt(value.substring(value.lastIndexOf('/') + 1)) > 128) {
+        return 'IPv6 前缀长度超出 0-128';
+      }
+    } else if (type === 'GEOIP') {
+      if (!/^[A-Za-z]{2,8}$/.test(value)) {
+        return 'GEOIP 值应为 2-8 位国家/地区代码（如 CN、US）';
+      }
+    }
+    const target = parts[2].toUpperCase();
+    const allowedTargets: string[] = ['DIRECT', 'PROXY', 'REJECT', 'PASS', 'REJECT-DROP'];
+    if (!allowedTargets.includes(target)) {
+      return `策略 ${parts[2]} 不支持（支持：${allowedTargets.join(' / ')}）`;
+    }
+    if (parts.length === 4) {
+      if (parts[3] !== 'no-resolve') {
+        return '第四段只支持 no-resolve';
+      }
+      if (type !== 'IP-CIDR' && type !== 'IP-CIDR6' && type !== 'GEOIP') {
+        return 'no-resolve 仅对 IP/GEOIP 规则有效';
+      }
+    }
+    return '';
+  }
+
+  /**
+   * 规则调试（P1-5）：给定一个域名，模拟配置中域名类规则的命中顺序。
+   * 返回命中的规则描述（"TYPE value → TARGET"）或 ''（未命中任何自定义域名规则）。
+   * 顺序与 rules 段一致：自定义规则（先于强制直连/代理名单）。
+   */
+  static debugDomainMatch(domain: string, rules: string[]): string {
+    const host = domain.trim().toLowerCase();
+    if (host.length === 0) {
+      return '';
+    }
+    for (const raw of rules) {
+      const parts = raw.split(',').map((v: string) => v.trim());
+      if (parts.length < 3) {
+        continue;
+      }
+      const type = parts[0].toUpperCase();
+      const value = parts[1].toLowerCase();
+      const target = parts[2].toUpperCase();
+      if (type === 'DOMAIN' && host === value) {
+        return `DOMAIN,${value} → ${target}`;
+      }
+      if (type === 'DOMAIN-SUFFIX' && (host === value || host.endsWith('.' + value))) {
+        return `DOMAIN-SUFFIX,${value} → ${target}`;
+      }
+      if (type === 'DOMAIN-KEYWORD' && host.indexOf(value) >= 0) {
+        return `DOMAIN-KEYWORD,${value} → ${target}`;
+      }
+    }
+    return '';
+  }
+
+  /** 节点 → 内核类型（ss/ssr 用模型枚举，其余用 proxyType 小写） */
+  private static proxyTypeOf(n: ProxyNode): string {
+    return n.type === ProxyNodeType.SSR ? 'ssr'
+      : (n.type === ProxyNodeType.SS ? 'ss' : n.proxyType.toLowerCase());
+  }
+
+  /**
+   * 「能否写入内核配置」的唯一判定（顺序与旧 proxyYamlLine 的 return '' 分支严格一致）：
+   * 协议不支持 → 文本不安全 → 缺 name/server 或协议必需字段 → 端口非法。
+   * 生成配置与诊断计数共用此函数，保证「丢弃计数」与「实际写入行」永不漂移。
+   */
+  static dropReasonFor(n: ProxyNode): ProxyDropReason {
+    const proxyType = ClashConfigGenerator.proxyTypeOf(n);
+    // direct 出站只有 name/type（mihomo 合法节点），没有 server/port/凭据可校验
+    if (proxyType === 'direct') {
+      return n.name.length === 0 ? ProxyDropReason.MISSING_FIELD : ProxyDropReason.NONE;
+    }
+    if (proxyType !== 'ss' && proxyType !== 'ssr' && proxyType !== 'vless'
+      && proxyType !== 'vmess' && proxyType !== 'trojan' && proxyType !== 'hysteria2'
+      && !YamlMerger.isRelayType(proxyType)) {
+      return ProxyDropReason.UNSUPPORTED_PROTOCOL;
+    }
+    const textValues: string[] = [n.name, n.server, n.password, n.method, n.protocol, n.protocolParam,
+      n.obfs, n.obfsParam, n.uuid, n.network, n.servername, n.flow, n.clientFingerprint,
+      n.certFingerprint, n.realityPublicKey, n.realityShortId, n.wsPath, n.wsHost,
+      n.grpcServiceName, n.hyUp, n.hyDown, n.alpnList];
+    for (const value of textValues) {
+      if (!ClashConfigGenerator.isSafeText(value)) {
+        return ProxyDropReason.UNSAFE_TEXT;
+      }
+    }
+    if (n.name.length === 0 || n.server.length === 0) {
+      return ProxyDropReason.MISSING_FIELD;
+    }
+    if (n.port <= 0 || n.port > 65535) {
+      return ProxyDropReason.INVALID_PORT;
+    }
+    if (proxyType === 'ss' || proxyType === 'ssr') {
+      // method 缺失属结构缺字段; password 缺失属凭据缺失(加密层未回填的典型信号)
+      if (n.method.length === 0) {
+        return ProxyDropReason.MISSING_FIELD;
+      }
+      if (n.password.length === 0) {
+        return ProxyDropReason.MISSING_CREDENTIAL;
+      }
+    }
+    if (proxyType === 'ssr' && (n.protocol.length === 0 || n.obfs.length === 0)) {
+      return ProxyDropReason.MISSING_FIELD;
+    }
+    if ((proxyType === 'vless' || proxyType === 'vmess') && n.uuid.length === 0) {
+      return ProxyDropReason.MISSING_CREDENTIAL;
+    }
+    if (n.realityPublicKey.length > 0 || n.realityShortId.length > 0) {
+      // REALITY 字段合法性对齐内核解析规则(mihomo reality.go):
+      // public-key = base64url(RawURLEncoding) 解码后必须 32 字节(43 字符);
+      // short-id 必须偶数长度 hex 且解码后 ≤8 字节(≤16 字符)。
+      // 新版官方内核对解析失败的代理是「跳过该节点」; 捆绑的旧内核是
+      // 「整份配置解析失败」→ 一个坏节点曾让内核完全起不来(全部超时)。
+      // 这里在生成前拦截: 非法 REALITY 字段的节点按无效丢弃并计数。
+      if (n.realityPublicKey.length > 0
+        && !/^[A-Za-z0-9_-]{43}$/.test(n.realityPublicKey)) {
+        return ProxyDropReason.MISSING_FIELD;
+      }
+      if (n.realityShortId.length > 0
+        && !/^[0-9a-fA-F]{2}([0-9a-fA-F]{2}){0,7}$/.test(n.realityShortId)) {
+        return ProxyDropReason.MISSING_FIELD;
+      }
+    }
+    if (proxyType === 'trojan' && n.password.length === 0) {
+      return ProxyDropReason.MISSING_CREDENTIAL;
+    }
+    if (proxyType === 'hysteria2' && n.password.length === 0) {
+      return ProxyDropReason.MISSING_CREDENTIAL;
+    }
+    // 中继白名单(isRelayType)对任意合法小写类型放行(订阅升级不丢协议),但 mihomo
+    // 对下面这些协议有必填凭据/参数:一个空 password/uuid 的节点会让**整份配置**
+    // 解析失败(真机报错 `proxy "N": has unset fields:password`,内核完全起不来)。
+    // 因此必须在生成前按内核必填字段丢弃,统一进「无效节点」账本提示。
+    if (proxyType === 'tuic' && (n.password.length === 0 || n.uuid.length === 0)) {
+      return ProxyDropReason.MISSING_CREDENTIAL;
+    }
+    if (proxyType === 'hysteria'
+      && (n.password.length === 0 || n.protocol.length === 0
+        || n.hyUp.length === 0 || n.hyDown.length === 0)) {
+      return ProxyDropReason.MISSING_CREDENTIAL;
+    }
+    if (proxyType === 'anytls' && n.password.length === 0) {
+      return ProxyDropReason.MISSING_CREDENTIAL;
+    }
+    if (n.alterId < 0 || !Number.isInteger(n.alterId)) {
+      return ProxyDropReason.MISSING_FIELD;
+    }
+    return ProxyDropReason.NONE;
+  }
+
+  /**
+   * 统计 nodes 中「列表有、内核无」的节点数与原因分类（漏洞 A 的核心修复）。
+   * 判定复用 dropReasonFor，因此与实际写入内核配置的判定完全同源。
+   *
+   * @param precomputed 调用方已算好的 node→原因映射。generate() 会把整批结果算一次
+   *        再传进来（省掉一次全量重算）；缺省时退化为自行计算，对外行为不变。
+   */
+  static countDroppedNodes(nodes: ProxyNode[], precomputed: Map<ProxyNode, string> | null = null): ProxyDropStats {
+    const stats = new ProxyDropStats();
+    stats.total = nodes.length;
+    const samples: string[] = [];
+    for (const n of nodes) {
+      const cached = precomputed === null ? undefined : precomputed.get(n);
+      const reason = cached !== undefined ? cached : ClashConfigGenerator.dropReasonFor(n);
+      if (reason === ProxyDropReason.NONE) {
+        stats.kept = stats.kept + 1;
+        continue;
+      }
+      if (reason === ProxyDropReason.UNSUPPORTED_PROTOCOL) {
+        stats.unsupportedProtocol = stats.unsupportedProtocol + 1;
+      } else if (reason === ProxyDropReason.UNSAFE_TEXT) {
+        stats.unsafeText = stats.unsafeText + 1;
+      } else if (reason === ProxyDropReason.INVALID_PORT) {
+        stats.invalidPort = stats.invalidPort + 1;
+      } else {
+        stats.missingFields = stats.missingFields + 1;
+        if (reason === ProxyDropReason.MISSING_CREDENTIAL) {
+          stats.missingCredential = stats.missingCredential + 1;
+        }
+      }
+      if (samples.length < 3) {
+        samples.push(n.name.length > 0 ? n.name : '(未命名)');
+      }
+    }
+    stats.samples = samples.join('、');
+    return stats;
+  }
+
+  /**
+   * 「双轨」provider 计划：决定本次配置要不要输出 proxy-providers / use:。
+   *
+   * 硬约束（缺一不可，任何一条不满足都只是「少一条 provider」，绝不产生悬空引用）：
+   * 1) settings.useRawProviderConfig 为 true（开关关闭 → 直接返回空计划，输出与现状一致）；
+   * 2) 该订阅的原文已成功落盘且文件此刻仍存在（RawSubscriptionStore.active 已校验）；
+   * 3) 该订阅此刻仍有节点在列表里（订阅被删/被隐藏后不再引用其 provider）。
+   * 差额（缺失文件 / 无对应节点）全部计入 lastProviderStats，由诊断面板展示。
+   */
+  static planRawProviders(settings: AppSettings, allNodes: ProxyNode[]): RawProviderPlan {
+    const plan = new RawProviderPlan();
+    plan.stats.pathMode = RAW_PROVIDER_PATH_MODE;
+    if (!settings.useRawProviderConfig) {
+      // 默认路径：开关关闭时行为与现状完全一致（不产生任何额外行 / 额外 IO）
+      plan.stats.enabled = false;
+      return plan;
+    }
+    plan.stats.enabled = true;
+    const liveSubscriptions = new Set<string>();
+    for (const n of allNodes) {
+      if (n.subscriptionId.length > 0) {
+        liveSubscriptions.add(n.subscriptionId);
+      }
+    }
+    const names: string[] = [];
+    for (const entry of RawSubscriptionStore.active()) {
+      plan.stats.candidates = plan.stats.candidates + 1;
+      if (!liveSubscriptions.has(entry.subscriptionId)) {
+        plan.stats.orphaned = plan.stats.orphaned + 1;
+        continue;
+      }
+      if (!RawSubscriptionStore.has(entry.subscriptionId)) {
+        plan.stats.missingFiles = plan.stats.missingFiles + 1;
+        continue;
+      }
+      plan.entries.push(entry);
+      names.push(entry.providerName);
+    }
+    plan.stats.emitted = plan.entries.length;
+    plan.stats.providerNames = names.join(',');
+    if (plan.stats.candidates > plan.stats.emitted) {
+      AppLogger.warn(TAG, `raw provider plan: ${plan.stats.detail()}`);
+    }
+    return plan;
+  }
+
+  /**
+   * 提取 extras 里以 `ws-opts.<sub>` 前缀保全的 WS 高级子键（max-early-data 等），
+   * 返回 [subKey, 发射值]：布尔/数字原样、其余引号，供并入 ws-opts 结构。
+   */
+  private static wsExtraPairs(extraOpts: string): string[][] {
+    const out: string[][] = [];
+    for (const pair of YamlMerger.parseExtraOpts(extraOpts)) {
+      const key = pair[0];
+      if (!key.startsWith('ws-opts.')) {
+        continue;
+      }
+      const sub = key.substring('ws-opts.'.length);
+      if (!YamlMerger.isSafeExtraKey(sub) || !ClashConfigGenerator.isSafeText(pair[1])) {
+        continue;
+      }
+      const value = pair[1];
+      if (value === 'true' || value === 'false' || /^-?[0-9]+(\.[0-9]+)?$/.test(value)
+        || value.startsWith('{') || value.startsWith('[')) {
+        out.push([sub, ClashConfigGenerator.sanitizeControlChars(value)]);
+      } else {
+        out.push([sub, `"${ClashConfigGenerator.escapeYaml(value)}"`]);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 全局代理名唯一化（**就地**改名，幂等）。
+   *
+   * 为什么必须有这一层：mihomo 对重名代理是**致命**的 ——
+   *   config/config.go:900-907
+   *     for idx, mapping := range proxiesConfig { …
+   *       return nil, nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name()) }
+   * 只要 `proxies:` 里出现两个同名条目，内核会**拒绝加载整份配置**（不是跳过其一），
+   * 用户表现为「连不上」，而 App 侧只看到配置加载失败，极难定位。
+   *
+   * 为什么单靠 SubscriptionParser.dedupName 不够：那个函数只在**单个订阅内部**去重
+   * （它只看本次 parse 累积的 nodes）。而配置是把**所有订阅 + provider** 的节点合并
+   * 生成的，两个订阅各有一个「香港 01」时没有任何一层兜底 —— 这正是本函数补的洞。
+   *
+   * 改名规则与 dedupName 一致（首个保留原名，其后追加 " 2"、" 3"…），
+   * 且**幂等**：第二次调用时名字已唯一，不会再追加序号。
+   * 注意 originalName 不动，所以 proxy-groups 里按面板原始名写的成员
+   * 仍能通过 planProxyGroups 的 originalToDisplay 映射解析到改名后的显示名。
+   *
+   * @returns 实际改名的节点数（0 = 本来就没有重名）
+   */
+  static ensureUniqueProxyNames(nodes: ProxyNode[]): number {
+    const used = new Set<string>();
+    let renamed = 0;
+    for (const n of nodes) {
+      const base = n.name.length > 0 ? n.name : 'node';
+      let candidate = base;
+      let i = 2;
+      while (used.has(candidate)) {
+        candidate = `${base} ${i++}`;
+      }
+      if (candidate !== n.name) {
+        n.name = candidate;
+        renamed = renamed + 1;
+      }
+      used.add(candidate);
+    }
+    if (renamed > 0) {
+      AppLogger.warn(TAG, `renamed ${renamed} duplicate proxy name(s) `
+        + 'to keep the config loadable (mihomo rejects duplicate proxy names)');
+    }
+    return renamed;
+  }
+
+  static proxyYamlLine(n: ProxyNode): string {
+    // 判定统一走 dropReasonFor：能写出合法行的节点必定判定为 NONE，
+    // 判定非 NONE 的节点返回空行（调用方用 countDroppedNodes 记账并提示）。
+    if (ClashConfigGenerator.dropReasonFor(n) !== ProxyDropReason.NONE) {
+      return '';
+    }
+    const proxyType = ClashConfigGenerator.proxyTypeOf(n);
+    const q = (value: string): string => `"${ClashConfigGenerator.escapeYaml(value)}"`;
+    // ── 逐字模板优先（根治「解析→重生成丢字段」）──
+    // 订阅原始 flow-map 已去 name/凭据，原样回写，再注入去重后的 name 与
+    // 加密层回填的凭据。传输/选项字段(xhttp-opts、reality-opts、headers、
+    // dialer-proxy、null 值…)全部逐字保留，与桌面 Clash 用原始 YAML 等价。
+    if (n.rawTemplate.length > 0 && ClashConfigGenerator.isSafeText(n.rawTemplate)) {
+      const rawParts: string[] = [`name: ${q(n.name)}`, ClashConfigGenerator.sanitizeControlChars(n.rawTemplate)];
+      if (n.uuid.length > 0) {
+        rawParts.push(`uuid: ${q(n.uuid)}`);
+      }
+      if (n.password.length > 0) {
+        rawParts.push(`password: ${q(n.password)}`);
+      }
+      if (n.protocolParam.length > 0) {
+        rawParts.push(`protocol-param: ${q(n.protocolParam)}`);
+      }
+      if (n.obfsParam.length > 0) {
+        rawParts.push(`${proxyType === 'hysteria2' ? 'obfs-password' : 'obfs-param'}: ${q(n.obfsParam)}`);
+      }
+      // 保留结构化路径的 WS 兜底: 面板把 ws 节点写成 network: ws 却省略 ws-opts 时,
+      // mihomo 会发无路径/无 Host 的 Upgrade 被 Cloudflare 拒绝, 这里补默认值。
+      if ((proxyType === 'vless' || proxyType === 'vmess' || proxyType === 'trojan')
+        && n.network === 'ws' && !n.rawTemplate.includes('ws-opts')) {
+        const ws: string[] = ['path: "/"'];
+        if (n.servername.length > 0) {
+          ws.push(`headers: {Host: ${q(n.servername)}}`);
+        }
+        rawParts.push(`ws-opts: {${ws.join(', ')}}`);
+      }
+      return `  - {${rawParts.join(', ')}}`;
+    }
+    // ── 无模板(URI 导入/块式写法)：回退结构化生成 ──
+    const fields: string[] = [];
+    fields.push(`name: ${q(n.name)}`);
+    fields.push(`type: ${proxyType}`);
+    if (proxyType !== 'direct') {
+      // direct 出站没有 server/port（mihomo 的 DirectOption 不含这两个键）
+      fields.push(`server: ${q(n.server)}`);
+      fields.push(`port: ${n.port}`);
+    }
+    if (proxyType === 'ss' || proxyType === 'ssr' || proxyType === 'vmess') {
+      fields.push(`cipher: ${q(n.method.length > 0 ? n.method : 'auto')}`);
+    }
+    if (proxyType === 'ss' || proxyType === 'ssr' || proxyType === 'trojan'
+      || proxyType === 'hysteria2' || (proxyType !== 'vless' && proxyType !== 'vmess'
+        && n.password.length > 0)) {
+      // 口令类协议: vless/vmess 用 uuid, 其余(含 tuic/hysteria/socks5/http)用 password
+      fields.push(`password: ${q(n.password)}`);
+    }
+    if (proxyType === 'ssr') {
+      fields.push(`protocol: ${q(n.protocol)}`);
+      fields.push(`protocol-param: ${q(n.protocolParam)}`);
+      fields.push(`obfs: ${q(n.obfs)}`);
+      fields.push(`obfs-param: ${q(n.obfsParam)}`);
+    }
+    if ((proxyType === 'vless' || proxyType === 'vmess' || proxyType === 'tuic')
+      && n.uuid.length > 0) {
+      fields.push(`uuid: ${q(n.uuid)}`);
+    }
+    if (proxyType === 'vmess') {
+      fields.push(`alterId: ${n.alterId}`);
+    }
+    if (n.udp) {
+      fields.push('udp: true');
+    }
+    if (n.network.length > 0) {
+      fields.push(`network: ${q(n.network)}`);
+    }
+    if (n.tls) {
+      fields.push('tls: true');
+    }
+    if (n.servername.length > 0) {
+      // hysteria2/hysteria/tuic 的 SNI 键名是 sni（不接受 servername 键）
+      fields.push(`${YamlMerger.usesSniKey(proxyType) ? 'sni' : 'servername'}: ${q(n.servername)}`);
+    }
+    if (n.skipCertVerify) {
+      fields.push('skip-cert-verify: true');
+    }
+    if (n.flow.length > 0) {
+      fields.push(`flow: ${q(n.flow)}`);
+    }
+    if (n.clientFingerprint.length > 0) {
+      // uTLS 指纹固定发 client-fingerprint（不要再按协议改写键名）
+      fields.push(`client-fingerprint: ${q(n.clientFingerprint)}`);
+    }
+    if (n.certFingerprint.length > 0) {
+      // 证书指纹 pinSHA256 → fingerprint，与上面的 uTLS 指纹是两个独立的键
+      fields.push(`fingerprint: ${q(n.certFingerprint)}`);
+    }
+    if (proxyType === 'hysteria2') {
+      if (n.obfs.length > 0) {
+        fields.push(`obfs: ${q(n.obfs)}`);
+      }
+      if (n.obfsParam.length > 0) {
+        fields.push(`obfs-password: ${q(n.obfsParam)}`);
+      }
+      if (n.hyUp.length > 0) {
+        fields.push(`up: ${q(n.hyUp)}`);
+      }
+      if (n.hyDown.length > 0) {
+        fields.push(`down: ${q(n.hyDown)}`);
+      }
+    }
+    if (n.alpnList.length > 0 && YamlMerger.supportsAlpn(proxyType)) {
+      // alpn 不再只输出给 hysteria2: vless/vmess/trojan/tuic 同样需要 ALPN 协商
+      const items: string[] = [];
+      for (const it of n.alpnList.split(',')) {
+        if (it.length > 0) {
+          items.push(q(it));
+        }
+      }
+      if (items.length > 0) {
+        fields.push(`alpn: [${items.join(', ')}]`);
+      }
+    }
+    if (n.realityPublicKey.length > 0 || n.realityShortId.length > 0) {
+      const reality: string[] = [];
+      if (n.realityPublicKey.length > 0) {
+        reality.push(`public-key: ${q(n.realityPublicKey)}`);
+      }
+      if (n.realityShortId.length > 0) {
+        reality.push(`short-id: ${q(n.realityShortId)}`);
+      }
+      fields.push(`reality-opts: {${reality.join(', ')}}`);
+    }
+    if (n.wsPath.length > 0 || n.wsHost.length > 0) {
+      const ws: string[] = [];
+      if (n.wsPath.length > 0) {
+        ws.push(`path: ${q(n.wsPath)}`);
+      }
+      if (n.wsHost.length > 0) {
+        ws.push(`headers: {Host: ${q(n.wsHost)}}`);
+      }
+      // ws-opts 高级子键（max-early-data 等）从 extras 并回 ws-opts 结构
+      for (const pair of ClashConfigGenerator.wsExtraPairs(n.extraOpts)) {
+        ws.push(`${pair[0]}: ${pair[1]}`);
+      }
+      fields.push(`ws-opts: {${ws.join(', ')}}`);
+    } else if (n.network === 'ws') {
+      // 订阅未提供 ws-opts 的 WS 节点（典型：Cloudflare 隧道，servername 是
+      // xxx.trycloudflare.com 而 path/Host 留空）。mihomo 缺 ws-opts 时不会发
+      // 正确的 WebSocket Upgrade（无路径/无 Host），CF 直接拒绝 → 测速 503/
+      // 连上也不通。主流客户端（Clash Verge/v2rayN）对这类节点默认 path="/"、
+      // Host 取 SNI，这里对齐同样语义。仅对 network=ws 生效，不影响
+      // grpc/hysteria2/plain tcp 节点；订阅已给出 path/host 时走上面的分支原样保留。
+      const ws: string[] = [`path: ${q('/')}`];
+      if (n.servername.length > 0) {
+        ws.push(`headers: {Host: ${q(n.servername)}}`);
+      }
+      fields.push(`ws-opts: {${ws.join(', ')}}`);
+    }
+    if (n.grpcServiceName.length > 0) {
+      fields.push(`grpc-opts: {grpc-service-name: ${q(n.grpcServiceName)}}`);
+    }
+    // extraOpts 中继: 结构化槽位未覆盖的键(plugin/plugin-opts、h2-opts、ports、tfo、
+    // mptcp、ip-version、smux、packet-encoding 等, 以及 tuic/hysteria/http/socks5 等
+    // 中继协议的专用键)原样回写; 与已输出键重名时以结构化字段为准。
+    const emitted = new Set<string>();
+    for (const f of fields) {
+      const ci = f.indexOf(':');
+      if (ci > 0) {
+        emitted.add(f.substring(0, ci).trim());
+      }
+    }
+    for (const pair of YamlMerger.parseExtraOpts(n.extraOpts)) {
+      const key = pair[0];
+      const value = pair[1];
+      if (emitted.has(key) || key === 'name' || key === 'type' || key === 'server'
+        || key === 'port' || !YamlMerger.isSafeExtraKey(key)) {
+        continue;
+      }
+      if (!ClashConfigGenerator.isSafeText(value)) {
+        continue;
+      }
+      if (value.startsWith('{') || value.startsWith('[')
+        || value === 'true' || value === 'false' || /^-?[0-9]+(\.[0-9]+)?$/.test(value)) {
+        fields.push(`${key}: ${value}`);
+      } else {
+        fields.push(`${key}: ${q(value)}`);
+      }
+      emitted.add(key);
+    }
+    return `  - {${fields.join(', ')}}`;
+  }
+
+  /** 规范化域名列表并去重，忽略无法安全表达的条目。 */
+  private static normalizeDomains(values: string[]): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const value of values) {
+      const domain = ClashConfigGenerator.normalizeDomain(value);
+      if (domain.length > 0 && !seen.has(domain)) {
+        seen.add(domain);
+        out.push(domain);
+      }
+    }
+    return out;
+  }
+
+  /** 规范化并验证 hosts/规则使用的域名，拒绝通配符、换行和 YAML/规则元字符。 */
+  private static normalizeDomain(value: string): string {
+    let domain = value.trim().toLowerCase();
+    while (domain.endsWith('.')) {
+      domain = domain.substring(0, domain.length - 1);
+    }
+    if (domain.length === 0 || domain.length > 253 || domain.includes('\n') || domain.includes('\r')
+      || domain.includes(',') || domain.includes(':') || domain.includes('#') || domain.includes('[')
+      || domain.includes(']') || domain.includes('{') || domain.includes('}') || domain.includes('*')
+      || domain.startsWith('.') || domain.endsWith('.') || domain.includes('..')) {
+      return '';
+    }
+    const labels = domain.split('.');
+    for (const label of labels) {
+      if (label.length === 0 || label.length > 63 || label.startsWith('-') || label.endsWith('-')
+        || !/^[a-z0-9-]+$/.test(label)) {
+        return '';
+      }
+    }
+    return domain;
+  }
+
+  /** hosts 值仅接受规范 IPv4 或无区域标识的 IPv6 字面量。 */
+  private static isValidIpAddress(value: string): boolean {
+    if (value.length === 0 || value.includes('\n') || value.includes('\r') || value.includes('%')
+      || value.includes('#') || value.includes(',') || value.includes(' ') || value.includes('\t')) {
+      return false;
+    }
+    const ipv4 = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4 !== null) {
+      for (let i = 1; i <= 4; i++) {
+        const part = parseInt(ipv4[i]);
+        if (part < 0 || part > 255) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (!/^[0-9a-fA-F:]+$/.test(value) || !value.includes(':')) {
+      return false;
+    }
+    const pieces = value.split(':');
+    if (pieces.length < 3 || pieces.length > 8) {
+      return false;
+    }
+    let emptyRuns = 0;
+    for (let i = 0; i < pieces.length; i++) {
+      const piece = pieces[i];
+      if (piece.length === 0) {
+        if (i > 0 && pieces[i - 1].length === 0) {
+          emptyRuns++;
+        }
+      } else if (piece.length > 4 || !/^[0-9a-fA-F]+$/.test(piece)) {
+        return false;
+      }
+    }
+    return emptyRuns <= 1;
+  }
+
+  private static isSafeText(value: string): boolean {
+    return value.length <= 64 * 1024 && !value.includes('\n') && !value.includes('\r')
+      && !value.includes('\u0000');
+  }
+
+  static escapeYaml(value: string): string {
+    let out = '';
+    for (let i = 0; i < value.length; i++) {
+      const ch = value.charAt(i);
+      const code = value.charCodeAt(i);
+      if (ch === '\\') {
+        out += '\\\\';
+      } else if (ch === '"') {
+        out += '\\"';
+      } else if (ch === '\t') {
+        out += '\\t';
+      } else if (code < 0x20 || code === 0x7f) {
+        out += '?';
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  }
+
+  /** 自定义规则集文件名键（P1-2）：名称已限 [a-zA-Z0-9_-]，这里兜底只留白名单字符 */
+  static sanitizeFileKey(name: string): string {
+    let out = '';
+    for (let i = 0; i < name.length; i++) {
+      const ch = name.charAt(i);
+      const ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+        || (ch >= '0' && ch <= '9') || ch === '_' || ch === '-';
+      if (ok) {
+        out += ch;
+      }
+    }
+    return out.length > 0 ? out : 'unnamed';
+  }
+
+  /**
+   * YAML 可打印白名单净化（用户真机修复 2026-09-18）：
+   * mihomo 的 yaml.v3 对 C0 控制符（除 \t\n\r）、0x7F-0x84、0x86-0x9F 一律报
+   * "control characters are not allowed"，整份配置拒绝启动。订阅节点里
+   * （rawTemplate / ws-opts 原样值 / 历史持久化数据）任何路径漏进来的非法字符
+   * 在此统一清洗：制表/游离回车→空格，其余不可打印→'?'。
+   * generate() 出口与逐字模板出口双重调用，杜绝"单点遗漏→整机无法连接"。
+   *
+   * 性能：出口处对整份 150~250KB 配置调用，而绝大多数订阅不含任何控制字符。
+   * 先做一遍**零分配**的 charCode 扫描判断是否需要改写，命中才进逐字符拼接循环 ——
+   * 干净输入（绝大多数情况）直接原样返回，省掉十几万次单字符字符串拼接，
+   * 那才是 ArkTS 主线程上真正贵的那部分。
+   * 预扫描判据与下方逐字符分支严格等价：0x09 / 0x0D 会被改写，0x0A 保留，
+   * 其余小于 0x20 与 0x7F-0x9F 会被改写。
+   */
+  static sanitizeControlChars(value: string): string {
+    let needsRewrite = false;
+    for (let i = 0; i < value.length; i++) {
+      const probe = value.charCodeAt(i);
+      if (probe === 0x09 || probe === 0x0d || (probe < 0x20 && probe !== 0x0a)
+        || (probe >= 0x7f && probe <= 0x9f)) {
+        needsRewrite = true;
+        break;
+      }
+    }
+    if (!needsRewrite) {
+      return value;
+    }
+    let out = '';
+    for (let i = 0; i < value.length; i++) {
+      const code = value.charCodeAt(i);
+      if (code === 0x09 || code === 0x0d) {
+        out += ' ';
+      } else if (code === 0x0a || (code >= 0x20 && code <= 0x7e) || code >= 0xa0) {
+        out += value.charAt(i);
+      } else {
+        out += '?';
+      }
+    }
+    return out;
+  }
+
+  /** 为端口冲突策略提供本实现使用的端口清单（对应 runtime_port_conflict_policy.dart） */
+  static requiredPorts(): number[] {
+    return [1053, 7890];
+  }
+}

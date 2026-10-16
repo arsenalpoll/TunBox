@@ -1,0 +1,1367 @@
+/**
+ * SubscriptionPage —— Nexus 订阅页（对齐 HTML + Ultimate 文档 §6/§7/§8）
+ * 布局：大标题+刷新全部+“+”导入 → 状态卡(当前订阅/节点/统计) → 手风琴订阅卡(展开节点单选) → 液态玻璃Dock
+ * 后端：复用 SubscriptionService / SettingsService / LatencyController / BackgroundLatencyService 全量逻辑。
+ */
+import { router, promptAction } from '@kit.ArkUI';
+import { picker, fileIo as fs } from '@kit.CoreFileKit';
+import { util } from '@kit.ArkTS';
+import scanBarcode from '@hms.core.scan.scanBarcode';
+import { BusinessError } from '@kit.BasicServicesKit';
+import { Nx, NexusPing } from '../theme/NexusTokens';
+import { Ui } from '../theme/UiTokens';
+import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
+import { SubscriptionService, DIRECT_GROUP_ID } from '../commons/services/SubscriptionService';
+import { Subscription, SubscriptionRefreshStatus } from '../commons/models/Subscription';
+import { ProxyNode } from '../commons/models/ProxyNode';
+import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
+import { SettingsService } from '../commons/services/SettingsService';
+import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
+import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
+import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
+import { AppLogger } from '../commons/utils/AppLogger';
+import { ThemeService } from '../theme/ThemeService';
+import { LatencyController } from '../commons/services/LatencyController';
+import { NodeProtocolPolicy } from '../commons/services/NodeSortPersistence';
+import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
+import {
+  ConcurrentRefresh, RefreshBatchProgress, RefreshItemOutcome
+} from '../commons/services/ConcurrentRefresh';
+
+const TAG = 'SubscriptionPage';
+
+/** “+”导入三选一弹窗（扫描 / URL / 文件），对齐 HTML import-overlay */
+@CustomDialog
+struct ImportDialog {
+  controller?: CustomDialogController;
+  @State mode: string = 'main';
+  @State urlText: string = '';
+  onScan: () => void = () => {};
+  onUrl: (url: string) => void = () => {};
+  onFile: () => void = () => {};
+
+  aboutToAppear(): void {
+    this.mode = 'main';
+  }
+
+  @Builder
+  OptionBtn(icon: string, title: string, desc: string, bg: ResourceColor, fg: ResourceColor, target: string) {
+    Row({ space: 14 }) {
+      Text(icon).fontSize(20).fontColor(fg)
+        .width(40).height(40).textAlign(TextAlign.Center)
+        .borderRadius(10).backgroundColor(bg)
+      Column({ space: 1 }) {
+        Text(title).fontSize(14).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).width('100%')
+        Text(desc).fontSize(11).fontColor(Nx.muted()).width('100%')
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+    .borderRadius(12)
+    .backgroundColor(Nx.surface())
+    .borderWidth(1).borderColor(Nx.border())
+    .onClick(() => {
+      this.mode = target;
+    })
+  }
+
+  build() {
+    Column({ space: 10 }) {
+      Row() {
+        Text(this.mode === 'main' ? '导入订阅' : (this.mode === 'scan' ? '扫码导入' : (this.mode === 'url' ? '从 URL 链接导入' : '从本地文件导入')))
+          .fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).layoutWeight(1)
+        Text('✕').fontSize(16).fontColor(Nx.muted()).padding(6)
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+          })
+      }.width('100%')
+
+      if (this.mode === 'main') {
+        this.OptionBtn('☷', '扫描', '扫描屏幕或纸质二维码导入订阅',
+          Nx.successSoft(), Nx.success(), 'scan')
+        this.OptionBtn('🔗', 'URL', '输入或粘贴订阅链接一键解析',
+          Nx.accentSoft(), Nx.accent(), 'url')
+        this.OptionBtn('📄', '文件', '选择本地 .yaml / .json / .conf 配置文件',
+          'rgba(245, 158, 11, 0.12)', Nx.warning(), 'file')
+      } else if (this.mode === 'scan') {
+        Column() {
+          Text('[ 摄像头：请在系统扫码页对准二维码 ]')
+            .fontSize(12).fontColor(Nx.success())
+            .width('100%').textAlign(TextAlign.Center)
+            .padding(30).borderRadius(10)
+            .backgroundColor('#0f172a')
+            .borderWidth(1).borderColor('rgba(16, 185, 129, 0.50)')
+        }.width('100%')
+        Row({ space: 8 }) {
+          Button('返回').layoutWeight(1).borderRadius(8)
+            .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg()).fontSize(13)
+            .onClick(() => { this.mode = 'main'; })
+          Button('开始扫码').layoutWeight(1).borderRadius(8)
+            .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(13)
+            .onClick(() => {
+              if (this.controller !== undefined) {
+                this.controller.close();
+              }
+              this.onScan();
+            })
+        }.width('100%').margin({ top: 2 })
+      } else if (this.mode === 'url') {
+        Text('输入订阅链接（节点链接可一行一个批量导入）：').fontSize(12).fontColor(Nx.muted()).width('100%')
+        TextArea({ placeholder: 'https://... 或 vless://...（一行一个）', text: this.urlText })
+          .onChange((v: string) => { this.urlText = v; })
+          .height(88).borderRadius(8).fontSize(13)
+          .backgroundColor(Nx.inputBg())
+          .borderWidth(1).borderColor(Nx.border())
+          .fontColor(Nx.fg())
+        Row({ space: 8 }) {
+          Button('返回').layoutWeight(1).borderRadius(8)
+            .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg()).fontSize(13)
+            .onClick(() => { this.mode = 'main'; })
+          Button('确认导入').layoutWeight(1).borderRadius(8)
+            .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(13)
+            .onClick(() => {
+              if (this.controller !== undefined) {
+                this.controller.close();
+              }
+              this.onUrl(this.urlText);
+            })
+        }.width('100%').margin({ top: 2 })
+      } else {
+        Column({ space: 2 }) {
+          Text('选择本地 Clash / V2Ray 配置文件').fontSize(13).fontWeight(FontWeight.Bold)
+            .fontColor(Nx.fg()).width('100%').textAlign(TextAlign.Center)
+          Text('支持 .yaml、.json、.conf 格式').fontSize(11).fontColor(Nx.muted())
+            .width('100%').textAlign(TextAlign.Center)
+        }.width('100%').padding(16).borderRadius(8)
+        .borderWidth(1.5).borderColor(Nx.border())
+        Row({ space: 8 }) {
+          Button('返回').layoutWeight(1).borderRadius(8)
+            .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg()).fontSize(13)
+            .onClick(() => { this.mode = 'main'; })
+          Button('选择文件').layoutWeight(1).borderRadius(8)
+            .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(13)
+            .onClick(() => {
+              if (this.controller !== undefined) {
+                this.controller.close();
+              }
+              this.onFile();
+            })
+        }.width('100%').margin({ top: 2 })
+      }
+    }
+    .padding(20)
+    .borderRadius(20)
+    // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
+    // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
+    // 不透明背景色、背景模糊与自定义 shadow 都会遮挡材质（官方反模式），根容器不再设置，
+    // 视觉交给系统材质统一接管；内容层（行卡片/输入框/按钮）样式保持不动。
+  }
+}
+
+@CustomDialog
+struct DeleteConfirmDialog {
+  controller?: CustomDialogController;
+  onConfirm: () => void = () => {};
+
+  build() {
+    Column({ space: 14 }) {
+      Text('确认删除').fontSize(18).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+      Text('删除后将无法恢复，确定要删除吗？')
+        .fontSize(13).fontColor(Nx.muted()).textAlign(TextAlign.Center)
+      Row({ space: 12 }) {
+        Button('取消').layoutWeight(1).borderRadius(10)
+          .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg())
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+          })
+        Button('删除').layoutWeight(1).borderRadius(10)
+          .backgroundColor(Nx.danger()).fontColor(Color.White)
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+            this.onConfirm();
+          })
+      }.width('100%')
+    }
+    .padding(24).borderRadius(20)
+    // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
+    // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
+    // 不透明背景色、背景模糊与自定义 shadow 都会遮挡材质（官方反模式），根容器不再设置，
+    // 视觉交给系统材质统一接管；内容层（按钮）样式保持不动。
+  }
+}
+
+/**
+ * 长按节点后的单节点删除确认框。
+ * 语义与 NodeSelectionPage.NodeDeleteDialog 一致：删除 = 移出节点表并记入隐藏清单，
+ * 后续订阅刷新自动过滤，被删节点不会"复活"。
+ */
+@CustomDialog
+struct NodeDeleteConfirmDialog {
+  controller?: CustomDialogController;
+  getNodeName: () => string = (): string => '';
+  onConfirm: () => void = () => {};
+
+  build() {
+    Column({ space: 14 }) {
+      Text('删除节点').fontSize(18).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+      Text(`确定删除「${this.getNodeName()}」吗？该节点在订阅刷新后不会再出现。`)
+        .fontSize(13).fontColor(Nx.muted()).textAlign(TextAlign.Center)
+      Row({ space: 12 }) {
+        Button('取消').layoutWeight(1).borderRadius(10)
+          .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg())
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+          })
+        Button('删除').layoutWeight(1).borderRadius(10)
+          .backgroundColor(Nx.danger()).fontColor(Color.White)
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+            this.onConfirm();
+          })
+      }.width('100%')
+    }
+    .padding(24).borderRadius(20)
+    // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
+    // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
+    // 不透明背景色、背景模糊与自定义 shadow 都会遮挡材质（官方反模式），根容器不再设置，
+    // 视觉交给系统材质统一接管；内容层（按钮）样式保持不动。
+  }
+}
+
+@CustomDialog
+struct EditSubscriptionDialog {
+  controller?: CustomDialogController;
+  @State editName: string = '';
+  @State editUrl: string = '';
+  @State isLocal: boolean = false;
+  getInitialName: () => string = () => '';
+  getInitialUrl: () => string = () => '';
+  getIsLocal: () => boolean = () => false;
+  onConfirm: (name: string, url: string) => void = () => {};
+
+  aboutToAppear(): void {
+    this.editName = this.getInitialName();
+    this.editUrl = this.getInitialUrl();
+    this.isLocal = this.getIsLocal();
+  }
+
+  build() {
+    Column({ space: 14 }) {
+      Text('编辑订阅').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+      TextInput({ placeholder: '订阅名称', text: this.editName })
+        .onChange((v: string) => { this.editName = v; })
+        .height(40).borderRadius(8).fontSize(13)
+        .backgroundColor(Nx.inputBg())
+        .borderWidth(1).borderColor(Nx.border())
+        .fontColor(Nx.fg())
+      if (!this.isLocal) {
+        TextInput({ placeholder: '订阅链接', text: this.editUrl })
+          .onChange((v: string) => { this.editUrl = v; })
+          .height(40).borderRadius(8).fontSize(13)
+          .backgroundColor(Nx.inputBg())
+          .borderWidth(1).borderColor(Nx.border())
+          .fontColor(Nx.fg())
+      } else {
+        Text('本地导入的订阅仅支持改名')
+          .fontSize(11).fontColor(Nx.muted()).width('100%')
+      }
+      Row({ space: 12 }) {
+        Button('取消').layoutWeight(1).borderRadius(8)
+          .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg()).fontSize(13)
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+          })
+        Button('保存').layoutWeight(1).borderRadius(8)
+          .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(13)
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+            this.onConfirm(this.editName, this.editUrl);
+          })
+      }.width('100%')
+    }
+    .padding(20).borderRadius(20)
+    // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
+    // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
+    // 不透明背景色、背景模糊与自定义 shadow 都会遮挡材质（官方反模式），根容器不再设置，
+    // 视觉交给系统材质统一接管；内容层（输入框/按钮）样式保持不动。
+  }
+}
+
+@Component
+export struct SubscriptionPage {
+  @StorageLink('theme_revision') themeRevision: number = 0;
+  /** 宿主（MainPage）「重新展示」通知桥：替代 @Entry 页面的 onPageShow（见 TabLifecycleBridge） */
+  shownBridge?: TabLifecycleBridge;
+  @State subs: Subscription[] = [];
+  @State expandedIds: string[] = [];
+  @State activeSubId: string = '';
+  @State activeNodeId: string = '';
+  /** 自动选点模式（manual 手动固定 / auto 内核 smart 优选），与设置页同一份持久化 */
+  @State autoSelectMode: string = AutoSelectModes.MANUAL;
+  /** 节点排布列数（1=单列 2=双列），用户在订阅分组展开区手动切换，选择持久化 */
+  @State nodeColumns: number = 1;
+  @State latencyTick: number = 0;
+  @State isAdding: boolean = false;
+  @State isRefreshing: boolean = false;
+  @State refreshingIds: string[] = [];
+  @State isImporting: boolean = false;
+  @State isScanning: boolean = false;
+  @State toastMsg: string = '';
+  @State toastVisible: boolean = false;
+  @State deleteTargetId: string = '';
+  /** tunbox://import 导入请求 seq（EntryAbility.captureImportScheme 发布，@Watch 即时消费） */
+  @StorageLink('import_request_seq') @Watch('onImportRequest') importRequestSeq: number = 0;
+  /** 长按删除单个节点目标（确认框标题展示用） */
+  @State deleteNodeTargetName: string = '';
+  private deleteNodeTargetId: string = '';
+  @State spinTick: number = 0;
+  private service: SubscriptionService = SubscriptionService.instance();
+  private settings: AppSettings = new AppSettings();
+  private readonly latencyListener: () => void = (): void => {
+    this.latencyTick = this.latencyTick + 1;
+  };
+  private latencyBound: boolean = false;
+  private deleteDialog: CustomDialogController = new CustomDialogController({
+    builder: DeleteConfirmDialog({
+      onConfirm: () => {
+        this.doDelete(this.deleteTargetId);
+      }
+    })
+  });
+  /** 长按节点后的单节点删除确认框（复用 SubscriptionService.removeNode） */
+  private deleteNodeDialog: CustomDialogController = new CustomDialogController({
+    builder: NodeDeleteConfirmDialog({
+      getNodeName: (): string => this.deleteNodeTargetName,
+      onConfirm: () => {
+        this.doDeleteNode();
+      }
+    }),
+    autoCancel: true
+  });
+  private editTarget: Subscription | null = null;
+  private editDialog: CustomDialogController = new CustomDialogController({
+    builder: EditSubscriptionDialog({
+      getInitialName: (): string => this.editTarget !== null ? this.editTarget.name : '',
+      getInitialUrl: (): string => this.editTarget !== null ? this.editTarget.url : '',
+      getIsLocal: (): boolean => this.editTarget !== null && this.editTarget.url.startsWith('local://'),
+      onConfirm: (name: string, url: string) => {
+        this.doEdit(name, url);
+      }
+    }),
+    autoCancel: true
+  });
+  private importDialog: CustomDialogController = new CustomDialogController({    builder: ImportDialog({
+      onScan: () => {
+        this.importFromQr();
+      },
+      onUrl: (url: string) => {
+        this.importFromUrl(url);
+      },
+      onFile: () => {
+        this.importYamlFile();
+      }
+    }),
+    autoCancel: true
+  });
+
+  aboutToAppear(): void {
+    // 作为 HdsTabs 页签内容组件（非 @Entry 页）后：页签「重新展示」由宿主经桥通知，
+    // 语义等价于原 onPageShow（从子页返回 / 首次切入 / 切回页签时刷新）。
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler((): void => { this.refreshForShown(); });
+    }
+    // tunbox://import scheme（P1-3c）：@StorageLink 即时响应外部导入请求
+    // （EntryAbility.captureImportScheme 解析 tunbox://import?url=… 后发布）。
+    this.importRequestSeq = AppStorage.get<number>('import_request_seq') ?? 0;
+  }
+
+  /** 宿主通知的「重新展示」：执行原 onPageShow 的刷新 */
+  refreshForShown(): void {
+    this.bootstrap();
+  }
+
+  /** tunbox://import scheme 消费（P1-3c）：seq 变化即取 url 导入（一次性，取后清空） */
+  onImportRequest(): void {
+    const pendingUrl = AppStorage.get<string>('import_request_url') ?? '';
+    if (pendingUrl.length === 0) {
+      return;
+    }
+    AppStorage.setOrCreate('import_request_url', '');
+    this.importFromUrl(pendingUrl).catch((): void => {});
+  }
+
+  aboutToDisappear(): void {
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler(null);
+    }
+    if (this.latencyBound) {
+      LatencyController.removeListener(this.latencyListener);
+      this.latencyBound = false;
+    }
+  }
+
+  private async bootstrap(): Promise<void> {
+    const ctx = getContext(this) as Context;
+    ConnectionOrchestrator.instance().init(ctx);
+    await SettingsService.init(ctx);
+    await this.service.init(ctx);
+    this.settings = await SettingsService.load();
+    this.activeSubId = this.settings.preferredNodeSubscriptionId;
+    this.activeNodeId = this.settings.preferredNodeId;
+    this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
+    this.nodeColumns = await SettingsService.loadNodeColumns();
+    this.reload();
+    if (!this.latencyBound) {
+      this.latencyBound = true;
+      LatencyController.addListener(this.latencyListener);
+    }
+  }
+
+  private expandedInitialized: boolean = false;
+
+  private reload(): void {
+    this.subs = this.service.subscriptions.filter((s: Subscription) =>
+      s.id !== DIRECT_GROUP_ID || s.nodeCount > 0);
+    // 展开状态只在首次进入时给默认值（活动订阅）；此后删/加订阅一律保持
+    // 用户当前的展开/收起状态，不重置（此前 expandedIds 空了就自动展开第一个，
+    // 表现为"每次删/加订阅都自动展开第一个分组"）。
+    if (!this.expandedInitialized) {
+      this.expandedInitialized = true;
+      if (this.subs.length > 0) {
+        const first = this.subs.find((s) => s.id === this.activeSubId) ?? this.subs[0];
+        this.expandedIds = [first.id];
+      }
+    }
+    // 同步活动节点展示
+    const node = this.service.findNode(this.activeNodeId);
+    if (node === null && this.service.nodes.length > 0) {
+      this.activeNodeId = this.service.nodes[0].id;
+      this.activeSubId = this.service.nodes[0].subscriptionId;
+    }
+  }
+
+  private showToast(msg: string): void {
+    this.toastMsg = msg;
+    this.toastVisible = true;
+    setTimeout(() => {
+      this.toastVisible = false;
+    }, 2400);
+  }
+
+  /** 节点排布单列/双列切换（订阅分组始终单行），选择经 SettingsService 持久化 */
+  private toggleNodeColumns(): void {
+    const next = this.nodeColumns === 2 ? 1 : 2;
+    this.nodeColumns = next;
+    SettingsService.saveNodeColumns(next);
+    this.showToast(next === 2 ? '节点已切换为双列排布' : '节点已切换为单列排布');
+  }
+
+  /**
+   * 节点卡片（单列 100% / 双列 48.5% 共用同一套样式）。
+   * 两行信息列：名称/协议/延迟三者挤在一行时窄屏下名称被截断、协议被 layoutWeight(1)
+   * 压成残字，改为名称行 + 协议行两段后各自完整可读。
+   */
+  @Builder
+  nodeCard(node: ProxyNode, cardWidth: string) {
+    Row({ space: 9 }) {
+      // 单选圆圈 16px
+      Stack({ alignContent: Alignment.Center }) {
+        Circle({ width: 16, height: 16 })
+          .fill(node.id === this.activeNodeId ? Nx.accent() : Color.Transparent)
+          .stroke(node.id === this.activeNodeId ? Nx.accent() : Nx.radioEdge())
+          .strokeWidth(1.6)
+        if (node.id === this.activeNodeId) {
+          Circle({ width: 5, height: 5 }).fill(Color.White)
+        }
+      }.width(16).height(16)
+      Column({ space: 3 }) {
+        // 第一行：节点名称 + 延迟
+        Row({ space: 8 }) {
+          Text(node.name)
+            .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Nx.fg())
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+          Row({ space: 4 }) {
+            Circle({ width: 5, height: 5 }).fill(NexusPing.color(this.pingOf(node)))
+            Text(NexusPing.text(this.pingOf(node)))
+              .fontSize(11).fontWeight(FontWeight.Bold)
+              .fontColor(NexusPing.color(this.pingOf(node))).fontFamily('monospace')
+          }
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+        // 第二行：协议（独占一行，名称下方）
+        Text(this.protoOf(node))
+          .fontSize(10)
+          .fontFamily('monospace')
+          .fontColor(Nx.muted())
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width(cardWidth)
+    .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+    .borderRadius(10)
+    .backgroundColor(node.id === this.activeNodeId ? Nx.accentBg() : Nx.surface())
+    .borderWidth(1)
+    .borderColor(node.id === this.activeNodeId ? Nx.accent() : Nx.border())
+    .shadow(node.id === this.activeNodeId ?
+      { radius: 4, color: 'rgba(37, 99, 235, 0.15)', offsetY: 1 } :
+      { radius: 0, color: Color.Transparent, offsetY: 0 })
+    .margin({ right: this.nodeColumns === 2 ? 3 : 0, bottom: this.nodeColumns === 2 ? 5 : 0 })
+    .onClick(() => this.selectNode(node))
+    // 长按弹出单节点删除确认框（与节点页长按删除同语义）
+    .gesture(LongPressGesture().onAction(() => {
+      this.deleteNodeTargetId = node.id;
+      this.deleteNodeTargetName = node.name;
+      this.deleteNodeDialog.open();
+    }))
+  }
+
+  private isOpen(id: string): boolean {
+    return this.expandedIds.includes(id);
+  }
+
+  private toggleOpen(id: string): void {
+    if (this.isOpen(id)) {
+      this.expandedIds = this.expandedIds.filter((x) => x !== id);
+    } else {
+      this.expandedIds = this.expandedIds.concat([id]);
+    }
+  }
+
+  private activeSub(): Subscription | null {
+    const s = this.subs.find((x) => x.id === this.activeSubId);
+    if (s !== undefined) {
+      return s;
+    }
+    return this.subs.length > 0 ? this.subs[0] : null;
+  }
+
+  private activeNode(): ProxyNode | null {
+    return this.service.findNode(this.activeNodeId);
+  }
+
+  private totalNodes(): number {
+    let n = 0;
+    for (const s of this.subs) {
+      n += this.service.nodesOf(s.id).length;
+    }
+    return n;
+  }
+
+  /**
+   * 协议展示文本（第二行小字）：VLESS·REALITY / VMESS / TROJAN / HYSTERIA2 / SS / SSR / 未知。
+   *
+   * 复用 NodeProtocolPolicy（与 NodeSelectionPage 同一口径），不再用旧的
+   * proxyType.toUpperCase().slice(0, 8)：那是把「VLESS」「HYSTERIA2」硬截成
+   * 8 字符的土办法，看不出 REALITY，且未知协议直接显示空串。
+   */
+  private protoOf(node: ProxyNode): string {
+    return NodeProtocolPolicy.fromNode(node).display();
+  }
+
+  private pingOf(node: ProxyNode): number | null {
+    return LatencyController.latencyFor(node.name);
+  }
+
+  /**
+   * 节点按延迟升序（边测边排）：有效延迟小的在前；未测(null)/超时沉底并保持
+   * 原相对顺序。ForEach 键含 latencyTick，测速中每批新结果落地（控制器 200ms
+   * 合并通知）即重渲染重排，用户实时看到快节点「冒泡」到前面。
+   */
+  private nodesSortedByLatency(subId: string): ProxyNode[] {
+    const arr: ProxyNode[] = this.service.nodesOf(subId).slice();
+    const key = (node: ProxyNode): number => {
+      const v = LatencyController.latencyFor(node.name);
+      return (v === null || v < 0) ? Number.MAX_SAFE_INTEGER : v;
+    };
+    // 稳定排序：ArkTS sort 对相同 key 保持插入序（ECMAScript 规范）
+    arr.sort((a: ProxyNode, b: ProxyNode): number => key(a) - key(b));
+    return arr;
+  }
+
+  private async selectNode(node: ProxyNode): Promise<void> {
+    // 真实节点必须退出自动模式（同 NodeSelectionPage 语义）：否则 orchestrator 的
+    // pinSmartGroup 会把 PROXY 指向 smart 组，preferredNodeId 被架空，主页环永远显示“自动选择”。
+    if (this.settings.autoSelectMode === AutoSelectModes.AUTO) {
+      this.settings.autoSelectMode = AutoSelectModes.MANUAL;
+      this.autoSelectMode = AutoSelectModes.MANUAL;
+      AppLogger.info(TAG, `manual node pick (${node.name}); auto mode disabled`);
+    }
+    this.activeNodeId = node.id;
+    this.activeSubId = node.subscriptionId;
+    this.settings.preferredNodeId = node.id;
+    this.settings.preferredNodeSubscriptionId = node.subscriptionId;
+    this.settings.selectedSubscriptionId = node.subscriptionId;
+    await SettingsService.save(this.settings);
+    // 已连接时完整重连让新节点即时生效；未连接时仅保存选择。
+    const didRestart = await ConnectionOrchestrator.instance()
+      .reconnectWithNode(node, this.service, 'preferredNode=' + node.id);
+    if (didRestart) {
+      this.showToast(`已选择 ${node.name}，正在自动重连…`);
+      AppStorage.setOrCreate('public_ip_revision', (AppStorage.get<number>('public_ip_revision') ?? 0) + 1);
+    } else {
+      this.showToast(`已选择 ${node.name}`);
+    }
+  }
+
+  /**
+   * 启用内核智能选点（mihomo-smart LightGBM）：跨全部订阅自动优选出口，
+   * 故障自动切换 + 网络变化自动重连由编排器既有策略承担（默认全开）。
+   * 语义同节点页 smart 合成行：重连仍需一个真实节点做拨号目标。
+   */
+  private async enableAutoSelect(): Promise<void> {
+    if (this.autoSelectMode === AutoSelectModes.AUTO) {
+      this.showToast('已在使用内核智能选点');
+      return;
+    }
+    const pool: ProxyNode[] = this.service.nodes;
+    let target: ProxyNode | null = this.service.findNode(this.settings.preferredNodeId);
+    if (target === null && pool.length > 0) {
+      target = pool[0];
+    }
+    if (target === null) {
+      this.showToast('没有可用节点');
+      return;
+    }
+    this.settings.autoSelectMode = AutoSelectModes.AUTO;
+    await SettingsService.save(this.settings);
+    this.autoSelectMode = AutoSelectModes.AUTO;
+    const didRestart = await ConnectionOrchestrator.instance()
+      .reconnectWithNode(target, this.service, 'autoSelectMode=auto');
+    if (didRestart) {
+      AppStorage.setOrCreate('public_ip_revision', (AppStorage.get<number>('public_ip_revision') ?? 0) + 1);
+    }
+    this.showToast(didRestart ? '已启用内核智能选点，正在自动重连…' : '已启用内核智能选点，下次连接生效');
+  }
+
+  private async speedTestSub(subId: string): Promise<void> {
+    try {
+      this.showToast('正在测速…');
+      await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId);
+      this.showToast('✓ 测速完成');
+    } catch (e) {
+      this.showToast('测速失败，请重试');
+    }
+  }
+
+  private isRefreshingSub(id: string): boolean {
+    return this.refreshingIds.includes(id);
+  }
+
+  private async refreshOne(sub: Subscription): Promise<void> {
+    if (sub.id === DIRECT_GROUP_ID || this.isRefreshing || this.isRefreshingSub(sub.id)) {
+      return;
+    }
+    this.spinTick += 1;
+    this.refreshingIds = this.refreshingIds.concat([sub.id]);
+    try {
+      const result = await this.service.refreshSubscription(sub.id);
+      this.reload();
+      if (result.status === SubscriptionRefreshStatus.OK) {
+        this.showToast(`✓ 已刷新「${sub.name}」及节点测速`);
+      } else {
+        this.showToast(`${sub.name}：${result.userText('刷新失败')}`);
+      }
+    } finally {
+      this.refreshingIds = this.refreshingIds.filter((x) => x !== sub.id);
+    }
+  }
+
+  private async refreshAll(): Promise<void> {
+    if (this.isAdding || this.isRefreshing || this.refreshingIds.length > 0) {
+      return;
+    }
+    const ids: string[] = [];
+    for (const s of this.subs) {
+      if (s.id !== DIRECT_GROUP_ID) {
+        ids.push(s.id);
+      }
+    }
+    if (ids.length === 0) {
+      this.showToast('没有可刷新的订阅');
+      return;
+    }
+    this.spinTick += 1;
+    this.isRefreshing = true;
+    this.refreshingIds = ids.slice();
+    try {
+      const summary = await this.service.refreshSubscriptionsConcurrently(ids,
+        ConcurrentRefresh.DEFAULT_LANES,
+        (progress: RefreshBatchProgress, item: RefreshItemOutcome) => {
+          this.refreshingIds = this.refreshingIds.filter((x) => x !== item.id);
+          this.reload();
+        },
+        (): boolean => !this.isRefreshing);
+      if (summary.failCount === 0) {
+        this.showToast(`✓ 已成功刷新全部 ${summary.total} 个订阅及节点！`);
+      } else if (summary.okCount > 0) {
+        this.showToast(`部分刷新成功（${summary.okCount} 成功 / ${summary.failCount} 失败）`);
+      } else {
+        this.showToast('刷新失败，请检查网络后重试');
+      }
+    } finally {
+      this.refreshingIds = [];
+      this.isRefreshing = false;
+      this.reload();
+    }
+  }
+
+  private subscriptionNameOf(id: string): string {
+    const f = this.subs.find((s: Subscription) => s.id === id);
+    return f === undefined ? id : f.name;
+  }
+
+  /** URL 导入（HTML importFromUrl 等价：按 host 自动命名） */
+  private async importFromUrl(rawUrl: string): Promise<void> {
+    const raw = rawUrl.trim();
+    if (raw.length === 0 || this.isAdding || this.isRefreshing) {
+      return;
+    }
+    // 多行输入（一行一个节点链接）走批量导入；单行保持原行为（节点/订阅二选一）
+    const nonEmptyLines = raw.split(/\r?\n/)
+      .map((l: string): string => l.trim())
+      .filter((l: string): boolean => l.length > 0);
+    if (nonEmptyLines.length > 1) {
+      await this.importNodeUris(raw);
+      return;
+    }
+    if (SubscriptionService.isNodeUri(raw)) {
+      await this.importNodeUris(raw);
+      return;
+    }
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(raw)) {
+      promptAction.showToast({ message: '请输入有效的URL地址' });
+      return;
+    }
+    const dupe = this.subs.find((s) => s.url === raw);
+    if (dupe !== undefined) {
+      promptAction.showToast({ message: '该订阅已存在，无需重复添加' });
+      return;
+    }
+    this.isAdding = true;
+    try {
+      let host = raw.replace(/^https?:\/\//, '').split('/')[0];
+      if (host.length === 0) {
+        host = '订阅';
+      }
+      const sub = await this.service.addSubscription(`🔗 ${host} 节点组`, raw, '', '');
+      // 立刻上屏：订阅卡先出现（0 节点 · 刷新中），不等网络刷新完成。
+      // 此前 reload 放在 refreshSubscription 之后，慢订阅要等十几秒才有可见反馈。
+      this.expandedIds = [sub.id];
+      this.activeSubId = sub.id;
+      this.reload();
+      this.showToast('已添加，正在获取节点…');
+      const result = await this.service.refreshSubscription(sub.id);
+      if (result.status === SubscriptionRefreshStatus.OK && result.nodeCount > 0) {
+        const nodes = this.service.nodesOf(sub.id);
+        if (nodes.length > 0) {
+          await this.selectNode(nodes[0]);
+        }
+      }
+      this.reload();
+      this.showToast(result.status === SubscriptionRefreshStatus.OK
+        ? `✓ 订阅成功，获取到 ${result.nodeCount} 个节点` : `已添加，但刷新失败：${result.userText('请稍后重试')}`);
+    } catch (e) {
+      promptAction.showToast({ message: '添加失败，请检查链接是否有效' });
+    }
+    this.isAdding = false;
+  }
+
+  /** 节点链接导入：一行一个批量（vless/vmess/ss/trojan…），重复与无效逐条隔离 */
+  private async importNodeUris(raw: string): Promise<void> {
+    this.isAdding = true;
+    try {
+      const r = await this.service.addDirectNodesText(raw);
+      this.reload();
+      if (r.added > 0) {
+        let msg = r.added === 1
+          ? `节点链接已导入，当前共 ${this.service.nodes.length} 个节点`
+          : `✓ 已导入 ${r.added} 个节点，当前共 ${this.service.nodes.length} 个`;
+        const extra: string[] = [];
+        if (r.duplicate > 0) {
+          extra.push(`${r.duplicate} 条重复`);
+        }
+        if (r.invalid > 0) {
+          extra.push(`${r.invalid} 条无效`);
+        }
+        if (extra.length > 0) {
+          msg += `（${extra.join('，')}）`;
+        }
+        this.showToast(msg);
+      } else if (r.duplicate > 0 && r.invalid === 0) {
+        this.showToast(r.duplicate === 1 ? '该节点已存在，无需重复添加' : `${r.duplicate} 条链接均已存在，无需重复添加`);
+      } else {
+        this.showToast('导入失败，请检查链接是否有效');
+      }
+    } catch (e) {
+      this.showToast('导入失败，请检查链接是否有效');
+    }
+    this.isAdding = false;
+  }
+
+  private async importFromQr(): Promise<void> {
+    if (this.isScanning || this.isAdding || this.isRefreshing || this.isImporting) {
+      return;
+    }
+    this.isScanning = true;
+    try {
+      const result = await scanBarcode.startScanForResult(getContext(this) as Context, {
+        enableMultiMode: false,
+        enableAlbum: true
+      });
+      const raw = result.originalValue.trim();
+      if (raw.length === 0) {
+        this.showToast('二维码内容为空');
+        return;
+      }
+      if (SubscriptionService.isNodeUri(raw)) {
+        await this.importNodeUris(raw);
+        return;
+      }
+      const lower = raw.toLowerCase();
+      if (!(lower.startsWith('https://') || lower.startsWith('http://'))
+        || !SubscriptionFetchPolicy.isValidSubscriptionUrl(raw, true)) {
+        this.showToast('二维码不是有效的 HTTP 或 HTTPS 订阅链接');
+        return;
+      }
+      await this.importFromUrl(raw);
+    } catch (e) {
+      const err = e as BusinessError;
+      if (err.code === 1000500002) {
+        this.showToast('已取消二维码扫描');
+      } else if (err.code === 201) {
+        this.showToast('相机权限被拒绝，无法扫描二维码');
+      } else {
+        this.showToast('二维码扫描失败，请重试');
+      }
+    } finally {
+      this.isScanning = false;
+    }
+  }
+
+  private async importYamlFile(): Promise<void> {
+    if (this.isImporting) {
+      return;
+    }
+    this.isImporting = true;
+    try {
+      const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
+      const opts = new picker.DocumentSelectOptions();
+      opts.maxSelectNumber = 1;
+      opts.fileSuffixFilters = ['.yaml', '.yml', '.txt', '.json', '.conf'];
+      const uris = await docPicker.select(opts);
+      if (uris.length === 0) {
+        return;
+      }
+      const uri = uris[0];
+      const file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      try {
+        const stat = fs.statSync(file.fd);
+        if (stat.size <= 0 || stat.size > 4 * 1024 * 1024) {
+          this.showToast('文件大小需在 4MB 以内');
+          return;
+        }
+        const buf = new ArrayBuffer(Number(stat.size));
+        let readLen = 0;
+        while (readLen < Number(stat.size)) {
+          const chunk = fs.readSync(file.fd, buf, { offset: readLen, length: Number(stat.size) - readLen });
+          if (chunk <= 0) {
+            break;
+          }
+          readLen += chunk;
+        }
+        const text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, readLen));
+        const fileName = uri.substring(uri.lastIndexOf('/') + 1);
+        const count = await this.service.addLocalYaml(fileName, text);
+        if (count > 0) {
+          this.showToast(`文件导入成功，解析出 ${count} 个节点`);
+          this.reload();
+        } else {
+          this.showToast('文件未解析出节点（支持 Clash YAML 与 ss/vless/vmess/trojan 链接）');
+        }
+      } finally {
+        fs.closeSync(file);
+      }
+    } catch (e) {
+      AppLogger.warn(TAG, `yaml file import failed: ${AppLogger.errText(e)}`);
+      this.showToast('导入失败，请重试');
+    } finally {
+      this.isImporting = false;
+    }
+  }
+
+  private async doDelete(id: string): Promise<void> {
+    if (id === DIRECT_GROUP_ID) {
+      this.showToast('单节点分组为常驻分组，不能删除');
+      return;
+    }
+    await this.service.removeSubscription(id);
+    this.expandedIds = this.expandedIds.filter((x) => x !== id);
+    if (this.activeSubId === id) {
+      this.activeSubId = '';
+      this.activeNodeId = '';
+    }
+    this.reload();
+    this.showToast('订阅已删除');
+  }
+
+  private openEdit(sub: Subscription): void {
+    this.editTarget = sub;
+    this.editDialog.open();
+  }
+
+  /**
+   * 长按删除单个节点（语义与 NodeSelectionPage.doDeleteNode 一致）：
+   * - 服务端 removeNode 会把节点指纹记入隐藏清单，订阅刷新后该节点不会"复活"；
+   * - 删除的是当前选中节点时清空偏好（所有消费方都有 nodes[0] 兜底），并同步
+   *   页面态 activeNodeId/activeSubId，避免状态卡仍显示已删节点。
+   */
+  private async doDeleteNode(): Promise<void> {
+    const nodeId = this.deleteNodeTargetId;
+    this.deleteNodeTargetId = '';
+    if (nodeId.length === 0) {
+      return;
+    }
+    const node = this.service.findNode(nodeId);
+    const wasSelected = this.activeNodeId === nodeId;
+    const ok = await this.service.removeNode(nodeId);
+    if (!ok) {
+      this.showToast('删除失败，请重试');
+      return;
+    }
+    if (wasSelected) {
+      this.settings.preferredNodeId = '';
+      this.settings.preferredNodeSubscriptionId = '';
+      await SettingsService.save(this.settings);
+      this.activeNodeId = '';
+      this.activeSubId = '';
+    }
+    this.reload();
+    this.showToast(node !== null ? `已删除「${node.name}」` : '节点已删除');
+  }
+
+  private async doEdit(name: string, url: string): Promise<void> {
+    const target = this.editTarget;
+    if (target === null) {
+      return;
+    }
+    if (name.trim().length === 0) {
+      this.showToast('订阅名称不能为空');
+      return;
+    }
+    const isLocal = target.url.startsWith('local://');
+    if (target.id !== DIRECT_GROUP_ID && !isLocal && url.trim().length === 0) {
+      this.showToast('订阅链接不能为空');
+      return;
+    }
+    // 本地导入允许改名；http/https 走完整 URL 校验
+    if (target.id !== DIRECT_GROUP_ID && !isLocal && !url.trim().startsWith('local://')
+      && !SubscriptionFetchPolicy.isValidSubscriptionUrl(url.trim())) {
+      this.showToast('请输入有效的订阅链接');
+      return;
+    }
+    const dupe = target.id === DIRECT_GROUP_ID ? undefined
+      : this.subs.find((s) => s.url === url.trim() && s.id !== target.id);
+    if (dupe !== undefined) {
+      this.showToast('该订阅链接已存在');
+      return;
+    }
+    target.name = name.trim();
+    if (target.id !== DIRECT_GROUP_ID && !isLocal) {
+      target.url = url.trim();
+    }
+    await this.service.updateSubscription(target);
+    this.reload();
+    this.editTarget = null;
+    this.showToast('订阅已更新');
+  }
+
+  private formatUpdateTime(ts: number): string {
+    if (ts <= 0) {
+      return '未更新';
+    }
+    const diff = Date.now() - ts;
+    const minutes = Math.floor(diff / 60000);
+    if (minutes < 1) {
+      return '刚刚';
+    }
+    if (minutes < 60) {
+      return `${minutes}分钟前`;
+    }
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) {
+      return `${hours}小时前`;
+    }
+    const days = Math.floor(hours / 24);
+    if (days < 7) {
+      return `${days}天前`;
+    }
+    const d = new Date(ts);
+    return `${d.getMonth() + 1}/${d.getDate()}`;
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column().width('100%').height('100%')
+        .backgroundColor(Nx.bg())
+        .linearGradient(ThemeService.isDark() ? undefined : { angle: 135, colors: Ui.backdropColors })
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+
+      Column() {
+        Scroll() {
+          Column({ space: 0 }) {
+            // 顶部 Toast（刷新反馈，居中悬浮等价：顶部横条）
+            if (this.toastVisible) {
+              Text(this.toastMsg)
+                .fontSize(11.5).fontWeight(FontWeight.Bold).fontColor(Color.White)
+                .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+                .borderRadius(9999)
+                .backgroundColor('rgba(15, 23, 42, 0.88)')
+                .margin({ bottom: 8 })
+            }
+            // ── 顶部大标题 + 刷新全部 + “+” ──
+            Row() {
+              Column({ space: 1 }) {
+                Text('订阅与节点').fontSize(22).fontWeight(FontWeight.Bold)
+                  .fontColor(Nx.fg()).width('100%')
+                Text('展开查看节点，点击即可直接选用')
+                  .fontSize(12).fontColor(Nx.muted()).width('100%')
+              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+              Row({ space: 8 }) {
+                // 单列/双列节点排布切换（候选4图形，显示目标模式：单列时双列图标/双列时单列图标）
+                Stack({ alignContent: Alignment.Center }) {
+                  Rect({ width: 20, height: 16 })
+                    .radius(4)
+                    .fill(Color.Transparent)
+                    .stroke(Nx.muted())
+                    .strokeWidth(2)
+                  if (this.nodeColumns === 1) {
+                    // 目标：双列 → 中央竖线分栏
+                    Rect({ width: 2, height: 12 })
+                      .fill(Nx.muted())
+                  }
+                }
+                .height(30)
+                .padding({ left: 12, right: 12 })
+                .borderRadius(9999)
+                .backgroundColor(Nx.glassFill())
+                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+                .borderWidth(1.5).borderColor(Nx.glassEdge())
+                .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.05)', offsetY: 2 })
+                .onClick(() => this.toggleNodeColumns())
+                // 刷新全部 38px
+                Stack({ alignContent: Alignment.Center }) {
+                  if (this.isRefreshing) {
+                    LoadingProgress().width(18).height(18).color(Nx.accent())
+                  } else {
+                    Text('↻').fontSize(18).fontColor(Nx.muted())
+                      .rotate({ angle: this.spinTick * 360 })
+                      .animation({ duration: 650, curve: Curve.EaseInOut })
+                  }
+                }
+                .width(38).height(38).borderRadius(9999)
+                .backgroundColor(Nx.glassFill())
+                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+                .borderWidth(1.5).borderColor(Nx.glassEdge())
+                .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.05)', offsetY: 2 })
+                .onClick(() => this.refreshAll())
+                // “+”导入 38px
+                Text('+')
+                  .fontSize(22).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                  .width(38).height(38).textAlign(TextAlign.Center)
+                  .borderRadius(9999)
+                  .backgroundColor(Nx.glassFill())
+                  .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+                  .borderWidth(1.5).borderColor(Nx.glassEdge())
+                  .shadow({ radius: 8, color: 'rgba(15, 23, 42, 0.06)', offsetY: 2 })
+                  .onClick(() => this.importDialog.open())
+              }.alignItems(VerticalAlign.Center)
+            }.width('100%').margin({ bottom: 12 })
+
+            // ── 当前状态卡 ──
+            Column({ space: 5 }) {
+              Row() {
+                Text('当前使用订阅').fontSize(12).fontColor(Nx.muted()).layoutWeight(1)
+                Text(this.activeSub() !== null ? (this.activeSub() as Subscription).name : '暂无')
+                  .fontSize(12).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+                  .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+              }.width('100%')
+              Row() {
+                Text('当前连接节点').fontSize(12).fontColor(Nx.muted()).layoutWeight(1)
+                Text(this.activeNode() !== null ? (this.activeNode() as ProxyNode).name : '未选择')
+                  .fontSize(12).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                  .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+              }.width('100%')
+              Row() {
+                Text('统计总览').fontSize(12).fontColor(Nx.muted()).layoutWeight(1)
+                Text(`${this.subs.length} 个订阅 · ${this.totalNodes()} 个节点`)
+                  .fontSize(12).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+                  .fontFamily('monospace')
+              }.width('100%')
+            }
+            .width('100%')
+            .padding({ left: 13, right: 13, top: 11, bottom: 11 })
+            .borderRadius(14)
+            .backgroundColor(Nx.glassFill())
+            .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+            .backgroundEffect(Nx.glassEffect())
+            .borderWidth(1).borderColor(Nx.glassEdge())
+            .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
+            .margin({ bottom: 12 })
+
+            // ── 自动选择分组（mihomo-smart 内核智能选点，跨全部订阅优选） ──
+            Column({ space: 0 }) {
+              Row({ space: 10 }) {
+                Text('♻️').fontSize(15).fontColor(Nx.success())
+                  .width(32).height(32).textAlign(TextAlign.Center)
+                  .borderRadius(8).backgroundColor(Nx.successSoft())
+                Column({ space: 2 }) {
+                  Row({ space: 6 }) {
+                    Text('自动选择 · 内核智能选点')
+                      .fontSize(14).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                    if (this.autoSelectMode === AutoSelectModes.AUTO) {
+                      Text('使用中')
+                        .fontSize(10).fontWeight(FontWeight.Bold).fontColor(Nx.success())
+                        .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                        .borderRadius(9999)
+                        .backgroundColor(Nx.successSoft())
+                    }
+                  }.width('100%')
+                  Text(`跨订阅自动优选 · 故障自动切换 · ${this.totalNodes()} 个候选节点`)
+                    .fontSize(11).fontColor(Nx.muted()).width('100%')
+                    .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                Text('›')
+                  .fontSize(18).fontColor(Nx.muted())
+                  .rotate({ angle: this.isOpen('__auto_select__') ? 90 : 0 })
+                  .animation({ duration: 250, curve: Curve.EaseInOut })
+              }
+              .width('100%')
+              .padding({ left: 15, right: 15, top: 13, bottom: 13 })
+              .backgroundColor(Nx.surface())
+              .onClick(() => this.toggleOpen('__auto_select__'))
+
+              if (this.isOpen('__auto_select__')) {
+                Column({ space: 5 }) {
+                  Row() {
+                    Text('由 smart 内核按连接目标自动选点，无需手动切换')
+                      .fontSize(11).fontColor(Nx.muted()).layoutWeight(1)
+                  }.width('100%').padding({ left: 6, right: 6, top: 4, bottom: 2 })
+                  Row({ space: 9 }) {
+                    Stack({ alignContent: Alignment.Center }) {
+                      Circle({ width: 16, height: 16 })
+                        .fill(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accent() : Color.Transparent)
+                        .stroke(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accent() : Nx.radioEdge())
+                        .strokeWidth(1.6)
+                      if (this.autoSelectMode === AutoSelectModes.AUTO) {
+                        Circle({ width: 5, height: 5 }).fill(Color.White)
+                      }
+                    }.width(16).height(16)
+                    Text(ClashConfigGenerator.SMART_GROUP_NAME)
+                      .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Nx.fg())
+                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .layoutWeight(1)
+                    Text('SMART')
+                      .fontSize(10).fontColor(Nx.muted()).fontFamily('monospace')
+                      .padding({ left: 5, right: 5, top: 1, bottom: 1 })
+                      .borderRadius(4).backgroundColor(Nx.fgSoft())
+                    Text('自动优选')
+                      .fontSize(11).fontWeight(FontWeight.Bold)
+                      .fontColor(Nx.success()).fontFamily('monospace')
+                  }
+                  .width('100%')
+                  .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+                  .borderRadius(10)
+                  .backgroundColor(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accentBg() : Nx.surface())
+                  .borderWidth(1)
+                  .borderColor(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accent() : Nx.border())
+                  .shadow(this.autoSelectMode === AutoSelectModes.AUTO ?
+                    { radius: 4, color: 'rgba(37, 99, 235, 0.15)', offsetY: 1 } :
+                    { radius: 0, color: Color.Transparent, offsetY: 0 })
+                  .onClick(() => this.enableAutoSelect())
+                }
+                .width('100%')
+                .padding({ left: 10, right: 10, bottom: 12, top: 4 })
+                .backgroundColor(Nx.bg())
+                .borderWidth({ top: 1 })
+                .borderColor(Nx.border())
+              }
+            }
+            .width('100%')
+            .borderRadius(14)
+            .backgroundColor(Nx.glassFill())
+            .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+            .backgroundEffect(Nx.glassEffect())
+            .borderWidth(1.5)
+            .borderColor(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accent() : Nx.border())
+            .shadow(this.autoSelectMode === AutoSelectModes.AUTO ?
+              { radius: 12, color: 'rgba(37, 99, 235, 0.10)', offsetY: 3 } :
+              { radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
+            .margin({ bottom: 12 })
+            .clip(true)
+
+            // ── 手风琴订阅列表 ──
+            ForEach(this.subs, (sub: Subscription) => {
+              Column({ space: 0 }) {
+                // 头部
+                Row({ space: 10 }) {
+                  Text('📦').fontSize(15).fontColor(Nx.accent())
+                    .width(32).height(32).textAlign(TextAlign.Center)
+                    .borderRadius(8).backgroundColor(Nx.accentSoft())
+                  Column({ space: 2 }) {
+                    Row({ space: 6 }) {
+                      Text(sub.name)
+                        .fontSize(14).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                      if (sub.id === this.activeSubId) {
+                        Text('使用中')
+                          .fontSize(10).fontWeight(FontWeight.Bold).fontColor(Nx.success())
+                          .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                          .borderRadius(9999)
+                          .backgroundColor(Nx.successSoft())
+                      }
+                    }.width('100%')
+                    Text(`${this.service.nodesOf(sub.id).length} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
+                      .fontSize(11).fontColor(Nx.muted()).width('100%')
+                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                  // 单个刷新 28px
+                  Stack({ alignContent: Alignment.Center }) {
+                    if (this.isRefreshingSub(sub.id)) {
+                      LoadingProgress().width(15).height(15).color(Nx.accent())
+                    } else {
+                      Text('↻').fontSize(15).fontColor(Nx.muted())
+                    }
+                  }
+                  .width(28).height(28).borderRadius(9999)
+                  .onClick(() => this.refreshOne(sub))
+                  // 重命名（常驻分组头，不用展开）
+                  Text('✎')
+                    .fontSize(15).fontColor(Nx.muted())
+                    .width(28).height(28).textAlign(TextAlign.Center)
+                    .borderRadius(9999)
+                    .onClick(() => this.openEdit(sub))
+                  if (sub.id !== DIRECT_GROUP_ID) {
+                    Text('🗑')
+                      .fontSize(14).fontColor(Nx.muted())
+                      .width(28).height(28).textAlign(TextAlign.Center)
+                      .borderRadius(9999)
+                      .onClick(() => {
+                        this.deleteTargetId = sub.id;
+                        this.deleteDialog.open();
+                      })
+                  }
+                  Text('›')
+                    .fontSize(18).fontColor(Nx.muted())
+                    .rotate({ angle: this.isOpen(sub.id) ? 90 : 0 })
+                    .animation({ duration: 250, curve: Curve.EaseInOut })
+                }
+                .width('100%')
+                .padding({ left: 15, right: 15, top: 13, bottom: 13 })
+                .backgroundColor(Nx.surface())
+                .onClick(() => this.toggleOpen(sub.id))
+
+                // 展开节点区
+                if (this.isOpen(sub.id)) {
+                  Column({ space: 5 }) {
+                    Row() {
+                      Text('点击选用节点 · 长按可删除单个节点')
+                        .fontSize(11).fontColor(Nx.muted()).layoutWeight(1)
+                      Text('⚡ 一键测速')
+                        .fontSize(11).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
+                        .onClick(() => this.speedTestSub(sub.id))
+                    }.width('100%').padding({ left: 6, right: 6, top: 4, bottom: 2 })
+                    if (this.nodeColumns === 2) {
+                      Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
+                        ForEach(this.nodesSortedByLatency(sub.id), (node: ProxyNode) => {
+                          this.nodeCard(node, '48.5%')
+                        }, (node: ProxyNode) => node.id)
+                      }
+                      .width('100%')
+                    } else {
+                      Column({ space: 5 }) {
+                        ForEach(this.nodesSortedByLatency(sub.id), (node: ProxyNode) => {
+                          this.nodeCard(node, '100%')
+                        }, (node: ProxyNode) => node.id)
+                      }
+                      .width('100%')
+                    }
+                    // 编辑/删除行
+                    if (sub.id !== DIRECT_GROUP_ID) {
+                      Row({ space: 12 }) {
+                        Blank()
+                        Text('✎ 编辑')
+                          .fontSize(12).fontColor(Nx.muted())
+                          .onClick(() => this.openEdit(sub))
+                        Text('🗑 删除')
+                          .fontSize(12).fontColor(Nx.danger())
+                          .onClick(() => {
+                            this.deleteTargetId = sub.id;
+                            this.deleteDialog.open();
+                          })
+                      }.width('100%').padding({ top: 4, right: 4 })
+                    }
+                  }
+                  .width('100%')
+                  .padding({ left: 10, right: 10, bottom: 12, top: 4 })
+                  .backgroundColor(Nx.bg())
+                  .borderWidth({ top: 1 })
+                  .borderColor(Nx.border())
+                }
+              }
+              .width('100%')
+              .borderRadius(14)
+              .backgroundColor(Nx.glassFill())
+              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
+              .backgroundEffect(Nx.glassEffect())
+              .borderWidth(1.5)
+              .borderColor(sub.id === this.activeSubId ? Nx.accent() : Nx.border())
+              .shadow(sub.id === this.activeSubId ?
+                { radius: 12, color: 'rgba(37, 99, 235, 0.10)', offsetY: 3 } :
+                { radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
+              .margin({ bottom: 12 })
+              .clip(true)
+            }, (sub: Subscription) => `${sub.id}|${sub.name}|${this.service.nodesOf(sub.id).length}|${sub.lastFetchedAt}|${this.isOpen(sub.id) ? 1 : 0}|${sub.id === this.activeSubId ? 1 : 0}|${this.activeNodeId}|${this.latencyTick}`)
+
+            if (this.subs.length === 0) {
+              Column({ space: 10 }) {
+                Text('📡').fontSize(44)
+                Text('暂无订阅').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.muted())
+                Text('点击右上角 + 添加订阅').fontSize(12).fontColor(Nx.faint())
+              }.width('100%').padding({ top: 50, bottom: 50 })
+            }
+          }
+          .width('100%')
+          // 底部仅留页签栏高度：barOverlap(true) 语义为「内容延伸到页签栏之下」，
+          // 留大片空白会让悬浮栏下方无内容可透，毛玻璃退化成实色圆角片。
+          .padding({ left: 18, right: 18, top: 10, bottom: 100 })
+        }
+        .width('100%').height('100%')
+        .scrollBar(BarState.Off)
+        .align(Alignment.Top)
+      }
+      .width('100%').height('100%')
+
+    }
+    .width('100%').height('100%')
+  }
+}

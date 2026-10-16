@@ -1,0 +1,1244 @@
+[user]
+<acp tokens="426" type="text">m00190</acp>
+Agent 14ab6200-09d3-4fe6-a962-054eead0b881 sent a message: B2 done — C:\Worker\TunBox\docs\ios-vpn-comparison\B2-surge-qx-loon-sfi.md，227 行，全部 A–I 维度 + 矩阵表完成（每条关键结论带来源 URL + 证据等级 📗/📘/📙/⚠️）。
+
+三句要点：
+1. SFI 是唯一实现级可逆的：PacketTunnelProvider.swift 仅 3 行，逻辑全在 Library/Network/ExtensionProvider.swift——iOS 50MB 内存上限的解法 = oomKillerEnabled 恒开（逼近上限时主动断连接自救而非被系统杀），SharedPreferences.swift:61 的 oom_memory_limit_mb 默认 50；alwaysOn 走单条 NEOnDemandRuleConnect，与手动停止用 wasOnDemandEnabled 标记互斥（否则系统立即自动重连）；iOS 18 ControlWidget 可放控制中心/锁屏/Action Button，无主屏 Timeline widget。
+2. 协议/定价修正：QX 实际 $9.99 买断（简报中 $7.99 过时）且已支持 SS2022/VLESS-Reality/AnyTLS（issue #212 过时），但仍无 HY2/TUIC/WireGuard；Loon $7.99 有 HY2 端口跳跃+WG+AnyTLS+JS Custom 节点，无 TUIC；Surge 无 VLESS、iOS 忽略 PROCESS 规则；四家 URL Scheme 面差异大（loon:// 最全含开关，quantumult-x:// 只能导入资源）。
+3. TunBox 差距结论（文件 §5）：领先=订阅兼容面/App 级分流（iOS 四家全部做不到）/无 NE 内存硬限；必补=DNS 层 REJECT 预匹配、端口跳跃、TLS 指纹模拟、Reality 全覆盖、SSID 条件规则、失败自动切换；生态位缺口=模块/插件系统、脚本+重写+MitM、控制中心常驻开关、一键导入 scheme。
+
+[user]
+<acp tokens="65" type="text">m00191</acp>
+Time sampled while preparing turn 11, step 1: 2026-10-13T14:43:55+08:00[Asia/Shanghai]
+Browser time zone for this request: unavailable. Ask the user to clarify otherwise-unqualified dates and times.
+Elapsed since the preceding model-visible message: 15m 38s.
+
+[assistant • edit]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\entryability\\EntryAbility.ets","new_string":"    this.captureWant(want);\n    // 订阅自动刷新（双轨触发之一）：注册 WorkScheduler 周期任务 + 冷启动兜底检查。\n    // autoUpdateSubscription 开关此前无任何调度器消费，节点池会随机场更新逐渐失效。\n    SubscriptionUpdateScheduler.instance().onAppStart(this.context);\n    // 后台被杀后被重新拉起（含桌面图标/卡片/快捷方式等任何入口）：只要磁盘上的","old_string":"    this.captureWant(want);\n    // 后台被杀后被重新拉起（含桌面图标/卡片/快捷方式等任何入口）：只要磁盘上的"}
+
+[tool • edit]
+Error: cannot edit "C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\entryability\EntryAbility.ets": file changed since it was read — re-read the file, then retry
+
+[assistant • edit]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\entryability\\EntryAbility.ets","new_string":"    this.captureWant(want);\n    // 订阅自动刷新（双轨触发之一）：注册 WorkScheduler 周期任务 + 冷启动兜底检查。\n    // autoUpdateSubscription 开关此前无任何调度器消费，节点池会随机场更新逐渐失效。\n    SubscriptionUpdateScheduler.instance().onAppStart(this.context);\n    // 后台被杀后被重新拉起（含桌面图标/卡片/快捷方式等任何入口）：只要磁盘上的","old_string":"    this.captureWant(want);\n    // 后台被杀后被重新拉起（含桌面图标/卡片/快捷方式等任何入口）：只要磁盘上的"}
+
+[tool • edit]
+The file C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\entryability\EntryAbility.ets has been updated successfully.
+
+[assistant • edit]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\entryability\\EntryAbility.ets","new_string":"  onForeground(): void {\n    this.publishPendingWant();\n    // 订阅自动刷新的前台兜底（双轨触发之二，5 分钟节流）：\n    // WorkScheduler 实际触发时机受系统调度影响，回前台立刻补一次过期检查。\n    SubscriptionUpdateScheduler.instance().onForeground(this.context);\n    this.scheduleSelfHeal('foreground');\n  }","old_string":"  onForeground(): void {\n    this.publishPendingWant();\n    this.scheduleSelfHeal('foreground');\n  }"}
+
+[tool • edit]
+Error: cannot edit "C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\entryability\EntryAbility.ets": file changed since it was read — re-read the file, then retry
+
+[assistant • edit]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\entryability\\EntryAbility.ets","new_string":"  onForeground(): void {\n    this.publishPendingWant();\n    // 订阅自动刷新的前台兜底（双轨触发之二，5 分钟节流）：\n    // WorkScheduler 实际触发时机受系统调度影响，回前台立刻补一次过期检查。\n    SubscriptionUpdateScheduler.instance().onForeground(this.context);\n    this.scheduleSelfHeal('foreground');\n  }","old_string":"  onForeground(): void {\n    this.publishPendingWant();\n    this.scheduleSelfHeal('foreground');\n  }"}
+
+[tool • edit]
+The file C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\entryability\EntryAbility.ets has been updated successfully.
+
+[assistant]
+<acp tokens="56" type="text">m00343</acp>
+P0-1 完成（调度器 + WorkScheduler 扩展 + module.json5 声明 + EntryAbility 双轨接线）。转 P0-2：订阅拉取自救。先看订阅拉取路径如何走网络（直连 or 经代理）：
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionFetchPolicy.ets","pattern":"export|class|http|createHttp"}
+
+[tool • grep]
+Found 22 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionFetchPolicy.ets
+Line 8: import { http, connection } from '@kit.NetworkKit';
+Line 43: export const UA_CHAIN: string[] = [
+Line 51: export class SubscriptionUserInfo {
+Line 58: export class SubscriptionFetchResult {
+Line 73: export enum SubscriptionFetchErrorKind {
+Line 75:   HTTP = 'http',
+Line 81: export class SubscriptionFetchError extends Error {
+Line 84:    * 失败时的 HTTP 状态码（0 = 不适用/未知）。429/403 需要与普通 http 错误区分：
+Line 87:   httpStatus: number = 0;
+Line 97:   constructor(kind: SubscriptionFetchErrorKind, message: string, httpStatus: number = 0) {
+Line 100:     this.httpStatus = httpStatus;
+Line 106:       && (this.httpStatus === 429 || this.httpStatus === 403);
+Line 110: export class SubscriptionFetchPolicy {
+Line 309:     if (e instanceof SubscriptionFetchError && e.httpStatus > 0) {
+Line 310:       return e.httpStatus;
+Line 326:     const req = http.createHttp();
+Line 329:         method: http.RequestMethod.GET,
+Line 334:         expectDataType: http.HttpDataType.ARRAY_BUFFER,
+Line 470:     if (location.startsWith('https://') || location.startsWith('http://')) {
+Line 623:     return urlStr.toLowerCase().startsWith('https://');
+Line 651:       || (!lower.startsWith('https://') && !(allowInsecureHttp && lower.startsWith('http://')))
+Line 659:       if ((proto !== 'https' && !(allowInsecureHttp && proto === 'http'))
+
+[user]
+<acp tokens="63" type="text">m00346</acp>
+Time sampled while preparing turn 13, step 45: 2026-10-13T15:48:11+08:00[Asia/Shanghai]
+Browser time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.
+Elapsed since the preceding step context: 11m 14s.
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets","pattern":"usingProxy|request2|SOCKS|socks5|usingProxy.*true|proxy.*http\\.createHttp"}
+
+[tool • grep]
+Found 5 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ClashConfigGenerator.ets
+Line 1171:       // 口令类协议: vless/vmess 用 uuid, 其余(含 tuic/hysteria/socks5/http)用 password
+Line 1280:     // mptcp、ip-version、smux、packet-encoding 等, 以及 tuic/hysteria/http/socks5 等
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\YamlMerger.ets
+Line 72:    * 2) 中继协议(tuic/hysteria/http/socks5/snell/anytls/ssh/mieru/wireguard)
+Line 1383:     'tuic', 'hysteria', 'http', 'socks5', 'snell', 'anytls', 'naive', 'shadowtls',
+Line 1819:     // 中继协议(tuic/hysteria/http/socks5/...)无结构化槽位: 除核心四字段外全部原样透传,
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets","pattern":"external-controller|clashApiPort|apiPort|9090|controllerPort"}
+
+[tool • grep]
+Found 49 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\widgets\DiagnosticsSheet.ets
+Line 347:           ? $r('app.string.diagnostics_api_reachable', this.diag.clashApiPort)
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\vpnability\VpnExtensionAbility.ets
+Line 16:  *    表现为 UI 侧 30s 超时报「9090 端口跨进程不可达」。
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\pages\NodeSelectionPage.ets
+Line 277:     // 不能无条件覆盖 endpoint：无头测速内核与真实隧道共用 9090 端口但 secret 不同，
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\models\PublicIpInfo.ets
+Line 23:   clashApiPort: number = 0;
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\CoreLogStream.ets
+Line 88:    * secret 为空时仍允许连接（内核 external-controller 未设 secret 的场景）。
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ClashConfigGenerator.ets
+Line 7:  * - external-controller 仅绑定 127.0.0.1，secret 由调用方注入
+Line 131:     mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
+Line 138:     lines.push('external-controller: 127.0.0.1:' + apiPort);
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ClashApiService.ets
+Line 129:   private apiPort: number = 9090;
+Line 156:     this.apiPort = port;
+Line 165:     return this.apiPort;
+Line 179:     return `http://127.0.0.1:${this.apiPort}`;
+Line 451:     out.port = this.apiPort;
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ConnectionOrchestrator.ets
+Line 52: const API_PORT = 9090;
+Line 56:  * 同样占用 9090/7890/1053，任一被占都会导致内核 controller bind 失败 → 看似"无法启动"。
+Line 60:   [9090, 7890, 1053],
+Line 61:   [19090, 17890, 11053],
+Line 62:   [29090, 27890, 21053]
+Line 286:   private apiPort: number = API_PORT;
+Line 690:       const yaml = ClashConfigGenerator.generate(node, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
+Line 1728:     if (this.api.currentPort() !== this.apiPort || !this.api.hasSecret(this.testCoreSecret)) {
+Line 1761:    *  1. **已连接**：隧道内核就在 `apiPort` 且带着全部节点（实测 106 节点 / 16 组）
+Line 1805:    * （扩展进程 PID 变更、external-controller 的 secret 随之失效），其后所有
+Line 1827:           api.setEndpoint(this.apiPort, this.testCoreSecret);
+Line 1906:         this.api.setEndpoint(this.apiPort, this.testCoreSecret);
+Line 1988:       ws.connect(`ws://127.0.0.1:${this.apiPort}/logs?token=${encodeURIComponent(secret)}`, (err: BusinessError) => {
+Line 2040:       // 端口探测：其他 mihomo 系应用（NekoBox 等）可能占用默认 9090/7890/1053
+Line 2049:         this.mixedPort, this.apiPort, this.dnsPort, this.testCoreSecret, testGeoip, false, hosts, false,
+Line 2076:       this.api.setEndpoint(this.apiPort, this.testCoreSecret);
+Line 2150:     this.api.setEndpoint(this.apiPort, '');
+Line 2163:    * 必须拒绝在 headless 测速内核仍在服务时覆盖：两者共用 9090 端口，但 secret
+Line 2164:    * 完全不同（测速内核每次随机生成）。旧实现无条件 setEndpoint(9090, 真实secret)
+Line 2170:       this.api.setEndpoint(this.apiPort, realSecret);
+Line 2177:     this.api.setEndpoint(this.apiPort, realSecret);
+Line 2291:         this.apiPort = candidate[0];
+Line 2295:           AppLogger.warn(TAG, `default ports busy; shifted to api=${this.apiPort} mixed=${this.mixedPort} dns=${this.dnsPort}`);
+Line 2300:     AppLogger.warn(TAG, `all port candidate sets busy; keeping defaults api=${this.apiPort}`);
+Line 2306:    * 驻留时会话槽位与回环端口 9090 都可能被它持有，且它可能在 reservePorts 探测
+Line 2361:     // 真实连接会重建扩展进程（同一 9090 端口换成隧道配置 + 真实 secret）：
+Line 2575:       const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
+Line 2663:       this.api.setEndpoint(this.apiPort, this.apiSecret);
+Line 2727:           throw new Error(`端口 ${this.apiPort} 上检测到其他代理应用的内核在运行（如 NekoBox 等 Clash/mihomo 系`
+Line 2732:           throw new Error(`内核已启动但 API 探测失败（端口 ${this.apiPort} 跨进程不可达），请反馈日志`);
+Line 2791:       this.api.setEndpoint(this.apiPort, '');
+Line 3359:     d.clashApiPort = this.apiPort;
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\LatencyEngine.ets
+Line 24:  *  - 已连接时隧道的 controller 就在 127.0.0.1:9090 且**带着全部真实节点**
+Line 362:    * 通道失联时的自愈：内核**中途重启会换掉 external-controller 的 secret**
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\YamlMerger.ets
+Line 127:     'geodata-loader', 'geosite-matcher', 'external-controller',
+Line 128:     'external-controller-cors', 'external-controller-tls', 'external-ui',
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionService.ets","pattern":"SubscriptionFetchPolicy\\.fetch|proxyFetch|viaProxy|tunUp"}
+
+[tool • grep]
+Found 4 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionService.ets
+Line 1697:       const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue,
+Line 1797:         : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue, false, sub.etag);
+Line 1917:             const providerFetched = await SubscriptionFetchPolicy.fetch(
+Line 2075:         const providerFetched = await SubscriptionFetchPolicy.fetch(entry.url, headerName, headerValue);
+
+[user]
+<acp tokens="63" type="text">m00361</acp>
+Time sampled while preparing turn 13, step 52: 2026-10-13T15:59:33+08:00[Asia/Shanghai]
+Browser time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.
+Elapsed since the preceding step context: 11m 22s.
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services","pattern":"ensureTestCore|testCore"}
+
+[tool • grep]
+Found 68 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ConnectionOrchestrator.ets
+Line 1680:   /** @deprecated 仅作兼容读出口，真实状态看 testCoreFlight.getStatus() */
+Line 1681:   testCoreActive: boolean = false;
+Line 1682:   private testCoreSecret: string = '';
+Line 1684:   private testCoreFlight: SingleFlightTestCore | null = null;
+Line 1690:   private testCoreNegativeUntil: number = 0;
+Line 1694:     if (this.testCoreFlight === null) {
+Line 1695:       this.testCoreFlight = new SingleFlightTestCore({
+Line 1700:           this.testCoreActive = status === TestCoreStatus.ACTIVE;
+Line 1704:     return this.testCoreFlight;
+Line 1714:     return this.testCoreFlight !== null && this.testCoreFlight.isActive();
+Line 1725:     if (this.testCoreSecret.length === 0) {
+Line 1728:     if (this.api.currentPort() !== this.apiPort || !this.api.hasSecret(this.testCoreSecret)) {
+Line 1743:     if (this.testCoreFlight === null || !this.testCoreFlight.isActive()) {
+Line 1751:     return Date.now() < this.testCoreNegativeUntil;
+Line 1778:     // 2) 未连接：尝试 headless 测速内核（复用既有 ensureTestCore，含负缓存与安全门禁）
+Line 1785:         const ready = await this.ensureTestCore(subs, await this.lastSettingsForLatency());
+Line 1791:         AppLogger.warn(TAG, `latency channel: ensureTestCore failed: ${AppLogger.errText(e)}`);
+Line 1826:         if (this.testCoreSecret.length > 0) {
+Line 1827:           api.setEndpoint(this.apiPort, this.testCoreSecret);
+Line 1891:   async ensureTestCore(subs: SubscriptionService, settings: AppSettings): Promise<boolean> {
+Line 1901:         this.testCoreNegativeUntil = 0;
+Line 1905:       if (this.testCoreSecret.length > 0) {
+Line 1906:         this.api.setEndpoint(this.apiPort, this.testCoreSecret);
+Line 1909:           this.testCoreNegativeUntil = 0;
+Line 1923:       AppLogger.info(TAG, `ensureTestCore skipped: orchestrator busy (state=${this.state})`);
+Line 1929:         AppLogger.info(TAG, `ensureTestCore skipped: real tunnel is authoritative (${authority.reason})`);
+Line 1935:         `ensureTestCore authority probe failed: ${AppLogger.errText(error)}`);
+Line 1938:       AppLogger.info(TAG, 'ensureTestCore skipped: negative cache cooling down');
+Line 1941:     this.testCoreSubs = subs;
+Line 1942:     this.testCoreSettings = settings;
+Line 1945:       this.testCoreNegativeUntil = 0;
+Line 1947:       this.testCoreNegativeUntil = Date.now() + TEST_CORE_NEGATIVE_COOLDOWN_MS;
+Line 1949:         `ensureTestCore failed; negative cache ${TEST_CORE_NEGATIVE_COOLDOWN_MS}ms`);
+Line 1955:   private testCoreSubs: SubscriptionService | null = null;
+Line 1956:   private testCoreSettings: AppSettings | null = null;
+Line 2019:     const subs = this.testCoreSubs;
+Line 2020:     const settings = this.testCoreSettings;
+Line 2039:       this.testCoreSecret = `ssr-test-${Date.now().toString(36)}-${Math.floor(Math.random() * 0x7FFFFFFF).toString(36)}`;
+Line 2049:         this.mixedPort, this.apiPort, this.dnsPort, this.testCoreSecret, testGeoip, false, hosts, false,
+Line 2076:       this.api.setEndpoint(this.apiPort, this.testCoreSecret);
+Line 2088:           this.startCoreLogStream(this.testCoreSecret);
+Line 2104:       AppLogger.warn(TAG, `ensureTestCore failed: ${AppLogger.errText(e)}`);
+Line 2145:    * stopTestCore / teardownTestCore 之后必须走这里，否则页面级 testCoreOk 与真实
+Line 2149:     this.testCoreSecret = '';
+Line 2151:     this.testCoreActive = false;
+Line 2152:     this.testCoreNegativeUntil = 0;
+Line 2155:     if (this.testCoreFlight !== null) {
+Line 2156:       this.testCoreFlight.resetIdle();
+Line 2186:     this.testCoreNegativeUntil = 0;
+Line 2187:     this.testCoreSecret = '';
+Line 2188:     this.testCoreActive = false;
+Line 2189:     if (this.testCoreFlight !== null) {
+Line 2190:       this.testCoreFlight.resetIdle();
+Line 2203:     if (this.testCoreFlight === null) {
+Line 2208:     await this.testCoreFlight.stop();
+Line 2210:     this.testCoreActive = false;
+Line 2211:     this.testCoreNegativeUntil = 0;
+Line 2212:     if (this.testCoreFlight.isActive()) {
+Line 2214:       this.testCoreFlight.resetIdle();
+Line 2225:   private testCoreIdleTimer: number = -1;
+Line 2240:     this.testCoreIdleTimer = setTimeout((): void => {
+Line 2241:       this.testCoreIdleTimer = -1;
+Line 2252:     if (this.testCoreIdleTimer >= 0) {
+Line 2253:       clearTimeout(this.testCoreIdleTimer);
+Line 2254:       this.testCoreIdleTimer = -1;
+Line 3254:     if (this.testCoreFlight !== null) {
+Line 3256:         await this.testCoreFlight.stop();
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\LatencyEngine.ets
+Line 6:  * 旧实现（NodeSelectionPage.runBatch + ConnectionOrchestrator.ensureTestCore）在
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services","pattern":"mixedPort.*7890|mixed-port|mixedPort: number"}
+
+[tool • grep]
+Found 4 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ClashConfigGenerator.ets
+Line 131:     mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
+Line 137:     lines.push('mixed-port: ' + mixedPort);
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ConnectionOrchestrator.ets
+Line 287:   private mixedPort: number = MIXED_PORT;
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\YamlMerger.ets
+Line 129:     'external-ui-name', 'external-ui-url', 'mixed-port', 'mixed-port-range',
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\ConnectionOrchestrator.ets","pattern":"MIXED_PORT|DNS_PORT = |const API_PORT"}
+
+[tool • grep]
+Found 3 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ConnectionOrchestrator.ets
+Line 51: const MIXED_PORT = 7890;
+Line 52: const API_PORT = 9090;
+Line 287:   private mixedPort: number = MIXED_PORT;
+
+[user]
+<acp tokens="63" type="text">m00372</acp>
+Time sampled while preparing turn 13, step 57: 2026-10-13T16:09:41+08:00[Asia/Shanghai]
+Browser time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.
+Elapsed since the preceding step context: 10m 8s.
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\ConnectionOrchestrator.ets","pattern":"dnsPort: number|private dnsPort|1053"}
+
+[tool • grep]
+Found 7 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ConnectionOrchestrator.ets
+Line 53: const DNS_LISTEN_PORT = 1053;
+Line 56:  * 同样占用 9090/7890/1053，任一被占都会导致内核 controller bind 失败 → 看似"无法启动"。
+Line 60:   [9090, 7890, 1053],
+Line 61:   [19090, 17890, 11053],
+Line 62:   [29090, 27890, 21053]
+Line 288:   private dnsPort: number = DNS_LISTEN_PORT;
+Line 2040:       // 端口探测：其他 mihomo 系应用（NekoBox 等）可能占用默认 9090/7890/1053
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\ConnectionOrchestrator.ets","pattern":"instance\\(\\)|private constructor|static shared"}
+
+[tool • grep]
+Found 4 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ConnectionOrchestrator.ets
+Line 232:   private static shared: ConnectionOrchestrator | null = null;
+Line 234:   static instance(): ConnectionOrchestrator {
+Line 469:       const subs = SubscriptionService.instance();
+Line 1782:       ? this.lastSubs : SubscriptionService.instance();
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\ConnectionOrchestrator.ets","limit":70,"offset":1760}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ConnectionOrchestrator.ets</path>
+<type>file</type>
+<content>
+1760:    *
+1761:    *  1. **已连接**：隧道内核就在 `apiPort` 且带着全部节点（实测 106 节点 / 16 组）
+1762:    *     → 直接返回 `this.api`，零额外启动、零额外内存。
+1763:    *  2. **未连接**：复用既有的 headless 测速内核（无 TUN、独立 secret），
+1764:    *     它解析配置是毫秒级。
+1765:    *
+1766:    * 两条都不可用时返回 **null** —— 调用方必须据此走「离线粗略通道」或明确提示，
+1767:    * **绝不能把 null 当成"全部节点超时"**（旧实现的 143 节点全超时就是这么来的）。
+1768:    */
+1769:   async ensureLatencyApi(): Promise<ClashApiService | null> {
+1770:     // 1) 真实隧道优先：它已经带着完整节点表，且是唯一权威的运行时配置
+1771:     if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING) {
+1772:       if (await this.api.healthProbe()) {
+1773:         AppLogger.info(TAG, 'latency channel: reusing connected tunnel controller');
+1774:         return this.api;
+1775:       }
+1776:       AppLogger.warn(TAG, 'latency channel: tunnel state is CONNECTED but controller is unresponsive');
+1777:     }
+1778:     // 2) 未连接：尝试 headless 测速内核（复用既有 ensureTestCore，含负缓存与安全门禁）
+1779:     //    订阅来源优先用本次会话连接过的，其次用全局单例 —— 冷启动后用户可能一次都
+1780:     //    没连接过（lastSubs 为 null），此时仍应能测速，否则未连接测速会退化成离线粗略值。
+1781:     const subs: SubscriptionService = this.lastSubs !== null
+1782:       ? this.lastSubs : SubscriptionService.instance();
+1783:     if (this.context !== null && subs.nodes.length > 0) {
+1784:       try {
+1785:         const ready = await this.ensureTestCore(subs, await this.lastSettingsForLatency());
+1786:         if (ready) {
+1787:           AppLogger.info(TAG, 'latency channel: headless test core ready');
+1788:           return this.api;
+1789:         }
+1790:       } catch (e) {
+1791:         AppLogger.warn(TAG, `latency channel: ensureTestCore failed: ${AppLogger.errText(e)}`);
+1792:       }
+1793:     } else {
+1794:       AppLogger.info(TAG, `latency channel: headless core not attempted `
+1795:         + `(context=${this.context !== null} nodes=${subs.nodes.length})`);
+1796:     }
+1797:     AppLogger.info(TAG, 'latency channel: no core available (offline fallback applies)');
+1798:     return null;
+1799:   }
+1800: 
+1801:   /**
+1802:    * 批测中途通道失联时的自愈：重新下发内核凭证并复探。
+1803:    *
+1804:    * 为什么需要它（真机实证）：一次 106 节点的批测跑到 53 个时隧道内核重启
+1805:    * （扩展进程 PID 变更、external-controller 的 secret 随之失效），其后所有
+1806:    * `/delay` 全部连接异常 —— 旧实现把这一片异常盖章成"节点失败"，用户看到
+1807:    * 半张列表变红。现在引擎连续失联时会调这里救一次。
+1808:    *
+1809:    * 凭证来源用**既有的权威通道**：`SettingsService.getApiSecret()`（系统加密
+1810:    * AssetStore，connect() 每次生成并落盘）+ `applyRealTunnelEndpoint()`（内含
+1811:    * "测速内核正在服务时不得覆盖"的保护）。不要自己去解析 yaml —— secret 的
+1812:    * 权威存储是 AssetStore，配置文件只是它的下游产物。
+1813:    *
+1814:    * @returns 是否恢复成功（重新下发后复探通过）
+1815:    */
+1816:   async refreshLatencyEndpoint(api: ClashApiService): Promise<boolean> {
+1817:     try {
+1818:       const secret = await SettingsService.getApiSecret();
+1819:       if (secret.length === 0) {
+1820:         AppLogger.warn(TAG, 'latency channel recovery: no stored api secret');
+1821:         return false;
+1822:       }
+1823:       const applied = await this.applyRealTunnelEndpoint(secret);
+1824:       if (!applied) {
+1825:         // 测速内核正在服务（未连接场景）：那它用的就是本进程持有的测速 secret
+1826:         if (this.testCoreSecret.length > 0) {
+1827:           api.setEndpoint(this.apiPort, this.testCoreSecret);
+1828:         } else {
+1829:           return false;
+
+(Showing lines 1760-1829 of 3394. Use offset=1830 to continue.)
+</content>
+
+[assistant • search_context]
+{"query":"P0-2 订阅拉取自救 直连 代理 拉取方案设计"}
+
+[tool • search_context]
+Found 3 block(s) for "P0-2 订阅拉取自救 直连 代理 拉取方案设计":
+
+b16 (T1) "任务批准+快照+P0-1实施" [m00192–m00289 · 98 msgs]
+  ... heduler.WorkInfo)/onWorkStop(work)；context 为 WorkSchedulerExtensionContext。
+
+## 【P0-2】 订阅拉取自救（调查中）
+- 拉取路径：SubscriptionFetchPolicy.fetch(url, headerName, headerValue, …)（SubscriptionFetchPolicy.ets:326 h ...
+
+b8 (T1) "子代理失败史 + 我自己做的 iOS REA 调研（重要：iOS 事实全在这里）" [m00076, m00079–m00080, m00083, m00104–m00112, m00114–m00117 …+55 more · 72 msgs]
+  ## TASK AS OF THIS BLOCK
+用户要求检查 TunBox、REA 逆向 iOS VPN、对比后给出优化/新增建议（m00001）。子【代理】陆续失败后，用户明确指示（m00129/m00131）：「你不要去调用子智能体了，你自己完成，然后告诉我那些需要优化和增加的」→ 改为我自己用 web_search/web_fetch 完成 iOS 侧调研。
+
+## 子代理失败史（教训）
+-  ...
+
+b15 (T1) "P0-1 完成 + P0-2 结构调查" [m00290–m00330, m00333–m00334, m00339–m00340, m00347–m00350, m00355–m00356 …+6 more · 57 msgs]
+  ... eground(this.context)（均在 publishPendingWant 后、scheduleSelfHeal 前）。
+
+## 已核实的代码事实（【P0-2】 用）
+- 订阅拉取全是直连（SubscriptionFetchPolicy.requestWithRedirectValidation 用 http.createHttp 无 usingProxy）；SubscriptionFet ...
+
+[assistant • decompress]
+{"blockId":"b15"}
+
+[tool • decompress]
+[Block b15 content — 57 item(s)]
+Content (106117 chars) written to: C:\Users\Administrator\AppData\Local\Temp\acp-decompress-b15-1791879573947.txt
+Use the read tool to access it.
+
+[assistant • grep]
+{"path":"C:\\Users\\Administrator\\AppData\\Local\\Temp\\acp-decompress-b15-1791879573947.txt","pattern":"P0-2|自救|直连|混合端口|ensureLatencyApi|方案"}
+
+[tool • grep]
+Found 4 matches
+
+C:\Users\Administrator\AppData\Local\Temp\acp-decompress-b15-1791879573947.txt
+Line 56: Line 6:  * settings 为完整 AppSettings 快照：含强制代理/直连网站、应用分流名单、
+Line 812: 102:    * 映射命中，TLS SNI 与 DNS 不一致的场景（CDN / 直连 IP 访问）会分错流。默认开启，
+Line 953: 136:   /** 强制直连网站（始终 DIRECT, 不走代理） */
+Line 1509: 302:         + '请先连接 VPN 后重试；或改用可直连的订阅地址。';
+
+[user]
+<acp tokens="63" type="text">m00385</acp>
+Time sampled while preparing turn 13, step 65: 2026-10-13T16:20:46+08:00[Asia/Shanghai]
+Browser time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.
+Elapsed since the preceding step context: 11m 4s.
+
+[assistant • read]
+{"file_path":"C:\\Users\\Administrator\\AppData\\Local\\Temp\\acp-decompress-b15-1791879573947.txt","limit":120,"offset":1470}
+
+[tool • read]
+<path>C:\Users\Administrator\AppData\Local\Temp\acp-decompress-b15-1791879573947.txt</path>
+<type>file</type>
+<content>
+1470: 54:    *
+1471: 55:    * 为什么每次回前台都要查：`dataTransfer` 长时任务只是"尽量别被杀"，被杀是常态。
+1472: 56:    * 进程重启后进程内一切归零（state / 心跳 / UiGuardian.registered 都不可信），
+1473: 57:    * 只有磁盘上的用户意图 + 跨进程心跳租约还在 —— 自愈判定正是基于这两者。
+1474: 58:    */
+1475: 59:   onForeground(): void {
+1476: 60:     this.publishPendingWant();
+1477: 61:     this.scheduleSelfHeal('foreground');
+1478: 62:   }
+1479: 63: 
+1480: 64:   onBackground(): void {
+1481: 65:     // 进后台时若隧道确实活着，补一次驻留凭证：UiGuardian.registered 是进程级静态
+1482: 66:     // 布尔，进程重启后必然为 false，只有 HomePage 存在时才会被重新 engage ——
+1483: 67:     // 卡片/快捷方式路径拉起的会话没有页面，这里兜住最后一环。
+1484: 68:     this.reengageGuardian().catch((e: Error): void => {
+1485: 69:       AppLogger.warn(TAG, `background guardian re-engage failed: ${e.message}`);
+1486: 70:     });
+1487: 71:   }
+1488: 72: 
+1489: 73:   private scheduleSelfHeal(trigger: string): void {
+1490: 74:     if (this.healTask !== null) {
+1491: 75:       return;
+1492: 76:     }
+1493: 77:     // 有明确的用户请求（桌面快捷方式 / 服务卡片）时不介入：
+1494: 78:     // 那条路径自己会走 VpnQuickStart，语义是"切换"，自愈再并行拉一次连接
+1495: 79:     // 只会和它抢 connectSeq，把一次点击变成两次互相打断的建连。
+1496: 
+1497: (Showing lines 50-79 of 179. Use offset=80 to continue.)
+1498: </content>
+1499: 
+1500: [assistant • read]
+1501: {"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionFetchPolicy.ets","limit":120,"offset":300}
+1502: 
+1503: [tool • read]
+1504: <path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionFetchPolicy.ets</path>
+1505: <type>file</type>
+1506: <content>
+1507: 300:     } else {
+1508: 301:       advice = '无法连接到该订阅地址。若它在浏览器/电脑客户端也要挂代理才能打开，'
+1509: 302:         + '请先连接 VPN 后重试；或改用可直连的订阅地址。';
+1510: 303:     }
+1511: 304:     return advice;
+1512: 305:   }
+1513: 306: 
+1514: 307:   /** 从错误对象或消息文本中提取 HTTP 状态码（0 = 无） */
+1515: 308:   private static extractHttpStatus(e: Object, msg: string): number {
+1516: 309:     if (e instanceof SubscriptionFetchError && e.httpStatus > 0) {
+1517: 310:       return e.httpStatus;
+1518: 311:     }
+1519: 312:     const m = msg.match(/HTTP\s+(\d{3})/);
+1520: 313:     if (m === null) {
+1521: 314:       return 0;
+1522: 315:     }
+1523: 316:     const code = Number(m[1]);
+1524: 317:     return Number.isInteger(code) ? code : 0;
+1525: 318:   }
+1526: 319: 
+1527: 320:   private static async requestWithRedirectValidation(urlStr: string, headers: Record<string, string>,
+1528: 321:     allowInsecureHttp: boolean, redirectCount: number): Promise<SubscriptionFetchResult> {
+1529: 322:     if (redirectCount > MAX_REDIRECTS) {
+1530: 323:       throw new Error('订阅重定向次数超限');
+1531: 324:     }
+1532: 325:     await SubscriptionFetchPolicy.validateResolvedTarget(urlStr, allowInsecureHttp);
+1533: 326:     const req = http.createHttp();
+1534: 327:     try {
+1535: 328:       const resp = await req.request(urlStr, {
+1536: 329:         method: http.RequestMethod.GET,
+1537: 330:         header: headers,
+1538: 331:         connectTimeout: 15000,
+1539: 332:         readTimeout: 20000,
+1540: 333:         usingCache: false,
+1541: 334:         expectDataType: http.HttpDataType.ARRAY_BUFFER,
+1542: 335:         maxRedirects: 0
+1543: 336:       });
+1544: 337:       if (resp.responseCode >= 300 && resp.responseCode < 400) {
+1545: 338:         const location = SubscriptionFetchPolicy.headerValue(resp.header, 'location');
+1546: 339:         if (location.length === 0) {
+1547: 340:           throw new Error(`HTTP ${resp.responseCode} 重定向缺少 Location`);
+1548: 341:         }
+1549: 342:         const nextUrl = SubscriptionFetchPolicy.resolveRedirectUrl(urlStr, location);
+1550: 343:         return SubscriptionFetchPolicy.requestWithRedirectValidation(
+1551: 344:           nextUrl, SubscriptionFetchPolicy.redirectHeaders(headers, nextUrl), allowInsecureHttp, redirectCount + 1);
+1552: 345:       }
+1553: 346:       if (resp.responseCode === 304) {
+1554: 347:         // 条件请求命中：内容未变，无响应体。etag 原样回传（服务端可能刷新了 ETag）。
+1555: 348:         const notModified = new SubscriptionFetchResult();
+1556: 349:         notModified.notModified = true;
+1557: 350:         notModified.etag = SubscriptionFetchPolicy.responseEtag(resp.header);
+1558: 351:         notModified.userInfo = SubscriptionFetchPolicy.parseUserInfo(
+1559: 352:           SubscriptionFetchPolicy.headerValue(resp.header, 'subscription-userinfo'));
+1560: 353:         return notModified;
+1561: 354:       }
+1562: 355:       if (resp.responseCode !== 200) {
+1563: 356:         throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP, `HTTP ${resp.responseCode}`);
+1564: 357:       }
+1565: 358:       let bytes = 0;
+1566: 359:       let body = '';
+1567: 360:       if (resp.result instanceof ArrayBuffer) {
+1568: 361:         bytes = resp.result.byteLength;
+1569: 362:         if (!SubscriptionFetchPolicy.isResponseSizeAllowed(bytes)) {
+1570: 363:           throw new Error('订阅响应体超过 8 MiB 限制');
+1571: 364:         }
+1572: 365:         try {
+1573: 366:           body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
+1574: 367:         } catch (e) {
+1575: 368:           throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
+1576: 369:             `响应 UTF-8 解码失败：${AppLogger.errText(e)}`);
+1577: 370:         }
+1578: 371:       } else if (typeof resp.result === 'string') {
+1579: 372:         body = resp.result as string;
+1580: 373:         bytes = body.length;
+1581: 374:         if (!SubscriptionFetchPolicy.isResponseSizeAllowed(bytes)) {
+1582: 375:           throw new Error('订阅响应体超过 8 MiB 限制');
+1583: 376:         }
+1584: 377:       }
+1585: 378:       const out = new SubscriptionFetchResult();
+1586: 379:       out.body = body.trim();
+1587: 380:       out.userInfo = SubscriptionFetchPolicy.parseUserInfo(
+1588: 381:         SubscriptionFetchPolicy.headerValue(resp.header, 'subscription-userinfo'));
+1589: 382:       out.etag = SubscriptionFetchPolicy.responseEtag(resp.header);
+
+(Showing lines 1470-1589 of 2214. Use offset=1590 to continue.)
+</content>
+
+[assistant • grep]
+{"path":"C:\\Users\\Administrator\\AppData\\Local\\Temp\\acp-decompress-b15-1791879573947.txt","pattern":"P0-2|【P0|实施计划|下一步|待实施"}
+
+[tool • grep]
+Found 2 matches
+
+C:\Users\Administrator\AppData\Local\Temp\acp-decompress-b15-1791879573947.txt
+Line 1760: 232:     // 网络失败：message 保留原始错误码（日志用），advice 给出人话 + 下一步（UI 用）
+Line 1869: 91:    * 而卡片/弹窗要展示的是人话 + 下一步该干什么。
+
+[assistant • decompress]
+{"blockId":"b16"}
+
+[tool • decompress]
+[Block b16 content — 40 item(s)]
+Content (53453 chars) written to: C:\Users\Administrator\AppData\Local\Temp\acp-decompress-b16-1791879844920.txt
+Use the read tool to access it.
+
+[assistant • grep]
+{"path":"C:\\Users\\Administrator\\AppData\\Local\\Temp\\acp-decompress-b16-1791879844920.txt","pattern":"P0-2|P0-3|P0-4|P0-5|P0-6|P0-7|P0-8|P1-|P2-|必补|领先"}
+
+[tool • grep]
+Found 2 matches
+
+C:\Users\Administrator\AppData\Local\Temp\acp-decompress-b16-1791879844920.txt
+Line 60: {"title":"TunBox 对标 iOS 落地实施（P0+P1+P2 除 direct 模式）","summary":"用户批准按《TunBox-vs-iOS-VPN-对标分析与优化建议.md》实施：除 P1-1（direct 代理模式不改）外，全部 P0 优化、P1 体验差距、P2 新功能都要开工。P0：订阅自动刷新接线（WorkScheduler）、订阅拉取自救（headless 内核经代理拉订阅）、DNS 层 REJECT 预匹配、备份加密、断言/IPv6 收尾。P1：自定义规则集 UI、miniBar、卡片深链、tunbox://import scheme、LazyForEach+搜索、规则调试闭环。P2：端口跳跃 UI、失败自动切换阈值、流量统计、内存降级、YAML 覆盖层。开工前已做文件级快照可回退。"}
+Line 97: {"todos":[{"content":"P0-1 订阅自动刷新接线（WorkScheduler+前台兜底）","status":"in_progress"},{"content":"P0-2 订阅拉取自救（headless 内核经代理拉订阅）","status":"pending"},{"content":"P0-3 DNS 层 REJECT 预匹配","status":"pending"},{"content":"P0-4 备份加密","status":"pending"},{"content":"P0-5 断言卫生/IPv6 收尾","status":"pending"},{"content":"P1-2 用户自定义规则集（rule-provider UI+生成）","status":"pending"},{"content":"P1-3a miniBar 常驻状态+一键启停","status":"pending"},{"content":"P1-3b 卡片 targetPage 深链消费","status":"pending"},{"content":"P1-3c tunbox://import 一键导入 scheme","status":"pending"},{"content":"P1-4 LazyForEach 虚拟化+节点搜索/收藏/批量","status":"pending"},{"content":"P1-5 规则调试闭环（命中检索+一键修正）","status":"pending"},{"content":"P2 端口跳跃 UI+失败切换阈值","status":"pending"},{"content":"P2 流量统计页","status":"pending"},{"content":"P2 内存压力自适应降级","status":"pending"},{"content":"P2 YAML 配置覆盖层","status":"pending"},{"content":"构建验证 BUILD SUCCESSFUL + 回归测试","status":"pending"}]}
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionFetchPolicy.ets","limit":45,"offset":100}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionFetchPolicy.ets</path>
+<type>file</type>
+<content>
+100:     this.httpStatus = httpStatus;
+101:   }
+102: 
+103:   /** 面板限流/拒绝访问 */
+104:   isRateLimited(): boolean {
+105:     return this.kind === SubscriptionFetchErrorKind.HTTP
+106:       && (this.httpStatus === 429 || this.httpStatus === 403);
+107:   }
+108: }
+109: 
+110: export class SubscriptionFetchPolicy {
+111:   /**
+112:    * 依次尝试 UA 链，返回第一个非空响应体。HTTP 仅在调用方显式接受风险时启用。
+113:    *
+114:    * @param etag 上次成功拉取拿到的 ETag（可空）。非空时带 `If-None-Match`：
+115:    *   面板内容未变会回 304，省掉整份订阅的下载与解析（对齐 FlClash/Clash Verge
+116:    *   的增量刷新语义）。
+117:    */
+118:   static async fetch(urlStr: string, headerName: string, headerValue: string,
+119:     allowInsecureHttp: boolean = false, etag: string = ''): Promise<SubscriptionFetchResult> {
+120:     if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr, allowInsecureHttp)) {
+121:       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
+122:         '订阅地址无效：仅允许公开 HTTPS 地址');
+123:     }
+124:     const customHeader = headerName.length > 0 && headerValue.length > 0;
+125:     const attempts: string[] = [];
+126:     // 整条 UA 链里出现过的 HTTP 状态码（用于区分限流与其它错误；优先保留 429/403）
+127:     let rateLimitStatus = 0;
+128:     let lastHttpStatus = 0;
+129:     // 首个传输层失败（无 HTTP 状态）的原始消息，用于生成可读原因
+130:     let transportMessage = '';
+131:     let transportAttempts = 0;
+132:     const transportStartedAt = Date.now();
+133:     // 用尽预算/次数后才真正收束；否则同一 UA 重试（换连接 = 可能落到另一个 IP）
+134:     let transportExhausted = false;
+135:     let uaIndex = 0;
+136:     while (uaIndex < UA_CHAIN.length) {
+137:       const ua = customHeader ? headerValue : UA_CHAIN[uaIndex];
+138:       try {
+139:         const headers: Record<string, string> = {};
+140:         if (customHeader && SubscriptionFetchPolicy.maySendCustomHeader(urlStr, headerName)) {
+141:           headers[headerName] = ua;
+142:         } else {
+143:           headers['User-Agent'] = ua;
+144:         }
+
+(Showing lines 100-144 of 722. Use offset=145 to continue.)
+</content>
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionFetchPolicy.ets","limit":120,"offset":145}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionFetchPolicy.ets</path>
+<type>file</type>
+<content>
+145:         if (etag.length > 0) {
+146:           headers['If-None-Match'] = etag;
+147:         }
+148:         const result = await SubscriptionFetchPolicy.requestWithRedirectValidation(
+149:           urlStr, headers, allowInsecureHttp, 0);
+150:         if (result.notModified) {
+151:           // 304：内容未变。与「响应为空」是完全不同的语义，必须原样返回给调用方，
+152:           // 绝不能落到下面的 EMPTY_RESPONSE 分支（那会把「没变化」报成「拉取失败」）。
+153:           AppLogger.info(TAG, 'subscription not modified (304), reusing cached nodes');
+154:           return result;
+155:         }
+156:         if (result.body.length > 0) {
+157:           AppLogger.info(TAG, `subscription fetched (${result.body.length} bytes)`);
+158:           return result;
+159:         }
+160:         attempts.push('响应为空');
+161:       } catch (e) {
+162:         const msg = AppLogger.errText(e);
+163:         AppLogger.warn(TAG, `subscription fetch attempt failed: ${msg}`);
+164:         attempts.push(msg);
+165:         const status = SubscriptionFetchPolicy.extractHttpStatus(e, msg);
+166:         if (status === 429 || status === 403) {
+167:           if (rateLimitStatus !== 429) {
+168:             rateLimitStatus = status;
+169:           }
+170:         } else if (status > 0) {
+171:           lastHttpStatus = status;
+172:         } else {
+173:           // 传输层失败（DNS/连接/TLS/超时，拿不到任何 HTTP 状态）。
+174:           //
+175:           // UA 链的用途是**内容协商**（同一个 200 因 UA 不同而返回 YAML 或链接列表），
+176:           // 它修不好「这个域名根本连不上」。此前这里继续把剩下 4 个 UA 跑完，
+177:           // 每个都要吃满 connectTimeout，实测一次被阻断的域名要用户干等
+178:           // 5 × 15s = 75s 才拿到结论。
+179:           //
+180:           // 但「换 UA 无用」不等于「重试无用」：设备到面板的路径存在**概率性**干扰
+181:           // （ikuuu 实测：面板健康、PC 稳定 200，设备端偶发 TLS/RST 后自愈），
+182:           // 换一条新连接有机会绕过。所以先在同一 UA 上重试，用**时间预算**封顶 ——
+183:           // 快速失败（RST/TLS/DNS）能真正重试几次，而一次 15s 超时就会耗尽预算、
+184:           // 立即收束，不会退回 75s。
+185:           transportAttempts = transportAttempts + 1;
+186:           if (transportMessage.length === 0) {
+187:             transportMessage = msg;
+188:           }
+189:           const elapsed = Date.now() - transportStartedAt;
+190:           const canRetry = transportAttempts < TRANSPORT_RETRY_MAX
+191:             && elapsed < TRANSPORT_RETRY_BUDGET_MS;
+192:           if (canRetry) {
+193:             AppLogger.info(TAG, `transport failure ${transportAttempts}/${TRANSPORT_RETRY_MAX}, `
+194:               + `retrying same UA after ${TRANSPORT_RETRY_BACKOFF_MS}ms (elapsed ${elapsed}ms)`);
+195:             await SubscriptionFetchPolicy.delay(TRANSPORT_RETRY_BACKOFF_MS);
+196:             // uaIndex 不自增 → 重试同一个 UA
+197:             continue;
+198:           }
+199:           transportExhausted = true;
+200:           break;
+201:         }
+202:       }
+203:       uaIndex = uaIndex + 1;
+204:     }
+205:     // 重试会让同一条消息重复入列，摘要按「去重后的前 2 条」展示，避免噪声
+206:     const uniqueAttempts: string[] = [];
+207:     for (const item of attempts) {
+208:       if (!uniqueAttempts.includes(item)) {
+209:         uniqueAttempts.push(item);
+210:       }
+211:     }
+212:     const summary = uniqueAttempts.slice(0, 2).join(' / ');
+213:     if (attempts.length > 0 && attempts.every((item: string) => item === '响应为空')) {
+214:       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.EMPTY_RESPONSE,
+215:         `订阅响应为空（${SubscriptionFetchPolicy.redactUrl(urlStr)}）`);
+216:     }
+217:     if (rateLimitStatus > 0) {
+218:       // 全 UA 链都拿到 429/403：面板限流/拒绝，而不是地址或网络问题
+219:       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
+220:         `面板限流或拒绝访问（HTTP ${rateLimitStatus}，${UA_CHAIN.length} 个 UA 全部失败，`
+221:         + `请稍后重试或更换订阅链接）：${summary}`, rateLimitStatus);
+222:     }
+223:     if (attempts.some((item: string) => item.startsWith('HTTP '))) {
+224:       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
+225:         `订阅 HTTP 请求失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`,
+226:         lastHttpStatus);
+227:     }
+228:     if (attempts.some((item: string) => item.includes('解码失败'))) {
+229:       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
+230:         `订阅响应解码失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`);
+231:     }
+232:     // 网络失败：message 保留原始错误码（日志用），advice 给出人话 + 下一步（UI 用）
+233:     const err = new SubscriptionFetchError(SubscriptionFetchErrorKind.NETWORK,
+234:       `订阅拉取失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`);
+235:     err.transportFailure = transportAttempts > 0;
+236:     err.advice = SubscriptionFetchPolicy.transportAdvice(transportMessage, urlStr);
+237:     if (transportAttempts > 1) {
+238:       // 让用户知道「不是没试」：多次重试仍失败，通常说明该域名在当前网络确实不可达
+239:       err.advice += `（已自动重试 ${transportAttempts} 次仍失败）`;
+240:     }
+241:     throw err;
+242:   }
+243: 
+244:   /** 退避等待（与 ClashApiService.sleep 同款写法，ArkTS 下可直接 await） */
+245:   private static delay(ms: number): Promise<void> {
+246:     return new Promise<void>((resolve) => {
+247:       setTimeout(() => resolve(), ms);
+248:     });
+249:   }
+250: 
+251:   /**
+252:    * 把传输层原始错误翻译成用户能看懂的原因 + 该怎么做。
+253:    * 只做关键词归类（各平台错误码不统一），拿不准就退回通用文案，
+254:    * 绝不臆断具体原因。
+255:    */
+256:   static transportAdvice(rawMessage: string, urlStr: string): string {
+257:     const msg = rawMessage.toLowerCase();
+258:     // 分类只用于选「下一步建议」，所以这里保留 cause 键；
+259:     // 展示句单独成句（不能用 `该订阅地址${cause}` 拼，会出现
+260:     // 「该订阅地址TLS 握手失败」「该订阅地址地址被判定为…」这类病句）。
+261:     let cause = '';
+262:     if (msg.includes('未解析到地址') || msg.includes('enotfound')
+263:       || msg.includes('nodename') || msg.includes('name not resolved')
+264:       || msg.includes('getaddressesbyname')) {
+
+(Showing lines 145-264 of 722. Use offset=265 to continue.)
+</content>
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionFetchPolicy.ets","limit":30,"offset":1}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionFetchPolicy.ets</path>
+<type>file</type>
+<content>
+1: /**
+2:  * 订阅拉取策略：UA 协商
+3:  * 移植自 upstream: packages/ssrvpn_shared/lib/services/subscription_fetch_policy.dart
+4:  *
+5:  * UA 顺序（必须一致）：SSRVPN → Clash Verge → v2rayN → Shadowrocket。
+6:  * 每次降级重试都在 HTTP 403/406 或空结果时触发。
+7:  */
+8: import { http, connection } from '@kit.NetworkKit';
+9: import { url, util } from '@kit.ArkTS';
+10: import { AppLogger } from '../utils/AppLogger';
+11: import { AppInfo } from '../utils/AppInfo';
+12: 
+13: const TAG = 'SubscriptionFetchPolicy';
+14: const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+15: const MAX_FIELD_LENGTH = 4096;
+16: const MAX_NODE_COUNT = 2000;
+17: const MAX_REDIRECTS = 5;
+18: /**
+19:  * 传输层失败的重试预算。
+20:  *
+21:  * 实测背景（2026-09-19 真机 + PC 对照）：ikuuu 面板本身完全健康 ——
+22:  * 单条 A 记录（无多 IP）、ZeroSSL 证书有效、UA 无关、PC 上 11/11 稳定 200；
+23:  * 但设备上偶发 `code=2300060 Invalid SSL peer certificate` / 连接重置，过一会儿又自愈。
+24:  * 即故障在**设备到面板的网络路径**上（中间设备干扰/阻断呈概率性），
+25:  * 面板、解析层、证书都不是原因。
+26:  *
+27:  * 概率性干扰下「换一条新连接」有机会绕过，所以值得重试；
+28:  * 而 UA 链的用途是内容协商、不是可达性，拿它当重试手段会让一次被阻断的域名
+29:  * 要用户干等 5 × 15s = 75s。
+30:  * 这里用**时间预算**封顶：一次超时已吃掉 15s，预算即耗尽、不再重试；
+
+(Showing lines 1-30 of 722. Use offset=31 to continue.)
+</content>
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionFetchPolicy.ets","limit":15,"offset":31}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionFetchPolicy.ets</path>
+<type>file</type>
+<content>
+31:  * 只有快速失败（RST / TLS 拒绝 / DNS 失败，通常 <1s）才真正重试。
+32:  * 因此最坏总时长仍约等于一次超时 + 少量退避，不会退回 75s。
+33:  */
+34: const TRANSPORT_RETRY_MAX = 3;
+35: const TRANSPORT_RETRY_BUDGET_MS = 20000;
+36: const TRANSPORT_RETRY_BACKOFF_MS = 700;
+37: 
+38: /**
+39:  * UA 顺序：优先 Clash 系 UA 让面板直接返回 Clash YAML（vmess/vless/trojan 字段最完整），
+40:  * 其余 UA 依次兜底；解析层同时支持 vless/vmess/trojan 链接格式。
+41:  * SSRVPN 自家 UA 携带实时版本（AppInfo 单一来源, 不再硬编码）。
+42:  */
+43: export const UA_CHAIN: string[] = [
+44:   'clash-verge/v1.7.7',
+45:   'clash.meta/v1.18.8',
+
+(Showing lines 31-45 of 722. Use offset=46 to continue.)
+</content>
+
+[assistant • grep]
+{"include":"ConnectionOrchestrator.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services","pattern":"currentMixedPort|getMixedPort|mixedPort\\(\\)|currentDnsPort"}
+
+[tool • grep]
+No matches found
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\ConnectionOrchestrator.ets","limit":40,"offset":280}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\ConnectionOrchestrator.ets</path>
+<type>file</type>
+<content>
+280:   /** 上次连接写入配置的 DoH pin 结果 + GEOIP 判定，供热重载复用（避免重建隧道）。 */
+281:   private lastProxyHosts: Record<string, string> = {};
+282:   private lastUseGeoip: boolean = false;
+283:   /** 上次连接是否启用了内核 smart 组（热重载复用同一决策，避免两次生成不一致） */
+284:   private lastUseSmart: boolean = false;
+285:   /** 本次会话实际启用的 mihomo 端口（reservePorts 探测后更新；热重载必须复用，禁止重选）。 */
+286:   private apiPort: number = API_PORT;
+287:   private mixedPort: number = MIXED_PORT;
+288:   private dnsPort: number = DNS_LISTEN_PORT;
+289:   /** 规则/站点等变更触发的热重载在途门控（防并发重载）。 */
+290:   private reloading: boolean = false;
+291:   private recoveryAttempts: number = 0; // 内核恢复退避计数（对应 core_recovery_policy）
+292:   private lastNodeName: string = '';
+293: 
+294:   // ── 第二阶段：网络切换感知 → 退避智能重连 ──────────────────────────
+295:   private netWatcher: NetworkStateWatcher | null = null;
+296:   /** 上一次已上报的网络类型（'' = 尚未建立基线） */
+297:   private lastNetType: string = '';
+298:   /** 上一次处理过的网络事件代数（防重复处理） */
+299:   private lastNetGeneration: number = -1;
+300:   private reconnectTimer: number = -1;
+301:   private reconnectAttempts: number = 0;
+302:   private reconnectReasonText: string = '';
+303:   private reconnectPendingDelayMs: number = 0;
+304:   private reconnectMaxMs: number = RECONNECT_MAX_MS;
+305:   private readonly reconnectMaxAttempts: number = RECONNECT_MAX_ATTEMPTS;
+306: 
+307:   // ── 第二阶段：链路自检 → 有限自动修复 ──────────────────────────────
+308:   private healthReport: LinkHealthReport | null = null;
+309:   private healthSummaryCache: LinkHealthSummary | null = null;
+310:   private healthRepairCache: string[] = [];
+311:   private healthRunning: boolean = false;
+312:   private coreLossHandling: boolean = false;
+313:   private inRepairConnect: boolean = false;
+314: 
+315:   // ── 第二阶段：连续失败 → 自动切换节点 ──────────────────────────────
+316:   private failoverRunning: boolean = false;
+317:   private lastFailoverAt: number = 0;
+318:   private lastFailoverFrom: string = '';
+319:   private lastFailoverTo: string = '';
+
+(Showing lines 280-319 of 3394. Use offset=320 to continue.)
+</content>
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets","pattern":"usingProxy"}
+
+[tool • grep]
+No matches found
+
+[assistant • grep]
+{"include":"*.ets","path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets","pattern":"REQ001|HttpRequestOptions|connectTimeout.*readTimeout"}
+
+[tool • grep]
+Found 2 matches
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\DoHResolver.ets
+Line 230:         } as http.HttpRequestOptions);
+
+TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\UpdateChecker.ets
+Line 28:         connectTimeout: 8000, readTimeout: 10000, usingCache: false
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\DoHResolver.ets","limit":40,"offset":205}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\DoHResolver.ets</path>
+<type>file</type>
+<content>
+205: 
+206:   static async resolveA(domain: string): Promise<string> {
+207:     await DoHResolver.ensureLoaded();
+208:     const d = domain.toLowerCase();
+209:     const cached = DoHResolver.cachedIp(d);
+210:     return cached.length > 0 ? cached : DoHResolver.resolveANoCache(d, Date.now() + 10000);
+211:   }
+212: 
+213:   private static async resolveANoCache(domain: string, deadline: number): Promise<string> {
+214:     for (const ep of ENDPOINTS) {
+215:       const remaining = deadline - Date.now();
+216:       if (remaining <= 0) {
+217:         break;
+218:       }
+219:       const req = http.createHttp();
+220:       // SDK 的连接/读取 timeout 不是共同截止时间，额外定时销毁覆盖完整请求预算。
+221:       const deadlineTimer = setTimeout((): void => { req.destroy(); }, remaining);
+222:       try {
+223:         const resp = await req.request(ep + '?name=' + encodeURIComponent(domain) + '&type=A', {
+224:           method: http.RequestMethod.GET,
+225:           header: { 'Accept': 'application/dns-json', 'User-Agent': 'TunBox' } as Record<string, string>,
+226:           connectTimeout: Math.min(2500, remaining),
+227:           readTimeout: Math.min(2500, remaining),
+228:           expectDataType: http.HttpDataType.STRING,
+229:           usingCache: false
+230:         } as http.HttpRequestOptions);
+231:         if (Date.now() >= deadline || resp.responseCode !== 200 || typeof resp.result !== 'string') {
+232:           continue;
+233:         }
+234:         const parsed = JSON.parse(resp.result as string) as DoHResponse;
+235:         if (parsed.Status !== 0 || !Array.isArray(parsed.Answer)) {
+236:           continue;
+237:         }
+238:         for (const a of parsed.Answer) {
+239:           if (a.type === 1 && typeof a.data === 'string' && DoHResolver.looksLikeIPv4(a.data)) {
+240:             DoHResolver.cachePut(domain, a.data, true, Date.now());
+241:             return a.data;
+242:           }
+243:         }
+244:       } catch (e) {
+
+(Showing lines 205-244 of 308. Use offset=245 to continue.)
+</content>
+
+[user]
+<acp tokens="63" type="text">m00412</acp>
+Time sampled while preparing turn 13, step 78: 2026-10-13T16:31:25+08:00[Asia/Shanghai]
+Browser time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.
+Elapsed since the preceding step context: 10m 39s.
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionFetchPolicy.ets","limit":80,"offset":560}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionFetchPolicy.ets</path>
+<type>file</type>
+<content>
+560:     }
+561:     return groups.length === 8 ? groups : null;
+562:   }
+563: 
+564:   static isPublicIpAddress(address: string): boolean {
+565:     const value = address.trim().toLowerCase();
+566:     const ipv4 = SubscriptionFetchPolicy.parseIpv4(value);
+567:     if (ipv4 !== null) {
+568:       const a = ipv4[0];
+569:       const b = ipv4[1];
+570:       const c = ipv4[2];
+571:       const d = ipv4[3];
+572:       return !(a === 0 || a === 10 || a === 127 || a >= 224
+573:         || (a === 100 && b >= 64 && b <= 127)
+574:         || (a === 169 && b === 254)
+575:         || (a === 172 && b >= 16 && b <= 31)
+576:         || (a === 192 && b === 0)
+577:         || (a === 192 && b === 168)
+578:         || (a === 198 && (b === 18 || b === 19))
+579:         || (a === 198 && b === 51 && c === 100)
+580:         || (a === 203 && b === 0 && c === 113)
+581:         || (a === 255 && b === 255 && c === 255 && d === 255));
+582:     }
+583:     const groups = SubscriptionFetchPolicy.expandIpv6(value);
+584:     if (groups === null) {
+585:       return false;
+586:     }
+587:     const allZero = groups.every((part) => part === 0);
+588:     const loopback = groups.slice(0, 7).every((part) => part === 0) && groups[7] === 1;
+589:     const mappedIpv4 = groups.slice(0, 5).every((part) => part === 0) && groups[5] === 0xffff;
+590:     if (mappedIpv4) {
+591:       return SubscriptionFetchPolicy.isPublicIpAddress(
+592:         `${groups[6] >> 8}.${groups[6] & 255}.${groups[7] >> 8}.${groups[7] & 255}`);
+593:     }
+594:     return !(allZero || loopback
+595:       || (groups[0] & 0xfe00) === 0xfc00
+596:       || (groups[0] & 0xffc0) === 0xfe80
+597:       || (groups[0] & 0xff00) === 0xff00
+598:       || (groups[0] === 0x2001 && groups[1] === 0x0db8));
+599:   }
+600: 
+601:   /**
+602:    * Mihomo fake-ip 默认网段：IPv4 198.18.0.0/15（198.18/198.19，RFC 2544 基准测试保留段），
+603:    * IPv6 为 fc00::/18。仅当本应用隧道开启时这些地址才是「预期路径」。
+604:    */
+605:   static isFakeIp(address: string): boolean {
+606:     const value = address.trim().toLowerCase();
+607:     const ipv4 = SubscriptionFetchPolicy.parseIpv4(value);
+608:     if (ipv4 !== null) {
+609:       return ipv4[0] === 198 && (ipv4[1] === 18 || ipv4[1] === 19);
+610:     }
+611:     const groups = SubscriptionFetchPolicy.expandIpv6(value);
+612:     if (groups === null) {
+613:       return false;
+614:     }
+615:     return (groups[0] & 0xffc0) === 0xfc00;
+616:   }
+617: 
+618:   static maySendCustomHeader(urlStr: string, headerName: string): boolean {
+619:     const lowerName = headerName.toLowerCase();
+620:     if (lowerName === 'user-agent') {
+621:       return true;
+622:     }
+623:     return urlStr.toLowerCase().startsWith('https://');
+624:   }
+625: 
+626:   static isResponseSizeAllowed(size: number): boolean {
+627:     return size >= 0 && size <= MAX_RESPONSE_BYTES;
+628:   }
+629: 
+630:   static isFieldLengthAllowed(value: string): boolean {
+631:     return value.length <= MAX_FIELD_LENGTH;
+632:   }
+633: 
+634:   static isNodeCountAllowed(count: number): boolean {
+635:     return count >= 0 && count <= MAX_NODE_COUNT;
+636:   }
+637: 
+638:   /** URL 脱敏（只保留 host），配合 log_redactor */
+639:   static redactUrl(urlStr: string): string {
+
+(Showing lines 560-639 of 722. Use offset=640 to continue.)
+</content>
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionFetchPolicy.ets","limit":60,"offset":440}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionFetchPolicy.ets</path>
+<type>file</type>
+<content>
+440:         }
+441:         if (Array.isArray(value) && value.length > 0) {
+442:           return String(value[0]);
+443:         }
+444:       }
+445:     }
+446:     return '';
+447:   }
+448: 
+449:   static parseUserInfo(value: string): SubscriptionUserInfo {
+450:     const out = new SubscriptionUserInfo();
+451:     for (const item of value.split(';')) {
+452:       const pair = item.trim().split('=');
+453:       if (pair.length !== 2 || !/^\d+$/.test(pair[1].trim())) {
+454:         continue;
+455:       }
+456:       const numberValue = Number(pair[1].trim());
+457:       if (!Number.isSafeInteger(numberValue) || numberValue < 0) {
+458:         continue;
+459:       }
+460:       const key = pair[0].trim().toLowerCase();
+461:       if (key === 'upload') out.uploadBytes = numberValue;
+462:       else if (key === 'download') out.downloadBytes = numberValue;
+463:       else if (key === 'total') out.totalBytes = numberValue;
+464:       else if (key === 'expire') out.expireAt = numberValue * 1000;
+465:     }
+466:     return out;
+467:   }
+468: 
+469:   private static resolveRedirectUrl(currentUrl: string, location: string): string {
+470:     if (location.startsWith('https://') || location.startsWith('http://')) {
+471:       return location;
+472:     }
+473:     const parsed = url.URL.parseURL(currentUrl);
+474:     const origin = `${parsed.protocol}//${parsed.host}`;
+475:     if (location.startsWith('/')) {
+476:       return origin + location;
+477:     }
+478:     const slash = parsed.pathname.lastIndexOf('/');
+479:     const base = slash >= 0 ? parsed.pathname.substring(0, slash + 1) : '/';
+480:     return origin + base + location;
+481:   }
+482: 
+483:   private static redirectHeaders(headers: Record<string, string>, nextUrl: string): Record<string, string> {
+484:     const out: Record<string, string> = {};
+485:     for (const key of Object.keys(headers)) {
+486:       if (SubscriptionFetchPolicy.maySendCustomHeader(nextUrl, key)) {
+487:         out[key] = headers[key];
+488:       }
+489:     }
+490:     return out;
+491:   }
+492: 
+493:   private static extractHost(authority: string): string {
+494:     const lower = authority.toLowerCase();
+495:     if (lower.startsWith('[')) {
+496:       const close = lower.indexOf(']');
+497:       return close > 0 ? lower.substring(1, close) : '';
+498:     }
+499:     const colon = lower.lastIndexOf(':');
+
+(Showing lines 440-499 of 722. Use offset=500 to continue.)
+</content>
+
+[assistant • read]
+{"file_path":"C:\\Worker\\TunBox\\TunBox_HarmonyOS\\entry\\src\\main\\ets\\commons\\services\\SubscriptionFetchPolicy.ets","limit":70,"offset":395}
+
+[tool • read]
+<path>C:\Worker\TunBox\TunBox_HarmonyOS\entry\src\main\ets\commons\services\SubscriptionFetchPolicy.ets</path>
+<type>file</type>
+<content>
+395:     if (etag.length > 0) {
+396:       return etag;
+397:     }
+398:     return SubscriptionFetchPolicy.headerValue(header, 'last-modified');
+399:   }
+400: 
+401:   private static async validateResolvedTarget(urlStr: string, allowInsecureHttp: boolean): Promise<void> {
+402:     if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr, allowInsecureHttp)) {
+403:       throw new Error('订阅目标不是允许的公开地址');
+404:     }
+405:     const parsed = url.URL.parseURL(urlStr);
+406:     const host = SubscriptionFetchPolicy.extractHost(parsed.host);
+407:     if (host.includes(':') || /^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+408:       if (!SubscriptionFetchPolicy.isPublicIpAddress(host)) {
+409:         throw new Error('订阅目标命中私网或保留地址');
+410:       }
+411:       return;
+412:     }
+413:     const addresses = await connection.getAddressesByName(host);
+414:     if (addresses.length === 0) {
+415:       throw new Error('订阅域名未解析到地址');
+416:     }
+417:     for (const address of addresses) {
+418:       if (SubscriptionFetchPolicy.isPublicIpAddress(address.address)) {
+419:         continue;
+420:       }
+421:       // Mihomo fake-ip DNS（本应用隧道开启时接管系统解析）会把所有域名解析到
+422:       // 198.18.0.0/15（IPv6 fc00::/18）。该网段不可能承载真实服务：
+423:       // 无隧道时连它必然失败（无 SSRF 风险），有隧道时连接会被本应用 TUN 截获
+424:       // 并按域名回源 —— 属预期路径。此前该场景被误判为「私网/保留地址」拦截，
+425:       // 导致「VPN 开启后刷新订阅」必然失败，这里无条件放行 fake-ip 网段。
+426:       if (SubscriptionFetchPolicy.isFakeIp(address.address)) {
+427:         continue;
+428:       }
+429:       throw new Error('订阅域名解析到私网或保留地址');
+430:     }
+431:   }
+432: 
+433:   private static headerValue(header: Object, name: string): string {
+434:     const values = JSON.parse(JSON.stringify(header)) as Record<string, Object>;
+435:     for (const key of Object.keys(values)) {
+436:       if (key.toLowerCase() === name.toLowerCase()) {
+437:         const value = values[key];
+438:         if (typeof value === 'string') {
+439:           return value as string;
+440:         }
+441:         if (Array.isArray(value) && value.length > 0) {
+442:           return String(value[0]);
+443:         }
+444:       }
+445:     }
+446:     return '';
+447:   }
+448: 
+449:   static parseUserInfo(value: string): SubscriptionUserInfo {
+450:     const out = new SubscriptionUserInfo();
+451:     for (const item of value.split(';')) {
+452:       const pair = item.trim().split('=');
+453:       if (pair.length !== 2 || !/^\d+$/.test(pair[1].trim())) {
+454:         continue;
+455:       }
+456:       const numberValue = Number(pair[1].trim());
+457:       if (!Number.isSafeInteger(numberValue) || numberValue < 0) {
+458:         continue;
+459:       }
+460:       const key = pair[0].trim().toLowerCase();
+461:       if (key === 'upload') out.uploadBytes = numberValue;
+462:       else if (key === 'download') out.downloadBytes = numberValue;
+463:       else if (key === 'total') out.totalBytes = numberValue;
+464:       else if (key === 'expire') out.expireAt = numberValue * 1000;
+
+(Showing lines 395-464 of 722. Use offset=465 to continue.)
+</content>
