@@ -689,7 +689,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const settings: AppSettings = await SettingsService.load();
       const yaml = ClashConfigGenerator.generate(node, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
         this.apiSecret, this.lastUseGeoip, false, this.lastProxyHosts, true, subs.proxyGroups,
-        this.isRuleProviderReady(), this.lastUseSmart);
+        this.isRuleProviderReady(), this.lastUseSmart,
+        subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       ensurePrivateDir(this.context.cacheDir);
       privateFs.writePrivate(configPath, yaml);
@@ -2047,7 +2048,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 测速核不启用 smart 组：它只做延迟探测，多一层内核选点会让测速结果失真
       const yaml = ClashConfigGenerator.generate(subs.nodes[0], subs.nodes, settings,
         this.mixedPort, this.apiPort, this.dnsPort, this.testCoreSecret, testGeoip, false, hosts, false,
-        subs.proxyGroups, testRuleProviderReady, false);
+        subs.proxyGroups, testRuleProviderReady, false,
+        subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
       const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
@@ -2578,7 +2580,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           + '(smart group disabled this session; downloading in background)');
       }
       const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
-        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups, ruleProviderReady, useSmart);
+        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups, ruleProviderReady, useSmart,
+        subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
       // 缓存本次连接的配置输入，供规则/站点热重载复用（不重跑 DoH、不重建隧道）。
       this.lastProxyHosts = proxyHosts;
       this.lastUseGeoip = useGeoip;

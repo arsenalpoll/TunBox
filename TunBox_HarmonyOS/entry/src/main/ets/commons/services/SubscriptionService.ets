@@ -48,8 +48,13 @@ import {
 } from './ConcurrentRefresh';
 
 const TAG = 'SubscriptionService';
-
 const PREF_NAME = 'ssrvpn_subscriptions';
+
+/** rules/rule-providers 段提取结果（模块级显式类，满足 arkts-no-untyped-obj-literals） */
+class SubscriptionRulesSections {
+  rules: string = '';
+  providers: string = '';
+}
 const KEY_SUBS = 'subscriptions_json';
 const KEY_NODES = 'nodes_json';
 const KEY_HIDDEN = 'hidden_nodes_json';
@@ -456,6 +461,28 @@ export class SubscriptionService {
     } catch (e) {
       return 0;
     }
+  }
+
+  /**
+   * 从订阅原文提取 rules / rule-providers 段（YamlMerger 归一化：2 空格基准缩进）。
+   * 任何解析异常都返回空段 —— 订阅自带规则的提取绝不影响节点导入主流程。
+   */
+  private static extractRulesSections(body: string): SubscriptionRulesSections {
+    const out = new SubscriptionRulesSections();
+    try {
+      out.rules = YamlMerger.extractSection(body, 'rules').trim();
+      out.providers = YamlMerger.extractSection(body, 'rule-providers').trim();
+    } catch (e) {
+      // 提取失败按「订阅未携带规则」处理，节点导入不受影响
+    }
+    return out;
+  }
+
+  /** 订阅原文 → 该订阅的自带 rules/rule-providers 落账（无规则段时清空旧值） */
+  private static applyRulesSections(sub: Subscription, body: string): void {
+    const sections = SubscriptionService.extractRulesSections(body);
+    sub.subRules = sections.rules;
+    sub.subRuleProviders = sections.providers;
   }
 
   /** 登记 provider（生成器 planRawProviders 只认登记表 + 文件存在性） */
@@ -982,6 +1009,13 @@ export class SubscriptionService {
       // etag 同为后加字段：非法/缺失一律归零（= 下次做完整拉取），不丢订阅
       if (typeof j.etag !== 'string' || j.etag.length > 1024) {
         j.etag = '';
+      }
+      // 订阅自带 rules/rule-providers：非法值就地归一（旧存储无这些键），绝不丢订阅
+      if (typeof j.subRules !== 'string' || j.subRules.length > 256 * 1024) {
+        j.subRules = '';
+      }
+      if (typeof j.subRuleProviders !== 'string' || j.subRuleProviders.length > 256 * 1024) {
+        j.subRuleProviders = '';
       }
       out.push(Subscription.fromPersistJson(j));
     }
@@ -1911,6 +1945,8 @@ export class SubscriptionService {
         SubscriptionService.absorbYamlMergeStats(diagnostics);
         parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
         parsedGroups = SubscriptionParser.parseProxyGroups(body, sub.id);
+        // 订阅自带 rules/rule-providers 段落账（无规则段时清空旧值）
+        SubscriptionService.applyRulesSections(sub, body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -2175,6 +2211,8 @@ export class SubscriptionService {
         SubscriptionService.absorbYamlMergeStats(diagnostics);
         parsed = SubscriptionService.mergedToNodes(merged, id, diagnostics);
         parsedGroups = SubscriptionParser.parseProxyGroups(body, id);
+        // 本地伪订阅刷新：自带 rules/rule-providers 段同样重新落账（原文可能已变化）
+        SubscriptionService.applyRulesSections(sub, body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length
           + diagnostics.invalidCount + diagnostics.unsupportedCount;
       } else {
@@ -2268,6 +2306,8 @@ export class SubscriptionService {
         SubscriptionService.absorbYamlMergeStats(diagnostics);
         parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
         parsedGroups = SubscriptionParser.parseProxyGroups(trimmed, sub.id);
+        // 本地 YAML 导入：自带 rules/rule-providers 段随订阅一并落账
+        SubscriptionService.applyRulesSections(sub, trimmed);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -2365,6 +2405,62 @@ export class SubscriptionService {
   /** 某订阅的全部代理组（保持声明顺序） */
   groupsOf(subscriptionId: string): ProxyGroup[] {
     return this.proxyGroups.filter((g) => g.subscriptionId === subscriptionId);
+  }
+
+  /**
+   * 全部启用订阅的自带规则行（去重、按订阅顺序，上限 1000 条）。
+   * 供配置生成器写入 rules 段 —— 订阅自带的分流规则必须真实生效。
+   */
+  subscriptionRulesLines(): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const s of this.subscriptions) {
+      if (!s.enabled || s.id === DIRECT_GROUP_ID || s.subRules.length === 0) {
+        continue;
+      }
+      for (const line of s.subRules.split('\n')) {
+        const t = line.trim();
+        if (t.length === 0 || t.startsWith('#') || seen.has(t)) {
+          continue;
+        }
+        if (out.length >= 1000) {
+          return out;
+        }
+        seen.add(t);
+        out.push(t);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 全部启用订阅的 rule-providers 块（按订阅顺序合并，同名 provider 先到先得）。
+   * 返回的是 2 空格缩进的块式原文（可直接跟在 `rule-providers:` 头之后）。
+   */
+  subscriptionRuleProvidersBlock(): string {
+    const lines: string[] = [];
+    const seen = new Set<string>();
+    for (const s of this.subscriptions) {
+      if (!s.enabled || s.id === DIRECT_GROUP_ID || s.subRuleProviders.length === 0) {
+        continue;
+      }
+      for (const line of s.subRuleProviders.split('\n')) {
+        const t = line.trim();
+        if (t.length === 0 || t.startsWith('#')) {
+          continue;
+        }
+        // provider 键行是 2 空格缩进的 `name:`；同名 provider 只保留先到者
+        const m = t.match(/^([A-Za-z0-9_-]+):$/);
+        if (m !== null) {
+          if (seen.has(m[1])) {
+            continue;
+          }
+          seen.add(m[1]);
+        }
+        lines.push(line);
+      }
+    }
+    return lines.join('\n');
   }
 
   /**
@@ -2987,4 +3083,8 @@ export class SubscriptionJson {
   rawProviderNodeEstimate?: number;
   /** ETag/Last-Modified 条件请求凭据（旧存储无此键，读取端 ?? '' 兜底） */
   etag?: string;
+  /** 订阅 yaml 自带 rules 段（后加字段，旧存储无此键，读取端 ?? '' 兜底） */
+  subRules?: string;
+  /** 订阅 yaml 自带 rule-providers 段（后加字段，旧存储无此键，读取端 ?? '' 兜底） */
+  subRuleProviders?: string;
 }

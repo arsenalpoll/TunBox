@@ -109,6 +109,8 @@ export class ClashConfigGenerator {
 
   /** 最近一次生成的丢弃账本（UI/诊断可读取，即使调用方忽略返回值也不丢信息） */
   static lastDropStats: ProxyDropStats = new ProxyDropStats();
+  /** 最近一次生成的「订阅/覆盖层规则跳过」计数（策略目标或 provider 未声明的行） */
+  static lastSkippedUserRules: number = 0;
   /** 最近一次生成的「双轨 provider」账本（开关关闭时 enabled=false 且 emitted=0） */
   static lastProviderStats: RawProviderStats = new RawProviderStats();
   /** 丢弃告警回调：UI 侧注册后，连接/测速生成配置时的丢弃会以提示形式触达用户 */
@@ -131,7 +133,8 @@ export class ClashConfigGenerator {
     mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
     ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
     tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = [],
-    ruleProviderReady: boolean = true, useSmart: boolean = false): string {
+    ruleProviderReady: boolean = true, useSmart: boolean = false,
+    subscriptionRules: string[] = [], subscriptionRuleProviders: string = ''): string {
     const lines: string[] = [];
 
     lines.push('mixed-port: ' + mixedPort);
@@ -527,6 +530,55 @@ export class ClashConfigGenerator {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
       }
     }
+    // ── YAML 覆盖层的 rules/rule-providers 预解析 ─────────────────────────
+    // mihomo 对同一 YAML 里的重复顶层键是「后者覆盖前者」：把覆盖层原文直接追加在
+    // 配置尾部、且覆盖层带 rules: 的话，覆盖层会整段替换掉订阅/规则页的分流规则
+    // （订阅与规则页的规则全部失效 —— 真机实证 2026-10-16 的根因之一）。
+    // 所以这里把覆盖层的 rules/rule-providers 段提取出来，按键合并进上方已生成的
+    // 同段（见下方规则发射），其余顶层键（dns 等）仍按 P2 语义追加原文。
+    let overrideBody = '';
+    let overrideRuleLines: string[] = [];
+    let overrideProviderLines: string[] = [];
+    const override = (settings.yamlOverride ?? '').trim();
+    if (override.length > 0 && ClashConfigGenerator.validateYamlOverride(override)) {
+      try {
+        const orules = YamlMerger.extractSection(override, 'rules').trim();
+        if (orules.length > 0) {
+          for (const line of orules.split('\n')) {
+            const t = line.trim();
+            if (t.length === 0 || t.startsWith('#') || !t.startsWith('- ')) {
+              continue;
+            }
+            overrideRuleLines.push(t.substring(2).trim());
+          }
+        }
+        const oprovs = YamlMerger.extractSection(override, 'rule-providers').trim();
+        if (oprovs.length > 0) {
+          for (const line of oprovs.split('\n')) {
+            const t = line.trim();
+            if (t.length === 0 || t.startsWith('#')) {
+              continue;
+            }
+            overrideProviderLines.push(line);
+          }
+        }
+      } catch (e) {
+        // 覆盖层 rules/rule-providers 解析失败按「未携带」处理，原文仍追加（旧语义）
+      }
+      overrideBody = (overrideRuleLines.length > 0 || overrideProviderLines.length > 0)
+        ? YamlMerger.removeSection(YamlMerger.removeSection(override, 'rules'),
+          'rule-providers').trim()
+        : override;
+    }
+    // 已声明 provider 名账本：订阅/覆盖层的 RULE-SET 引用必须落在已声明的 provider 上，
+    // 否则内核 config.Parse 阶段直接拒载整份配置（「引用未声明的 provider」）。
+    const emittedProviderNames = new Set<string>();
+    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
+      emittedProviderNames.add('hyper-adrules');
+    }
+    for (const ruleSet of settings.customRuleSets) {
+      emittedProviderNames.add(`rs-${ruleSet.name}`);
+    }
     // hyper-adrules 是 type: http 的 rule-provider：本地 path 文件缺失时，mihomo 会在
     // SsrvpnStart() 内部同步拉取远端 URL 并阻塞在启动协程里（不返回、不报错），
     // 表现为扩展 30s 静默无结果（真机实证 2026-09-19 全新安装首连）。
@@ -558,6 +610,55 @@ export class ClashConfigGenerator {
         lines.push(`    url: "${ClashConfigGenerator.escapeYaml(ruleSet.url)}"`);
       }
     }
+    // 订阅自带 rule-providers（导入订阅时落账）：与自定义规则集同一声明段。
+    // 用户 RULE-SET 引用的 provider 必须声明，二者缺一不可；同名 key 先到先得
+    // （避免 yaml.v3 对重复映射键报错整份拒载）。
+    if (settings.rulesEnabled && subscriptionRuleProviders.length > 0) {
+      const subProviderLines: string[] = [];
+      for (const line of subscriptionRuleProviders.split('\n')) {
+        const t = line.trim();
+        if (t.length === 0 || t.startsWith('#')) {
+          continue;
+        }
+        const m = t.match(/^([A-Za-z0-9_-]+):$/);
+        if (m !== null) {
+          if (emittedProviderNames.has(m[1])) {
+            continue; // 同名 provider 先到先得
+          }
+          emittedProviderNames.add(m[1]);
+        }
+        subProviderLines.push(line);
+      }
+      if (subProviderLines.length > 0) {
+        lines.push('');
+        lines.push('rule-providers:');
+        for (const pl of subProviderLines) {
+          lines.push(pl);
+        }
+      }
+    }
+    // YAML 覆盖层的 rule-providers 同段合并（先到先得；订阅优先，覆盖层只补缺失）
+    if (overrideProviderLines.length > 0) {
+      const ovProviderLines: string[] = [];
+      for (const line of overrideProviderLines) {
+        const t = line.trim();
+        const m = t.match(/^([A-Za-z0-9_-]+):$/);
+        if (m !== null) {
+          if (emittedProviderNames.has(m[1])) {
+            continue;
+          }
+          emittedProviderNames.add(m[1]);
+        }
+        ovProviderLines.push(line);
+      }
+      if (ovProviderLines.length > 0) {
+        lines.push('');
+        lines.push('rule-providers:');
+        for (const pl of ovProviderLines) {
+          lines.push(pl);
+        }
+      }
+    }
     lines.push('');
     lines.push('rules:');
     if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
@@ -571,6 +672,35 @@ export class ClashConfigGenerator {
       }
       for (const customRule of ClashConfigGenerator.normalizeCustomRules(settings.customRules)) {
         lines.push(`  - ${customRule}`);
+      }
+      // ── 订阅自带 rules（导入订阅时落账）──────────────────────────────
+      // 策略目标必须是已声明的代理组或内置策略、RULE-SET 必须引用已声明的 provider；
+      // 不合法的行跳过并计数（静态账本 lastSkippedUserRules），绝不整份拒载。
+      const groupTargets = new Set<string>(['DIRECT', 'PROXY', 'REJECT', 'REJECT-DROP',
+        'PASS', 'GLOBAL', 'COMPATIBLE', 'REJECT-DROP', ClashConfigGenerator.SMART_GROUP_NAME]);
+      for (const g of proxyGroups) {
+        groupTargets.add(g.name);
+      }
+      let skippedUserRules = 0;
+      for (const ruleLine of subscriptionRules) {
+        if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, emittedProviderNames, groupTargets)) {
+          lines.push(`  - ${ruleLine}`);
+        } else {
+          skippedUserRules = skippedUserRules + 1;
+        }
+      }
+      // ── YAML 覆盖层的 rules（同段合并，与订阅规则共存而不是整段替换）──
+      for (const ruleLine of overrideRuleLines) {
+        if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, emittedProviderNames, groupTargets)) {
+          lines.push(`  - ${ruleLine}`);
+        } else {
+          skippedUserRules = skippedUserRules + 1;
+        }
+      }
+      ClashConfigGenerator.lastSkippedUserRules = skippedUserRules;
+      if (skippedUserRules > 0) {
+        AppLogger.warn(TAG, `skipped ${skippedUserRules} user rule line(s) `
+          + '(policy target or rule provider not declared)');
       }
     }
     // 强制站点规则统一做域名规范化、格式验证和去重，避免规则/YAML 注入。
@@ -610,11 +740,10 @@ export class ClashConfigGenerator {
     // 追加在配置尾部。mihomo 解析语义：重复键后者覆盖前者 —— 用户可覆盖
     // dns/rules/proxies 之外的任何顶层键（覆盖 rules/proxies 由 UI 白名单拦截）。
     // 覆盖层本身经过控制字符净化，脏输入不会导致整份配置拒载。
-    const override = (settings.yamlOverride ?? '').trim();
-    if (override.length > 0 && ClashConfigGenerator.validateYamlOverride(override)) {
+    if (overrideBody.length > 0) {
       lines.push('');
       lines.push('# ---- user override (P2) ----');
-      lines.push(override);
+      lines.push(overrideBody);
     }
     // 最终出口净化：无论上游哪条路径漏进控制字符（rawTemplate/逐字 ws 值/持久化脏数据），
     // 落盘配置必然 YAML-printable，内核不会因 "control characters are not allowed" 拒载。
@@ -630,11 +759,48 @@ export class ClashConfigGenerator {
     if (text.length > 8 * 1024) {
       return false;
     }
-    const blocked = /^(rules|proxies|proxy-groups|external-controller|secret|tun)\s*:/;
+    const blocked = /^(proxies|proxy-groups|external-controller|secret|tun)\s*:/;
     for (const line of text.split('\n')) {
       if (blocked.test(line.trim())) {
         return false;
       }
+    }
+    return true;
+  }
+
+  /**
+   * 单条用户规则行（订阅自带 rules / 覆盖层 rules）是否可安全写入 rules 段：
+   * - 策略目标（最后一个逗号字段，容忍 no-resolve 参数）必须是已声明的代理组或内置策略；
+   * - RULE-SET 引用的 provider 必须已声明（声明段与引用同受校验）。
+   * 不合法的行由调用方跳过并计数 —— 内核 config.Parse 对「引用未声明的 provider /
+   * 不存在的组」会直接拒载整份配置，所以这里必须在生成侧兜底。
+   */
+  private static isValidUserRuleLine(rule: string, providerNames: Set<string>,
+    groupTargets: Set<string>): boolean {
+    const text = rule.trim();
+    if (text.length === 0 || text.length > 1024 || text.includes('\n') || text.includes('\r')) {
+      return false;
+    }
+    const parts: string[] = [];
+    for (const p of text.split(',')) {
+      const t = p.trim();
+      if (t.length > 0) {
+        parts.push(t);
+      }
+    }
+    if (parts.length < 2) {
+      return false;
+    }
+    let policy = parts[parts.length - 1];
+    if (policy.toUpperCase() === 'NO-RESOLVE' && parts.length >= 3) {
+      policy = parts[parts.length - 2];
+    }
+    if (!groupTargets.has(policy)) {
+      return false;
+    }
+    const type = parts[0].toUpperCase();
+    if (type === 'RULE-SET') {
+      return parts.length >= 3 && providerNames.has(parts[1]);
     }
     return true;
   }
