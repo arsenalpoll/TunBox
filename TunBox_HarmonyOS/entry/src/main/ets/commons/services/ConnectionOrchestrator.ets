@@ -434,14 +434,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /**
-   * 后台被杀后的自愈入口（冷启动 / 回前台时调用）。
+   * 进程被杀 / 回前台时的状态自愈入口。
    *
-   * 判定链（任一命中即不动，避免误拉起）：
+   * **不再自动拉起 VPN（用户明确要求）**：判定到"用户分层意图是想连着、但隧道确实
+   * 已经没了"时，只把磁盘上残留的意图落盘为"已断开"，让首页/卡片/快捷方式显示的
+   * 状态与真实一致，然后返回 —— 绝不代用户建连。用户必须自己在界面上点连接。
+   *
+   * 判定链（任一命中即不动）：
    *  1. 磁盘上没有"用户想连"的意图 → 用户从未连过，或已明确断开
-   *  2. 意图相位是 failed/disconnecting/disconnected → 上次确实没连成/已结束，不无限复活
-   *  3. 隧道其实还活着（心跳新鲜）→ 不打断正常会话
+   *  2. 意图相位是 failed/disconnecting/disconnected → 上次确实没连成/已结束
+   *  3. 隧道其实还活着（心跳新鲜）→ 不打断正常会话，仅复用真实状态
    *  4. 本进程已有连接在途（CONNECTING/RECOVERING）→ 让在途流程自己走完
-   *  5. 以上都不是 = 进程被杀或内核已死、而用户从没要求断开 → 自动重建隧道
+   *  5. 以上都不是 → 清掉残留意图，等待用户手动连接（auto-connect-disabled）
    *
    * 返回判定原因字符串供日志观察；内部已吞掉所有异常，调用方不应 await。
    */
@@ -464,35 +468,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (this.state === ConnState.CONNECTING || this.state === ConnState.RECOVERING) {
         return 'operation-in-flight';
       }
+      // 隧道确实没了：把残留的"想连着"意图落盘为断开。
+      // 不清会把 UI/卡片拖进"显示想连但实际没连"的错位状态（用户会以为已经连上）。
       AppLogger.warn(TAG, `self-heal: intent=${snap.phase} but tunnel is gone`
-        + ` (${authority.reason}); restoring with node="${snap.nodeName}"`);
-      const subs = SubscriptionService.instance();
-      await subs.init(context);
-      // 快照只存节点名（id 会随订阅刷新变化，跨进程恢复时更不可靠）：按名字回捞，
-      // 找不到就退回用户偏好节点，再退回第一个可用节点。
-      let node: ProxyNode | null = null;
-      if (snap.nodeName.length > 0) {
-        for (const n of subs.nodes) {
-          if (n.name === snap.nodeName) {
-            node = n;
-            break;
-          }
-        }
-      }
-      if (node === null) {
-        const settings = await SettingsService.load();
-        node = subs.findNode(settings.preferredNodeId);
-      }
-      if (node === null && subs.nodes.length > 0) {
-        node = subs.nodes[0];
-      }
-      if (node === null) {
-        AppLogger.warn(TAG, 'self-heal aborted: no node available');
-        return 'no-node';
-      }
-      const ok = await this.connect(node, subs);
-      AppLogger.info(TAG, `self-heal finished: ok=${ok} node=${node.name}`);
-      return ok ? 'restored' : 'restore-failed';
+        + ` (${authority.reason}); auto-connect disabled by policy — waiting for user gesture`);
+      await this.clearSessionIntent(snap.sessionGeneration);
+      return 'auto-connect-disabled';
     } catch (e) {
       AppLogger.warn(TAG, `self-heal error: ${AppLogger.errText(e)}`);
       return 'error';

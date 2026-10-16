@@ -40,7 +40,7 @@ import {
 } from './RawSubscriptionStore';
 import {
   CredentialStore, CredentialMigrationReport, NodeCredentialValues, SubscriptionCredentialSource,
-  CRED_PREF_NAME, NODE_CRED_FIELDS, baseNodeName, nodeCredentialId, setCredentialLogger
+  CRED_PREF_NAME, NODE_CRED_FIELDS, baseNodeName, nodeAlias, nodeCredentialId, setCredentialLogger, subAlias
 } from './CredentialStore';
 import { AppLogger } from '../utils/AppLogger';
 import {
@@ -321,6 +321,11 @@ export class SubscriptionService {
     // 分阶段计时（真机排查用）：订阅页加载慢时，日志能直接指出时间花在哪一段。
     // 每条日志都在"阶段完成"时打出，比较相邻两条的时间差即为该阶段耗时。
     const t0 = Date.now();
+    // 凭据回填作用域（2026-10-16 冷启动 4.5s 的修复）：批量查询不可用的固件上，
+    // 回填是逐条 Asset IPC，而 knownAliases 是历史累积的（634 条里活跃约 130 条）。
+    // 这里把"当前还活着的节点 + 手工节点 + 当前订阅"的候选别名交给凭据层，
+    // 回填只真读这一部分；作用域外的孤儿别名不会被读、更不会被删（用到时逐条兜底）。
+    SubscriptionService.applyHydrateScope(this.subscriptions, this.nodes);
     // 1) 一次性凭据迁移（必须在任何 persist 之前，避免明文被再次写回）
     await this.runCredentialMigrationOnce();
     AppLogger.info(TAG, `[perf] stage1 migration done at +${Date.now() - t0}ms`);
@@ -495,6 +500,41 @@ export class SubscriptionService {
     entry.bytes = RawSubscriptionStore.sizeOf(subscriptionId);
     entry.nodeEstimate = nodeEstimate;
     RawSubscriptionStore.upsert(entry);
+  }
+
+  /**
+   * 计算并设置凭据回填作用域：当前订阅 + 当前节点 + 手工节点的候选别名。
+   * 只对"批量查询不可用、需要逐条回填"的固件有意义（可用时批量一次拿全，无成本）。
+   * called from doInit（回填前）——重建作用域而不是增量维护，幂等且无遗漏。
+   */
+  private static applyHydrateScope(subs: Subscription[], nodes: ProxyNode[]): void {
+    const scope = new Set<string>();
+    for (const s of subs) {
+      if (s.id.length > 0) {
+        scope.add(subAlias(s.id));
+      }
+    }
+    for (const n of nodes) {
+      const nodeId = nodeCredentialId(n);
+      if (nodeId.length === 0) {
+        continue;
+      }
+      for (const f of NODE_CRED_FIELDS) {
+        scope.add(nodeAlias(nodeId, f));
+      }
+    }
+    // 手工节点（NodeEditPage 的常驻分组）不在本服务节点池里，但凭据在同一键空间，
+    // 同样纳入作用域；没有任何手工节点时这段循环是空转，成本为零。
+    for (const n of ManualNodeStore.all()) {
+      const nodeId = nodeCredentialId(n);
+      if (nodeId.length === 0) {
+        continue;
+      }
+      for (const f of NODE_CRED_FIELDS) {
+        scope.add(nodeAlias(nodeId, f));
+      }
+    }
+    CredentialStore.setHydrateScope(Array.from(scope));
   }
 
   /**
@@ -1707,6 +1747,7 @@ export class SubscriptionService {
     if (id === DIRECT_GROUP_ID) {
       return;
     }
+    const t0 = Date.now();
     // 双轨：删除订阅前先取出落盘原文（撤销窗口内可回写），随后立即删文件
     const rawBody = RawSubscriptionStore.readRaw(id);
     // 事务化快照以支持撤销
@@ -1718,6 +1759,8 @@ export class SubscriptionService {
     // 「不再需要即删干净」：删订阅即删其 provider 落盘原文与登记项
     RawSubscriptionStore.remove(id);
     await this.persist();
+    // 分阶段计时（真机排查用）：删除慢时据此区分"落盘"与"其余"
+    AppLogger.info(TAG, `[perf] subscription removed at +${Date.now() - t0}ms`);
   }
 
   async undoRemove(): Promise<boolean> {
