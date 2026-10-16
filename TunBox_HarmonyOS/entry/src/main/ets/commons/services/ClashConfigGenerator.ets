@@ -665,7 +665,15 @@ export class ClashConfigGenerator {
         groupTargets.add(g.name);
       }
       let skippedUserRules = 0;
+      // GEOIP 规则依赖 geoip.metadb（坑 40 同源）：metadb 缺失/损坏时内核会在
+      // config.Parse 阶段同步联网下载 MMDB（国内不可达）→ 启动卡死超时。
+      // 内置 GEOIP 已按 useGeoip 降级；订阅/覆盖层自带的 GEOIP 规则必须同闸门，
+      // 否则一条订阅规则就能把启动重新拖死。metadb 后台补齐后下次连接恢复。
       for (const ruleLine of subscriptionRules) {
+        if (!useGeoip && ruleLine.toUpperCase().startsWith('GEOIP,')) {
+          skippedUserRules = skippedUserRules + 1;
+          continue;
+        }
         if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, emittedProviderNames, groupTargets)) {
           lines.push(`  - ${ruleLine}`);
         } else {
@@ -674,6 +682,10 @@ export class ClashConfigGenerator {
       }
       // ── YAML 覆盖层的 rules（同段合并，与订阅规则共存而不是整段替换）──
       for (const ruleLine of overrideRuleLines) {
+        if (!useGeoip && ruleLine.toUpperCase().startsWith('GEOIP,')) {
+          skippedUserRules = skippedUserRules + 1;
+          continue;
+        }
         if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, emittedProviderNames, groupTargets)) {
           lines.push(`  - ${ruleLine}`);
         } else {

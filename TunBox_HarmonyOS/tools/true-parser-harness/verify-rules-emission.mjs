@@ -110,7 +110,11 @@ const groupNames = new Set(['DIRECT', 'PROXY', 'REJECT', 'REJECT-DROP', 'PASS', 
   'COMPATIBLE', '落地选择', '🔰 选择节点', '🐟 漏网之鱼']);
 const ruleLines = [];
 let skipped = 0;
+// 与生成器一致：metadb 缺失时（useGeoip=false）订阅/覆盖层 GEOIP 规则同降级。
+// 传 USE_GEOIP=false 环境变量可模拟 metadb 缺失场景（默认 true）。
+const useGeoip = process.env.USE_GEOIP !== 'false';
 for (const ruleLine of [...subscriptionRules, ...overrideRuleLines]) {
+  if (!useGeoip && ruleLine.toUpperCase().startsWith('GEOIP,')) { skipped++; continue; }
   if (isValidUserRuleLine(ruleLine, emittedProviderNames, groupNames)) ruleLines.push(`  - ${ruleLine}`);
   else skipped++;
 }

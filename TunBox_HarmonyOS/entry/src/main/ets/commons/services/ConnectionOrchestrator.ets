@@ -2973,9 +2973,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // CDN 错误页/拦截页同样可能很大，一旦把非 MMDB 内容按 geoip.metadb 落盘，
       // 内核侧 mmdb.Verify 会判定无效并**删除文件后重新联网下载**，等于把坑 40
       // 又引回来（config.Parse 阶段同步阻塞）。宁可下载失败，也不要写坏文件。
-      return await this.downloadAsset(GEOIP_MIRRORS, dest, 1024 * 100,
-        (buf: ArrayBuffer): boolean => ConnectionOrchestrator.bufferMagicOk(buf,
-          [0xAB, 0xCD, 0xEF, 0x4D]), source, 'geoip.metadb');
+      // 真源 8.4MB：体积下限 4MB（半截下载必小于它），标记在**尾部**而非头部
+      // （旧头部魔数判据把合法文件全判成坏，见 isGeoipReady 注释）。
+      return await this.downloadAsset(GEOIP_MIRRORS, dest, 1024 * 1024 * 4,
+        (buf: ArrayBuffer): boolean => ConnectionOrchestrator.bufferTailMagicOk(buf),
+        source, 'geoip.metadb');
     } finally {
       this.geoipDownloading = false;
     }
@@ -3001,6 +3003,29 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * （国内直连 github 不可达），等于把坑 40 重新引回来。
    * 魔数：MMDB 文件头前 4 字节固定为 0xAB 0xCD 0xEF 'M'。
    */
+  /** geoip.metadb 尾部 MMDB 标记（`«ÍïMaxMind.com`）查找窗口 */
+  private static bufferTailMagicOk(buf: ArrayBuffer): boolean {
+    const marker: number[] = [0xAB, 0xCD, 0xEF, 0x4D, 0x61, 0x78, 0x4D, 0x69, 0x6E, 0x64, 0x2E,
+      0x63, 0x6F, 0x6D];
+    const b = new Uint8Array(buf);
+    if (b.byteLength < marker.length) {
+      return false;
+    }
+    for (let i = b.byteLength - marker.length; i >= 0; i--) {
+      let hit = true;
+      for (let j = 0; j < marker.length; j++) {
+        if (b[i + j] !== marker[j]) {
+          hit = false;
+          break;
+        }
+      }
+      if (hit) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private isGeoipReady(): boolean {
     if (this.context === null) {
       return false;
@@ -3008,17 +3033,27 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     const path = `${this.context.cacheDir}/geoip.metadb`;
     let file: fs.File | null = null;
     try {
-      if (fs.statSync(path).size < 1024 * 100) {
+      const size = fs.statSync(path).size;
+      if (size < 1024 * 100) {
         return false;
       }
+      // MMDB 元数据标记 `«ÍïMaxMind.com` 在**文件尾部**（实测 meta-rules-dat
+      // geoip.metadb 8.4MB，标记位于倒数 ~185 字节；文件头是 `00 00 01 15 ...`）。
+      // 旧版读头部 4 字节判魔数，真文件永远判「损坏」→ GEOIP 分流被降级；
+      // 更糟的是内核 mmdb.Verify 判定损坏时会**删档并同步联网重下**，国内不可达
+      // → config.Parse 阻塞 20s 超时（真机表现为「内核启动超时」）。
+      // 判据改为：体积够 + 尾部窗口内存在标记。
       file = fs.openSync(path, fs.OpenMode.READ_ONLY);
-      const head = new ArrayBuffer(4);
-      const read = fs.readSync(file.fd, head);
-      if (read < 4) {
+      const window = 4096;
+      const readLen = Math.min(window, size);
+      const tail = new ArrayBuffer(readLen);
+      // HarmonyOS fileIo 无 lseekSync：readSync 支持 options.offset（**文件内**偏移）
+      // + length（读多少），第四参误传会落到缓冲区长度上。直接用 options 定位读取。
+      const got = fs.readSync(file.fd, tail, { offset: size - readLen, length: readLen });
+      if (got < readLen) {
         return false;
       }
-      const b = new Uint8Array(head);
-      return b[0] === 0xAB && b[1] === 0xCD && b[2] === 0xEF && b[3] === 0x4D;
+      return ConnectionOrchestrator.bufferTailMagicOk(tail);
     } catch (e) {
       return false;
     } finally {
