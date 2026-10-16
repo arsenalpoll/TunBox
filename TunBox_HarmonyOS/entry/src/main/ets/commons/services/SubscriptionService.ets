@@ -2419,8 +2419,12 @@ export class SubscriptionService {
         continue;
       }
       for (const line of s.subRules.split('\n')) {
-        const t = line.trim();
-        if (t.length === 0 || t.startsWith('#') || seen.has(t)) {
+        let t = line.trim();
+        // 落账行保留着 yaml 序列项的 "- " 前缀：生成时外层再加一层会变成 "- - RULE"（嵌套 seq），内核报「cannot unmarshal !!seq into string」拒载。
+        if (t.startsWith('- ')) {
+          t = t.substring(2).trim();
+        }
+        if (t.length === 0 || t.startsWith('#') || t.startsWith('- ') || seen.has(t)) {
           continue;
         }
         if (out.length >= 1000) {
