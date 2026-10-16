@@ -1048,14 +1048,29 @@ export struct SubscriptionPage {
               Row({ space: 8 }) {
                 // 单列/双列节点排布切换（候选4图形，显示目标模式：单列时双列图标/双列时单列图标）
                 Stack({ alignContent: Alignment.Center }) {
-                  Rect({ width: 20, height: 16 })
-                    .radius(4)
-                    .fill(Color.Transparent)
-                    .stroke(Nx.muted())
-                    .strokeWidth(2)
                   if (this.nodeColumns === 1) {
-                    // 目标：双列 → 中央竖线分栏
-                    Rect({ width: 2, height: 12 })
+                    // 单列 → 单框 + 内部多条横线（单列列表样式）
+                    Rect({ width: 11, height: 16 })
+                      .radius(3)
+                      .fill(Color.Transparent)
+                      .stroke(Nx.muted())
+                      .strokeWidth(2)
+                    Column({ space: 3 }) {
+                      Rect({ width: 6, height: 1.5 })
+                        .fill(Nx.muted())
+                      Rect({ width: 6, height: 1.5 })
+                        .fill(Nx.muted())
+                      Rect({ width: 6, height: 1.5 })
+                        .fill(Nx.muted())
+                    }
+                  } else {
+                    // 双列 → 横框 + 中缝（分栏）
+                    Rect({ width: 18, height: 14 })
+                      .radius(4)
+                      .fill(Color.Transparent)
+                      .stroke(Nx.muted())
+                      .strokeWidth(2)
+                    Rect({ width: 2, height: 10 })
                       .fill(Nx.muted())
                   }
                 }
