@@ -579,84 +579,65 @@ export class ClashConfigGenerator {
     for (const ruleSet of settings.customRuleSets) {
       emittedProviderNames.add(`rs-${ruleSet.name}`);
     }
-    // hyper-adrules 是 type: http 的 rule-provider：本地 path 文件缺失时，mihomo 会在
-    // SsrvpnStart() 内部同步拉取远端 URL 并阻塞在启动协程里（不返回、不报错），
-    // 表现为扩展 30s 静默无结果（真机实证 2026-09-19 全新安装首连）。
-    // 与下方 GEOIP 同策略：文件未就绪就不声明 provider、不引用 RULE-SET，
-    // 后台补齐后下次连接生效，绝不把"联网下载"塞进内核启动路径。
+    // ── rule-providers 声明段（单一合并段）────────────────────────────
+    // 真机实证 2026-10-16：多个 rule-providers: 顶层键（hyper/自定义/订阅/覆盖层各发
+    // 一个头）会让 yaml.v3 报重复键拒载；订阅 provider 块原样回写在缩进不规范时
+    // 报「did not find expected key」。所以这里统一收集、按键去重、逐条重缩进，
+    // 最后只发一个 rule-providers: 头。
+    const providerEntryLines: string[] = [];
     if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
-      lines.push('');
-      lines.push('rule-providers:');
-      lines.push('  hyper-adrules:');
-      lines.push('    type: http');
-      lines.push('    behavior: domain');
-      lines.push('    format: mrs');
-      lines.push('    interval: 86400');
-      lines.push('    path: ./ruleset/hyper_adrules_ads.mrs');
-      lines.push('    url: "https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs"');
+      providerEntryLines.push('  hyper-adrules:');
+      providerEntryLines.push('    type: http');
+      providerEntryLines.push('    behavior: domain');
+      providerEntryLines.push('    format: mrs');
+      providerEntryLines.push('    interval: 86400');
+      providerEntryLines.push('    path: ./ruleset/hyper_adrules_ads.mrs');
+      providerEntryLines.push('    url: "https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs"');
     }
-    // 用户自定义远程规则集（P1-2）：mihomo 自带 type: http 惰性拉取 + interval 自动更新；
-    // 拉取失败时内核保留上一版缓存文件（上游行为），失败回退无需我们额外实现。
     if (settings.rulesEnabled && settings.customRuleSets.length > 0) {
-      lines.push('');
-      lines.push('rule-providers:');
       for (const ruleSet of settings.customRuleSets) {
-        lines.push(`  rs-${ruleSet.name}:`);
-        lines.push('    type: http');
-        lines.push(`    behavior: ${ruleSet.behavior}`);
-        lines.push(`    format: ${ruleSet.format}`);
-        lines.push(`    interval: ${ruleSet.interval}`);
-        lines.push(`    path: ./ruleset/custom_rs_${ClashConfigGenerator.sanitizeFileKey(ruleSet.name)}`);
-        lines.push(`    url: "${ClashConfigGenerator.escapeYaml(ruleSet.url)}"`);
+        providerEntryLines.push(`  rs-${ruleSet.name}:`);
+        providerEntryLines.push('    type: http');
+        providerEntryLines.push(`    behavior: ${ruleSet.behavior}`);
+        providerEntryLines.push(`    format: ${ruleSet.format}`);
+        providerEntryLines.push(`    interval: ${ruleSet.interval}`);
+        providerEntryLines.push(`    path: ./ruleset/custom_rs_${ClashConfigGenerator.sanitizeFileKey(ruleSet.name)}`);
+        providerEntryLines.push(`    url: "${ClashConfigGenerator.escapeYaml(ruleSet.url)}"`);
       }
     }
-    // 订阅自带 rule-providers（导入订阅时落账）：与自定义规则集同一声明段。
-    // 用户 RULE-SET 引用的 provider 必须声明，二者缺一不可；同名 key 先到先得
-    // （避免 yaml.v3 对重复映射键报错整份拒载）。
     if (settings.rulesEnabled && subscriptionRuleProviders.length > 0) {
-      const subProviderLines: string[] = [];
-      for (const line of subscriptionRuleProviders.split('\n')) {
-        const t = line.trim();
-        if (t.length === 0 || t.startsWith('#')) {
+      for (const line of ClashConfigGenerator.normalizeProviderBlock(subscriptionRuleProviders.split('\n'))) {
+        providerEntryLines.push(line);
+      }
+    }
+    if (overrideProviderLines.length > 0) {
+      for (const line of ClashConfigGenerator.normalizeProviderBlock(overrideProviderLines)) {
+        providerEntryLines.push(line);
+      }
+    }
+    // 按键去重（先到先得：hyper/自定义 → 订阅 → 覆盖层）
+    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
+      emittedProviderNames.add('hyper-adrules');
+    }
+    for (const ruleSet of settings.customRuleSets) {
+      emittedProviderNames.add(`rs-${ruleSet.name}`);
+    }
+    const finalProviderLines: string[] = [];
+    for (const line of providerEntryLines) {
+      const m = line.match(/^  ([A-Za-z0-9_-]+):$/);
+      if (m !== null) {
+        if (emittedProviderNames.has(m[1])) {
           continue;
         }
-        const m = t.match(/^([A-Za-z0-9_-]+):$/);
-        if (m !== null) {
-          if (emittedProviderNames.has(m[1])) {
-            continue; // 同名 provider 先到先得
-          }
-          emittedProviderNames.add(m[1]);
-        }
-        subProviderLines.push(line);
+        emittedProviderNames.add(m[1]);
       }
-      if (subProviderLines.length > 0) {
-        lines.push('');
-        lines.push('rule-providers:');
-        for (const pl of subProviderLines) {
-          lines.push(pl);
-        }
-      }
+      finalProviderLines.push(line);
     }
-    // YAML 覆盖层的 rule-providers 同段合并（先到先得；订阅优先，覆盖层只补缺失）
-    if (overrideProviderLines.length > 0) {
-      const ovProviderLines: string[] = [];
-      for (const line of overrideProviderLines) {
-        const t = line.trim();
-        const m = t.match(/^([A-Za-z0-9_-]+):$/);
-        if (m !== null) {
-          if (emittedProviderNames.has(m[1])) {
-            continue;
-          }
-          emittedProviderNames.add(m[1]);
-        }
-        ovProviderLines.push(line);
-      }
-      if (ovProviderLines.length > 0) {
-        lines.push('');
-        lines.push('rule-providers:');
-        for (const pl of ovProviderLines) {
-          lines.push(pl);
-        }
+    if (finalProviderLines.length > 0) {
+      lines.push('');
+      lines.push('rule-providers:');
+      for (const pl of finalProviderLines) {
+        lines.push(pl);
       }
     }
     lines.push('');
@@ -803,6 +784,37 @@ export class ClashConfigGenerator {
       return parts.length >= 3 && providerNames.has(parts[1]);
     }
     return true;
+  }
+
+  /**
+   * 把 provider 声明块重缩进为规范 2/4 空格（provider 键行 2 空格、字段行按相对缩进 + 2）。
+   * 真实订阅的 rule-providers 缩进不规范（tab、缩进深度不一）时原样回写，会让
+   * yaml.v3 报「did not find expected key」整份拒载（真机实证 2026-10-16），
+   * 所以这里逐条重缩进，字段值原样保留。tab 归一为 2 空格，注释/空行剔除。
+   */
+  static normalizeProviderBlock(rawLines: string[]): string[] {
+    const out: string[] = [];
+    let keyIndent = -1;
+    for (const raw of rawLines) {
+      const line = raw.replace(/\t/g, '  ').replace(/\r$/, '');
+      const t = line.trim();
+      if (t.length === 0 || t.startsWith('#')) {
+        continue;
+      }
+      const indent = line.length - line.trimStart().length;
+      if (keyIndent < 0) {
+        keyIndent = indent;
+      }
+      const m = t.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+      const isKeyLine = m !== null && m[2].length === 0 && indent === keyIndent;
+      if (isKeyLine) {
+        out.push(`  ${m[1]}:`);
+        continue;
+      }
+      const rel = Math.max(0, indent - keyIndent);
+      out.push(' '.repeat(rel + 2) + t);
+    }
+    return out;
   }
 
   /** 与节点页持久化键保持一致：订阅 ID + NUL + 原始组名。 */
