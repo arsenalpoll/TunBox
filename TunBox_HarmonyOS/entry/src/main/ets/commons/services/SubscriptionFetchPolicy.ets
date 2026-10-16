@@ -109,17 +109,18 @@ export class SubscriptionFetchError extends Error {
 
 export class SubscriptionFetchPolicy {
   /**
-   * 依次尝试 UA 链，返回第一个非空响应体。HTTP 仅在调用方显式接受风险时启用。
+   * 依次尝试 UA 链，返回第一个非空响应体。HTTP 与 HTTPS 同样允许（应用明确支持
+   * http 订阅链接；SSRF 防护仍由公网地址校验保证）。
    *
    * @param etag 上次成功拉取拿到的 ETag（可空）。非空时带 `If-None-Match`：
    *   面板内容未变会回 304，省掉整份订阅的下载与解析（对齐 FlClash/Clash Verge
    *   的增量刷新语义）。
    */
   static async fetch(urlStr: string, headerName: string, headerValue: string,
-    allowInsecureHttp: boolean = false, etag: string = ''): Promise<SubscriptionFetchResult> {
+    allowInsecureHttp: boolean = true, etag: string = ''): Promise<SubscriptionFetchResult> {
     if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr, allowInsecureHttp)) {
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
-        '订阅地址无效：仅允许公开 HTTPS 地址');
+        '订阅地址无效：仅允许公开 HTTP/HTTPS 地址');
     }
     const customHeader = headerName.length > 0 && headerValue.length > 0;
     const attempts: string[] = [];
@@ -644,8 +645,8 @@ export class SubscriptionFetchPolicy {
     }
   }
 
-  /** 订阅 URL 合法性：默认仅允许 HTTPS；HTTP 必须由调用方显式开启。 */
-  static isValidSubscriptionUrl(urlStr: string, allowInsecureHttp: boolean = false): boolean {
+  /** 订阅 URL 合法性：允许公开 HTTP/HTTPS 地址。 */
+  static isValidSubscriptionUrl(urlStr: string, allowInsecureHttp: boolean = true): boolean {
     const lower = urlStr.toLowerCase();
     if (urlStr.length === 0 || urlStr.length > 8192
       || (!lower.startsWith('https://') && !(allowInsecureHttp && lower.startsWith('http://')))

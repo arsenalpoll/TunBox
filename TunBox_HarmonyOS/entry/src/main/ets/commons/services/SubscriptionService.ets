@@ -1732,13 +1732,13 @@ export class SubscriptionService {
       // 本地 YAML 伪订阅没有网络源：串行阶段按既有语义以现有节点数报成功，这里不预取
       return RefreshPrepOutcome.skipped(id);
     }
-    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(sub.url, false)) {
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(sub.url, true)) {
       // 地址非法交给串行阶段按原样报错（提示文案与单条刷新逐字一致），这里不预取
       return RefreshPrepOutcome.skipped(id);
     }
     try {
       const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue,
-        false, sub.etag);
+        true, sub.etag);
       this.prefetchCache.set(id,
         PrefetchedSubscription.body(sub.url, sub.headerName, sub.headerValue, fetched));
       return RefreshPrepOutcome.prefetched(id);
@@ -1837,7 +1837,7 @@ export class SubscriptionService {
       }
       const fetched: SubscriptionFetchResult = prefetched.hit
         ? prefetched.fetched
-        : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue, false, sub.etag);
+        : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue, true, sub.etag);
       // 304：面板确认内容未变。直接按「未变更」返回，沿用已落盘节点，
       // **不重新解析**（没有响应体可解析），也绝不把空体会当成 EMPTY_RESPONSE 报错。
       if (fetched.notModified) {
