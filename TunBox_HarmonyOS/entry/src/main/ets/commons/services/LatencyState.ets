@@ -72,6 +72,13 @@ export class LatencyRecord {
   atMs: number = 0;
   /** LatencyChannel.* */
   channel: string = LatencyChannel.CORE;
+  /**
+   * 结果来源：'auto'（后台/进页面静默批）| 'manual'（用户手点）。
+   * auto 来源的失败（TIMEOUT/FAILED）不显红 —— 冷内核并发把慢握手节点盖假超时章，
+   * 用户诉求「只是显示超时，用这个节点还能正常代理」→ 显示为中性「未测」。
+   * 持久化兼容：旧记录缺字段默认 'manual'（显示不回退，保持红）。
+   */
+  source: string = 'manual';
 
   static measured(name: string, delayMs: number, channel: string, atMs: number): LatencyRecord {
     const r = new LatencyRecord();

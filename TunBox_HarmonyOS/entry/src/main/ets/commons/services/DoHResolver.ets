@@ -5,9 +5,29 @@ import { SettingsService } from './SettingsService';
 
 const TAG = 'DoHResolver';
 const ENDPOINTS: string[] = ['https://doh.pub/dns-query', 'https://dns.alidns.com/resolve'];
-const FRESH_TTL_MS = 12 * 60 * 60 * 1000;
-const USABLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// pin TTL 收紧（加固③）：陈旧 pin 可能把节点钉死在失效 IP 上很久。
+// 3h 起进 stale 队列由 refreshStale 重解析，6h 硬过期（加载时过期即弃）。
+const FRESH_TTL_MS = 3 * 60 * 60 * 1000;
+const USABLE_TTL_MS = 6 * 60 * 60 * 1000;
 const PERSIST_DEBOUNCE_MS = 2000;
+
+/**
+ * 易变/临时隧道域名（加固③a）：quick tunnel / 内网穿透类域名轮换极快
+ * （*.trycloudflare.com 每次都是随机子域），把它们 pin 到固定 IP 会让
+ * 域名轮换后所有命中节点同时超时。这类域名不 pin、不缓存、不持久化，
+ * 域名留给内核运行时解析。
+ */
+const VOLATILE_DOMAIN_SUFFIXES: string[] = ['trycloudflare.com', 'loca.lt', 'serveo.net', 'localtunnel.me'];
+
+function isVolatileDomain(domain: string): boolean {
+  const d = domain.trim().toLowerCase();
+  for (const s of VOLATILE_DOMAIN_SUFFIXES) {
+    if (d === s || d.endsWith('.' + s)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 interface DoHAnswer {
   name: string;
@@ -61,6 +81,10 @@ export class DoHResolver {
       for (const domain of Object.keys(persisted)) {
         const packed = persisted[domain];
         if (typeof packed !== 'string') {
+          continue;
+        }
+        // 易变域名不加载历史 pin（加固③a）
+        if (isVolatileDomain(domain)) {
           continue;
         }
         const bar = packed.indexOf('|');
@@ -146,6 +170,48 @@ export class DoHResolver {
         break;
       }
       pending = remaining;
+    }
+    // 易变域名不进结果（加固③a）：本轮解析出的 IP 不供 hosts 写入
+    const volatileDropped: string[] = [];
+    for (const d of Object.keys(result)) {
+      if (isVolatileDomain(d)) {
+        volatileDropped.push(d);
+      }
+    }
+    // DNS 劫持/污染特征（加固③b）：一批结果里多个不同域名解析到同一 IP
+    // （真机 hosts 出现过多入口域名同 IP 的可疑 pin）。命中时这批不入 pin
+    // 不写 hosts（resolveANoCache 已写入缓存/入队的条目一并删除），域名留给内核运行时解析。
+    const byIp = new Map<string, string[]>();
+    for (const d of Object.keys(result)) {
+      const ip = result[d];
+      const list = byIp.get(ip);
+      if (list === undefined) {
+        byIp.set(ip, [d]);
+      } else {
+        list.push(d);
+      }
+    }
+    const collisionDropped: string[] = [];
+    for (const ip of Array.from(byIp.keys())) {
+      const list = byIp.get(ip) ?? [];
+      if (list.length < 2) {
+        continue;
+      }
+      for (const d of list) {
+        collisionDropped.push(d);
+        DoHResolver.cache.delete(d);
+        DoHResolver.staleQueue.delete(d);
+      }
+      AppLogger.warn(TAG, `doh hijack suspicion: ${list.length} domains -> ${ip}, pins dropped`);
+    }
+    if (volatileDropped.length > 0 || collisionDropped.length > 0) {
+      const filtered: Record<string, string> = {};
+      for (const d of Object.keys(result)) {
+        if (!isVolatileDomain(d) && !collisionDropped.includes(d)) {
+          filtered[d] = result[d];
+        }
+      }
+      return filtered;
     }
     return result;
   }
@@ -266,6 +332,10 @@ export class DoHResolver {
   }
 
   private static cachePut(domain: string, ip: string, schedule: boolean, resolvedAt: number): void {
+    // 易变域名不 pin（加固③a）：不进内存缓存也不持久化，域名留给内核运行时解析
+    if (isVolatileDomain(domain)) {
+      return;
+    }
     DoHResolver.cache.delete(domain);
     DoHResolver.cache.set(domain, new DoHPin(ip, resolvedAt));
     if (Date.now() - resolvedAt > FRESH_TTL_MS) {

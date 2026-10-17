@@ -416,7 +416,27 @@ export class ClashConfigGenerator {
       }
     }
     const groupSelected: ProxyNode = validNodes.includes(selectedNode) ? selectedNode : validNodes[0];
-    const emittedGroups = ClashConfigGenerator.planProxyGroups(proxyGroups, validNodes);
+    // ── YAML 覆盖层自定义 proxy-groups 聚合 ──────────────────────────────
+    // 覆盖层里用户手写的 proxy-groups（如「落地选择」）此前被 validateYamlOverride
+    // 连同整个覆盖层一起丢弃，订阅里引用它们的规则全部被 isValidUserRuleLine 判
+    // 「目标组未声明」而跳过（真机 517 条规则只落下 34 条的根因）。这里把覆盖层组
+    // 与订阅组合并后统一交给 planProxyGroups：名字冲突时覆盖层组优先（覆盖订阅组），
+    // 订阅组的 health-check url/interval 等测速语义保真不受影响。
+    const overrideGroupNames = new Set<string>();
+    let overrideGroups: ProxyGroup[] = [];
+    for (const og of overrideGroups) {
+      overrideGroupNames.add(og.name);
+    }
+    const mergedGroups: ProxyGroup[] = [];
+    for (const g of proxyGroups) {
+      if (!overrideGroupNames.has(g.name)) {
+        mergedGroups.push(g);
+      }
+    }
+    for (const og of overrideGroups) {
+      mergedGroups.push(og);
+    }
+    const emittedGroups = ClashConfigGenerator.planProxyGroups(mergedGroups, validNodes);
     const selections = ClashConfigGenerator.parseProxyGroupSelections(settings.proxyGroupSelections);
     // ── ♻️ 自动选择（内核 smart 组 / LightGBM）──────────────────────────────
     // 仅在「自动选择模式 + Model.bin 已就绪」时声明（见 isSmartModelReady）。
@@ -562,12 +582,20 @@ export class ClashConfigGenerator {
             overrideProviderLines.push(line);
           }
         }
+        // 覆盖层自定义 proxy-groups（如「落地选择」）同样预解析为组对象，
+        // 与订阅组合并后统一交给 planProxyGroups（见下方组聚合）。
+        const ogroups = YamlMerger.extractSection(override, 'proxy-groups').trim();
+        if (ogroups.length > 0) {
+          overrideGroups = ClashConfigGenerator.parseOverrideProxyGroups(ogroups);
+        }
       } catch (e) {
-        // 覆盖层 rules/rule-providers 解析失败按「未携带」处理，原文仍追加（旧语义）
+        // 覆盖层 rules/rule-providers/proxy-groups 解析失败按「未携带」处理，原文仍追加（旧语义）
+        overrideGroups = [];
       }
-      overrideBody = (overrideRuleLines.length > 0 || overrideProviderLines.length > 0)
-        ? YamlMerger.removeSection(YamlMerger.removeSection(override, 'rules'),
-          'rule-providers').trim()
+      overrideBody = (overrideRuleLines.length > 0 || overrideProviderLines.length > 0
+        || overrideGroups.length > 0)
+        ? YamlMerger.removeSection(YamlMerger.removeSection(
+          YamlMerger.removeSection(override, 'rules'), 'rule-providers'), 'proxy-groups').trim()
         : override;
     }
     // 已声明 provider 名账本：订阅/覆盖层的 RULE-SET 引用必须落在已声明的 provider 上，
@@ -661,7 +689,7 @@ export class ClashConfigGenerator {
       // 不合法的行跳过并计数（静态账本 lastSkippedUserRules），绝不整份拒载。
       const groupTargets = new Set<string>(['DIRECT', 'PROXY', 'REJECT', 'REJECT-DROP',
         'PASS', 'GLOBAL', 'COMPATIBLE', 'REJECT-DROP', ClashConfigGenerator.SMART_GROUP_NAME]);
-      for (const g of proxyGroups) {
+      for (const g of mergedGroups) {
         groupTargets.add(g.name);
       }
       let skippedUserRules = 0;
@@ -746,15 +774,18 @@ export class ClashConfigGenerator {
   }
 
   /**
-   * YAML 覆盖层白名单（P2）：拦截危险顶层键。rules/proxies/proxy-groups 三键
-   * 由生成器程序化生成（用户覆盖会绕过 UI 校验与去重），external-controller/
-   * secret/tun 三个键控制内核管理面，同样拦截。返回 true = 允许追加。
+   * YAML 覆盖层白名单（P2）：拦截危险顶层键。proxies 键由生成器程序化生成
+   * （用户覆盖会绕过 UI 校验与去重），external-controller/secret/tun 三个键
+   * 控制内核管理面，同样拦截。返回 true = 允许处理。
+   * rules/rule-providers/proxy-groups 三键不再整段拦截：由 generate() 提取后
+   * 按键合并进生成的同段（覆盖层 proxy-groups 聚合 + rules 同段合并），
+   * 其余顶层键（dns 等）仍按 P2 语义追加原文。
    */
   static validateYamlOverride(text: string): boolean {
     if (text.length > 8 * 1024) {
       return false;
     }
-    const blocked = /^(proxies|proxy-groups|external-controller|secret|tun)\s*:/;
+    const blocked = /^(proxies|external-controller|secret|tun)\s*:/;
     for (const line of text.split('\n')) {
       if (blocked.test(line.trim())) {
         return false;
@@ -830,6 +861,104 @@ export class ClashConfigGenerator {
   /** 与节点页持久化键保持一致：订阅 ID + NUL + 原始组名。 */
   static proxyGroupKey(group: ProxyGroup): string {
     return group.subscriptionId + '\u0000' + group.name;
+  }
+
+  /**
+   * 解析 YAML 覆盖层的 proxy-groups 段（extractSection 归一化输出）为组对象。
+   * 容错行解析：`- name:` 起新组；type/url/interval/tolerance/expected-status
+   * 映射到组字段（planProxyGroups 只对 url-test/fallback/load-balance 发射测速键）；
+   * proxies: 后的序列项为成员。仅保留名称合法且不重复的组；名称与 'PROXY' 冲突、
+   * 名字重复或含不安全文本的组跳过（绝不整份拒载）。流式写法（`- {name: ...}`）、
+   * include-all/filter 等动态分组语法不支持，保守跳过；成员为空的组由
+   * planProxyGroups 的落地性迭代统一丢弃。
+   */
+  private static parseOverrideProxyGroups(section: string): ProxyGroup[] {
+    const out: ProxyGroup[] = [];
+    const seenNames = new Set<string>();
+    let current: ProxyGroup | null = null;
+    let inProxies = false;
+    for (const rawLine of section.split('\n')) {
+      const line = rawLine.endsWith('\r') ? rawLine.substring(0, rawLine.length - 1) : rawLine;
+      const t = line.trim();
+      if (t.length === 0 || t.startsWith('#')) {
+        continue;
+      }
+      const itemMatch = t.match(/^-\s+name:\s*(.+)$/);
+      if (itemMatch !== null) {
+        if (current !== null) {
+          out.push(current);
+          current = null;
+        }
+        const name = ClashConfigGenerator.unquoteYamlScalar(itemMatch[1]);
+        if (name.length === 0 || name === 'PROXY' || seenNames.has(name)
+          || !ClashConfigGenerator.isSafeText(name)) {
+          continue;
+        }
+        const group = new ProxyGroup();
+        group.subscriptionId = '';
+        group.name = name;
+        seenNames.add(name);
+        current = group;
+        inProxies = false;
+        continue;
+      }
+      if (current === null) {
+        continue;
+      }
+      if (t === 'proxies:' || t.startsWith('proxies:')) {
+        inProxies = true;
+        continue;
+      }
+      if (t.startsWith('- ') && inProxies) {
+        const member = ClashConfigGenerator.unquoteYamlScalar(t.substring(2));
+        if (member.length > 0 && ClashConfigGenerator.isSafeText(member)
+          && !current.members.includes(member)) {
+          current.members.push(member);
+        }
+        continue;
+      }
+      // 非 member 序列项（不支持的动态分组键等）跳过
+      if (t.startsWith('- ')) {
+        continue;
+      }
+      inProxies = false;
+      const ci = t.indexOf(':');
+      if (ci <= 0) {
+        continue;
+      }
+      const key = t.substring(0, ci).trim().toLowerCase();
+      const value = t.substring(ci + 1).trim();
+      if (key === 'type') {
+        current.groupType = ClashConfigGenerator.unquoteYamlScalar(value).toLowerCase();
+      } else if (key === 'url') {
+        current.url = ClashConfigGenerator.unquoteYamlScalar(value);
+      } else if (key === 'interval' || key === 'tolerance') {
+        const n = Number(value);
+        if (Number.isFinite(n) && n > 0) {
+          if (key === 'interval') {
+            current.intervalSec = Math.floor(n);
+          } else {
+            current.toleranceMs = Math.floor(n);
+          }
+        }
+      } else if (key === 'expected-status') {
+        current.expectedStatus = ClashConfigGenerator.unquoteYamlScalar(value);
+      }
+    }
+    if (current !== null) {
+      out.push(current);
+    }
+    return out;
+  }
+
+  /** 剥掉 YAML 标量外层成对引号（覆盖层组名/成员/测速值常带引号落盘）。 */
+  private static unquoteYamlScalar(value: string): string {
+    let v = value.trim();
+    if (v.length >= 2
+      && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
+      v = v.substring(1, v.length - 1).trim();
+    }
+    return v;
   }
 
   /**

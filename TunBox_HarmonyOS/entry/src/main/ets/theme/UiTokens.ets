@@ -130,6 +130,12 @@ export class LatencyStyle {
       }
       return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
     }
+    if (rec.isFailure() && rec.source === 'auto') {
+      // auto 来源（后台/进页面静默批）的失败不显「超时/失败」：冷内核并发把慢握手
+      // 节点盖假超时章，用户诉求「只是显示超时，用这个节点还能正常代理」→ 显示
+      // 中性「未测」，用户手测（manual）仍是红色「超时」。
+      return '未测';
+    }
     return LatencyPolicy.stateText(rec.state);
   }
 
@@ -143,6 +149,10 @@ export class LatencyStyle {
         return Ui.textSecondary;
       }
       return LatencyStyle.color(rec.delayMs);
+    }
+    if (rec.isFailure() && rec.source === 'auto') {
+      // auto 来源失败：中性色，不显红（同 recordText 的「未测」语义）
+      return Ui.textSecondary;
     }
     if (rec.state === LatencyState.TIMEOUT || rec.state === LatencyState.FAILED) {
       return Ui.error;

@@ -48,14 +48,69 @@ function isValidUserRuleLine(rule, providerNames, groupTargets) {
   return true;
 }
 
+// 覆盖层 proxy-groups 解析（与 ClashConfigGenerator.parseOverrideProxyGroups 同逻辑）
+function unquoteScalar(v) {
+  let s = v.trim();
+  if (s.length >= 2 && ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+function parseOverrideProxyGroups(section) {
+  const out = [];
+  const seen = new Set();
+  let cur = null;
+  let inProxies = false;
+  for (const rawLine of section.split('\n')) {
+    const line = rawLine.endsWith(String.fromCharCode(13)) ? rawLine.slice(0, -1) : rawLine;
+    const t = line.trim();
+    if (t.length === 0 || t.startsWith('#')) continue;
+    const m = t.match(/^-\s+name:\s*(.+)$/);
+    if (m !== null) {
+      if (cur !== null) { out.push(cur); cur = null; }
+      const name = unquoteScalar(m[1]);
+      if (name.length === 0 || name === 'PROXY' || seen.has(name)) continue;
+      cur = { name, type: '', members: [], url: '', interval: 0, tolerance: 0, expectedStatus: '' };
+      seen.add(name);
+      inProxies = false;
+      continue;
+    }
+    if (cur === null) continue;
+    if (t === 'proxies:' || t.startsWith('proxies:')) { inProxies = true; continue; }
+    if (t.startsWith('- ') && inProxies) {
+      const mem = unquoteScalar(t.slice(2));
+      if (mem.length > 0 && !cur.members.includes(mem)) cur.members.push(mem);
+      continue;
+    }
+    if (t.startsWith('- ')) continue;
+    inProxies = false;
+    const ci = t.indexOf(':');
+    if (ci <= 0) continue;
+    const key = t.slice(0, ci).trim().toLowerCase();
+    const value = unquoteScalar(t.slice(ci + 1));
+    if (key === 'type') cur.type = value.toLowerCase();
+    else if (key === 'url') cur.url = value;
+    else if (key === 'interval') cur.interval = Math.floor(Number(value)) || 0;
+    else if (key === 'tolerance') cur.tolerance = Math.floor(Number(value)) || 0;
+    else if (key === 'expected-status') cur.expectedStatus = value;
+  }
+  if (cur !== null) out.push(cur);
+  return out;
+}
+
 // ---- 复刻生成器发射流程 ----
 // 设备状态模拟：订阅 yaml（用户提供，含 rules+rule-providers）；覆盖层 = 真机拉回配置里的
 // rule-providers 原文（用户粘贴进覆盖层的部分）；customRuleSets/单条规则 = 空。
-const overrideText = baseCfg.slice(baseCfg.indexOf('# ---- user override (P2) ----') + 30).trim();
+// 基座无覆盖层标记时（纯真机配置）覆盖层按空处理（与 generate() 的缺失语义一致），
+// 避免把整份配置体误当覆盖层重复解析/发射。
+const overrideMarkerIdx = baseCfg.indexOf('# ---- user override (P2) ----');
+const overrideText = overrideMarkerIdx >= 0 ? baseCfg.slice(overrideMarkerIdx + 30).trim() : '';
 
 // 1) 覆盖层预解析（与 generate() 同逻辑）
 let overrideRuleLines = [];
 let overrideProviderLines = [];
+let overrideGroups = [];
 let overrideBody = '';
 {
   const orules = YamlMerger.extractSection(overrideText, 'rules').trim();
@@ -74,8 +129,11 @@ let overrideBody = '';
       overrideProviderLines.push(line);
     }
   }
-  overrideBody = (overrideRuleLines.length > 0 || overrideProviderLines.length > 0)
-    ? YamlMerger.removeSection(YamlMerger.removeSection(overrideText, 'rules'), 'rule-providers').trim()
+  // 覆盖层自定义 proxy-groups 同样提取（与 generate() 新语义一致）
+  overrideGroups = parseOverrideProxyGroups(YamlMerger.extractSection(overrideText, 'proxy-groups').trim());
+  overrideBody = (overrideRuleLines.length > 0 || overrideProviderLines.length > 0 || overrideGroups.length > 0)
+    ? YamlMerger.removeSection(YamlMerger.removeSection(
+      YamlMerger.removeSection(overrideText, 'rules'), 'rule-providers'), 'proxy-groups').trim()
     : overrideText;
 }
 
@@ -83,7 +141,14 @@ let overrideBody = '';
 const subRulesSection = YamlMerger.extractSection(rawSub, 'rules').trim();
 const subProvidersSection = YamlMerger.extractSection(rawSub, 'rule-providers').trim();
 const subscriptionRules = subRulesSection.split('\n')
-  .map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('#'));
+  .map(l => {
+    // 与 SubscriptionService.subscriptionRulesLines 同逻辑：剥掉 yaml 序列项 "- " 前缀，
+    // 否则外层再加一层会变成 "- - RULE"（嵌套 seq），内核报 cannot unmarshal !!seq 拒载。
+    let t = l.trim();
+    if (t.startsWith('- ')) t = t.substring(2).trim();
+    return t;
+  })
+  .filter(l => l.length > 0 && !l.startsWith('#') && !l.startsWith('- '));
 
 // 3) provider 单一合并段（与 generate() 同逻辑：hyper 关、customRuleSets 空）
 const emittedProviderNames = new Set();
@@ -105,9 +170,14 @@ for (const line of providerEntryLines) {
   finalProviderLines.push(line);
 }
 
-// 4) rules 段（订阅 rules → 覆盖层 rules；组目标含订阅组 + 内置）
-const groupNames = new Set(['DIRECT', 'PROXY', 'REJECT', 'REJECT-DROP', 'PASS', 'GLOBAL',
-  'COMPATIBLE', '落地选择', '🔰 选择节点', '🐟 漏网之鱼']);
+// 4) rules 段（订阅 rules → 覆盖层 rules；组目标含订阅组 + 覆盖层组 + 内置）
+const groupNames = new Set(['DIRECT', 'PROXY', 'REJECT', 'REJECT-DROP', 'PASS', 'GLOBAL', 'COMPATIBLE']);
+for (const g of parseOverrideProxyGroups(YamlMerger.extractSection(rawSub, 'proxy-groups').trim())) {
+  groupNames.add(g.name);
+}
+for (const g of overrideGroups) {
+  groupNames.add(g.name);
+}
 const ruleLines = [];
 let skipped = 0;
 // 与生成器一致：metadb 缺失时（useGeoip=false）订阅/覆盖层 GEOIP 规则同降级。
@@ -119,8 +189,29 @@ for (const ruleLine of [...subscriptionRules, ...overrideRuleLines]) {
   else skipped++;
 }
 
-// 5) 拼装完整配置：替换基座配置的 rules/override 段
+// 5) 拼装完整配置：替换基座配置的 rules/override 段；覆盖层组聚合进 proxy-groups
 const lines = baseCfg.split('\n');
+if (overrideGroups.length > 0) {
+  const pgIdx = lines.findIndex(l => l.trim() === 'proxy-groups:');
+  let pgEnd = lines.length;
+  for (let i = pgIdx + 1; i < lines.length; i++) {
+    if (!lines[i].startsWith(' ') && !lines[i].startsWith('\t') && lines[i].trim().length > 0
+      && !lines[i].trim().startsWith('- ') && !lines[i].trim().startsWith('#')) { pgEnd = i; break; }
+  }
+  const block = [];
+  for (const g of overrideGroups) {
+    block.push(`  - name: "${g.name}"`);
+    block.push(`    type: ${g.type.length > 0 ? g.type : 'select'}`);
+    const isLatencyType = g.type === 'url-test' || g.type === 'fallback' || g.type === 'load-balance';
+    if (isLatencyType && g.url.length > 0) block.push(`    url: "${g.url}"`);
+    if (isLatencyType && g.interval > 0) block.push(`    interval: ${g.interval}`);
+    if (g.tolerance > 0) block.push(`    tolerance: ${g.tolerance}`);
+    if (g.expectedStatus.length > 0) block.push(`    expected-status: "${g.expectedStatus}"`);
+    block.push('    proxies:');
+    for (const mem of g.members) block.push(`      - "${mem}"`);
+  }
+  lines.splice(pgEnd, 0, ...block);
+}
 const rulesIdx = lines.findIndex(l => l.trim() === 'rules:');
 let endIdx = lines.length;
 for (let i = rulesIdx + 1; i < lines.length; i++) {

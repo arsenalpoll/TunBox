@@ -28,6 +28,7 @@ import {
 import {
   RefreshBatchProgress, RefreshItemOutcome, RefreshBatchSummary
 } from './ConcurrentRefresh';
+import { isEphemeralHost, EPHEMERAL_SUBSCRIPTION_REFRESH_MS } from './SubscriptionFetchPolicy';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'SubscriptionUpdateScheduler';
@@ -159,14 +160,35 @@ export class SubscriptionUpdateScheduler {
     const now = Date.now();
     const staleIds: string[] = [];
     let total = 0;
+    let ephemeralCount = 0;
     for (const s of subs.subscriptions) {
       if (s.url.startsWith('local://')) {
         continue; // 本地 YAML 伪订阅无远端可更新
       }
       total = total + 1;
-      if (s.lastFetchedAt <= 0 || now - s.lastFetchedAt > SUBSCRIPTION_STALE_MS) {
+      // 易变域名订阅（加固③）：节点 server 命中 trycloudflare 等临时隧道域名时，
+      // 隧道域名轮换后旧节点全部超时，刷新间隔压到 6h（EPHEMERAL_SUBSCRIPTION_REFRESH_MS，
+      // 与全局阈值同值 → 当前行为等价；全局阈值将来调大时易变订阅仍保持 6h）。
+      // 其它订阅的刷新行为不变（仍按 SUBSCRIPTION_STALE_MS）。
+      let ephemeral = false;
+      for (const n of subs.nodes) {
+        if (n.subscriptionId === s.id && isEphemeralHost(n.server)) {
+          ephemeral = true;
+          break;
+        }
+      }
+      if (ephemeral) {
+        ephemeralCount = ephemeralCount + 1;
+      }
+      const staleMs = ephemeral
+        ? Math.min(SUBSCRIPTION_STALE_MS, EPHEMERAL_SUBSCRIPTION_REFRESH_MS)
+        : SUBSCRIPTION_STALE_MS;
+      if (s.lastFetchedAt <= 0 || now - s.lastFetchedAt > staleMs) {
         staleIds.push(s.id);
       }
+    }
+    if (ephemeralCount > 0) {
+      AppLogger.info(TAG, `ephemeral-domain subscriptions: ${ephemeralCount}/${total} (refresh <= 6h)`);
     }
     if (staleIds.length === 0) {
       return StaleScanResult.none('no stale subscription');

@@ -1767,6 +1767,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         const ready = await this.ensureTestCore(subs, await this.lastSettingsForLatency());
         if (ready) {
           AppLogger.info(TAG, 'latency channel: headless test core ready');
+          // 预热：headless 内核 ready 后 controller API 仍是冷的（首批连接/凭证
+          // 初始化未完成），立刻起 44 节点全并发会把 API 打到 Operation timeout
+          // （真机取证 2026-10-17：code=2300028，整批中止）。等 ~1500ms 再放行。
+          await new Promise<void>((resolve) => setTimeout(() => resolve(), 1500));
           return this.api;
         }
       } catch (e) {

@@ -55,6 +55,33 @@ export class SubscriptionUserInfo {
   expireAt: number = -1;
 }
 
+/**
+ * 易变/临时隧道域名清单（加固③）：quick tunnel / 内网穿透类域名轮换极快
+ * （*.trycloudflare.com 每次都是随机子域），隧道域名轮换后旧节点全部超时。
+ */
+const EPHEMERAL_TUNNEL_DOMAINS: string[] = ['trycloudflare.com', 'loca.lt', 'serveo.net', 'localtunnel.me'];
+
+/**
+ * 节点 server 是否命中易变/临时隧道域名。命中时该订阅的刷新间隔压到
+ * EPHEMERAL_SUBSCRIPTION_REFRESH_MS（见 SubscriptionUpdateScheduler 的消费）。
+ */
+export function isEphemeralHost(server: string): boolean {
+  const h = server.trim().toLowerCase();
+  for (const d of EPHEMERAL_TUNNEL_DOMAINS) {
+    if (h === d || h.endsWith('.' + d)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 易变域名订阅的有效刷新间隔（毫秒）：临时隧道域名轮换快，压到 6h ——
+ * 与全局过期阈值 SUBSCRIPTION_STALE_MS 同值（当前语义下行为等价，契约显式化，
+ * 全局阈值将来调大时易变订阅仍保持 6h 刷新）。
+ */
+export const EPHEMERAL_SUBSCRIPTION_REFRESH_MS: number = 6 * 60 * 60 * 1000;
+
 export class SubscriptionFetchResult {
   body: string = '';
   userInfo: SubscriptionUserInfo = new SubscriptionUserInfo();

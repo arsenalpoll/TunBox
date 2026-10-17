@@ -49,8 +49,9 @@ import { DirectLatencyTester } from './DirectLatencyTester';
 
 const TAG = 'LatencyEngine';
 
-/** 并发探测数。内核侧并发无上限保护，用户要求更快：32 路 + 首批错峰。 */
-export const LATENCY_CONCURRENCY = 32;
+/** 并发探测数。OHOS http 单 host ~8 并发上限，32 路本来就在排队；冷内核 44 节点
+ * 全并发把 controller API 拖到 Operation timeout（真机取证 2026-10-17）。16 路。 */
+export const LATENCY_CONCURRENCY = 16;
 /** 单节点探测超时（mihomo 内部默认 5000ms）。 */
 export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
 /** 组测速（GET /group/{name}/delay）的整组预算。真机实测（2026-09-23）：内核的
@@ -115,6 +116,8 @@ export class LatencyRunOptions {
   timeoutMs: number = LATENCY_TIMEOUT_MS;
   /** true=全部重测；false=跳过仍新鲜的实测结果（进页面自动测速用） */
   force: boolean = true;
+  /** 结果来源：'auto'（静默批）| 'manual'（用户手点）；随记录落库供 UI 区分显示 */
+  source: string = 'manual';
   onResult: LatencyResultSink | null = null;
   onProgress: LatencyProgressSink | null = null;
 }
@@ -128,6 +131,7 @@ export class LatencyRun {
   private readonly url: string;
   private readonly timeoutMs: number;
   private readonly force: boolean;
+  private readonly source: string;
   private readonly onResult: LatencyResultSink | null;
   private readonly onProgress: LatencyProgressSink | null;
   private readonly progress: LatencyProgress = new LatencyProgress();
@@ -152,12 +156,14 @@ export class LatencyRun {
   private cursor: number = 0;
 
   constructor(api: ClashApiService | null, nodes: ProxyNode[], url: string, timeoutMs: number,
-    force: boolean, onResult: LatencyResultSink | null, onProgress: LatencyProgressSink | null) {
+    force: boolean, onResult: LatencyResultSink | null, onProgress: LatencyProgressSink | null,
+    source: string = 'manual') {
     this.api = api;
     this.nodes = nodes;
     this.url = url;
     this.timeoutMs = timeoutMs;
     this.force = force;
+    this.source = source;
     this.onResult = onResult;
     this.onProgress = onProgress;
     this.progress.total = nodes.length;
@@ -213,16 +219,29 @@ export class LatencyRun {
    */
   private clearOwnTestingMarks(): void {
     let cleared = 0;
+    let failuresReclaimed = 0;
     for (const node of this.nodes) {
       // 只收回**本批**打上的 TESTING：runId 是批次身份，抢占后的新批在
       // 同一节点上重新 markTesting(runId'≠runId)，旧批收尾不得清掉它。
       if (LatencyController.isTestingOwnedBy(node.name, this.runId)) {
         LatencyController.setRecord(LatencyRecord.untested(node.name));
         cleared = cleared + 1;
+        continue;
+      }
+      // 通道故障批（coreUnavailable）：中止前已盖章的失败同样无效 —— 此时
+      // **不能**把结果当节点结论（真机取证 2026-10-17：44 节点批测因 headless
+      // 内核 API 过载中止，11 个 TIMEOUT 章仍然生效，29 个 TESTING 被收回）。
+      // 用 runId 归属判断，只收本批打的章；取消批（coreUnavailable=false）
+      // 的已落库结果保持可见，不回滚。
+      if (this.progress.coreUnavailable
+        && LatencyController.isFailureOwnedBy(node.name, this.runId)) {
+        LatencyController.setRecord(LatencyRecord.untested(node.name));
+        failuresReclaimed = failuresReclaimed + 1;
       }
     }
-    if (cleared > 0) {
-      AppLogger.info(TAG, `latency cleanup: ${cleared} node(s) left TESTING -> untested `
+    if (cleared > 0 || failuresReclaimed > 0) {
+      AppLogger.info(TAG, `latency cleanup: ${cleared} node(s) left TESTING -> untested, `
+        + `${failuresReclaimed} stamped failure(s) -> untested `
         + `(cancelled=${this.cancelled} unavailable=${this.progress.coreUnavailable})`);
       LatencyController.notify();
     }
@@ -491,6 +510,10 @@ export class LatencyRun {
   }
 
   private publish(nodeName: string, rec: LatencyRecord): void {
+    // runId 写进每条已落库记录：通道故障批收尾据此认出本批盖的失败章并收回。
+    // source 随批落库：auto 来源的失败 UI 显示中性「未测」，manual 保持红。
+    rec.runId = this.runId;
+    rec.source = this.source;
     LatencyController.setRecord(rec);
     if (this.onResult !== null) {
       this.onResult(rec);
@@ -561,7 +584,7 @@ export class LatencyEngine {
       LatencyEngine.current.cancel();
     }
     const run = new LatencyRun(api, nodes, url, opts.timeoutMs, opts.force,
-      opts.onResult, opts.onProgress);
+      opts.onResult, opts.onProgress, opts.source);
     LatencyEngine.current = run;
     return run;
   }
