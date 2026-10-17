@@ -25,6 +25,7 @@ import { SubscriptionService } from './SubscriptionService';
 import { SubscriptionRefreshStatus } from '../models/Subscription';
 import { SettingsService, ConnectionSnapshot, AppRoutingSnapshot } from './SettingsService';
 import { SsrvpnNotifier } from './SsrvpnNotifier';
+import { TaskProgressUpdater } from './TaskProgressUpdater';
 import { TunnelAuthorityState, resolveAuthority, parseExtensionStatus, ExtensionStatusView, deriveUiPhase } from './TunnelAuthority';
 import {
   MAX_STATE_FILE_BYTES, PRIVATE_TEST_CONFIG_FILE,
@@ -1401,8 +1402,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 通知卡片/通知状态
     this.notify();
     try {
-      await SsrvpnNotifier.update(`TunBox · ${this.notifyNodeText(next.name)}`,
-        '', `连续失败 ${fails} 次，已自动切换`);
+      TaskProgressUpdater.updateLive(this.notifyNodeText(next.name),
+        `↓ 0 B/s  ↑ 0 B/s`, this.connDurationText());
     } catch (e) {
       AppLogger.warn(TAG, `[failover] notify update failed: ${AppLogger.errText(e)}`);
     }
@@ -2766,8 +2767,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       SsrvpnNotifier.ensurePermission(this.context).catch((e: Object): void => {
         AppLogger.warn(TAG, `ensure notification permission failed: ${AppLogger.errText(e)}`);
       });
-      await SsrvpnNotifier.update(`TunBox · ${this.notifyNodeText(target.name)}`,
-        '', `↓ 0 B/s  ↑ 0 B/s  ·  已运行 ${this.connDurationText()}`);
+      // 节点/速率/时长合并进系统长时任务通知（LIVE_VIEW），应用自有常驻通知已废除
+      // —— 两条通知重复（用户实锤），这里只清掉可能残留的旧 id-1001
+      SsrvpnNotifier.cancel().catch((): void => {});
       this.notify();
       AppLogger.info(TAG, `connected to node ${target.name}`);
       // P0-2 订阅自救：连接成功 → 隧道已可用（拉订阅天然走 VPN 出网），
@@ -3398,9 +3400,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.api.traffic().then((t: TrafficSnapshot) => {
         this.traffic = t;
         if (this.state === ConnState.CONNECTED) {
-          SsrvpnNotifier.update(`TunBox · ${this.notifyNodeText(this.lastNodeName.length > 0 ? this.lastNodeName : '已连接')}`,
-            '',
-            `↓ ${this.formatSpeed(t.downloadSpeed)}  ↑ ${this.formatSpeed(t.uploadSpeed)}  ·  已运行 ${this.connDurationText()}`);
+          TaskProgressUpdater.updateLive(
+            this.notifyNodeText(this.lastNodeName.length > 0 ? this.lastNodeName : '已连接'),
+            `↓ ${this.formatSpeed(t.downloadSpeed)}  ↑ ${this.formatSpeed(t.uploadSpeed)}`,
+            this.connDurationText());
         }
         this.notify();
       }).finally(() => {
