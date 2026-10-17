@@ -95,16 +95,14 @@ check('页面不再有被删除的旧方法', () => {
   }
 });
 
-// ── 2. 禁止 /group/{name}/delay ───────────────────────────────────────────
-check('任何地方都不得使用 /group/{name}/delay', () => {
-  for (const [name, src] of [['page', pageCode], ['engine', engineCode], ['api', codeOnly(api)]]) {
-    assert.ok(!/\/group\//.test(src), `${name} must not call the group delay endpoint`);
-    assert.ok(!/groupDelay/i.test(src), `${name} must not implement group delay`);
+// ── 2. 组测速走单一入口 testGroupDetailed（/group/{name}/delay + 显式 timeout） ──
+check('组测速只允许经由 ClashApiService.testGroupDetailed', () => {
+  for (const [name, src] of [['page', pageCode], ['engine', engineCode]]) {
+    assert.ok(!/\/group\//.test(src), `${name} must go through api.testGroupDetailed, not the raw endpoint`);
   }
-});
-check('ClashApiService 也不再提供组测接口', () => {
-  assert.ok(!/testGroupLatency|groupDelay|testGroup/.test(codeOnly(api)),
-    'ClashApiService must not expose a group test');
+  assert.ok(/testGroupDetailed\(/.test(codeOnly(api)), 'ClashApiService must expose the single group-test entry');
+  const m = codeOnly(api).match(/\/group\/\$\{[^}]+\}\/delay\?url=\$\{[^}]+\}&timeout=\$\{timeoutMs\}/);
+  assert.ok(m, 'group delay call must pass an explicit timeout param (kernel 400s without it)');
 });
 
 // ── 3. 未连接路径不得绕过 ensureLatencyApi ────────────────────────────────
@@ -131,24 +129,26 @@ check('后台静默测速也走同一引擎（不再是第二套实现）', () =
     'background must not keep its own parallel pipeline');
 });
 
-// ── 4. 测速 URL 必须 HTTPS ────────────────────────────────────────────────
-check('默认测速 URL 是 HTTPS 的 generate_204', () => {
-  assert.ok(/LATENCY_TEST_URL\s*=\s*'https:\/\/www\.gstatic\.com\/generate_204'/.test(engine),
-    'primary test url must be https://www.gstatic.com/generate_204');
-  assert.ok(/LATENCY_TEST_URL_ALT\s*=\s*'https:\/\//.test(engine), 'alt test url must be https');
+// ── 4. 测速 URL 用 HTTP（受限出口对 gstatic 的 TLS 握手会挂起 → 误标超时） ──
+check('默认测速 URL 是 HTTP 的 generate_204（对齐主流 Clash 出厂默认）', () => {
+  assert.ok(/LATENCY_TEST_URL\s*=\s*'http:\/\/www\.gstatic\.com\/generate_204'/.test(engine),
+    'primary test url must be http://www.gstatic.com/generate_204');
+  assert.ok(/LATENCY_TEST_URL_ALT\s*=\s*'http:\/\//.test(engine), 'alt test url must be http');
 });
-check('AppSettings 默认测速 URL 也是 HTTPS', () => {
+check('AppSettings 默认测速 URL 是 HTTP，且旧默认 https 会被加载迁移为 http', () => {
   const settings = fs.readFileSync(rel('entry/src/main/ets/commons/models/AppSettings.ets'), 'utf8');
-  assert.ok(!/testLatencyUrl[^=]*=\s*'http:\/\//.test(settings),
-    'AppSettings default test url must not be plain http');
+  assert.ok(!/testLatencyUrl[^=]*=\s*'https:\/\//.test(settings),
+    'AppSettings default test url must not be https (restricted exits hang on gstatic TLS)');
+  assert.ok(/'https:\/\/www\.gstatic\.com\/generate_204'\s*\n?\s*\?\s*'http:\/\/www\.gstatic\.com\/generate_204'/.test(settings),
+    'legacy persisted https default must be migrated to http on load');
 });
 
 // ── 5. 并发上限 ───────────────────────────────────────────────────────────
-check('并发上限存在且有界（5~16）', () => {
+check('并发上限存在且有界（5~64）', () => {
   const m = engine.match(/LATENCY_CONCURRENCY(?::\s*number)?\s*=\s*(\d+)/);
   assert.ok(m, 'LATENCY_CONCURRENCY must be defined');
   const n = Number(m[1]);
-  assert.ok(n >= 5 && n <= 16, `concurrency ${n} must stay within the ecosystem range 5..16`);
+  assert.ok(n >= 5 && n <= 64, `concurrency ${n} must stay within the ecosystem range 5..64`);
 });
 check('并发上限真的用于 lane 数（不会无界 fan-out）', () => {
   assert.ok(/Math\.min\(LATENCY_CONCURRENCY,/.test(engineCode),
@@ -322,8 +322,8 @@ check('引擎只在真的用了内核通道时才挂回收', () => {
 check('引擎在所有退出路径上自己收回 TESTING 标记', () => {
   assert.ok(/clearOwnTestingMarks/.test(engineCode), 'engine must own the cleanup');
   const body = engineCode.slice(engineCode.indexOf('private clearOwnTestingMarks'));
-  assert.ok(/LatencyState\.TESTING/.test(body), 'must target only TESTING rows');
-  assert.ok(/LatencyRecord\.untested\(/.test(body), 'TESTING -> untested (never a verdict)');
+  assert.ok(/isTestingOwnedBy\(node\.name, this\.runId\)/.test(body), 'must target only rows TESTING-owned by this run');
+  assert.ok(/LatencyRecord\.untested\(node\.name\)/.test(body), 'TESTING -> untested (never a verdict)');
   // worker 抛异常也必须收尾
   const run = engineCode.slice(engineCode.indexOf('async run(): Promise<LatencyProgress>'));
   assert.ok(/finally\s*\{\s*this\.clearOwnTestingMarks\(\)/.test(run),

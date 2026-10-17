@@ -37,6 +37,30 @@ export class SubscriptionParseResult {
   diagnostics: SubscriptionParseDiagnostics = new SubscriptionParseDiagnostics();
 }
 
+/** 每次解析独立维护名称索引，避免每个节点重建已有节点集合。 */
+export class SubscriptionNameAllocator {
+  private names: Set<string> = new Set<string>();
+  private nextSuffix: Map<string, number> = new Map<string, number>();
+
+  reserve(name: string): void {
+    this.names.add(name);
+  }
+
+  allocate(name: string): string {
+    const base = name.length > 0 ? name : 'node';
+    let finalName = base;
+    if (this.names.has(base)) {
+      let suffix = this.nextSuffix.get(base) ?? 2;
+      do {
+        finalName = `${base} ${suffix++}`;
+      } while (this.names.has(finalName));
+      this.nextSuffix.set(base, suffix);
+    }
+    this.names.add(finalName);
+    return finalName;
+  }
+}
+
 export class SubscriptionParser {
   /** 任意 scheme:// 形态都先按节点链接尝试；是否有解析器由 ProxyNode 注册表判定 */
   private static isProxyUri(trimmed: string): boolean {
@@ -65,6 +89,10 @@ export class SubscriptionParser {
     const diagnostics = result.diagnostics;
     const nodes: ProxyNode[] = [];
     const seen = new Set<string>();
+    // 名称分配器：共享一次遍历内的名称索引。旧实现每个节点都重建
+    // `new Set(existing.map(...))`，1000 节点订阅即 ~50 万次 Set 插入（O(N²)），
+    // 这是解析路径上最贵的一步；分配器把后缀起点也记住，重新分配同名不会从 2 重试。
+    const nameAllocator = new SubscriptionNameAllocator();
     let counter = 0;
 
     const add = (node: ProxyNode | null): void => {
@@ -88,7 +116,7 @@ export class SubscriptionParser {
         return;
       }
       seen.add(key);
-      node.name = SubscriptionParser.dedupName(nodes, node.name);
+      node.name = nameAllocator.allocate(node.name);
       nodes.push(node);
     };
 
@@ -253,6 +281,19 @@ export class SubscriptionParser {
           group.filterPattern = SubscriptionParser.yamlScalar(value);
         } else if (key === 'exclude-filter') {
           group.excludeFilterPattern = SubscriptionParser.yamlScalar(value);
+        } else if (key === 'url') {
+          // 组测速地址语义保真（url-test/fallback/load-balance）；非法值由生成端校验兜底
+          group.url = SubscriptionParser.yamlScalar(value);
+        } else if (key === 'interval') {
+          // 自动测速间隔（秒）：面板常见 60~86400；非数字按未声明处理
+          const interval = parseInt(value);
+          group.intervalSec = isNaN(interval) || interval <= 0 ? 0 : interval;
+        } else if (key === 'tolerance') {
+          // url-test/load-balance 的切换容差（毫秒）
+          const tolerance = parseInt(value);
+          group.toleranceMs = isNaN(tolerance) || tolerance < 0 ? 0 : tolerance;
+        } else if (key === 'expected-status') {
+          group.expectedStatus = SubscriptionParser.yamlScalar(value);
         }
       }
     }

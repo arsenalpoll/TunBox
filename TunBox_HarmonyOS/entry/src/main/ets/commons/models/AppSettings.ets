@@ -77,7 +77,7 @@ export class AppSettingsJson {
   preferredNodeSubscriptionId: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
-  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
+  testLatencyUrl: string = 'http://www.gstatic.com/generate_204';
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default' 订阅默认顺序 / 'auto' 按最近测速结果 / 'manual' 用户手动固定顺序 */
   nodeSortMode: string = 'default';
@@ -177,7 +177,7 @@ export class AppSettings {
   preferredNodeSubscriptionId: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
-  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
+  testLatencyUrl: string = 'http://www.gstatic.com/generate_204';
   /** 代理模式：rule = 规则 / global = 全局（对应 upstream settings.proxyMode） */
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default'=订阅默认顺序, 'auto'=按最近测速结果, 'manual'=手动固定顺序 */
@@ -334,7 +334,9 @@ export class AppSettings {
     s.autoUpdateSubscription = typeof j.autoUpdateSubscription === 'boolean' ? j.autoUpdateSubscription : true;
     s.selectedSubscriptionId = typeof j.selectedSubscriptionId === 'string' ? j.selectedSubscriptionId : '';
     s.testLatencyUrl = typeof j.testLatencyUrl === 'string' && j.testLatencyUrl.length > 0
-      ? j.testLatencyUrl : 'https://www.gstatic.com/generate_204';
+      ? (j.testLatencyUrl === 'https://www.gstatic.com/generate_204'
+        ? 'http://www.gstatic.com/generate_204' : j.testLatencyUrl)
+      : 'http://www.gstatic.com/generate_204';
     s.proxyMode = j.proxyMode === 'global' ? 'global' : 'rule';
     s.nodeSortMode = NodeSortModes.normalize(j.nodeSortMode);
     s.nodeSortSnapshot = typeof j.nodeSortSnapshot === 'string' ? j.nodeSortSnapshot : '';

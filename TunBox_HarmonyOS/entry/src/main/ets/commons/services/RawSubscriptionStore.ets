@@ -46,7 +46,7 @@ export const RAW_SUB_FILE_MODE = 0o600;
 export const RAW_PROVIDER_NAME_PREFIX = 'raw-';
 /** provider 健康检查（file provider 同样支持；失败时的表现需真机确认） */
 export const RAW_PROVIDER_HEALTH_CHECK_ENABLED: boolean = true;
-export const RAW_PROVIDER_HEALTH_CHECK_URL = 'https://www.gstatic.com/generate_204';
+export const RAW_PROVIDER_HEALTH_CHECK_URL = 'http://www.gstatic.com/generate_204';
 export const RAW_PROVIDER_HEALTH_CHECK_INTERVAL = 300;
 
 /** 落盘结果（ok=false 时 reason 为中文原因，调用方据此记诊断并降级） */

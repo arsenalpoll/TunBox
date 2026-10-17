@@ -840,7 +840,7 @@ export class ClashConfigGenerator {
     const url = raw.trim();
     if (url.length === 0 || url.length > 2048 || !ClashConfigGenerator.isSafeText(url)
       || !(url.startsWith('http://') || url.startsWith('https://'))) {
-      return 'https://www.gstatic.com/generate_204';
+      return 'http://www.gstatic.com/generate_204';
     }
     return ClashConfigGenerator.escapeYaml(url);
   }

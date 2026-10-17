@@ -15,6 +15,24 @@
  */
 import { util } from './stubs.ts';
 
+/**
+ * 错误 → 文本（本文件保持零额外依赖）：解析路径抛出的常是普通对象（{message}），
+ * Error 实例判断会丢消息（[object Object] 类问题）；与 AppLogger.errText 同语义。
+ */
+function errorTextOr(e: Object, fallback: string): string {
+  if (e !== null && e !== undefined) {
+    const msgVal = (e as Record<string, Object>).message;
+    if (typeof msgVal === 'string' && (msgVal as string).length > 0) {
+      return msgVal as string;
+    }
+    const text = String(e);
+    if (text.length > 0 && text !== '[object Object]') {
+      return text;
+    }
+  }
+  return fallback;
+}
+
 /** 单个合并后的代理节点，仅保存受支持协议（ss/ssr/vless/vmess/trojan/hysteria2）的白名单结构化字段。 */
 export class MergedProxy {
   name: string = '';
@@ -94,6 +112,35 @@ export class YamlMerger {
   static extractSection(yaml: string, sectionName: string): string {
     const lines = YamlMerger.normalizedSectionLines(yaml, sectionName);
     return lines.join('\n');
+  }
+
+  /**
+   * 删除指定顶层分节（其余内容原样保留，行序不变）。
+   * 分节不存在时原样返回。供 YAML 覆盖层的 rules/rule-providers 段合并
+   * （合并进生成器的同段后，原文不能再携带这两个键，否则 mihomo 按重复键
+   * 「后者覆盖前者」整段替换掉已合并的规则）。
+   */
+  static removeSection(yaml: string, sectionName: string): string {
+    const out: string[] = [];
+    let inSection = false;
+    for (const raw of yaml.split('\n')) {
+      const line = raw.endsWith('\n') ? raw.substring(0, raw.length - 1) : raw;
+      if (!line.startsWith(' ') && !line.startsWith('\t')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith(`${sectionName}:`)) {
+          inSection = true;
+          continue;
+        }
+        if (inSection && trimmed.length > 0 && !trimmed.startsWith('#')
+          && !trimmed.startsWith('- ')) {
+          inSection = false; // 下一顶层键行 = 分节结束
+        }
+      }
+      if (!inSection) {
+        out.push(line);
+      }
+    }
+    return out.join('\n');
   }
 
   /**
@@ -1525,7 +1572,9 @@ export class YamlMerger {
   /** SNI 键名方案: hysteria2/hysteria/tuic 用 sni, 其余用 servername */
   static usesSniKey(type: string): boolean {
     const t = type.trim().toLowerCase();
-    return t === 'hysteria2' || t === 'hysteria' || t === 'tuic';
+    // anytls 的内核选项只认 sni 键（AnytlsOption.SNI tag: proxy:"sni"），
+    // 写成 servername 会被丢弃，TLS Host 回退用 server 地址，与证书不匹配时全部超时。
+    return t === 'hysteria2' || t === 'hysteria' || t === 'tuic' || t === 'anytls';
   }
 
   /** 预读条目声明的 type(键顺序不定, 结构化映射前先判定是否走中继) */
@@ -2361,7 +2410,7 @@ export class YamlMerger {
           if (e instanceof YamlNodeError) {
             continue;
           }
-          throw new YamlMergeError(e instanceof Error ? e.message : '代理节点解析发生未知错误');
+          throw new YamlMergeError(errorTextOr(e, '代理节点解析发生未知错误'));
         }
         if (p === null) {
           continue;
@@ -2386,7 +2435,7 @@ export class YamlMerger {
           if (e instanceof YamlNodeError) {
             continue;
           }
-          throw new YamlMergeError(e instanceof Error ? e.message : '代理节点解析发生未知错误');
+          throw new YamlMergeError(errorTextOr(e, '代理节点解析发生未知错误'));
         }
         if (old === null) {
           continue;
