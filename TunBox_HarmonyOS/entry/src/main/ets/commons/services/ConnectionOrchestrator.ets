@@ -1401,8 +1401,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 通知卡片/通知状态
     this.notify();
     try {
-      await SsrvpnNotifier.update('TunBox 已切换节点', next.name,
-        `连续失败 ${fails} 次，已自动切换`);
+      await SsrvpnNotifier.update(`TunBox · ${this.notifyNodeText(next.name)}`,
+        '', `连续失败 ${fails} 次，已自动切换`);
     } catch (e) {
       AppLogger.warn(TAG, `[failover] notify update failed: ${AppLogger.errText(e)}`);
     }
@@ -2761,7 +2761,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 集成点③：连接成功 → 复位该节点连续失败统计（复用 NodeSortPersistence 记录结构）
       await this.recordNodeSuccess(target.name);
-      await SsrvpnNotifier.update('TunBox 已连接', target.name, '↓ 0 B/s  ↑ 0 B/s');
+      // 通知权限从未授予时弹一次系统授权框（真机 1600004 disabled 实锤：
+      // 不授权则常驻通知发不出，通知栏只剩系统 VPN 通知的运行时长）
+      SsrvpnNotifier.ensurePermission(this.context).catch((e: Object): void => {
+        AppLogger.warn(TAG, `ensure notification permission failed: ${AppLogger.errText(e)}`);
+      });
+      await SsrvpnNotifier.update(`TunBox · ${this.notifyNodeText(target.name)}`,
+        '', `↓ 0 B/s  ↑ 0 B/s  ·  已运行 ${this.connDurationText()}`);
       this.notify();
       AppLogger.info(TAG, `connected to node ${target.name}`);
       // P0-2 订阅自救：连接成功 → 隧道已可用（拉订阅天然走 VPN 出网），
@@ -3392,9 +3398,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.api.traffic().then((t: TrafficSnapshot) => {
         this.traffic = t;
         if (this.state === ConnState.CONNECTED) {
-          SsrvpnNotifier.update('TunBox 已连接',
-            this.lastNodeName.length > 0 ? this.lastNodeName : '已连接',
-            `↓ ${this.formatSpeed(t.downloadSpeed)}  ↑ ${this.formatSpeed(t.uploadSpeed)}`);
+          SsrvpnNotifier.update(`TunBox · ${this.notifyNodeText(this.lastNodeName.length > 0 ? this.lastNodeName : '已连接')}`,
+            '',
+            `↓ ${this.formatSpeed(t.downloadSpeed)}  ↑ ${this.formatSpeed(t.uploadSpeed)}  ·  已运行 ${this.connDurationText()}`);
         }
         this.notify();
       }).finally(() => {
@@ -3441,6 +3447,34 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
     }
     return `${(bytesPerSecond / 1024 / 1024).toFixed(2)} MB/s`;
+  }
+
+  /**
+   * 常驻通知栏的连接时长（H:MM:SS）。startedAt=0（未连接）时不显示时长段。
+   */
+  private connDurationText(): string {
+    if (this.startedAt <= 0) {
+      return '';
+    }
+    let s = Math.floor((Date.now() - this.startedAt) / 1000);
+    if (s < 0) {
+      s = 0;
+    }
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const mm = m < 10 ? `0${m}` : `${m}`;
+    const ss = sec < 10 ? `0${sec}` : `${sec}`;
+    return `${h}:${mm}:${ss}`;
+  }
+
+  /** 通知标题里的节点名：截断过长的名字，避免通知栏标题被挤没 */
+  private notifyNodeText(name: string): string {
+    const n = name.trim();
+    if (n.length <= 24) {
+      return n;
+    }
+    return `${n.substring(0, 24)}…`;
   }
 
   formatBytes(total: number): string {
