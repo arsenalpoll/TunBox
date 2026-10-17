@@ -25,6 +25,7 @@ import { SubscriptionService } from './SubscriptionService';
 import { SubscriptionRefreshStatus } from '../models/Subscription';
 import { SettingsService, ConnectionSnapshot, AppRoutingSnapshot } from './SettingsService';
 import { SsrvpnNotifier } from './SsrvpnNotifier';
+import { TaskProgressUpdater } from './TaskProgressUpdater';
 import { TunnelAuthorityState, resolveAuthority, parseExtensionStatus, ExtensionStatusView, deriveUiPhase } from './TunnelAuthority';
 import {
   MAX_STATE_FILE_BYTES, PRIVATE_TEST_CONFIG_FILE,
@@ -434,14 +435,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /**
-   * 后台被杀后的自愈入口（冷启动 / 回前台时调用）。
+   * 进程被杀 / 回前台时的状态自愈入口。
    *
-   * 判定链（任一命中即不动，避免误拉起）：
+   * **不再自动拉起 VPN（用户明确要求）**：判定到"用户分层意图是想连着、但隧道确实
+   * 已经没了"时，只把磁盘上残留的意图落盘为"已断开"，让首页/卡片/快捷方式显示的
+   * 状态与真实一致，然后返回 —— 绝不代用户建连。用户必须自己在界面上点连接。
+   *
+   * 判定链（任一命中即不动）：
    *  1. 磁盘上没有"用户想连"的意图 → 用户从未连过，或已明确断开
-   *  2. 意图相位是 failed/disconnecting/disconnected → 上次确实没连成/已结束，不无限复活
-   *  3. 隧道其实还活着（心跳新鲜）→ 不打断正常会话
+   *  2. 意图相位是 failed/disconnecting/disconnected → 上次确实没连成/已结束
+   *  3. 隧道其实还活着（心跳新鲜）→ 不打断正常会话，仅复用真实状态
    *  4. 本进程已有连接在途（CONNECTING/RECOVERING）→ 让在途流程自己走完
-   *  5. 以上都不是 = 进程被杀或内核已死、而用户从没要求断开 → 自动重建隧道
+   *  5. 以上都不是 → 清掉残留意图，等待用户手动连接（auto-connect-disabled）
    *
    * 返回判定原因字符串供日志观察；内部已吞掉所有异常，调用方不应 await。
    */
@@ -464,35 +469,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (this.state === ConnState.CONNECTING || this.state === ConnState.RECOVERING) {
         return 'operation-in-flight';
       }
+      // 隧道确实没了：把残留的"想连着"意图落盘为断开。
+      // 不清会把 UI/卡片拖进"显示想连但实际没连"的错位状态（用户会以为已经连上）。
       AppLogger.warn(TAG, `self-heal: intent=${snap.phase} but tunnel is gone`
-        + ` (${authority.reason}); restoring with node="${snap.nodeName}"`);
-      const subs = SubscriptionService.instance();
-      await subs.init(context);
-      // 快照只存节点名（id 会随订阅刷新变化，跨进程恢复时更不可靠）：按名字回捞，
-      // 找不到就退回用户偏好节点，再退回第一个可用节点。
-      let node: ProxyNode | null = null;
-      if (snap.nodeName.length > 0) {
-        for (const n of subs.nodes) {
-          if (n.name === snap.nodeName) {
-            node = n;
-            break;
-          }
-        }
-      }
-      if (node === null) {
-        const settings = await SettingsService.load();
-        node = subs.findNode(settings.preferredNodeId);
-      }
-      if (node === null && subs.nodes.length > 0) {
-        node = subs.nodes[0];
-      }
-      if (node === null) {
-        AppLogger.warn(TAG, 'self-heal aborted: no node available');
-        return 'no-node';
-      }
-      const ok = await this.connect(node, subs);
-      AppLogger.info(TAG, `self-heal finished: ok=${ok} node=${node.name}`);
-      return ok ? 'restored' : 'restore-failed';
+        + ` (${authority.reason}); auto-connect disabled by policy — waiting for user gesture`);
+      await this.clearSessionIntent(snap.sessionGeneration);
+      return 'auto-connect-disabled';
     } catch (e) {
       AppLogger.warn(TAG, `self-heal error: ${AppLogger.errText(e)}`);
       return 'error';
@@ -689,7 +671,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const settings: AppSettings = await SettingsService.load();
       const yaml = ClashConfigGenerator.generate(node, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
         this.apiSecret, this.lastUseGeoip, false, this.lastProxyHosts, true, subs.proxyGroups,
-        this.isRuleProviderReady(), this.lastUseSmart);
+        this.isRuleProviderReady(), this.lastUseSmart,
+        subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       ensurePrivateDir(this.context.cacheDir);
       privateFs.writePrivate(configPath, yaml);
@@ -1419,8 +1402,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 通知卡片/通知状态
     this.notify();
     try {
-      await SsrvpnNotifier.update('TunBox 已切换节点', next.name,
-        `连续失败 ${fails} 次，已自动切换`);
+      TaskProgressUpdater.updateLive(this.notifyNodeText(next.name),
+        `↓ 0 B/s  ↑ 0 B/s`, this.connDurationText());
     } catch (e) {
       AppLogger.warn(TAG, `[failover] notify update failed: ${AppLogger.errText(e)}`);
     }
@@ -1785,6 +1768,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         const ready = await this.ensureTestCore(subs, await this.lastSettingsForLatency());
         if (ready) {
           AppLogger.info(TAG, 'latency channel: headless test core ready');
+          // 预热：headless 内核 ready 后 controller API 仍是冷的（首批连接/凭证
+          // 初始化未完成），立刻起 44 节点全并发会把 API 打到 Operation timeout
+          // （真机取证 2026-10-17：code=2300028，整批中止）。等 ~1500ms 再放行。
+          await new Promise<void>((resolve) => setTimeout(() => resolve(), 1500));
           return this.api;
         }
       } catch (e) {
@@ -2047,7 +2034,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 测速核不启用 smart 组：它只做延迟探测，多一层内核选点会让测速结果失真
       const yaml = ClashConfigGenerator.generate(subs.nodes[0], subs.nodes, settings,
         this.mixedPort, this.apiPort, this.dnsPort, this.testCoreSecret, testGeoip, false, hosts, false,
-        subs.proxyGroups, testRuleProviderReady, false);
+        subs.proxyGroups, testRuleProviderReady, false,
+        subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
       const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
@@ -2578,7 +2566,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           + '(smart group disabled this session; downloading in background)');
       }
       const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
-        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups, ruleProviderReady, useSmart);
+        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups, ruleProviderReady, useSmart,
+        subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
       // 缓存本次连接的配置输入，供规则/站点热重载复用（不重跑 DoH、不重建隧道）。
       this.lastProxyHosts = proxyHosts;
       this.lastUseGeoip = useGeoip;
@@ -2773,7 +2762,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 集成点③：连接成功 → 复位该节点连续失败统计（复用 NodeSortPersistence 记录结构）
       await this.recordNodeSuccess(target.name);
-      await SsrvpnNotifier.update('TunBox 已连接', target.name, '↓ 0 B/s  ↑ 0 B/s');
+      // 通知权限从未授予时弹一次系统授权框（真机 1600004 disabled 实锤：
+      // 不授权则常驻通知发不出，通知栏只剩系统 VPN 通知的运行时长）
+      SsrvpnNotifier.ensurePermission(this.context).catch((e: Object): void => {
+        AppLogger.warn(TAG, `ensure notification permission failed: ${AppLogger.errText(e)}`);
+      });
+      // 节点/速率/时长合并进系统长时任务通知（LIVE_VIEW），应用自有常驻通知已废除
+      // —— 两条通知重复（用户实锤），这里只清掉可能残留的旧 id-1001
+      SsrvpnNotifier.cancel().catch((): void => {});
       this.notify();
       AppLogger.info(TAG, `connected to node ${target.name}`);
       // P0-2 订阅自救：连接成功 → 隧道已可用（拉订阅天然走 VPN 出网），
@@ -2970,9 +2966,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // CDN 错误页/拦截页同样可能很大，一旦把非 MMDB 内容按 geoip.metadb 落盘，
       // 内核侧 mmdb.Verify 会判定无效并**删除文件后重新联网下载**，等于把坑 40
       // 又引回来（config.Parse 阶段同步阻塞）。宁可下载失败，也不要写坏文件。
-      return await this.downloadAsset(GEOIP_MIRRORS, dest, 1024 * 100,
-        (buf: ArrayBuffer): boolean => ConnectionOrchestrator.bufferMagicOk(buf,
-          [0xAB, 0xCD, 0xEF, 0x4D]), source, 'geoip.metadb');
+      // 真源 8.4MB：体积下限 4MB（半截下载必小于它），标记在**尾部**而非头部
+      // （旧头部魔数判据把合法文件全判成坏，见 isGeoipReady 注释）。
+      return await this.downloadAsset(GEOIP_MIRRORS, dest, 1024 * 1024 * 4,
+        (buf: ArrayBuffer): boolean => ConnectionOrchestrator.bufferTailMagicOk(buf),
+        source, 'geoip.metadb');
     } finally {
       this.geoipDownloading = false;
     }
@@ -2998,6 +2996,29 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * （国内直连 github 不可达），等于把坑 40 重新引回来。
    * 魔数：MMDB 文件头前 4 字节固定为 0xAB 0xCD 0xEF 'M'。
    */
+  /** geoip.metadb 尾部 MMDB 标记（`«ÍïMaxMind.com`）查找窗口 */
+  private static bufferTailMagicOk(buf: ArrayBuffer): boolean {
+    const marker: number[] = [0xAB, 0xCD, 0xEF, 0x4D, 0x61, 0x78, 0x4D, 0x69, 0x6E, 0x64, 0x2E,
+      0x63, 0x6F, 0x6D];
+    const b = new Uint8Array(buf);
+    if (b.byteLength < marker.length) {
+      return false;
+    }
+    for (let i = b.byteLength - marker.length; i >= 0; i--) {
+      let hit = true;
+      for (let j = 0; j < marker.length; j++) {
+        if (b[i + j] !== marker[j]) {
+          hit = false;
+          break;
+        }
+      }
+      if (hit) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private isGeoipReady(): boolean {
     if (this.context === null) {
       return false;
@@ -3005,17 +3026,27 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     const path = `${this.context.cacheDir}/geoip.metadb`;
     let file: fs.File | null = null;
     try {
-      if (fs.statSync(path).size < 1024 * 100) {
+      const size = fs.statSync(path).size;
+      if (size < 1024 * 100) {
         return false;
       }
+      // MMDB 元数据标记 `«ÍïMaxMind.com` 在**文件尾部**（实测 meta-rules-dat
+      // geoip.metadb 8.4MB，标记位于倒数 ~185 字节；文件头是 `00 00 01 15 ...`）。
+      // 旧版读头部 4 字节判魔数，真文件永远判「损坏」→ GEOIP 分流被降级；
+      // 更糟的是内核 mmdb.Verify 判定损坏时会**删档并同步联网重下**，国内不可达
+      // → config.Parse 阻塞 20s 超时（真机表现为「内核启动超时」）。
+      // 判据改为：体积够 + 尾部窗口内存在标记。
       file = fs.openSync(path, fs.OpenMode.READ_ONLY);
-      const head = new ArrayBuffer(4);
-      const read = fs.readSync(file.fd, head);
-      if (read < 4) {
+      const window = 4096;
+      const readLen = Math.min(window, size);
+      const tail = new ArrayBuffer(readLen);
+      // HarmonyOS fileIo 无 lseekSync：readSync 支持 options.offset（**文件内**偏移）
+      // + length（读多少），第四参误传会落到缓冲区长度上。直接用 options 定位读取。
+      const got = fs.readSync(file.fd, tail, { offset: size - readLen, length: readLen });
+      if (got < readLen) {
         return false;
       }
-      const b = new Uint8Array(head);
-      return b[0] === 0xAB && b[1] === 0xCD && b[2] === 0xEF && b[3] === 0x4D;
+      return ConnectionOrchestrator.bufferTailMagicOk(tail);
     } catch (e) {
       return false;
     } finally {
@@ -3369,9 +3400,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.api.traffic().then((t: TrafficSnapshot) => {
         this.traffic = t;
         if (this.state === ConnState.CONNECTED) {
-          SsrvpnNotifier.update('TunBox 已连接',
-            this.lastNodeName.length > 0 ? this.lastNodeName : '已连接',
-            `↓ ${this.formatSpeed(t.downloadSpeed)}  ↑ ${this.formatSpeed(t.uploadSpeed)}`);
+          TaskProgressUpdater.updateLive(
+            this.notifyNodeText(this.lastNodeName.length > 0 ? this.lastNodeName : '已连接'),
+            `↓ ${this.formatSpeed(t.downloadSpeed)}  ↑ ${this.formatSpeed(t.uploadSpeed)}`,
+            this.connDurationText());
         }
         this.notify();
       }).finally(() => {
@@ -3418,6 +3450,34 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
     }
     return `${(bytesPerSecond / 1024 / 1024).toFixed(2)} MB/s`;
+  }
+
+  /**
+   * 常驻通知栏的连接时长（H:MM:SS）。startedAt=0（未连接）时不显示时长段。
+   */
+  private connDurationText(): string {
+    if (this.startedAt <= 0) {
+      return '';
+    }
+    let s = Math.floor((Date.now() - this.startedAt) / 1000);
+    if (s < 0) {
+      s = 0;
+    }
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const mm = m < 10 ? `0${m}` : `${m}`;
+    const ss = sec < 10 ? `0${sec}` : `${sec}`;
+    return `${h}:${mm}:${ss}`;
+  }
+
+  /** 通知标题里的节点名：截断过长的名字，避免通知栏标题被挤没 */
+  private notifyNodeText(name: string): string {
+    const n = name.trim();
+    if (n.length <= 24) {
+      return n;
+    }
+    return `${n.substring(0, 24)}…`;
   }
 
   formatBytes(total: number): string {

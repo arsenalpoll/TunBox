@@ -42,6 +42,18 @@ export class Subscription {
    * 非敏感（只是缓存校验值），随 preferences 正常持久化。
    */
   etag: string = '';
+  /**
+   * 订阅 yaml 自带的 rules 段（解析归一后的规则行，每行一条、不含 `rules:` 头）。
+   * 生成内核配置时按序写入 rules 段，让订阅自带的分流规则真实生效 ——
+   * 此前订阅导入只保留节点与组，rules 段被整段丢弃，全部流量落到内置 MATCH,PROXY。
+   * 非敏感，随 preferences 正常持久化。
+   */
+  subRules: string = '';
+  /**
+   * 订阅 yaml 自带的 rule-providers 段（归一化后的块式原文，2 空格缩进）。
+   * 与 subRules 配套：RULE-SET 引用的 provider 必须声明，二者缺一不可。
+   */
+  subRuleProviders: string = '';
 
   static newSubscription(id: string, name: string, url: string): Subscription {
     const s = new Subscription();
@@ -71,6 +83,8 @@ export class Subscription {
     j.rawProviderState = s.rawProviderState;
     j.rawProviderNodeEstimate = s.rawProviderNodeEstimate;
     j.etag = s.etag;
+    j.subRules = s.subRules;
+    j.subRuleProviders = s.subRuleProviders;
     return j;
   }
 
@@ -95,6 +109,9 @@ export class Subscription {
     s.rawProviderNodeEstimate = j.rawProviderNodeEstimate ?? 0;
     // 同理：etag 是后加字段，旧存储没有 → 空串 = 下次做完整拉取
     s.etag = j.etag ?? '';
+    // 订阅自带 rules/rule-providers 同为后加字段，旧存储没有 → 空串
+    s.subRules = j.subRules ?? '';
+    s.subRuleProviders = j.subRuleProviders ?? '';
     return s;
   }
 }

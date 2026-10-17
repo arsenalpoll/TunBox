@@ -2,6 +2,7 @@
   "app": {
     // 命令行 hvigor 无法使用 DevEco 加密密码串，signingConfigs 保持空（产 unsigned 包），
     // 签名一律走仓库根 sign-nexus-package.ps1（材料在 AGC通用证书目录，不入库）。
+    // test 分支的调试签名材料在 git 历史（release merge 前的提交）里，需要时恢复。
     "signingConfigs": [],
     "products": [
       {

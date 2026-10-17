@@ -6,13 +6,16 @@
  *                subscription_processing.dart / subscription_undo_record.dart
  *
  * 敏感凭据存储策略（对齐 SettingsService.apiSecret 的 AssetStore 先例）：
- * - 节点 password/uuid/protocolParam/obfsParam、订阅 headerValue 只允许写入系统加密
- *   AssetStore（@ohos.security.asset / @kit.AssetStoreKit），禁止降级为明文 preferences。
- * - 其余节点元数据（server/port/method/network/TLS 参数等）仍存 preferences，
+ * - 节点 password/uuid/protocolParam/obfsParam/extraOpts/rawUri、订阅 headerValue
+ *   只允许写入系统加密 AssetStore（@ohos.security.asset / @kit.AssetStoreKit），
+ *   禁止降级为明文 preferences。extraOpts 可内嵌 obfs-password、rawUri 是整条节点
+ *   链接，两者与 password 同级敏感，不能按字段名猜测是否安全。
+ * - 其余节点元数据（server/port/method/network/TLS 参数/rawTemplate 等）仍存 preferences。
+ *   rawTemplate 由 YamlMerger.buildRawTemplate 在构造期剔除全部凭据键，故可持久化。
  *   alias 采用稳定键 "ssrvpn_node|<nodeId>|<field>" / "ssrvpn_sub|<subId>|headerValue"。
- * - Asset 缺失（首次升级、清除数据、写入失败回滚）时回退读取一次性绑定字段：
- *   节点用 node.rawUri（上游同样只写 Asset，绝不写 preferences），订阅用内存态，
- *   两者都不落盘明文。
+ * - 写 preferences 前**逐字段**确认加密层已回读一致，才允许清空该字段的明文；
+ *   加密层不可用或回读不一致时保留明文（fail-closed：宁可多留一份也不丢凭据），
+ *   并由 credentialMissingCount 与诊断面板如实告知用户。
  * - 一次性迁移：把历史明文 preferences 中的凭据写入 Asset 并回读校验，成功后才删除明文；
  *   任一步失败保留明文并记录，绝不丢数据。迁移幂等（重跑只重写加密层，不清明文）。
  */
@@ -29,6 +32,7 @@ import { SubscriptionParseResult, SubscriptionParser } from './SubscriptionParse
 import {
   SubscriptionFetchPolicy, SubscriptionFetchError, SubscriptionFetchErrorKind, SubscriptionFetchResult
 } from './stubs.ts';
+import { SubscriptionQuotaService } from './SubscriptionQuotaService.ts';
 import { YamlMerger, MergedProxy, YamlMergeError, YamlNodeError } from './YamlMerger.ts';
 import { ClashConfigGenerator, ProxyDropStats } from './ClashConfigGenerator.ts';
 import { ProxyProviderEntry, ProxyProviderParser } from './ProxyProviderParser.ts';
@@ -37,7 +41,7 @@ import {
 } from './stubs.ts';
 import {
   CredentialStore, CredentialMigrationReport, NodeCredentialValues, SubscriptionCredentialSource,
-  CRED_PREF_NAME, MIGRATION_FLAG_KEY, NODE_CRED_FIELDS, baseNodeName, nodeCredentialId, setCredentialLogger
+  CRED_PREF_NAME, NODE_CRED_FIELDS, baseNodeName, nodeAlias, nodeCredentialId, setCredentialLogger, subAlias
 } from './stubs.ts';
 import { AppLogger } from './stubs.ts';
 import {
@@ -45,8 +49,13 @@ import {
 } from './ConcurrentRefresh.ts';
 
 const TAG = 'SubscriptionService';
-
 const PREF_NAME = 'ssrvpn_subscriptions';
+
+/** rules/rule-providers 段提取结果（模块级显式类，满足 arkts-no-untyped-obj-literals） */
+class SubscriptionRulesSections {
+  rules: string = '';
+  providers: string = '';
+}
 const KEY_SUBS = 'subscriptions_json';
 const KEY_NODES = 'nodes_json';
 const KEY_HIDDEN = 'hidden_nodes_json';
@@ -110,6 +119,13 @@ function nodeUriKey(nodeId: string): string {
   return `rawuri|${nodeId}`;
 }
 
+/** 批量节点直链导入结果（addDirectNodesText 用），重复与无效逐条隔离不互相影响 */
+export class DirectBatchResult {
+  added: number = 0;
+  duplicate: number = 0;
+  invalid: number = 0;
+}
+
 export class SubscriptionService {
   /**
    * 进程级单例（先例：ConnectionOrchestrator.instance()）。
@@ -156,6 +172,49 @@ export class SubscriptionService {
   /** 最近一次节点恢复（nodes_json → 内存）被丢弃的记录数与原因 */
   lastRestoreInvalidCount: number = 0;
   lastRestoreInvalidReasons: string = '';
+
+  /**
+   * 网络性拉取失败待重试标记（订阅 id → 失败时刻）。
+   *
+   * 为什么需要（P0-2 订阅自救，对齐 iOS「先连 VPN 再刷新」的自动版）：
+   * 拉取全走直连（SubscriptionFetchPolicy 无 per-request proxy，ArkTS http
+   * 不支持 usingProxy），被阻断的面板在未连接时必然失败 —— advice 已提示
+   * 「请先连接 VPN 后重试」，但用户手动重试是多余的一步。现在把
+   * NETWORK_ERROR 失败记进本表，VPN 连接成功后（ConnectionOrchestrator
+   * connect() 成功路径）自动补拉一次，用户无感修复。
+   */
+  private pendingNetworkRetry: Map<string, number> = new Map();
+  /** 标记有效期：超过后视为陈旧（用户可能已手动修好），不再自动补拉 */
+  private static readonly PENDING_RETRY_TTL_MS: number = 30 * 60 * 1000;
+
+  /** 记一次网络性拉取失败（幂等：同一条订阅只保留最新时刻） */
+  markNetworkFetchFailure(id: string): void {
+    this.pendingNetworkRetry.set(id, Date.now());
+    // 顺带清理陈旧标记，防止长期未连接时无限堆积
+    const cutoff = Date.now() - SubscriptionService.PENDING_RETRY_TTL_MS;
+    const staleKeys: string[] = [];
+    this.pendingNetworkRetry.forEach((at: number, key: string): void => {
+      if (at < cutoff) {
+        staleKeys.push(key);
+      }
+    });
+    for (const key of staleKeys) {
+      this.pendingNetworkRetry.delete(key);
+    }
+  }
+
+  /** 取出并清空待补拉标记（只返回仍在 TTL 内的 id），无标记时返回空数组 */
+  takePendingNetworkRetries(): string[] {
+    const now = Date.now();
+    const ids: string[] = [];
+    this.pendingNetworkRetry.forEach((at: number, key: string): void => {
+      if (now - at <= SubscriptionService.PENDING_RETRY_TTL_MS) {
+        ids.push(key);
+      }
+    });
+    this.pendingNetworkRetry.clear();
+    return ids;
+  }
   /**
    * 双轨（原始订阅 → file provider）最近一次的诊断口径字符串：
    * 「解析到 N / provider 读到 M」，诊断面板直接展示（任何差额可见）。
@@ -203,13 +262,23 @@ export class SubscriptionService {
     this.proxyGroups = [];
     this.hiddenNodes = [];
 
-    // 敏感凭据专用 preferences（仅存放一次性绑定字段，凭据本体在 AssetStore）
+    // 敏感凭据专用 preferences（仅存放一次性绑定字段与别名标记，凭据本体在 AssetStore）
     if (this.credStore === null) {
       this.credStore = await preferences.getPreferences(context, CRED_PREF_NAME);
     }
-    // 恢复会话级别名缓存：不支持批量查询的固件上，重启后凭据的唯一可读来源
-    // （缺失会导致节点被判缺 uuid/password，配置生成整批丢弃 → 测速 404）
-    CredentialStore.importAliasCache(await this.credStore.get(KEY_ALIAS_CACHE, '[]') as string);
+    // 恢复已封存别名标记（仅标记、不含值）；必要时以新格式重写该键，
+    // 净化历史版本遗留的明文凭据缓存（旧格式 [[alias, value], ...] 的值一律丢弃）。
+    //
+    // 只在**内容确实变化**时才回写：每次启动都无条件 put+flush 是两次无谓 IPC，
+    // 而且此刻能力尚未经真实查询确认，写回的仍是"怀疑值"。净化仍然保留 ——
+    // 旧格式或含值的缓存必然与新导出结果不同，因此必定被重写。
+    const prevAliasCache = await this.credStore.get(KEY_ALIAS_CACHE, '[]') as string;
+    CredentialStore.importAliasCache(prevAliasCache);
+    const nextAliasCache = CredentialStore.exportAliasCache();
+    if (nextAliasCache !== prevAliasCache) {
+      await this.credStore.put(KEY_ALIAS_CACHE, nextAliasCache);
+      await this.credStore.flush();
+    }
     setCredentialLogger((msg: string) => AppLogger.info(TAG, msg));
 
     try {
@@ -250,12 +319,22 @@ export class SubscriptionService {
       AppLogger.warn(TAG, 'invalid proxy groups preferences ignored');
     }
 
+    // 分阶段计时（真机排查用）：订阅页加载慢时，日志能直接指出时间花在哪一段。
+    // 每条日志都在"阶段完成"时打出，比较相邻两条的时间差即为该阶段耗时。
+    const t0 = Date.now();
+    // 凭据回填作用域（2026-10-16 冷启动 4.5s 的修复）：批量查询不可用的固件上，
+    // 回填是逐条 Asset IPC，而 knownAliases 是历史累积的（634 条里活跃约 130 条）。
+    // 这里把"当前还活着的节点 + 手工节点 + 当前订阅"的候选别名交给凭据层，
+    // 回填只真读这一部分；作用域外的孤儿别名不会被读、更不会被删（用到时逐条兜底）。
+    SubscriptionService.applyHydrateScope(this.subscriptions, this.nodes);
     // 1) 一次性凭据迁移（必须在任何 persist 之前，避免明文被再次写回）
     await this.runCredentialMigrationOnce();
+    AppLogger.info(TAG, `[perf] stage1 migration done at +${Date.now() - t0}ms`);
     // 2) 从加密层回填订阅凭据（headerValue 从不落 preferences）
     await this.hydrateSubscriptionCredentials();
     // 3) 节点凭据回填（Asset 缺失时用一次性 rawUri 解析兜底）
     await this.initNodes(this.nodes);
+    AppLogger.info(TAG, `[perf] stage2 hydrate done at +${Date.now() - t0}ms`);
 
     // 4) 明文清扫：加密层验证通过的记录删除 preferences 明文字段
     // 历史数据可能存在重名节点(内核会拒绝启动), 加载时即去重并落库
@@ -264,6 +343,7 @@ export class SubscriptionService {
     // 4.5) 分组恢复兜底：旧存储没有 proxy_groups_json 但存在 yaml_cache_ 的订阅，
     //      从结构化缓存重解析分组并按当前节点池物化（升级后首次启动即可用）。
     const groupsRebuilt = await this.rebuildGroupsFromCacheIfMissing();
+    AppLogger.info(TAG, `[perf] stage3 groups done at +${Date.now() - t0}ms`);
 
     let directGroup = this.subscriptions.find((s) => s.id === DIRECT_GROUP_ID);
     let createdDirectGroup = false;
@@ -389,6 +469,28 @@ export class SubscriptionService {
     }
   }
 
+  /**
+   * 从订阅原文提取 rules / rule-providers 段（YamlMerger 归一化：2 空格基准缩进）。
+   * 任何解析异常都返回空段 —— 订阅自带规则的提取绝不影响节点导入主流程。
+   */
+  private static extractRulesSections(body: string): SubscriptionRulesSections {
+    const out = new SubscriptionRulesSections();
+    try {
+      out.rules = YamlMerger.extractSection(body, 'rules').trim();
+      out.providers = YamlMerger.extractSection(body, 'rule-providers').trim();
+    } catch (e) {
+      // 提取失败按「订阅未携带规则」处理，节点导入不受影响
+    }
+    return out;
+  }
+
+  /** 订阅原文 → 该订阅的自带 rules/rule-providers 落账（无规则段时清空旧值） */
+  private static applyRulesSections(sub: Subscription, body: string): void {
+    const sections = SubscriptionService.extractRulesSections(body);
+    sub.subRules = sections.rules;
+    sub.subRuleProviders = sections.providers;
+  }
+
   /** 登记 provider（生成器 planRawProviders 只认登记表 + 文件存在性） */
   private registerRawProvider(subscriptionId: string, nodeEstimate: number): void {
     const entry = new RawProviderEntry();
@@ -399,6 +501,41 @@ export class SubscriptionService {
     entry.bytes = RawSubscriptionStore.sizeOf(subscriptionId);
     entry.nodeEstimate = nodeEstimate;
     RawSubscriptionStore.upsert(entry);
+  }
+
+  /**
+   * 计算并设置凭据回填作用域：当前订阅 + 当前节点 + 手工节点的候选别名。
+   * 只对"批量查询不可用、需要逐条回填"的固件有意义（可用时批量一次拿全，无成本）。
+   * called from doInit（回填前）——重建作用域而不是增量维护，幂等且无遗漏。
+   */
+  private static applyHydrateScope(subs: Subscription[], nodes: ProxyNode[]): void {
+    const scope = new Set<string>();
+    for (const s of subs) {
+      if (s.id.length > 0) {
+        scope.add(subAlias(s.id));
+      }
+    }
+    for (const n of nodes) {
+      const nodeId = nodeCredentialId(n);
+      if (nodeId.length === 0) {
+        continue;
+      }
+      for (const f of NODE_CRED_FIELDS) {
+        scope.add(nodeAlias(nodeId, f));
+      }
+    }
+    // 手工节点（NodeEditPage 的常驻分组）不在本服务节点池里，但凭据在同一键空间，
+    // 同样纳入作用域；没有任何手工节点时这段循环是空转，成本为零。
+    for (const n of ManualNodeStore.all()) {
+      const nodeId = nodeCredentialId(n);
+      if (nodeId.length === 0) {
+        continue;
+      }
+      for (const f of NODE_CRED_FIELDS) {
+        scope.add(nodeAlias(nodeId, f));
+      }
+    }
+    CredentialStore.setHydrateScope(Array.from(scope));
   }
 
   /**
@@ -429,7 +566,7 @@ export class SubscriptionService {
     try {
       report = await CredentialStore.canonicalize(this.nodes, sources, !firstRun);
     } catch (e) {
-      AppLogger.warn(TAG, `credential canonicalize aborted: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `credential canonicalize aborted: ${AppLogger.errText(e)}`);
       return;
     }
 
@@ -480,7 +617,13 @@ export class SubscriptionService {
       `credential migration done: ${report.migratedNodes} node(s) / ${report.migratedSubscriptions} sub credential(s) moved to asset store`);
   }
 
-  /** 残留一键扫描（专项验证用）：返回 preferences 中仍可枚举到的明文凭据键 */
+  /**
+   * 残留一键扫描（专项验证用）：返回 preferences 中仍可枚举到的明文凭据键。
+   *
+   * 必须扫描**全部**出现位置：只查第一处会漏报 —— 第一个节点该字段是空串、
+   * 后面的节点却有值时，第一个匹配点恰好是空串，审计会误判为"无残留"。
+   * 凭据残留是安全结论，宁可多报也不能漏报。
+   */
   async scanPlaintextResidue(): Promise<string[]> {
     const out: string[] = [];
     if (this.store === null) {
@@ -490,19 +633,33 @@ export class SubscriptionService {
     const subsRaw = await this.store.get(KEY_SUBS, '[]') as string;
     for (const field of CredentialStore.plaintextFieldKeys()) {
       const needle = `"${field}":"`;
-      if (nodesRaw.includes(needle)) {
-        const probe = `"${field}":""`;
-        // 空串是规范化目标，只有非空值才算残留
-        const hit = nodesRaw.indexOf(needle);
-        if (hit >= 0 && !nodesRaw.startsWith(probe, hit)) {
-          out.push(`nodes_json.${field}`);
-        }
+      const probe = `"${field}":""`;
+      if (SubscriptionService.hasNonEmptyField(nodesRaw, needle, probe)) {
+        out.push(`nodes_json.${field}`);
       }
-      if (subsRaw.includes(needle)) {
+      if (SubscriptionService.hasNonEmptyField(subsRaw, needle, probe)) {
         out.push(`subscriptions_json.${field}`);
       }
     }
     return out;
+  }
+
+  /**
+   * 该 JSON 文本中是否存在**任一**非空的指定字段（空串是规范化目标，不算残留）。
+   * 公开：纯谓词、无副作用，供残留审计单测直接断言（安全结论必须能被测试覆盖）。
+   */
+  static hasNonEmptyField(text: string, needle: string, probe: string): boolean {
+    let from = 0;
+    for (;;) {
+      const hit = text.indexOf(needle, from);
+      if (hit < 0) {
+        return false;
+      }
+      if (!text.startsWith(probe, hit)) {
+        return true;
+      }
+      from = hit + needle.length;
+    }
   }
 
   /**
@@ -537,11 +694,14 @@ export class SubscriptionService {
           n.rawUri = '';
           sealedNodes = sealedNodes + 1;
         }
-        await this.store.put(KEY_NODES, JSON.stringify(SubscriptionService.nodesToJson(this.nodes)));
+        // report 传 null：明文清理由本方法**逐节点**用 hasVerifiableStoredCredentials
+        // 验证后直接改内存完成，不再走 nodesToJson 的二次判定（避免两套判据不一致）。
+        // 未通过验证的节点保留明文 = fail-closed，宁可多留一份也不丢凭据。
+        await this.store.put(KEY_NODES, JSON.stringify(SubscriptionService.nodesToJson(this.nodes, null)));
         await this.store.flush();
       } catch (e) {
         AppLogger.warn(TAG,
-          `plaintext seal failed (plaintext kept in memory only, no credential loss): ${e instanceof Error ? e.message : String(e)}`);
+          `plaintext seal failed (plaintext kept in memory only, no credential loss): ${AppLogger.errText(e)}`);
       }
     }
     if (unverifiedNodes > 0) {
@@ -564,8 +724,12 @@ export class SubscriptionService {
    * 无需凭据的节点（如 anytls/tuic 中继型）直接视为可封存。
    */
   private static async hasVerifiableStoredCredentials(n: ProxyNode): Promise<boolean> {
+    // extraOpts / rawUri 自 2026-10 起同样是 Asset 字段（写入端见 CredentialStore.
+    // NODE_CRED_FIELDS），因此"可封存"判定必须一并校验，否则会出现
+    // 「明文已清、加密层却没存」→ hysteria2 混淆/端口跳跃/直链回退静默失效。
     const needed = n.password.length > 0 || n.uuid.length > 0
-      || n.protocolParam.length > 0 || n.obfsParam.length > 0;
+      || n.protocolParam.length > 0 || n.obfsParam.length > 0
+      || n.extraOpts.length > 0 || n.rawUri.length > 0;
     if (!needed) {
       return true;
     }
@@ -588,19 +752,24 @@ export class SubscriptionService {
     if (n.obfsParam.length > 0 && stored.obfsParam !== n.obfsParam) {
       return false;
     }
+    if (n.extraOpts.length > 0 && stored.extraOpts !== n.extraOpts) {
+      return false;
+    }
+    if (n.rawUri.length > 0 && stored.rawUri !== n.rawUri) {
+      return false;
+    }
     return true;
   }
 
+  /**
+   * 迁移标记写入：与 loadMigrationFlag（从 Asset 读）**同一存储**。
+   *
+   * 历史 bug：这里写 preferences、那里读 Asset，永远读不到 → isFirstRun() 恒为
+   * true → sealPlaintext（130 节点循环 + 一次大 JSON 落盘）每次启动都重跑。
+   * 真机实测这一条就占 1.6s。
+   */
   private async markMigrationDone(): Promise<void> {
-    if (this.credStore === null) {
-      return;
-    }
-    try {
-      await this.credStore.put(MIGRATION_FLAG_KEY, '1');
-      await this.credStore.flush();
-    } catch (e) {
-      AppLogger.warn(TAG, `migration flag write failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+    await CredentialStore.markMigrationFlagInAsset();
   }
 
   private static readJsonStringArray(raw: string): string[] {
@@ -625,7 +794,8 @@ export class SubscriptionService {
 
   /**
    * 节点凭据回填：Asset 优先。
-   * 缺失时回退一次性绑定的 rawUri（内存解析，绝不落盘），在加密层写入成功后即解除绑定。
+   * 缺失时回退一次性绑定的 rawUri（解析仅驻留内存；绑定本身在解除前会短暂驻留
+   * preferences，见 storeCredentials —— 写入成功后由 markNodeSealed 立即删除）。
    */
   async initNodes(nodes: ProxyNode[]): Promise<void> {
     if (this.credStore === null) {
@@ -659,6 +829,15 @@ export class SubscriptionService {
       n.uuid = values.uuid;
       n.protocolParam = values.protocolParam;
       n.obfsParam = values.obfsParam;
+      // extraOpts 可内嵌 obfs-password / ports，rawUri 是整条节点链接：两者都已从
+      // Preferences 剥离，必须在这里回填，否则 hysteria2 混淆与端口跳跃会静默失效。
+      // 只在加密层确实有值时才覆盖，避免把解析阶段刚得到的值抹成空串。
+      if (values.extraOpts.length > 0) {
+        n.extraOpts = values.extraOpts;
+      }
+      if (values.rawUri.length > 0) {
+        n.rawUri = values.rawUri;
+      }
       if (uri.length > 0) {
         await this.markNodeSealed(nodeCredentialId(n), n, sealed);
       }
@@ -684,7 +863,7 @@ export class SubscriptionService {
       await this.credStore.put('sealed_node_keys_json', JSON.stringify(Array.from(sealed)));
       await this.credStore.flush();
     } catch (e) {
-      AppLogger.warn(TAG, `sealed node record update failed: ${e instanceof Error ? e.message : String(e)}`);
+      AppLogger.warn(TAG, `sealed node record update failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -801,16 +980,35 @@ export class SubscriptionService {
     return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
   }
 
+  /**
+   * 落盘的 lastRefreshResult 白名单。
+   *
+   * ⚠ 这里漏掉任何一个**会被写入**的枚举值，都会造成**订阅静默丢失**：
+   * mapSubs 对白名单外的值走 `skipped++; continue;`，整条订阅记录被丢弃 ——
+   * 用户下次启动时那条订阅直接不见了，且只有一行 warn 日志。
+   *
+   * 曾经真实踩到：RATE_LIMITED / EMPTY_ENTRIES 会被 1869/1788/1989 写入，
+   * 但不在白名单里 ⇒ 一次 429 限流或「200 但 0 条目」之后，重启即丢订阅。
+   * 因此本函数改为**遍历枚举全集**，新增枚举值自动纳入，不会再漏。
+   */
   private static validRefreshStatus(value: string): boolean {
-    return value === '' || value === SubscriptionRefreshStatus.OK
-      || value === SubscriptionRefreshStatus.NOT_MODIFIED
-      || value === SubscriptionRefreshStatus.NETWORK_ERROR
-      || value === SubscriptionRefreshStatus.HTTP_ERROR
-      || value === SubscriptionRefreshStatus.EMPTY_RESPONSE
-      || value === SubscriptionRefreshStatus.DECODE_ERROR
-      || value === SubscriptionRefreshStatus.PARSE_ERROR
-      || value === SubscriptionRefreshStatus.LIMIT_EXCEEDED
-      || value === SubscriptionRefreshStatus.PERSIST_ERROR;
+    if (value === '') {
+      return true;
+    }
+    const all: string[] = [
+      SubscriptionRefreshStatus.OK,
+      SubscriptionRefreshStatus.NOT_MODIFIED,
+      SubscriptionRefreshStatus.NETWORK_ERROR,
+      SubscriptionRefreshStatus.HTTP_ERROR,
+      SubscriptionRefreshStatus.EMPTY_RESPONSE,
+      SubscriptionRefreshStatus.DECODE_ERROR,
+      SubscriptionRefreshStatus.PARSE_ERROR,
+      SubscriptionRefreshStatus.LIMIT_EXCEEDED,
+      SubscriptionRefreshStatus.PERSIST_ERROR,
+      SubscriptionRefreshStatus.RATE_LIMITED,
+      SubscriptionRefreshStatus.EMPTY_ENTRIES
+    ];
+    return all.indexOf(value) >= 0;
   }
 
   private static mapSubs(json: Object): Subscription[] {
@@ -848,6 +1046,17 @@ export class SubscriptionService {
         || !Number.isInteger(j.rawProviderNodeEstimate)
         || j.rawProviderNodeEstimate < 0 || j.rawProviderNodeEstimate > 100000) {
         j.rawProviderNodeEstimate = 0;
+      }
+      // etag 同为后加字段：非法/缺失一律归零（= 下次做完整拉取），不丢订阅
+      if (typeof j.etag !== 'string' || j.etag.length > 1024) {
+        j.etag = '';
+      }
+      // 订阅自带 rules/rule-providers：非法值就地归一（旧存储无这些键），绝不丢订阅
+      if (typeof j.subRules !== 'string' || j.subRules.length > 256 * 1024) {
+        j.subRules = '';
+      }
+      if (typeof j.subRuleProviders !== 'string' || j.subRuleProviders.length > 256 * 1024) {
+        j.subRuleProviders = '';
       }
       out.push(Subscription.fromPersistJson(j));
     }
@@ -967,7 +1176,7 @@ export class SubscriptionService {
 
   /** 统一异常文案（不输出 URL / 凭据，只输出错误消息） */
   private static describeError(e: Object): string {
-    return e instanceof Error ? e.message : String(e);
+    return AppLogger.errText(e);
   }
 
   /**
@@ -1227,6 +1436,7 @@ export class SubscriptionService {
       n.skipCertVerify = m.skipCertVerify;
       n.flow = m.flow;
       n.clientFingerprint = m.clientFingerprint;
+      n.certFingerprint = m.certFingerprint;
       n.realityPublicKey = m.realityPublicKey;
       n.realityShortId = m.realityShortId;
       n.wsPath = m.wsPath;
@@ -1299,6 +1509,9 @@ export class SubscriptionService {
         || typeof j.skipCertVerify !== 'boolean'
         || !SubscriptionService.validString(j.flow, 4096)
         || !SubscriptionService.validString(j.clientFingerprint, 256)
+        // certFingerprint 是**后加**字段：老 nodes_json 里没有这个键，
+        // 必须按可选校验，否则整条节点记录会被丢弃（同 validRefreshStatus 那类坑）。
+        || (j.certFingerprint !== undefined && !SubscriptionService.validString(j.certFingerprint, 256))
         || !SubscriptionService.validString(j.realityPublicKey, 4096)
         || !SubscriptionService.validString(j.realityShortId, 4096)
         || !SubscriptionService.validString(j.wsPath, 64 * 1024)
@@ -1342,6 +1555,7 @@ export class SubscriptionService {
       n.skipCertVerify = j.skipCertVerify;
       n.flow = j.flow;
       n.clientFingerprint = j.clientFingerprint;
+      n.certFingerprint = j.certFingerprint ?? '';
       n.realityPublicKey = j.realityPublicKey;
       n.realityShortId = j.realityShortId;
       n.wsPath = j.wsPath;
@@ -1404,14 +1618,20 @@ export class SubscriptionService {
     if (this.store === null) {
       return 0;
     }
-    // 凭据先写加密层（订阅 headerValue / 节点 rawUri 一次性绑定），再落元数据
-    const credentialFailed = await this.storeCredentials();
+    // 凭据先写加密层（订阅 headerValue / 节点 rawUri 一并入 Asset），再落元数据。
+    // 报告决定元数据里哪些节点的明文凭据**可以**被安全清空（见 nodesToJson）。
+    const report = await this.storeCredentials();
+    // 返回给调用方的仍是"凭据未落盘字段数"（>0 即失败，调用方据此写诊断）。
+    // 加密层不可用/未初始化时没有任何字段能确认入库，按节点数计，确保非零。
+    const credentialFailed = report === null
+      ? this.nodes.length
+      : report.failed + (report.storeUnavailable ? this.nodes.length : 0);
     const subsJson: SubscriptionJson[] = [];
     for (const s of this.subscriptions) {
       subsJson.push(Subscription.toJson(s));
     }
     await this.store.put(KEY_SUBS, JSON.stringify(subsJson));
-    await this.store.put(KEY_NODES, JSON.stringify(SubscriptionService.nodesToJson(this.nodes)));
+    await this.store.put(KEY_NODES, JSON.stringify(SubscriptionService.nodesToJson(this.nodes, report)));
     await this.store.put(KEY_HIDDEN, JSON.stringify(this.hiddenNodes));
     const groupsJson: ProxyGroupJson[] = [];
     for (const g of this.proxyGroups) {
@@ -1419,50 +1639,44 @@ export class SubscriptionService {
     }
     await this.store.put(KEY_GROUPS, JSON.stringify(groupsJson));
     await this.store.flush();
+    // 订阅集合（含节点/分组）发生任何持久化变更 → 推进 revision。
+    // 节点页用它决定「是否要重新自动测速」：revision 变了说明订阅被导入/刷新/增删，
+    // 此时旧延迟大概率失效，值得再测一轮；revision 没变就不再重复测。
+    // 放在唯一 persist 收口点，避免逐个入口（导入/刷新/删订阅/加本地 yaml…）漏改。
+    AppStorage.setOrCreate('subscription_revision',
+      (AppStorage.get<number>('subscription_revision') ?? 0) + 1);
     return credentialFailed;
   }
 
   /**
    * 敏感凭据落盘（透明写入路径）：节点凭据写 AssetStore；
-   * 订阅 headerValue 同样入加密层，另存一次性绑定 rawUri 以便 Asset 缺失时回退。
-   * Asset 不可用时绝不写明文，仅记录告警（元数据仍可正常持久化）。
-   * 返回失败字段数（Asset 整体不可用时按节点数计, 确保上层诊断为非零）。
+   * 订阅 headerValue 同样入加密层。**绝不把凭据写入普通 Preferences**。
+   * 返回迁移报告（null = 加密层不可用/写出异常）；调用方据此决定是否清明文。
    */
-  private async storeCredentials(): Promise<number> {
+  private async storeCredentials(): Promise<CredentialMigrationReport | null> {
     if (this.credStore === null) {
-      return 0;
+      // 凭据偏好未初始化：本进程无法确认任何凭据已入库 → 必须按"未验证"处理，
+      // 既不写明文也不清明文（上层用 credentialMissingCount 如实提示）。
+      AppLogger.warn(TAG, 'credential preferences unavailable: credentials not persisted this round');
+      return null;
     }
-    let failed = 0;
+    let report: CredentialMigrationReport;
     try {
-      const report = await CredentialStore.canonicalize(this.nodes, this.subscriptionCredentialSources(), false);
-      failed = report.failed;
+      report = await CredentialStore.canonicalize(this.nodes, this.subscriptionCredentialSources(), false);
       if (report.storeUnavailable) {
-        // 加密层整体不可用：绝不写明文, 但凭据确实没有落盘, 必须计入诊断提示用户
-        failed = failed + this.nodes.length;
+        // 加密层整体不可用：绝不写明文, 但凭据确实没有落盘, 上层必须据此提示用户
         AppLogger.warn(TAG,
-          'credential store unavailable: node credentials were not persisted (plaintext metadata kept, no plaintext credential file written)');
+          'credential store unavailable: credentials not persisted; plaintext retained so connection keeps working');
       }
     } catch (e) {
-      AppLogger.warn(TAG, `credential store write aborted: ${e instanceof Error ? e.message : String(e)}`);
-      return -1;
+      AppLogger.warn(TAG, `credential store write aborted: ${AppLogger.errText(e)}`);
+      return null;
     }
-    const sealed = new Set<string>();
-    const rawSealed = await this.credStore.get('sealed_node_keys_json', '[]') as string;
-    for (const k of SubscriptionService.readJsonStringArray(rawSealed)) {
-      sealed.add(k);
-    }
-    for (const n of this.nodes) {
-      const id = nodeCredentialId(n);
-      if (sealed.has(id) || n.rawUri.length === 0) {
-        continue;
-      }
-      n.rawYaml = '';
-      await this.credStore.put(nodeUriKey(id), n.rawUri);
-    }
-    // 会话级别名缓存持久化：重启后凭据仍可读（批量查询不可用固件的唯一来源）
+    // 会话级别名标记持久化（仅别名、不含值）：批量查询不可用的固件重启后，
+    // 靠这份标记逐条从 AssetStore 回填凭据 —— 值绝不落 preferences。
     await this.credStore.put(KEY_ALIAS_CACHE, CredentialStore.exportAliasCache());
     await this.credStore.flush();
-    return failed;
+    return report;
   }
 
   private subscriptionCredentialSources(): SubscriptionCredentialSource[] {
@@ -1479,10 +1693,42 @@ export class SubscriptionService {
     return out;
   }
 
-  private static nodesToJson(nodes: ProxyNode[]): ProxyNodeJson[] {
+  /**
+   * 普通 Preferences 持久化专用的（近乎）无凭据 DTO。
+   *
+   * Preferences 是**明文**存储：任何凭据写进去都等于绕过 AssetStore 加密层。
+   * 因此凭据字段默认清空，只由 CredentialStore 持有、加载时经 initNodes 逐字段回填。
+   *
+   * 但清空必须 fail-closed 的**反面** —— 没验证过入库就绝不能清：加密层不可用
+   * （probe 失败）或该字段回读不一致时，Preferences 里那份明文是用户唯一可用的
+   * 副本。此时保留该字段明文，并由 credentialMissingCount 与诊断面板如实告知，
+   * 而不是让"保存成功"变成一次静默的数据丢失。
+   *
+   * 按**字段**而非整节点判定：每个字段在 initNodes 里各自独立回填，没有跨字段
+   * 依赖，所以只清已验证的那些能把明文暴露面压到最小且不丢任何数据。
+   *
+   * 与 CredentialStore.NODE_CRED_FIELDS 对齐（含 extraOpts 与 rawUri：两者都可能
+   * 内嵌 obfs-password / 完整节点链接，不能按字段名猜测是否敏感）。
+   * rawTemplate 例外：YamlMerger.buildRawTemplate 在构造期就剔除了全部凭据键，
+   * 它是生成端逐字回写所依赖的非敏感模板，必须持久化。
+   */
+  private static nodesToJson(nodes: ProxyNode[], report: CredentialMigrationReport | null): ProxyNodeJson[] {
     const out: ProxyNodeJson[] = [];
     for (const n of nodes) {
-      out.push(ProxyNodeJson.fromNode(n));
+      const j = ProxyNodeJson.fromNode(n);
+      const id = nodeCredentialId(n);
+      // 只有确认入库（回读一致）的字段才允许清空；未验证的一律保留明文
+      const clearable = (field: string, value: string): boolean => {
+        return report !== null && !report.storeUnavailable
+          && value.length > 0 && report.fieldStored(id, field);
+      };
+      if (clearable('password', j.password)) { j.password = ''; }
+      if (clearable('uuid', j.uuid)) { j.uuid = ''; }
+      if (clearable('protocolParam', j.protocolParam)) { j.protocolParam = ''; }
+      if (clearable('obfsParam', j.obfsParam)) { j.obfsParam = ''; }
+      if (clearable('extraOpts', j.extraOpts ?? '')) { j.extraOpts = ''; }
+      if (clearable('rawUri', j.rawUri)) { j.rawUri = ''; }
+      out.push(j);
     }
     return out;
   }
@@ -1502,6 +1748,7 @@ export class SubscriptionService {
     if (id === DIRECT_GROUP_ID) {
       return;
     }
+    const t0 = Date.now();
     // 双轨：删除订阅前先取出落盘原文（撤销窗口内可回写），随后立即删文件
     const rawBody = RawSubscriptionStore.readRaw(id);
     // 事务化快照以支持撤销
@@ -1513,6 +1760,8 @@ export class SubscriptionService {
     // 「不再需要即删干净」：删订阅即删其 provider 落盘原文与登记项
     RawSubscriptionStore.remove(id);
     await this.persist();
+    // 分阶段计时（真机排查用）：删除慢时据此区分"落盘"与"其余"
+    AppLogger.info(TAG, `[perf] subscription removed at +${Date.now() - t0}ms`);
   }
 
   async undoRemove(): Promise<boolean> {
@@ -1561,12 +1810,13 @@ export class SubscriptionService {
       // 本地 YAML 伪订阅没有网络源：串行阶段按既有语义以现有节点数报成功，这里不预取
       return RefreshPrepOutcome.skipped(id);
     }
-    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(sub.url, false)) {
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(sub.url, true)) {
       // 地址非法交给串行阶段按原样报错（提示文案与单条刷新逐字一致），这里不预取
       return RefreshPrepOutcome.skipped(id);
     }
     try {
-      const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue);
+      const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue,
+        true, sub.etag);
       this.prefetchCache.set(id,
         PrefetchedSubscription.body(sub.url, sub.headerName, sub.headerValue, fetched));
       return RefreshPrepOutcome.prefetched(id);
@@ -1639,7 +1889,7 @@ export class SubscriptionService {
       return RefreshItemOutcome.success(id, result.nodeCount);
     }
     return RefreshItemOutcome.failure(id, result.message.length > 0 ? result.message : `${result.status}`,
-      result.status === SubscriptionRefreshStatus.RATE_LIMITED);
+      result.status === SubscriptionRefreshStatus.RATE_LIMITED, result.advice);
   }
 
   async refreshSubscription(id: string): Promise<SubscriptionRefreshResult> {
@@ -1665,8 +1915,34 @@ export class SubscriptionService {
       }
       const fetched: SubscriptionFetchResult = prefetched.hit
         ? prefetched.fetched
-        : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue);
+        : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue, true, sub.etag);
+      // 304：面板确认内容未变。直接按「未变更」返回，沿用已落盘节点，
+      // **不重新解析**（没有响应体可解析），也绝不把空体会当成 EMPTY_RESPONSE 报错。
+      if (fetched.notModified) {
+        sub.lastFetchedAt = Date.now();
+        if (fetched.etag.length > 0) {
+          sub.etag = fetched.etag;
+        }
+        sub.lastRefreshResult = SubscriptionRefreshStatus.NOT_MODIFIED;
+        try {
+          await this.persist();
+        } catch (persistError) {
+          return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
+            `刷新成功但状态持久化失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
+        }
+        AppLogger.info(TAG, `subscription ${id} not modified (304)`);
+        // 配额提醒（fire-and-forget）：304 时 userinfo 沿用既有值，也值得复查阈值
+        SubscriptionQuotaService.run(this.subscriptions)
+          .catch((quotaError: Object): void => {
+            AppLogger.warn(TAG, `quota check failed: ${String(quotaError)}`);
+          });
+        return SubscriptionRefreshResult.ok(sub.nodeCount, diagnostics);
+      }
       const body = fetched.body;
+      // 记住 ETag 供下次条件请求（服务端没给就保持空串 = 下次完整拉取）
+      if (fetched.etag.length > 0) {
+        sub.etag = fetched.etag;
+      }
       sub.uploadBytes = fetched.userInfo.uploadBytes;
       sub.downloadBytes = fetched.userInfo.downloadBytes;
       sub.totalBytes = fetched.userInfo.totalBytes;
@@ -1713,6 +1989,8 @@ export class SubscriptionService {
         SubscriptionService.absorbYamlMergeStats(diagnostics);
         parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
         parsedGroups = SubscriptionParser.parseProxyGroups(body, sub.id);
+        // 订阅自带 rules/rule-providers 段落账（无规则段时清空旧值）
+        SubscriptionService.applyRulesSections(sub, body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -1849,22 +2127,34 @@ export class SubscriptionService {
           + 'credential field(s) not persisted');
       }
       this.noteConfigDrops(diagnostics);
+      // 配额提醒（fire-and-forget）：userinfo 已随本次刷新更新
+      SubscriptionQuotaService.run(this.subscriptions)
+        .catch((quotaError: Object): void => {
+          AppLogger.warn(TAG, `quota check failed: ${String(quotaError)}`);
+        });
       return SubscriptionRefreshResult.ok(parsed.length, diagnostics);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = AppLogger.errText(e);
       let status = SubscriptionRefreshStatus.PARSE_ERROR;
+      let advice = '';
       if (e instanceof SubscriptionFetchError) {
         if (e.isRateLimited()) {
           // HTTP 429/403：面板限流/拒绝访问，与「地址写错」的用户提示完全不同
           status = SubscriptionRefreshStatus.RATE_LIMITED;
+          advice = '面板限流或拒绝访问，请稍后重试或更换订阅链接。';
         } else if (e.kind === SubscriptionFetchErrorKind.HTTP) {
           status = SubscriptionRefreshStatus.HTTP_ERROR;
         } else if (e.kind === SubscriptionFetchErrorKind.EMPTY_RESPONSE) {
           status = SubscriptionRefreshStatus.EMPTY_RESPONSE;
+          advice = '订阅响应为空，请确认订阅是否已过期或被重置。';
         } else if (e.kind === SubscriptionFetchErrorKind.DECODE) {
           status = SubscriptionRefreshStatus.DECODE_ERROR;
         } else {
           status = SubscriptionRefreshStatus.NETWORK_ERROR;
+          // 传输层失败的可读原因 + 下一步（拉取不走代理，被阻断域名必然失败）
+          advice = e.advice;
+          // P0-2 订阅自救：网络性失败记入待补拉标记，VPN 连接成功后自动重试一次
+          this.markNetworkFetchFailure(id);
         }
       }
       sub.lastRefreshResult = status;
@@ -1874,7 +2164,9 @@ export class SubscriptionService {
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
           `刷新失败且状态持久化失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
       }
-      return SubscriptionRefreshResult.fail(status, msg, diagnostics);
+      const failure = SubscriptionRefreshResult.fail(status, msg, diagnostics);
+      failure.advice = advice;
+      return failure;
     }
   }
 
@@ -1963,6 +2255,8 @@ export class SubscriptionService {
         SubscriptionService.absorbYamlMergeStats(diagnostics);
         parsed = SubscriptionService.mergedToNodes(merged, id, diagnostics);
         parsedGroups = SubscriptionParser.parseProxyGroups(body, id);
+        // 本地伪订阅刷新：自带 rules/rule-providers 段同样重新落账（原文可能已变化）
+        SubscriptionService.applyRulesSections(sub, body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length
           + diagnostics.invalidCount + diagnostics.unsupportedCount;
       } else {
@@ -2056,6 +2350,8 @@ export class SubscriptionService {
         SubscriptionService.absorbYamlMergeStats(diagnostics);
         parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
         parsedGroups = SubscriptionParser.parseProxyGroups(trimmed, sub.id);
+        // 本地 YAML 导入：自带 rules/rule-providers 段随订阅一并落账
+        SubscriptionService.applyRulesSections(sub, trimmed);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -2153,6 +2449,66 @@ export class SubscriptionService {
   /** 某订阅的全部代理组（保持声明顺序） */
   groupsOf(subscriptionId: string): ProxyGroup[] {
     return this.proxyGroups.filter((g) => g.subscriptionId === subscriptionId);
+  }
+
+  /**
+   * 全部启用订阅的自带规则行（去重、按订阅顺序，上限 1000 条）。
+   * 供配置生成器写入 rules 段 —— 订阅自带的分流规则必须真实生效。
+   */
+  subscriptionRulesLines(): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const s of this.subscriptions) {
+      if (!s.enabled || s.id === DIRECT_GROUP_ID || s.subRules.length === 0) {
+        continue;
+      }
+      for (const line of s.subRules.split('\n')) {
+        let t = line.trim();
+        // 落账行保留着 yaml 序列项的 "- " 前缀：生成时外层再加一层会变成 "- - RULE"（嵌套 seq），内核报「cannot unmarshal !!seq into string」拒载。
+        if (t.startsWith('- ')) {
+          t = t.substring(2).trim();
+        }
+        if (t.length === 0 || t.startsWith('#') || t.startsWith('- ') || seen.has(t)) {
+          continue;
+        }
+        if (out.length >= 1000) {
+          return out;
+        }
+        seen.add(t);
+        out.push(t);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 全部启用订阅的 rule-providers 块（按订阅顺序合并，同名 provider 先到先得）。
+   * 返回的是 2 空格缩进的块式原文（可直接跟在 `rule-providers:` 头之后）。
+   */
+  subscriptionRuleProvidersBlock(): string {
+    const lines: string[] = [];
+    const seen = new Set<string>();
+    for (const s of this.subscriptions) {
+      if (!s.enabled || s.id === DIRECT_GROUP_ID || s.subRuleProviders.length === 0) {
+        continue;
+      }
+      for (const line of s.subRuleProviders.split('\n')) {
+        const t = line.trim();
+        if (t.length === 0 || t.startsWith('#')) {
+          continue;
+        }
+        // provider 键行是 2 空格缩进的 `name:`；同名 provider 只保留先到者
+        const m = t.match(/^([A-Za-z0-9_-]+):$/);
+        if (m !== null) {
+          if (seen.has(m[1])) {
+            continue;
+          }
+          seen.add(m[1]);
+        }
+        lines.push(line);
+      }
+    }
+    return lines.join('\n');
   }
 
   /**
@@ -2383,6 +2739,77 @@ export class SubscriptionService {
     return 1;
   }
 
+  /** 批量节点直链导入：一行一个链接（vless/vmess/ss/trojan…，允许空行），重复/无效逐条隔离 */
+  async addDirectNodesText(text: string): Promise<DirectBatchResult> {
+    const out = new DirectBatchResult();
+    const uris: string[] = [];
+    for (const line of text.split(/\r?\n/)) {
+      const t = line.trim();
+      if (t.length > 0) {
+        uris.push(t);
+      }
+    }
+    if (uris.length === 0) {
+      return out;
+    }
+    const diagnostics = new SubscriptionImportDiagnostics();
+    this.lastImportDiagnostics = diagnostics;
+    diagnostics.inputCount = uris.length;
+    const keyOf = (n: ProxyNode): string => `${n.server}:${n.port}:${n.proxyType.length > 0 ? n.proxyType : n.type}`
+      + `:${n.password}:${n.uuid}:${n.rawUri}`;
+    const existing = new Set<string>();
+    for (const n of this.nodes) {
+      existing.add(keyOf(n));
+    }
+    const addedNodes: ProxyNode[] = [];
+    const batchSeen = new Set<string>();
+    for (const uri of uris) {
+      if (!SubscriptionService.isNodeUri(uri)) {
+        out.invalid = out.invalid + 1;
+        continue;
+      }
+      let node: ProxyNode | null = null;
+      try {
+        node = ProxyNode.fromUri(uri, DIRECT_GROUP_ID, util.generateRandomUUID());
+      } catch (e) {
+        node = null;
+      }
+      if (node === null) {
+        out.invalid = out.invalid + 1;
+        continue;
+      }
+      const key = keyOf(node);
+      if (existing.has(key) || batchSeen.has(key)) {
+        out.duplicate = out.duplicate + 1;
+        continue;
+      }
+      batchSeen.add(key);
+      addedNodes.push(node);
+    }
+    if (addedNodes.length > 0) {
+      for (const n of addedNodes) {
+        this.nodes.push(n);
+      }
+      this.ensureUniqueNames();
+      this.syncDirectGroup();
+      diagnostics.addedCount = addedNodes.length;
+      diagnostics.configMissingCredentialCount = this.credentialMissingCount;
+      try {
+        const credentialFailed = await this.persist();
+        if (credentialFailed > 0) {
+          diagnostics.persistFailedCount = credentialFailed;
+        }
+      } catch (e) {
+        diagnostics.persistFailedCount = this.nodes.length;
+        AppLogger.warn(TAG, `direct nodes batch persist failed: ${SubscriptionService.describeError(e)}`);
+      }
+      this.noteConfigDrops(diagnostics);
+    }
+    out.duplicate = out.duplicate + diagnostics.duplicateCount;
+    out.added = addedNodes.length;
+    return out;
+  }
+
   /** 更新订阅名称/URL（对应 upstream SubscriptionEditStatus.saved 持久化路径） */
   async updateSubscription(target: Subscription): Promise<void> {
     const index = this.subscriptions.findIndex((s) => s.id === target.id);
@@ -2394,6 +2821,30 @@ export class SubscriptionService {
     }
     this.subscriptions[index] = target;
     await this.persist();
+  }
+
+  /**
+   * Nexus 备份恢复入口：整体覆盖订阅/节点/代理组/隐藏名单后全量落盘。
+   * 调用方（BackupRestoreService）负责 JSON 结构校验与字段清洗，这里只做覆盖 + persist。
+   */
+  async restoreBackup(subs: Subscription[], nodes: ProxyNode[],
+    groups: ProxyGroup[], hidden: string[]): Promise<void> {
+    this.subscriptions = subs;
+    this.nodes = nodes;
+    this.proxyGroups = groups;
+    this.hiddenNodes = hidden;
+    await this.initNodes(this.nodes);
+    await this.persist();
+  }
+
+  /** 代理组备份解析（复用 mapGroups 校验口径：坏记录跳过） */
+  static parseGroups(json: Object): ProxyGroup[] {
+    return SubscriptionService.mapGroups(json);
+  }
+
+  /** 已隐藏节点 key 快照（Nexus 备份导出用） */
+  listHiddenKeys(): string[] {
+    return this.hiddenNodes.slice();
   }
 
   /** 判断是否为默认占位名（"订阅 N"） */
@@ -2485,7 +2936,7 @@ export class ManualNodeStore {
     // 手工节点同样走凭据分离：迁移 → 加密回填 → 清扫明文 → 落库
     await ManualNodeStore.migrateCredentials();
     CredentialStore.canonicalizeNodes(ManualNodeStore.nodes, false)
-      .catch((e: Object) => AppLogger.warn(TAG, `manual node credential sync failed: ${e instanceof Error ? e.message : String(e)}`));
+      .catch((e: Object) => AppLogger.warn(TAG, `manual node credential sync failed: ${AppLogger.errText(e)}`));
   }
 
   /** 手工节点一次性迁移（与订阅节点同一套 Asset 键空间，幂等） */
@@ -2596,6 +3047,8 @@ export class ProxyNodeJson {
   skipCertVerify: boolean = false;
   flow: string = '';
   clientFingerprint: string = '';
+  /** 可选：老存储无此键（新增字段必须允许 undefined，见 ValidProxyNodeJson 校验） */
+  certFingerprint?: string = '';
   realityPublicKey: string = '';
   realityShortId: string = '';
   wsPath: string = '';
@@ -2639,6 +3092,7 @@ export class ProxyNodeJson {
     j.skipCertVerify = n.skipCertVerify;
     j.flow = n.flow;
     j.clientFingerprint = n.clientFingerprint;
+    j.certFingerprint = n.certFingerprint;
     j.realityPublicKey = n.realityPublicKey;
     j.realityShortId = n.realityShortId;
     j.wsPath = n.wsPath;
@@ -2675,4 +3129,10 @@ export class SubscriptionJson {
   rawProviderState?: string;
   /** 双轨 provider 落盘原文条目估算（旧存储无此键，读取端 ?? 0 兜底） */
   rawProviderNodeEstimate?: number;
+  /** ETag/Last-Modified 条件请求凭据（旧存储无此键，读取端 ?? '' 兜底） */
+  etag?: string;
+  /** 订阅 yaml 自带 rules 段（后加字段，旧存储无此键，读取端 ?? '' 兜底） */
+  subRules?: string;
+  /** 订阅 yaml 自带 rule-providers 段（后加字段，旧存储无此键，读取端 ?? '' 兜底） */
+  subRuleProviders?: string;
 }

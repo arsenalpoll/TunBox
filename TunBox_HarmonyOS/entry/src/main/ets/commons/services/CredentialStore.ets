@@ -301,18 +301,29 @@ export class CredentialStore {
 
     const needIo: PendingCredentialWrite[] = [];
     for (const item of pending) {
+      // 本进程内已对**同一别名同一值**做过真实 Asset 精确读/写入回读确认：
+      // 直接复用那次确认，不再产生 IPC（重复 persist 的整批逐条读就此消失）。
+      if (CredentialStore.confirmedInProcess.get(item.alias) === item.value) {
+        report.markStored(item.ownerId, item.field);
+        report.alreadyStored += 1;
+        continue;
+      }
       const existing = bulk.get(item.alias);
       if (bulkAuthoritative && existing !== undefined && existing === item.value) {
         // 真实批量读已确认原值一致 → 无需任何逐条 IPC
         report.markStored(item.ownerId, item.field);
         report.alreadyStored += 1;
+        CredentialStore.confirmedInProcess.set(item.alias, item.value);
         continue;
       }
       needIo.push(item);
     }
 
     // 仅对**新增/变更/无法批量确认**的项做精确读写校验；有界并发而非串行。
-    const CONFIRM_CONCURRENCY = 8;
+    // 并发度（2026-10-16 真机回归）：批量查询不可用的固件上每次 asset IPC 实测
+    // ~56ms，127 节点一轮"删订阅/刷新"要把全部字段过一遍 needIo —— 并发 8 时
+    // 4.5s 起（这正是"删订阅/进订阅页很慢"的主因），提到 24 后墙钟时间约 1/3。
+    const CONFIRM_CONCURRENCY = 24;
     for (let i = 0; i < needIo.length; i += CONFIRM_CONCURRENCY) {
       const slice = needIo.slice(i, i + CONFIRM_CONCURRENCY);
       await Promise.all(slice.map(async (item: PendingCredentialWrite): Promise<void> => {
@@ -327,22 +338,29 @@ export class CredentialStore {
           }
           if (current !== item.value) {
             await CredentialStore.writeAsset(item.alias, item.value);
+            // 写入之后必须精确回读确认，才允许清明文
+            const verified = await CredentialStore.readAsset(item.alias);
+            if (!verified.found || verified.value !== item.value) {
+              throw new Error('asset read-back mismatch');
+            }
           }
-          // 写入或"不确定"之后都必须精确回读确认，才允许清明文
-          const verified = await CredentialStore.readAsset(item.alias);
-          if (!verified.found || verified.value !== item.value) {
-            throw new Error('asset read-back mismatch');
-          }
+          // current === item.value 时**不再补一次回读**：上面那次 readAsset 本身就是
+          // Asset 真读（不是进程内缓存命中），已经满足"入库确认"的安全要求。
+          // 旧实现在这条路上白白多花一倍 IPC —— 批量查询不可用的固件上，
+          // 127 节点的一轮落盘要 2×127 次读，是"删订阅慢"的另一半原因。
           report.markStored(item.ownerId, item.field);
           if (current === item.value) {
             report.alreadyStored += 1;
           } else {
             report.addedNew += 1;
           }
+          // 记录本进程内的"真读确认"：后续 persist 不再为这个字段花 IPC。
+          CredentialStore.confirmedInProcess.set(item.alias, item.value);
           CredentialStore.cachePut(item.alias, item.value);
         } catch (e) {
           report.failed++;
           report.markFailed(item.ownerId, item.field);
+          CredentialStore.confirmedInProcess.delete(item.alias);
           CredentialStore.cacheDelete(item.alias);
           AppLoggerSafe(`credential confirmation failed (field=${item.field})`);
         }
@@ -414,6 +432,38 @@ export class CredentialStore {
   private static knownAliases: Set<string> = new Set<string>();
   /** 本进程是否已完成逐条回填（仅批量查询不可用的固件需要） */
   private static aliasHydrated: boolean = false;
+
+  /**
+   * 回填作用域（2026-10-16 真机回归修复）。
+   *
+   * 批量查询不可用的固件上，回填成本 = 逐条 Asset IPC × knownAliases 总数，而
+   * knownAliases 是**历史累积**的：真机实测 634 条里当前活跃的只有约 130 条，
+   * 其余是历史导入/已删订阅/改过名节点的孤儿别名 —— 冷启动 4.5s 全部由这些
+   * 无用的读构成（`[perf] stage1 migration done at +4504ms`）。
+   *
+   * 调用方（SubscriptionService.doInit）在回填前把"当前还活着的节点/订阅"的
+   * 候选别名放进作用域，回填只真读这一部分。null = 不限制（向后兼容）。
+   * 纯读侧收窄：绝不删除 Asset 里的任何东西，作用域外的别名仍留在 knownAliases，
+   * 被真正用到时由 nodeCredentials 的逐条兜底真读回填（见 pickOrRead）。
+   */
+  private static hydrateScope: Set<string> | null = null;
+
+  /**
+   * 本进程内经**真实 Asset 读 / 写入回读**确认过的值（alias → value）。
+   *
+   * 与 aliasCache 的本质区别：aliasCache 允许从磁盘别名标记恢复（值未经验证），
+   * 这里只由 canonicalize 的精确读、以及写入后的回读成功路径写入。因此命中
+   * 等价于"本进程刚刚真读过且一致"，可以直接当作入库确认 —— 同一进程内的重复
+   * persist（删订阅 / 刷新订阅 / 改节点）不必再把全部字段重新过一遍逐条 IPC。
+   * 安全语义不变：清明文的前提依然是"有真实 Asset 读确认"，只是复用本进程内
+   * 已经做过的那次确认。
+   */
+  private static confirmedInProcess: Map<string, string> = new Map<string, string>();
+
+  /** 设定回填作用域（null = 不限制）。仅影响"启动回填读哪些别名"，不影响写入。 */
+  static setHydrateScope(aliases: string[] | null): void {
+    CredentialStore.hydrateScope = aliases === null ? null : new Set<string>(aliases);
+  }
 
   /** 维护会话缓存与标记集（所有写路径统一走这里） */
   private static cachePut(alias: string, value: string): void {
@@ -510,11 +560,21 @@ export class CredentialStore {
     CredentialStore.aliasHydrated = true;
     const missing: string[] = [];
     for (const alias of CredentialStore.knownAliases) {
-      if (!CredentialStore.aliasCache.has(alias)) {
-        missing.push(alias);
+      if (CredentialStore.aliasCache.has(alias)) {
+        continue;
       }
+      // 回填作用域：只真读"当前还活着的节点/订阅"的候选别名。作用域外的是
+      // 历史孤儿别名（已删订阅 / 改名节点 / 旧导入），读它们纯属浪费 ——
+      // 真机实测 634 条里活跃只有约 130 条，这一条就是冷启动 4.5s 的根源。
+      // 绝不删除：孤儿别名仍留在 knownAliases，被用到时由 pickOrRead 逐条回填。
+      if (CredentialStore.hydrateScope !== null && !CredentialStore.hydrateScope.has(alias)) {
+        continue;
+      }
+      missing.push(alias);
     }
-    const CHUNK = 8;
+    // 并发度：24（同 canonicalize 的 CONFIRM_CONCURRENCY；本固件每次 asset IPC
+    // ~56ms，634 别名并发 8 时 4.5s —— 冷启动 stage1 的全部耗时都在这里）
+    const CHUNK = 24;
     for (let i = 0; i < missing.length; i += CHUNK) {
       const slice = missing.slice(i, i + CHUNK);
       let reads: CredentialRead[] = [];
@@ -530,7 +590,9 @@ export class CredentialStore {
         }
       }
     }
-    AppLoggerSafe(`alias cache hydrated from asset store (${missing.length} alias(es))`);
+    AppLoggerSafe(`alias cache hydrated from asset store (${missing.length} alias(es)`
+      + `, known ${CredentialStore.knownAliases.size}`
+      + `, scope ${CredentialStore.hydrateScope === null ? 'all' : `${CredentialStore.hydrateScope.size}`})`);
   }
 
   /** 仅节点凭据的规范化入口（ManualNodeStore 等只有节点的调用方使用） */
@@ -665,7 +727,7 @@ export class CredentialStore {
         }
       }
       if (chunked.length > 0) {
-        const EXPAND_CONCURRENCY = 8;
+        const EXPAND_CONCURRENCY = 24;
         for (let base = 0; base < chunked.length; base += EXPAND_CONCURRENCY) {
           const slice = chunked.slice(base, base + EXPAND_CONCURRENCY);
           const expanded = await Promise.all(slice.map((alias: string): Promise<CredentialRead> =>
@@ -853,13 +915,15 @@ export class CredentialStore {
       // 内存）→ 130 次全表查询 ≈ 数秒，这正是"订阅页加载 3~4 秒"的第二个根因。
       // loadAllCredentials 内部已做单飞与缓存，稳态零额外 IPC。
       const cache = await CredentialStore.loadAllCredentials();
-      out.password = CredentialStore.pick(cache, nodeAlias(nodeId, 'password'), out.password);
-      out.uuid = CredentialStore.pick(cache, nodeAlias(nodeId, 'uuid'), out.uuid);
-      out.protocolParam = CredentialStore.pick(cache, nodeAlias(nodeId, 'protocolParam'), out.protocolParam);
-      out.obfsParam = CredentialStore.pick(cache, nodeAlias(nodeId, 'obfsParam'), out.obfsParam);
-      out.extraOpts = CredentialStore.pick(cache, nodeAlias(nodeId, 'extraOpts'), out.extraOpts);
-      out.rawTemplate = CredentialStore.pick(cache, nodeAlias(nodeId, 'rawTemplate'), out.rawTemplate);
-      out.rawUri = CredentialStore.pick(cache, nodeAlias(nodeId, 'rawUri'), out.rawUri);
+      out.password = await CredentialStore.pickOrRead(cache, nodeAlias(nodeId, 'password'), out.password);
+      out.uuid = await CredentialStore.pickOrRead(cache, nodeAlias(nodeId, 'uuid'), out.uuid);
+      out.protocolParam = await CredentialStore.pickOrRead(cache, nodeAlias(nodeId, 'protocolParam'),
+        out.protocolParam);
+      out.obfsParam = await CredentialStore.pickOrRead(cache, nodeAlias(nodeId, 'obfsParam'), out.obfsParam);
+      out.extraOpts = await CredentialStore.pickOrRead(cache, nodeAlias(nodeId, 'extraOpts'), out.extraOpts);
+      out.rawTemplate = await CredentialStore.pickOrRead(cache, nodeAlias(nodeId, 'rawTemplate'),
+        out.rawTemplate);
+      out.rawUri = await CredentialStore.pickOrRead(cache, nodeAlias(nodeId, 'rawUri'), out.rawUri);
       return out;
     } catch (e) {
       // 读取异常：整体回退一次性来源，绝不让连接因加密层故障而失败
@@ -867,9 +931,33 @@ export class CredentialStore {
     }
   }
 
-  private static pick(cache: Map<string, string>, alias: string, fallback: string): string {
+  /**
+   * 缓存未命中时的逐条真读兜底（配合回填作用域）。
+   *
+   * 作用域收窄后，理论上会有少量"活跃但没进作用域"的别名（如调用方在 init 之后
+   * 才加载的节点）不在 aliasCache 里 —— 绝不能因此把凭据判为缺失：只要别名标记
+   * 说它存在（knownAliases），就真读一次 Asset 并回填缓存。有这条兜底，作用域
+   * 收窄是安全的：漏掉的最多多花 1 次 IPC，而不是凭据静默丢失。
+   */
+  private static async pickOrRead(cache: Map<string, string>, alias: string,
+    fallback: string): Promise<string> {
     const cached = cache.get(alias);
-    return cached === undefined ? fallback : cached;
+    if (cached !== undefined && cached.length > 0) {
+      return cached;
+    }
+    if (!CredentialStore.knownAliases.has(alias)) {
+      return fallback;
+    }
+    try {
+      const read = await CredentialStore.readAsset(alias);
+      if (read.found && read.value.length > 0) {
+        CredentialStore.cachePut(alias, read.value);
+        return read.value;
+      }
+    } catch (e) {
+      // 真读失败按缺失处理，调用方回退一次性来源
+    }
+    return fallback;
   }
 
   /** 订阅凭据透明读取：Asset 优先，缺失返回 fallback（一次性来源） */

@@ -28,8 +28,25 @@ const util = {
  * 已知极限（不做全量 YAML 语义）：多行 literal 块体进入单行槽位时按该字段缺失处理；
  *           别名只解到锚点的原始文本，不做锚点内嵌锚点的深度再解析；不支持 YAML 标签、
  *           复杂键（`? key`）、`!!binary`/时间戳等类型化标量、以及流式多文档合并。
+ */// [harness-stripped] import { util } from '@kit.ArkTS';
+/**
+ * 错误 → 文本（本文件保持零额外依赖）：解析路径抛出的常是普通对象（{message}），
+ * Error 实例判断会丢消息（[object Object] 类问题）；与 AppLogger.errText 同语义。
  */
-// [harness-stripped] import { util } from '@kit.ArkTS';
+function errorTextOr(e: Object, fallback: string): string {
+  if (e !== null && e !== undefined) {
+    const msgVal = (e as Record<string, Object>).message;
+    if (typeof msgVal === 'string' && (msgVal as string).length > 0) {
+      return msgVal as string;
+    }
+    const text = String(e);
+    if (text.length > 0 && text !== '[object Object]') {
+      return text;
+    }
+  }
+  return fallback;
+}
+
 /** 单个合并后的代理节点，仅保存受支持协议（ss/ssr/vless/vmess/trojan/hysteria2）的白名单结构化字段。 */
 export class MergedProxy {
   name: string = '';
@@ -51,6 +68,8 @@ export class MergedProxy {
   skipCertVerify: boolean = false;
   flow: string = '';
   clientFingerprint: string = '';
+  /** 证书指纹 pinSHA256（mihomo 键 `fingerprint`），与 uTLS 的 clientFingerprint 分开 */
+  certFingerprint: string = '';
   realityPublicKey: string = '';
   realityShortId: string = '';
   wsPath: string = '';
@@ -70,6 +89,14 @@ export class MergedProxy {
    * 键名与值在入库前均经白名单校验, 生成配置时原样回写 —— 不再静默丢字段。
    */
   extraOpts: string = '';
+  /**
+   * 原始节点行的逐字模板（flow-map 内部键值），已剔除 name 与凭据键
+   * (uuid/password/protocol-param/obfs-param/obfs-password)。生成配置时
+   * 直接回写这段 + 注入 name/凭据，避免「解析→重生成」丢失任何传输字段
+   * （xhttp-opts、reality-opts、headers、null 值等）。块式写法或 URI 导入
+   * 的节点无此模板，回退到结构化生成路径。
+   */
+  rawTemplate: string = '';
 }
 
 /** 合并限额（照抄 upstream SubscriptionYamlMerger 常量） */
@@ -99,6 +126,35 @@ export class YamlMerger {
   static extractSection(yaml: string, sectionName: string): string {
     const lines = YamlMerger.normalizedSectionLines(yaml, sectionName);
     return lines.join('\n');
+  }
+
+  /**
+   * 删除指定顶层分节（其余内容原样保留，行序不变）。
+   * 分节不存在时原样返回。供 YAML 覆盖层的 rules/rule-providers 段合并
+   * （合并进生成器的同段后，原文不能再携带这两个键，否则 mihomo 按重复键
+   * 「后者覆盖前者」整段替换掉已合并的规则）。
+   */
+  static removeSection(yaml: string, sectionName: string): string {
+    const out: string[] = [];
+    let inSection = false;
+    for (const raw of yaml.split('\n')) {
+      const line = raw.endsWith('\n') ? raw.substring(0, raw.length - 1) : raw;
+      if (!line.startsWith(' ') && !line.startsWith('\t')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith(`${sectionName}:`)) {
+          inSection = true;
+          continue;
+        }
+        if (inSection && trimmed.length > 0 && !trimmed.startsWith('#')
+          && !trimmed.startsWith('- ')) {
+          inSection = false; // 下一顶层键行 = 分节结束
+        }
+      }
+      if (!inSection) {
+        out.push(line);
+      }
+    }
+    return out.join('\n');
   }
 
   /**
@@ -775,7 +831,16 @@ export class YamlMerger {
     // 裸标量里的 " #" 之后是 YAML 行内注释, 截掉; 值本身含 '#'(如密码)则保留
     const commentIdx = value.indexOf(' #');
     if (commentIdx >= 0) {
-      return value.substring(0, commentIdx).trim();
+      value = value.substring(0, commentIdx).trim();
+    }
+    // YAML 裸 null 归一化: 面板常把可选字段写成 `short-id: null` / `sni: ~` /
+    // `password: null`（YAML 里这些是 null 值, 等价于「不填」）。此前把字面量
+    // "null"/"~" 当字符串保留 → reality 的 short-id 变成非法 hex 被校验误杀、
+    // 或 sni/password 被塞进 "null" 污染配置。引号形态的 "null" 在上面已原样
+    // 返回, 不受影响(那是用户真实值)。
+    if (value.length === 0 || value === '~'
+      || value === 'null' || value === 'Null' || value === 'NULL') {
+      return '';
     }
     return value;
   }
@@ -1186,7 +1251,25 @@ export class YamlMerger {
    * 已解析到的非空值不会被后续来源覆盖（“订阅给了就严格保留”）。
    */
   private static parseNestedOptions(fields: Map<string, string>, p: MergedProxy,
-    itemLines: string[]): void {
+    itemLines: string[], extras: string[][]): void {
+    // ws-opts 的高级子键（路径/Host 之外）：max-early-data、early-data-header-name、
+    // v2ray-http-upgrade(+fast-open)。丢失会导致 early-data/v2ray upgrade 模式节点
+    // 在内核侧退化为普通 WS 甚至不可用 —— 以 `ws-opts.<key>` 形式存 extras，
+    // 生成端把它们合并回 ws-opts 结构。
+    const wsExtraKeys = new Set<string>(['max-early-data', 'early-data-header-name',
+      'v2ray-http-upgrade', 'v2ray-http-upgrade-fast-open']);
+    const pushWsExtra = (k: string, v: string): void => {
+      const value = v.trim();
+      if (value.length === 0 || value.length > 512 || value.includes('\n') || value.includes('\r')) {
+        return;
+      }
+      for (const pair of extras) {
+        if (pair[0] === 'ws-opts.' + k) {
+          return;
+        }
+      }
+      extras.push(['ws-opts.' + k, value]);
+    };
     // 顶层别名（优先级最低，先落位，后续 ws-opts 非空值可补齐/覆盖）
     const aliasPath = fields.get('ws-path');
     if (aliasPath !== undefined && aliasPath.length > 0) {
@@ -1241,7 +1324,9 @@ export class YamlMerger {
     const wsFlow = fields.get('ws-opts');
     if (wsFlow !== undefined && wsFlow.trim().length > 0) {
       try {
-        const ws = YamlMerger.parseRestrictedFlowMap(wsFlow, new Set<string>(['path', 'headers']));
+        const ws = YamlMerger.parseRestrictedFlowMap(wsFlow,
+          new Set<string>(['path', 'headers', 'max-early-data', 'early-data-header-name',
+            'v2ray-http-upgrade', 'v2ray-http-upgrade-fast-open']));
         const pathV = ws.get('path');
         if (pathV !== undefined && pathV.length > 0) {
           p.wsPath = YamlMerger.decodeScalar(pathV);
@@ -1255,13 +1340,19 @@ export class YamlMerger {
             p.wsHost = YamlMerger.decodeScalar(hostV);
           }
         }
+        for (const ek of wsExtraKeys) {
+          const ev = ws.get(ek);
+          if (ev !== undefined) {
+            pushWsExtra(ek, ev);
+          }
+        }
       } catch (e) {
         // 结构异常按「未提供」降级
       }
     }
-    if (p.wsPath.length === 0 && p.wsHost.length === 0) {
-      const wsBlock = YamlMerger.extractBlockBody(itemLines, 'ws-opts');
-      if (wsBlock.length > 0) {
+    const wsBlock = YamlMerger.extractBlockBody(itemLines, 'ws-opts');
+    if (wsBlock.length > 0) {
+      if (p.wsPath.length === 0 && p.wsHost.length === 0) {
         const ws = YamlMerger.parseWsBlock(wsBlock);
         const bp = ws.get('path');
         if (bp !== undefined && bp.length > 0) {
@@ -1271,6 +1362,18 @@ export class YamlMerger {
         if (bh !== undefined && bh.length > 0) {
           p.wsHost = bh;
         }
+      }
+      // 块式 ws-opts 的高级子键同样保全（与 flow 来源幂等：先到先得）
+      try {
+        const wsExtra = YamlMerger.parseSimpleBlock(wsBlock, wsExtraKeys);
+        for (const ek of wsExtraKeys) {
+          const ev = wsExtra.get(ek);
+          if (ev !== undefined) {
+            pushWsExtra(ek, ev);
+          }
+        }
+      } catch (e) {
+        // 结构异常按「未提供」降级
       }
     }
 
@@ -1483,7 +1586,9 @@ export class YamlMerger {
   /** SNI 键名方案: hysteria2/hysteria/tuic 用 sni, 其余用 servername */
   static usesSniKey(type: string): boolean {
     const t = type.trim().toLowerCase();
-    return t === 'hysteria2' || t === 'hysteria' || t === 'tuic';
+    // anytls 的内核选项只认 sni 键（AnytlsOption.SNI tag: proxy:"sni"），
+    // 写成 servername 会被丢弃，TLS Host 回退用 server 地址，与证书不匹配时全部超时。
+    return t === 'hysteria2' || t === 'hysteria' || t === 'tuic' || t === 'anytls';
   }
 
   /** 预读条目声明的 type(键顺序不定, 结构化映射前先判定是否走中继) */
@@ -1499,9 +1604,9 @@ export class YamlMerger {
    * 必须括号平衡且仅含安全字符 —— 防止破坏 flow-map 结构或注入额外配置行。
    * 非法时返回 null(仅丢该键, 绝不影响节点其余部分)。
    */
-  /** 额外字段键必须是普通 Mihomo 键，并拒绝原型污染保留名。 */
+  /** 额外字段键必须是普通 Mihomo 键（含 auth_str 等下划线键），并拒绝原型污染保留名。 */
   static isSafeExtraKey(key: string): boolean {
-    return /^[a-z][a-z0-9-]{0,63}$/.test(key)
+    return /^[a-z][a-z0-9_-]{0,63}$/.test(key)
       && key !== '__proto__' && key !== 'prototype' && key !== 'constructor';
   }
 
@@ -1510,7 +1615,11 @@ export class YamlMerger {
       return null;
     }
     const raw = rawValue.trim();
-    if (raw.length === 0 || raw.length > 512 || raw.includes('\n') || raw.includes('\r')
+    // 512 → 8192: 面板生成的 xhttp-opts（XHTTP 传输）普遍 600+ 字符且含嵌套
+    // reuse-settings，512 上限会把整批 XHTTP 节点静默降级成「无传输参数」，
+    // 在内核侧表现为测速全部超时。流式结构(大括号)走下方深度+字符集校验，
+    // 下游 validateNodeText 仍有 64KB 兜底。
+    if (raw.length === 0 || raw.length > 8192 || raw.includes('\n') || raw.includes('\r')
       || raw.includes('#')) {
       return null;
     }
@@ -1525,7 +1634,12 @@ export class YamlMerger {
           if (depth < 0) {
             return null;
           }
-        } else if (!/[A-Za-z0-9_ \t.,:\/=\-+"']/.test(c)) {
+        } else if (!/[A-Za-z0-9_ \t.,:\/=\-+"'();%<>!@^&*?~]/.test(c)) {
+          // 白名单需覆盖真实面板值: http 中转节点的 headers 里
+          // User-Agent 含 '(' ')' ';' '%' (如 'Dalvik/2.1.0 (Linux; U; Android 9; ...)'),
+          // Host 含 ':'。曾因白名单过窄把整个 headers 键静默丢弃 →
+          // 中转鉴权头丢失 → 依赖该中转的全部节点拨号瞬间失败。
+          // '#' 仍拒绝(注释符), 换行/控制字符仍拒绝, 大括号走深度校验。
           return null;
         }
       }
@@ -1767,6 +1881,8 @@ export class YamlMerger {
     let body = contentText.startsWith('- ') ? contentText.substring(2) : contentText;
     // `- &anchor {..}` / `- !!map {..}`: 先剥离前导锚点/标签修饰符再判定写法。
     body = YamlMerger.stripModifiers(body);
+    // flow-map 原文（用于生成逐字模板）；块式写法保持 null → 回退结构化生成。
+    let flowInner: string | null = null;
     try {
       if (body.trimStart().startsWith('{')) {
         const trimmedBody = body.trim();
@@ -1778,6 +1894,7 @@ export class YamlMerger {
         // 只取**第一个闭合** flow-map 的内容: 跨行书写的 flow-map 会被完整拼合,
         // 其后的行内注释与挂在本条目行组尾部的噪声行一律忽略 —— 节点去留不能由它们决定。
         const content = trimmedBody.substring(open + 1, close);
+        flowInner = content;
         const pairs = YamlMerger.splitFlowMap(content);
         for (const pair of pairs) {
           const idx = YamlMerger.findUnquotedColon(pair);
@@ -1882,7 +1999,10 @@ export class YamlMerger {
     const server = fields.get('server') ?? '';
     const portStr = fields.get('port') ?? '0';
     const proxyType = (fields.get('type') ?? '').toLowerCase();
-    if (name.length === 0 || server.length === 0 || proxyType.length === 0) {
+    // mihomo 的 direct 出站只有 name/type（无 server/port），必须放行否则被当缺字段丢弃
+    const isDirectOutbound = proxyType === 'direct';
+    if (name.length === 0 || proxyType.length === 0
+      || (server.length === 0 && !isDirectOutbound)) {
       throw YamlMerger.invalidNode('代理节点缺少 name、type 或 server');
     }
     if (proxyType !== 'ss' && proxyType !== 'ssr' && proxyType !== 'vless'
@@ -1896,7 +2016,7 @@ export class YamlMerger {
       throw YamlMerger.invalidNode('代理节点端口格式无效');
     }
     const portNum = parseInt(portStr);
-    if (portNum <= 0 || portNum > 65535) {
+    if ((portNum <= 0 || portNum > 65535) && !isDirectOutbound) {
       throw YamlMerger.invalidNode('代理节点端口超出范围');
     }
     const p = new MergedProxy();
@@ -1928,11 +2048,13 @@ export class YamlMerger {
     p.skipCertVerify = YamlMerger.parseBoolean(fields.get('skip-cert-verify') ?? 'false',
       'skip-cert-verify');
     p.flow = fields.get('flow') ?? '';
+    // 两个指纹是**不同语义的键**，必须各归各位：
+    //   client-fingerprint = uTLS 指纹（TLS 客户端伪装）
+    //   fingerprint        = 证书指纹 pinSHA256（校验对端证书）
+    // 此前 fingerprint 被当成 client-fingerprint 的兜底塞进同一槽位，导致同时带
+    // 两键的 hysteria2 节点把真正的 pin 丢掉、并被回写成 `fingerprint: chrome`。
     p.clientFingerprint = fields.get('client-fingerprint') ?? '';
-    if (p.clientFingerprint.length === 0) {
-      // hysteria2 的证书指纹(pinSHA256)键名是 fingerprint
-      p.clientFingerprint = fields.get('fingerprint') ?? '';
-    }
+    p.certFingerprint = fields.get('fingerprint') ?? '';
     if (proxyType === 'hysteria2' || proxyType === 'hysteria') {
       p.hyUp = YamlMerger.normalizeBandwidth(fields.get('up') ?? fields.get('upmbps') ?? '');
       p.hyDown = YamlMerger.normalizeBandwidth(fields.get('down') ?? fields.get('downmbps') ?? '');
@@ -1942,7 +2064,7 @@ export class YamlMerger {
       p.alpnList = YamlMerger.normalizeAlpnList(fields.get('alpn') ?? '');
     }
     try {
-      YamlMerger.parseNestedOptions(fields, p, itemLines);
+      YamlMerger.parseNestedOptions(fields, p, itemLines, extras);
     } catch (e) {
       // reality-opts/ws-opts/grpc-opts 结构异常时忽略嵌套项, 不丢弃整个节点
       if (e instanceof YamlMergeError) {
@@ -1951,13 +2073,13 @@ export class YamlMerger {
     }
     const values: string[] = [p.name, p.server, p.cipher, p.password, p.protocol, p.protocolParam,
       p.obfs, p.obfsParam, p.uuid, p.network, p.servername, p.flow, p.clientFingerprint,
-      p.realityPublicKey, p.realityShortId, p.wsPath, p.wsHost, p.grpcServiceName,
+      p.certFingerprint, p.realityPublicKey, p.realityShortId, p.wsPath, p.wsHost, p.grpcServiceName,
       p.hyUp, p.hyDown, p.alpnList];
     // 与 values 一一对应的字段名：限额/控制字符诊断里直接给出用户看得懂的字段名
     const valueNames: string[] = ['name', 'server', 'cipher', 'password', 'protocol',
       'protocol-param', 'obfs', 'obfs-param', 'uuid', 'network', 'servername', 'flow',
-      'client-fingerprint', 'reality-public-key', 'reality-short-id', 'ws-path', 'ws-host',
-      'grpc-service-name', 'up', 'down', 'alpn'];
+      'client-fingerprint', 'fingerprint', 'reality-public-key', 'reality-short-id', 'ws-path',
+      'ws-host', 'grpc-service-name', 'up', 'down', 'alpn'];
     for (let i = 0; i < values.length; i++) {
       YamlMerger.validateNodeText(values[i], i < valueNames.length ? valueNames[i] : `field-${i}`);
     }
@@ -1983,7 +2105,54 @@ export class YamlMerger {
     if (p.type === 'hysteria2' && p.password.length === 0) {
       throw YamlMerger.invalidNode(`Hysteria2 节点「${p.name}」缺少 password`);
     }
+    // 逐字模板：flow-map 原文剔除 name 与凭据键（凭据走加密层，模板可安全持久化）。
+    // 块式写法/URI 节点无模板 → 生成端回退结构化路径。
+    p.rawTemplate = flowInner !== null ? YamlMerger.buildRawTemplate(flowInner) : '';
     return p;
+  }
+
+  /** 从模板里剔除的键：name（生成时用去重后的显示名注入）+ 全部凭据键（走加密层）。 */
+  private static readonly RAW_TEMPLATE_STRIP_KEYS: Set<string> = new Set<string>([
+    'name', 'uuid', 'password', 'protocol-param', 'protocol_param',
+    'obfs-param', 'obfs_param', 'obfs-password'
+  ]);
+
+  /**
+   * 由 flow-map 原文构造逐字模板：保留除 name/凭据外所有键的**原始文本**
+   * （含 xhttp-opts、reality-opts、headers、null 值等），生成端原样回写。
+   * 结构异常或超长返回 ''（回退结构化路径）。
+   */
+  private static buildRawTemplate(inner: string): string {
+    const trimmed = inner.trim();
+    if (trimmed.length === 0 || trimmed.length > 8192) {
+      return '';
+    }
+    const kept: string[] = [];
+    try {
+      for (const pair of YamlMerger.splitFlowMap(trimmed)) {
+        const idx = YamlMerger.findUnquotedColon(pair);
+        if (idx <= 0) {
+          continue;
+        }
+        let key = '';
+        try {
+          key = YamlMerger.decodeScalar(pair.substring(0, idx).trim());
+        } catch (e) {
+          continue;
+        }
+        if (key.length === 0 || YamlMerger.RAW_TEMPLATE_STRIP_KEYS.has(key) || key === '<<') {
+          continue;
+        }
+        const pairText = pair.trim();
+        if (pairText.includes('\n') || pairText.includes('\r')) {
+          continue;
+        }
+        kept.push(pairText);
+      }
+    } catch (e) {
+      return '';
+    }
+    return kept.join(', ');
   }
 
   /** 带宽值规整（Hysteria2 up/down）: 仅接受 数字[单位]；非法则丢弃 */
@@ -2035,6 +2204,7 @@ export class YamlMerger {
     parts.push(`skipCertVerify=${p.skipCertVerify ? 'true' : 'false'}`);
     parts.push(`flow=${JSON.stringify(p.flow)}`);
     parts.push(`clientFingerprint=${JSON.stringify(p.clientFingerprint)}`);
+    parts.push(`certFingerprint=${JSON.stringify(p.certFingerprint)}`);
     parts.push(`realityPublicKey=${JSON.stringify(p.realityPublicKey)}`);
     parts.push(`realityShortId=${JSON.stringify(p.realityShortId)}`);
     parts.push(`wsPath=${JSON.stringify(p.wsPath)}`);
@@ -2101,7 +2271,13 @@ export class YamlMerger {
         fields.push(`flow: ${YamlMerger.encodeScalar(p.flow)}`);
       }
       if (p.clientFingerprint.length > 0) {
-        fields.push(`${p.type === 'hysteria2' ? 'fingerprint' : 'client-fingerprint'}: ${YamlMerger.encodeScalar(p.clientFingerprint)}`);
+        // uTLS 指纹固定发 `client-fingerprint`（hysteria2 也支持该键，不要改写成 fingerprint）
+        fields.push(`client-fingerprint: ${YamlMerger.encodeScalar(p.clientFingerprint)}`);
+      }
+      if (p.certFingerprint.length > 0) {
+        // 证书指纹 pinSHA256 → `fingerprint`。此前这里把 clientFingerprint 当成 pin 发成
+        // `fingerprint`，结果是 `fingerprint: chrome`（内核拿到非法 pin）且真正的 pin 丢失。
+        fields.push(`fingerprint: ${YamlMerger.encodeScalar(p.certFingerprint)}`);
       }
       if (p.type === 'hysteria2' || p.type === 'hysteria') {
         if (p.hyUp.length > 0) {
@@ -2248,7 +2424,7 @@ export class YamlMerger {
           if (e instanceof YamlNodeError) {
             continue;
           }
-          throw new YamlMergeError(e instanceof Error ? e.message : '代理节点解析发生未知错误');
+          throw new YamlMergeError(errorTextOr(e, '代理节点解析发生未知错误'));
         }
         if (p === null) {
           continue;
@@ -2273,7 +2449,7 @@ export class YamlMerger {
           if (e instanceof YamlNodeError) {
             continue;
           }
-          throw new YamlMergeError(e instanceof Error ? e.message : '代理节点解析发生未知错误');
+          throw new YamlMergeError(errorTextOr(e, '代理节点解析发生未知错误'));
         }
         if (old === null) {
           continue;

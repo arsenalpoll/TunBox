@@ -45,10 +45,25 @@ const FILES = [
   {
     src: 'commons/models/AppSettings.ets', out: 'AppSettings.ts', map: {
       '../services/NodeSortPersistence': './NodeSortPersistence.ts',
+      '../services/AppRoutingPolicy': './AppRoutingPolicy.ts',
+      '../services/SettingsService': './stubs.ts',
+      '../services/ProxyGroupStore': './stubs.ts',
+      '../services/ManualNodeStore': './stubs.ts',
+      '../services/CredentialStore': './stubs.ts',
+      '../services/SubscriptionService': './stubs.ts',
+      '../services/NodeSortModes': './NodeSortModes.ts',
+      '../models/ProxyNode': './ProxyNode.ts',
+      '../utils/AppLogger': './stubs.ts',
+    },
+  },
+  {
+    src: 'commons/services/AppRoutingPolicy.ets', out: 'AppRoutingPolicy.ts', map: {
+      '../utils/AppLogger': './stubs.ts',
     },
   },
   {
     src: 'commons/services/SubscriptionService.ets', out: 'SubscriptionService.ts', map: {
+      './SubscriptionQuotaService': './SubscriptionQuotaService.ts',
       '@kit.ArkData': './stubs.ts',
       '@kit.AssetStoreKit': './stubs.ts',
       '@kit.ArkTS': './stubs.ts',
@@ -65,6 +80,16 @@ const FILES = [
       './CredentialStore': './stubs.ts',
       '../utils/AppLogger': './stubs.ts',
       './ConcurrentRefresh': './ConcurrentRefresh.ts',
+    },
+  },
+  {
+    src: 'commons/services/SubscriptionQuotaService.ets', out: 'SubscriptionQuotaService.ts', map: {
+      '@kit.NotificationKit': './stubs.ts',
+      '@kit.BasicServicesKit': './stubs.ts',
+      '../utils/AppLogger': './stubs.ts',
+      '../models/Subscription': './Subscription.ts',
+      './SettingsService': './stubs.ts',
+      '../models/AppSettings': './AppSettings.ts',
     },
   },
   {

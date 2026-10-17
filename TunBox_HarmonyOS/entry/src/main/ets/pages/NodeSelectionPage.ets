@@ -962,6 +962,9 @@ struct NodeSelectionPage {
     const opts = new LatencyRunOptions();
     opts.force = force;
     opts.timeoutMs = LATENCY_TIMEOUT_MS;
+    // 来源：用户主动点（force=true，含单节点手测与「测全部」）= manual，失败保持
+    // 红色「超时」；进页面自动补测（force=false）= auto，失败显示中性「未测」。
+    opts.source = force ? 'manual' : 'auto';
     // 结果不需要在这里手动处理：LatencyEngine 自己写 LatencyController，页面的
     // latencyListener 已经在 200ms 合并窗口里 bump latencyTick 触发重排/重绘。
     opts.onResult = null;
@@ -1160,7 +1163,7 @@ struct NodeSelectionPage {
       promptAction.showToast({ message: '暂无可测速的节点' });
       return;
     }
-    const progress = await this.runGroupLatency(list, true);
+    const progress = await this.runGroupLatency(list, true, 'manual');
     if (this.batchCancelled) {
       // 用户取消 / 离开页面：已落库的结果保持可见（不回滚）。
       return;
@@ -1169,6 +1172,16 @@ struct NodeSelectionPage {
       if (this.pageActive) {
         promptAction.showToast({ message: '内核不可用，已跳过（未写入超时）' });
       }
+      return;
+    }
+    if (progress.coreUnavailable) {
+      // 通道不可用批的结论无效：节点已恢复未测，不能报普通「测速完成」
+      if (this.pageActive) {
+        promptAction.showToast({
+          message: '通道不可用，本轮测速结果无效，节点已恢复未测'
+        });
+      }
+      AppLogger.warn(TAG, 'group latency batch aborted: core unavailable, results voided');
       return;
     }
     this.commitLatencySnapshot(list);
@@ -1189,7 +1202,8 @@ struct NodeSelectionPage {
    * 「要么超时要么延迟」，不留未测。请求失败（连接失败/全超时）= 通道不可用，
    * 保持未测 + 由 testAll 提示。
    */
-  private async runGroupLatency(list: ProxyNode[], driveHeader: boolean): Promise<LatencyProgress | null> {
+  private async runGroupLatency(list: ProxyNode[], driveHeader: boolean,
+    source: string): Promise<LatencyProgress | null> {
     if (list.length === 0) {
       return null;
     }
@@ -1264,8 +1278,11 @@ struct NodeSelectionPage {
           LatencyRecord.measured(n.name, delay, LatencyChannel.CORE, Date.now()));
         progress.measured = progress.measured + 1;
       } else {
-        LatencyController.setRecord(
-          LatencyRecord.failed(n.name, LatencyState.TIMEOUT, Date.now(), LatencyChannel.CORE));
+        const failedRec = LatencyRecord.failed(n.name, LatencyState.TIMEOUT, Date.now(),
+          LatencyChannel.CORE);
+        failedRec.source = source;
+        failedRec.runId = 0;
+        LatencyController.setRecord(failedRec);
         progress.timeout = progress.timeout + 1;
       }
       progress.finished = progress.finished + 1;
@@ -1277,8 +1294,10 @@ struct NodeSelectionPage {
     let testing = 0;
     for (const n of list) {
       if (LatencyController.stateFor(n.name) === LatencyState.TESTING) {
-        LatencyController.setRecord(
-          LatencyRecord.failed(n.name, LatencyState.TIMEOUT, Date.now(), LatencyChannel.CORE));
+        const leftover = LatencyRecord.failed(n.name, LatencyState.TIMEOUT, Date.now(),
+          LatencyChannel.CORE);
+        leftover.source = source;
+        LatencyController.setRecord(leftover);
         testing = testing + 1;
       }
     }

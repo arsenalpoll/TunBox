@@ -9,6 +9,7 @@
 import { notificationManager } from '@kit.NotificationKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { wantAgent, WantAgent } from '@kit.AbilityKit';
+import { common } from '@kit.AbilityKit';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'SsrvpnNotifier';
@@ -26,6 +27,30 @@ export class SsrvpnNotifier {
   /** 点击通知回前台的 WantAgent（懒构建、进程内复用；构建失败不影响通知发布） */
   private static clickAgent: WantAgent | null = null;
   private static agentBuilding: boolean = false;
+  /** 通知授权是否已问过（每进程一次；用户拒绝后系统不允许再弹框） */
+  private static permissionRequested: boolean = false;
+
+  /**
+   * 通知权限从未授予时弹一次系统授权框（连接成功时调用）。
+   * 真机日志实锤：通知权限未授予时 publish 一直 1600004（disabled），通知栏
+   * 只剩系统自己的 VPN 通知（只有运行时长）。isNotificationEnabled() 对
+   * 「从未问过」与「用户已拒绝」都返回 false；拒绝后 requestEnableNotification
+   * 无法再弹框（系统限制），失败静默——发布路径的退避语义不变。
+   */
+  static async ensurePermission(context: Context): Promise<void> {
+    if (SsrvpnNotifier.permissionRequested) {
+      return;
+    }
+    SsrvpnNotifier.permissionRequested = true;
+    try {
+      const enabled = await notificationManager.isNotificationEnabled();
+      if (!enabled) {
+        await notificationManager.requestEnableNotification(context as common.UIAbilityContext);
+      }
+    } catch (e) {
+      AppLogger.warn(TAG, `notify permission request failed: ${AppLogger.errText(e)}`);
+    }
+  }
 
   /** 通知当前是否因被禁用而处于退避抑制状态 */
   static isSuppressed(): boolean {

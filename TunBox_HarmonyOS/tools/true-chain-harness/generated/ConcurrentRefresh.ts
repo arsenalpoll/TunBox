@@ -84,6 +84,12 @@ export class RefreshItemOutcome {
   rateLimited: boolean = false;
   nodeCount: number = 0;
   message: string = '';
+  /**
+   * 人话 + 下一步（来自 SubscriptionRefreshResult.advice）。
+   * 批量汇总的 toast 优先展示它 —— message 里是原始错误码
+   * （如 `code=2300060 Invalid SSL peer certificate…`），适合日志不适合给用户看。
+   */
+  advice: string = '';
 
   static success(id: string, nodeCount: number): RefreshItemOutcome {
     const o = new RefreshItemOutcome();
@@ -93,12 +99,13 @@ export class RefreshItemOutcome {
     return o;
   }
 
-  static failure(id: string, message: string, rateLimited: boolean): RefreshItemOutcome {
+  static failure(id: string, message: string, rateLimited: boolean, advice: string = ''): RefreshItemOutcome {
     const o = new RefreshItemOutcome();
     o.id = id;
     o.ok = false;
     o.message = message;
     o.rateLimited = rateLimited;
+    o.advice = advice;
     return o;
   }
 }
@@ -160,12 +167,22 @@ export class ConcurrentRefresh {
     return value;
   }
 
-  /** 统一异常文案（不输出 URL / 凭据，只输出错误消息） */
+  /**
+   * 统一异常文案（不输出 URL / 凭据，只输出错误消息）。
+   * BusinessError 形态的普通对象（{code,message}）也要正确提取；本文件必须保持
+   * 零 HarmonyOS SDK 依赖（Node 侧 type-stripping 直接加载），因此不走 AppLogger。
+   */
   static describeError(e: Object): string {
-    if (e instanceof Error) {
-      return e.message.length > 0 ? e.message : 'unknown error';
+    if (e === null || e === undefined) {
+      return 'unknown error';
     }
-    return String(e);
+    const biz = e as Record<string, Object>;
+    const msgVal = biz.message;
+    if (typeof msgVal === 'string' && (msgVal as string).length > 0) {
+      return msgVal as string;
+    }
+    const text = String(e);
+    return (text.length === 0 || text === '[object Object]') ? 'unknown error' : text;
   }
 
   /**

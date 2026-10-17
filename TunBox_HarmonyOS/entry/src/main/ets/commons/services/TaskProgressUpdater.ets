@@ -16,6 +16,7 @@
  */
 import { notificationManager } from '@kit.NotificationKit';
 import { AppLogger } from '../utils/AppLogger';
+import { SsrvpnNotifier } from './SsrvpnNotifier';
 
 const TAG = 'TaskProgressUpdater';
 /** 更新周期：官方窗口为 10 分钟，这里 5 分钟留一倍冗余 */
@@ -32,6 +33,30 @@ export class TaskProgressUpdater {
   private static timer: number = -1;
   private static startedAt: number = 0;
   private static lastFailLogAt: number = 0;
+  /** 最近一次实况内容（流量心跳更新，5 分钟心跳沿用同一内容） */
+  private static lastNodeText: string = 'TunBox';
+  private static lastSpeedLine: string = '隧道已连接 · 持续保护中';
+  private static lastDurationText: string = '';
+
+  /**
+   * 实况内容更新（连接期间由流量轮询每 2s 调用）：节点名进 title、速率+时长进
+   * fileName —— 与「已连接 X 分钟」同一渲染位，不新增第二条通知。长时任务通知
+   * 是系统强制的（dataTransfer 连续任务），应用自己的常驻通知与它重复，已合并到
+   * 这里。任务通知 id 未拿到（长时任务未挂上）时退回应用自有通知兜底。
+   */
+  static updateLive(nodeText: string, speedLine: string, durationText: string): void {
+    TaskProgressUpdater.lastNodeText = nodeText.trim().length > 0 ? nodeText.trim() : 'TunBox';
+    TaskProgressUpdater.lastSpeedLine = speedLine;
+    TaskProgressUpdater.lastDurationText = durationText;
+    const id = TaskProgressUpdater.taskNotificationId;
+    if (id < 0) {
+      // 长时任务未挂上：退回应用自有通知（attach 成功时会被 cancel，避免双通知）
+      SsrvpnNotifier.update(`TunBox · ${TaskProgressUpdater.lastNodeText}`, '',
+        `${speedLine}  ·  已运行 ${durationText}`).catch((): void => {});
+      return;
+    }
+    TaskProgressUpdater.push();
+  }
 
   /** 长时任务申请成功后调用：接管返回的 notificationId，立即推一帧并起周期心跳。 */
   static attach(notificationId: number): void {
@@ -42,6 +67,8 @@ export class TaskProgressUpdater {
     }
     TaskProgressUpdater.taskNotificationId = notificationId;
     TaskProgressUpdater.startedAt = Date.now();
+    // 应用自有常驻通知与长时任务通知重复（用户实锤「两个通知消息」），接管即撤
+    SsrvpnNotifier.cancel().catch((): void => {});
     TaskProgressUpdater.push();
     TaskProgressUpdater.timer = setInterval((): void => {
       TaskProgressUpdater.push();
@@ -71,9 +98,13 @@ export class TaskProgressUpdater {
     }
     const minutes: number = TaskProgressUpdater.startedAt > 0
       ? Math.max(0, Math.floor((Date.now() - TaskProgressUpdater.startedAt) / 60000)) : 0;
+    const nodeText = TaskProgressUpdater.lastNodeText;
+    const liveLine = TaskProgressUpdater.lastDurationText.length > 0
+      ? `${TaskProgressUpdater.lastSpeedLine}  ·  已运行 ${TaskProgressUpdater.lastDurationText}`
+      : TaskProgressUpdater.lastSpeedLine;
     const data: Record<string, Object> = {};
-    data['title'] = 'TunBox 运行中';
-    data['fileName'] = `已连接 ${minutes} 分钟`;
+    data['title'] = nodeText;
+    data['fileName'] = liveLine;
     data['progressValue'] = minutes % 100;
     const request: notificationManager.NotificationRequest = {
       id: id,
@@ -82,8 +113,8 @@ export class TaskProgressUpdater {
         notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_SYSTEM_LIVE_VIEW,
         systemLiveView: {
           typeCode: TYPE_CODE_DATA_TRANSFER,
-          title: 'TunBox',
-          text: '隧道已连接 · 持续保护中'
+          title: `TunBox · ${nodeText}`,
+          text: liveLine
         }
       },
       template: {

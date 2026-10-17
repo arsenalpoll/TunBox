@@ -114,6 +114,35 @@ export class YamlMerger {
   }
 
   /**
+   * 删除指定顶层分节（其余内容原样保留，行序不变）。
+   * 分节不存在时原样返回。供 YAML 覆盖层的 rules/rule-providers 段合并
+   * （合并进生成器的同段后，原文不能再携带这两个键，否则 mihomo 按重复键
+   * 「后者覆盖前者」整段替换掉已合并的规则）。
+   */
+  static removeSection(yaml: string, sectionName: string): string {
+    const out: string[] = [];
+    let inSection = false;
+    for (const raw of yaml.split('\n')) {
+      const line = raw.endsWith('\n') ? raw.substring(0, raw.length - 1) : raw;
+      if (!line.startsWith(' ') && !line.startsWith('\t')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith(`${sectionName}:`)) {
+          inSection = true;
+          continue;
+        }
+        if (inSection && trimmed.length > 0 && !trimmed.startsWith('#')
+          && !trimmed.startsWith('- ')) {
+          inSection = false; // 下一顶层键行 = 分节结束
+        }
+      }
+      if (!inSection) {
+        out.push(line);
+      }
+    }
+    return out.join('\n');
+  }
+
+  /**
    * 已知的 mihomo/clash 顶层配置键。proxies 分节提取以此为「分节结束」的判定依据：
    * 只有顶层键行才可能结束分节，`<<:` 合并键、`...`/`---` 文档标记、锚点定义行
    * （`key: &anchor`）与零缩进的序列项（顶格写法 `- {...}`）都不再截断分节。

@@ -1,1 +1,1 @@
-﻿{ "sha256_16": "5ab38f01073978b3", "note": "ClashConfigGenerator.ets 指纹：延迟测试重做不得改动配置生成器。若确实需要改动，请同步更新本文件并在 docs/latency-redesign.md 说明原因。" }
+{"sha256_16": "1b0662029c62e5ab", "note": "ClashConfigGenerator.ets 指纹：延迟测试重做不得改动配置生成器。若确实需要改动，请同步更新本文件并在 docs/latency-redesign.md 说明原因。 2026-10-17: safeGroupUrl 兜底从 https 改为 http（与引擎/AppSettings 默认对齐，受限出口 TLS 挂起误标超时修复）。 2026-10-17: YAML 覆盖层自定义 proxy-groups 聚合（parseOverrideProxyGroups + 组合并，validateYamlOverride 放行 proxy-groups 键，组引用守卫改用 mergedGroups）。 最终修正：overrideGroups 声明提升（修 ArkTS 编译错 used before assignment）。"}

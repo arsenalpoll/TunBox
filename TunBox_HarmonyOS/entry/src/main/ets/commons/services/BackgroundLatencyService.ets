@@ -125,6 +125,7 @@ export class BackgroundLatencyService {
       const opts = new LatencyRunOptions();
       opts.force = false;              // 静默批次只补缺失/过期结果
       opts.timeoutMs = LATENCY_TIMEOUT_MS;
+      opts.source = 'auto';            // 静默批：auto 来源的失败 UI 显示中性「未测」
       opts.onProgress = null;          // 静默：不驱动任何 UI
       opts.onResult = null;            // LatencyController 自己会通知监听者
       const run = LatencyEngine.start(api, nodes, url, opts);

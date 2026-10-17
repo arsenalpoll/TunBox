@@ -318,6 +318,8 @@ export struct SubscriptionPage {
   @State isAdding: boolean = false;
   @State isRefreshing: boolean = false;
   @State refreshingIds: string[] = [];
+  /** 分组头闪电测速按钮的防重入（对齐 refreshingIds 语义） */
+  @State speedTestingIds: string[] = [];
   @State isImporting: boolean = false;
   @State isScanning: boolean = false;
   @State toastMsg: string = '';
@@ -653,12 +655,18 @@ export struct SubscriptionPage {
   }
 
   private async speedTestSub(subId: string): Promise<void> {
+    if (subId === DIRECT_GROUP_ID || this.speedTestingIds.includes(subId)) {
+      return;
+    }
+    this.speedTestingIds = this.speedTestingIds.concat([subId]);
     try {
       this.showToast('正在测速…');
       await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId);
       this.showToast('✓ 测速完成');
     } catch (e) {
       this.showToast('测速失败，请重试');
+    } finally {
+      this.speedTestingIds = this.speedTestingIds.filter((x: string) => x !== subId);
     }
   }
 
@@ -1259,6 +1267,18 @@ export struct SubscriptionPage {
                       .fontSize(11).fontColor(Nx.muted()).width('100%')
                       .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                   }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                  // 分组头闪电测速（无文字，刷新按钮左边）
+                  if (sub.id !== DIRECT_GROUP_ID) {
+                    Stack({ alignContent: Alignment.Center }) {
+                      if (this.speedTestingIds.includes(sub.id)) {
+                        LoadingProgress().width(15).height(15).color(Nx.accent())
+                      } else {
+                        Text('⚡').fontSize(15).fontColor(Nx.accent())
+                      }
+                    }
+                    .width(28).height(28).borderRadius(9999)
+                    .onClick(() => this.speedTestSub(sub.id))
+                  }
                   // 单个刷新 28px
                   Stack({ alignContent: Alignment.Center }) {
                     if (this.isRefreshingSub(sub.id)) {
@@ -1299,11 +1319,8 @@ export struct SubscriptionPage {
                 if (this.isOpen(sub.id)) {
                   Column({ space: 5 }) {
                     Row() {
-                      Text('点击选用节点 · 长按可删除单个节点')
+                      Text('点击选用节点 · 长按可删除单个节点 · 点头部 ⚡ 测速')
                         .fontSize(11).fontColor(Nx.muted()).layoutWeight(1)
-                      Text('⚡ 一键测速')
-                        .fontSize(11).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
-                        .onClick(() => this.speedTestSub(sub.id))
                     }.width('100%').padding({ left: 6, right: 6, top: 4, bottom: 2 })
                     if (this.nodeColumns === 2) {
                       Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
