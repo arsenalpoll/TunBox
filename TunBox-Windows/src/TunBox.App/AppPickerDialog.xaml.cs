@@ -30,6 +30,7 @@ public partial class AppPickerDialog : Window
     public AppPickerDialog(IEnumerable<InstalledApp>? preScanned = null, IEnumerable<string>? preChecked = null)
     {
         InitializeComponent();
+        Lang.EnsureApplied(Lang.Resolve(new TunBox.Core.Storage.Workspace().LoadSettings().Language));
         _preScanned = preScanned as IReadOnlyList<InstalledApp> ?? preScanned?.ToList();
         _preChecked = new HashSet<string>(preChecked ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
         Loaded += OnLoaded;
@@ -57,7 +58,7 @@ public partial class AppPickerDialog : Window
         _loaded = true;
         if (_preScanned == null)
         {
-            Status.Text = "正在扫描已安装的应用…";
+            Status.Text = Lang.T("Dlg.Picker.Scanning");
             var scanned = await Task.Run(InstalledApps.Enumerate);
             if (!IsLoaded) return; // 扫描期间窗口被关了
             BuildItems(scanned);
@@ -67,8 +68,8 @@ public partial class AppPickerDialog : Window
             BuildItems(_preScanned);
         }
         Status.Text = _all.Count == 0
-            ? "没扫到可列出的应用，可以直接在主界面手动填进程名。"
-            : $"共 {_all.Count} 个应用，已勾选 {_all.Count(i => i.IsChecked)} 个";
+            ? Lang.T("Dlg.Picker.None")
+            : Lang.F("Dlg.Picker.Count", _all.Count, _all.Count(i => i.IsChecked));
         Search.Focus();
     }
 
@@ -91,10 +92,10 @@ public partial class AppPickerDialog : Window
     private void UpdateOkCount()
     {
         var n = _all.Count(i => i.IsChecked);
-        OkButton.Content = n > 0 ? $"确定（{n}）" : "确定";
+        OkButton.Content = n > 0 ? $"{Lang.T("Dlg.Picker.Ok")}（{n}）" : Lang.T("Dlg.Picker.Ok");
         Status.Text = _all.Count == 0
-            ? "没扫到可列出的应用，可以直接在主界面手动填进程名。"
-            : $"共 {_all.Count} 个应用，已勾选 {n} 个";
+            ? Lang.T("Dlg.Picker.None")
+            : Lang.F("Dlg.Picker.Count", _all.Count, n);
     }
 
     /// <summary>全选 / 清空只动当前过滤出来的可见行：搜索里的选择不受影响。</summary>

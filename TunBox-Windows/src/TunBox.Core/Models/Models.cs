@@ -69,6 +69,12 @@ public sealed class ProxyGroup
     public int IntervalSec { get; set; }
     public int ToleranceMs { get; set; }
     public string ExpectedStatus { get; set; } = "";
+    /// <summary>mihomo 的 include-all：成员 = 本订阅全部节点（解析时展开成显式名单）。</summary>
+    public bool IncludeAll { get; set; }
+    /// <summary>mihomo 的 filter 正则：按节点名再补一批成员。</summary>
+    public string Filter { get; set; } = "";
+    /// <summary>mihomo 的 exclude-filter 正则：从成员里剔掉匹配的节点。</summary>
+    public string ExcludeFilter { get; set; } = "";
     public string SubscriptionId { get; set; } = "";
 }
 
@@ -89,6 +95,8 @@ public sealed class Subscription
     public int UpdateIntervalMinutes { get; set; }
     /// <summary>上次成功拉取的 ETag，带 If-None-Match 让面板能回 304。</summary>
     public string Etag { get; set; } = "";
+    /// <summary>用户设定的自动更新间隔分钟；0 = 只手动更新（对齐 FlClash 的「自动更新」）。</summary>
+    public int AutoUpdateMinutes { get; set; }
 }
 
 public enum AppRoutingMode
@@ -124,6 +132,9 @@ public sealed class AppSettings
     public bool SystemProxyEnabled { get; set; } = true;
     /// <summary>虚拟网卡：接管全设备流量，不依赖应用自己认代理。</summary>
     public bool TunEnabled { get; set; }
+    /// <summary>TUN 协议栈：system（默认，内核态快）/ gvisor（用户态兼容好）/ mixed。
+    /// 只在设置里存字符串，生成配置前会归一化。</summary>
+    public string TunStack { get; set; } = "system";
     public bool RulesEnabled { get; set; } = true;
     public bool AdRulesEnabled { get; set; }
     public bool SniffingEnabled { get; set; } = true;
@@ -150,6 +161,39 @@ public sealed class AppSettings
     public CloseBehavior Close { get; set; } = CloseBehavior.Ask;
     /// <summary>暗色主题：null（缺字段）= 跟随系统；true/false = 用户手动锁定。</summary>
     public bool? DarkTheme { get; set; }
+    /// <summary>界面语言："" = 跟随系统，"zh" = 简体中文，"en" = English（对齐 FlClash 的多语言）。</summary>
+    public string Language { get; set; } = "";
+
+    // ── 全局快捷键（对齐 FlClash 的快捷键设置；空串 = 未启用）──────────
+    public string HotkeyShowWindow { get; set; } = "";
+    public string HotkeyToggleConnect { get; set; } = "";
+    public string HotkeyToggleSystemProxy { get; set; } = "";
+    public string HotkeyToggleTun { get; set; } = "";
+
+    // ── TUN 高级项（对齐 FlClash 的 TUN 设置）────────────────────────────
+    /// <summary>网卡 MTU；1280-65535 之外生成配置时归一回 1500。</summary>
+    public int TunMtu { get; set; } = 1500;
+    /// <summary>严格路由：拒绝绕过 TUN 的流量（防漏，但某些内网工具会失联）。</summary>
+    public bool TunStrictRoute { get; set; }
+    /// <summary>端点独立 NAT（UDP 对称 NAT 场景的兼容选项）。</summary>
+    public bool TunEndpointIndependentNat { get; set; }
+
+    // ── 静态 hosts 表（对齐 FlClash 的 Hosts 工具）───────────────────────
+    public Dictionary<string, string> Hosts { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    // ── 覆写（对齐 FlClash 的 Override：Merge 覆写 + Script 覆写）────────
+    public bool OverrideEnabled { get; set; }
+    /// <summary>Merge 覆写：一段 YAML，深合并进最终配置（数组整体替换，映射递归合并）。</summary>
+    public string OverrideMergeYaml { get; set; } = "";
+    /// <summary>Script 覆写：一段 JS，function main(config) { ...; return config; }，config 是最终配置的对象。</summary>
+    public string OverrideScript { get; set; } = "";
+
+    // ── 主窗口位置/尺寸记忆 ─────────────────────────────────────────────
+    public double WindowLeft { get; set; } = double.NaN;
+    public double WindowTop { get; set; } = double.NaN;
+    public double WindowWidth { get; set; }
+    public double WindowHeight { get; set; }
+    public bool WindowMaximized { get; set; }
 
     /// <summary>系统代理指向哪个端口：混合优先，其次独立 HTTP。返回 0 表示不该开系统代理。</summary>
     public int SystemProxyPort() => MixedPort > 0 ? MixedPort : HttpPort;

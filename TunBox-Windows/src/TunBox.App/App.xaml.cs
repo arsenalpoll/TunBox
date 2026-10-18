@@ -64,13 +64,13 @@ public partial class App : Application
         {
             var detail = args.Exception.InnerException?.Message ?? args.Exception.Message;
             System.Windows.MessageBox.Show(
-                "出现未处理的异常（已记录到 " + CrashLogDir + "）：\n" + detail,
+                TunBox.App.Lang.F("Msg.CrashBox", CrashLogDir, detail),
                 "TunBox", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
         else if (count == 4)
         {
             System.Windows.MessageBox.Show(
-                "同类异常反复出现，后续不再弹窗。完整记录在 " + CrashLogDir,
+                TunBox.App.Lang.F("Msg.CrashBoxRepeat", CrashLogDir),
                 "TunBox", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
@@ -86,7 +86,7 @@ public partial class App : Application
             // 已经有实例：能把它叫回来就安静退出，叫不动才提示一句。
             if (WakeRunningInstance()) { Step("single-instance: wake ok, shutdown"); Shutdown(); return; }
             Step("single-instance: wake failed, showing messagebox");
-            System.Windows.MessageBox.Show("TunBox 已经在运行（托盘图标可能被 Win11 收进了溢出区，点托盘小箭头找找）。",
+            System.Windows.MessageBox.Show(TunBox.App.Lang.T("Msg.AlreadyRunning"),
                 "TunBox", MessageBoxButton.OK, MessageBoxImage.Information);
             Shutdown();
             return;
@@ -113,14 +113,25 @@ public partial class App : Application
             args.SetObserved();   // 记下来即可，不该让一个被遗忘的后台任务带走进程
         };
 
+        // 语言字典先挂上：窗口里的 VM 构造时要取本地化文案，晚了就缓存原始键名。
+        try
+        {
+            var langSettings = new TunBox.Core.Storage.Workspace().LoadSettings();
+            TunBox.App.Lang.EnsureApplied(TunBox.App.Lang.Resolve(langSettings.Language));
+        }
+        catch { /* 读不到就按系统偏好 */ }
+
         // 托盘要在建窗口之前搞定：视图模型要显示「托盘到底可用吗」。
         SetupTray();
         Step("tray done, available=" + TrayAvailable);
         StartShowListener();
         _window = new MainWindow();
-        if (e.Args.Contains(MinimizedFlag)) _window.Hide();   // 开机自启：不要弹窗口挡在桌面上
+        // 开机自启带 --minimized；用户开「静默启动」时手动启动也不弹窗（对齐 FlClash 的静默启动）
+        var silent = e.Args.Contains(MinimizedFlag);
+        try { silent |= _window.ViewModel.StartMinimizedOn; } catch { /* 读不到设置就按参数来 */ }
+        if (silent) _window.Hide();
         else _window.Show();
-        Step("window shown");
+        Step("window shown, silent=" + silent);
         base.OnStartup(e);
     }
 
@@ -179,6 +190,8 @@ public partial class App : Application
             if (!_tray.TryCreate()) { _tray = null; return; }
             _tray.ShowRequested += ShowMainWindow;
             _tray.ExitRequested += ExitApplication;
+            _tray.ToggleConnectRequested += ToggleConnectFromTray;
+            _tray.ToggleLabel = () => _window?.ViewModel is { IsConnected: true } ? TunBox.App.Lang.T("Tray.Disconnect") : TunBox.App.Lang.T("Tray.Connect");
         }
         catch
         {
@@ -187,7 +200,7 @@ public partial class App : Application
         }
     }
 
-    private void ShowMainWindow()
+    public void ShowMainWindow()
     {
         if (_window == null) return;
         _window.Show();
@@ -196,11 +209,18 @@ public partial class App : Application
         _window.Activate();
     }
 
+    private void ToggleConnectFromTray()
+    {
+        if (_window?.ViewModel is not { } vm) return;
+        _ = vm.ToggleConnectCommand.ExecuteAsync(null);
+        // 状态变化会经 Manager.Changed 刷 UI；托盘菜单文案是弹出时现算的，无需主动刷新。
+    }
+
     public void MinimizeToTray()
     {
         _window?.Hide();
-        try { _tray?.ShowBalloon("TunBox 正在后台运行",
-            "点托盘图标或再运行一次 TunBox 都能唤回主窗口。要彻底退出请用托盘菜单里的「退出」。"); }
+        try { _tray?.ShowBalloon(TunBox.App.Lang.T("Tray.BalloonTitle"),
+            TunBox.App.Lang.T("Tray.BalloonText")); }
         catch { /* 气泡失败不影响主流程 */ }
     }
 

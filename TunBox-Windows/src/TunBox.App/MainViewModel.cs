@@ -1,6 +1,8 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Data;
@@ -90,7 +92,6 @@ public sealed class AsyncRelayCommand : ICommand
 /// <summary>
 /// 延迟配色（四档 + 超时/失败红，macOS 客户端的口径）：
 /// &lt;250 绿 / 250-399 琥珀 / ≥400 橙红 / 超时与失败红 / 测速中品牌蓝 / 未测灰。
-/// 旧的 250-399 蓝档和「很快」的绿挤在一起，用户读不出「勉强能用」的差别。
 /// </summary>
 public sealed class NodeItem : ObservableObject
 {
@@ -124,7 +125,7 @@ public sealed class NodeItem : ObservableObject
         }
     }
 
-    /// <summary>行背景：选中 = 品牌浅底（DataTrigger 绑它）。</summary>
+    /// <summary>卡片状态：选中 = 品牌浅底（DataTrigger 绑它）。</summary>
     public string RowState => _isSelectedNow ? "selected" : "";
 
     public void Refresh()
@@ -157,8 +158,8 @@ public sealed class NodeItem : ObservableObject
     public string LatencyTip => Model.State switch
     {
         DelayState.Ok => $"{Model.Name} · 延迟 {Model.LastLatency} ms，点击可重测",
-        DelayState.Testing => "正在测这个节点…",
-        DelayState.Untested => $"点击只测这一个节点（{Model.Server}:{Model.Port}）",
+        DelayState.Testing => Lang.T("Tip.TestingNode"),
+        DelayState.Untested => Lang.F("Tip.TestOne", Model.Server, Model.Port),
         _ => $"{Model.Name} · " + (Model.DelayError ?? "测速失败") + "（点击重试）",
     };
 
@@ -166,72 +167,64 @@ public sealed class NodeItem : ObservableObject
 }
 
 /// <summary>
-/// 一条订阅的手风琴卡：折叠时只占一行（名字 + 流量 + 更新时间），展开是该订阅的节点列表。
-/// 与鸿蒙客户端的订阅页同形态。
+/// 一条订阅（配置页的资料卡，对齐 FlClash 的 Profile）：名字 / 地址 / 流量 / 更新时间 /
+/// 自动更新档位。节点本身全部在「代理」页展示。
 /// </summary>
 public sealed class SubscriptionItem : ObservableObject
 {
     public Subscription Model { get; }
-    public SubscriptionItem(Subscription model) { Model = model; }
+    public SubscriptionItem(Subscription model)
+    {
+        Model = model;
+        _autoUpdateChoice = model.AutoUpdateMinutes.ToString();
+    }
 
-    /// <summary>该订阅的节点行（全量）。实例与总表的 NodeItem 是**同一批对象**，测速结果自动跟着变。</summary>
+    private bool _isUpdating;
+
+    /// <summary>更新中：图标顺时针连续旋转（700ms 一圈）。</summary>
+    public bool IsUpdating { get => _isUpdating; internal set => Set(ref _isUpdating, value); }
+
+    private bool _updateFlash;
+
+    /// <summary>完成反馈:图标变绿勾并轻微回弹(~1.4s),失败直接回原样(错误在状态条)。</summary>
+    public bool UpdateFlash { get => _updateFlash; internal set => Set(ref _updateFlash, value); }
+
+    /// <summary>这条订阅的全部节点行（与总表 Nodes 同一批实例：测速结果自动跟着变）。</summary>
     public System.Collections.ObjectModel.ObservableCollection<NodeItem> Nodes { get; } = new();
 
-    /// <summary>当前页面真正显示的那一份：按选中的分组筛过。订阅上的 ⚡ 测速测的就是它。</summary>
+    /// <summary>搜索过滤 + 排序后实际显示的节点。</summary>
     public System.Collections.ObjectModel.ObservableCollection<NodeItem> VisibleNodes { get; } = new();
 
-    /// <summary>订阅声明的代理组（第一颗是「全部节点」）。点它 = 筛选，不是测速。</summary>
-    public System.Collections.ObjectModel.ObservableCollection<GroupChip> Groups { get; } = new();
+    private bool _isExpanded = true;
 
-    private GroupChip? _activeGroup;
-    public GroupChip? ActiveGroup
+    /// <summary>展开 = 显示节点列表。折叠态要活过每一次列表重建（内核事件一秒好几次）。</summary>
+    public bool IsExpanded { get => _isExpanded; set => Set(ref _isExpanded, value); }
+
+    public string NodeCountText => Lang.F("Proxy.CountAll", VisibleNodes.Count, Nodes.Count, "");
+
+    /// <summary>空状态提示用：这张卡当前有没有可见节点。</summary>
+    public bool HasVisibleNodes => VisibleNodes.Count > 0;
+
+    /// <summary>按搜索词过滤 + 按所选方式排序。只挪不重建：滚动位置与测速结果都不丢。</summary>
+    internal void ApplyCardFilter(string search, string sort)
     {
-        get => _activeGroup;
-        set { if (!ReferenceEquals(_activeGroup, value)) { _activeGroup = value; ApplyFilter(); } }
-    }
-
-    private string _searchText = "";
-
-    /// <summary>节点搜索：和分组筛选叠加。空串 = 不搜。改一个字就重筛（列表量级 ≤几百，够快）。</summary>
-    public string SearchText
-    {
-        get => _searchText;
-        set { if (!Set(ref _searchText, value ?? "")) return; ApplyFilter(); }
-    }
-
-    private bool _isTesting;
-    public bool IsTesting
-    {
-        get => _isTesting;
-        set { if (Set(ref _isTesting, value)) { Raise(nameof(TestGlyph)); Raise(nameof(TestTip)); } }
-    }
-
-    public string TestGlyph => _isTesting ? "⚡…" : "⚡";
-    public string TestTip => _isTesting
-        ? "这一页的节点正在测…"
-        : "只测当前页面显示的节点（选中分组就只测该组）；测完按延迟从低到高排";
-
-    /// <summary>分组里存的是订阅原文里的成员名；显示名可能被唯一化改过，所以两边都比。</summary>
-    public bool InGroup(NodeItem item, GroupChip chip) =>
-        chip.Members.Contains(item.Model.OriginalName, StringComparer.Ordinal)
-        || chip.Members.Contains(item.Model.Name, StringComparer.Ordinal);
-
-    /// <summary>筛选只挪不重建：实例不变、滚动位置不丢，测速结果也不会被抹平。</summary>
-    public void ApplyFilter()
-    {
-        var chip = ActiveGroup;
-        var query = _searchText.Trim();
-        var matched = chip == null || chip.Name.Length == 0
-            ? Nodes.ToList()
-            : Nodes.Where(n => InGroup(n, chip)).ToList();
-        if (query.Length > 0)
+        var q = (search ?? "").Trim();
+        IEnumerable<NodeItem> matched = Nodes;
+        if (q.Length > 0)
             matched = matched.Where(n =>
-                n.Model.Name.Contains(query, StringComparison.OrdinalIgnoreCase)
-                || n.Model.OriginalName.Contains(query, StringComparison.OrdinalIgnoreCase)).ToList();
-        FilterNote = matched.Count == 0 && Nodes.Count > 0 && chip != null && chip.Name.Length > 0
-            ? $"「{chip.Name}」里一个节点都没对上（机场可能改了成员名），先按全部节点显示。"
-            : "";
-        var want = matched.Count > 0 ? matched : (query.Length > 0 ? matched : Nodes.ToList());
+                n.Model.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
+                || n.Model.OriginalName.Contains(q, StringComparison.OrdinalIgnoreCase));
+        var want = sort switch
+        {
+            "name" => matched.OrderBy(n => n.Model.Name, StringComparer.OrdinalIgnoreCase).ToList(),
+            "delay" => matched.OrderBy(n => n.Model.State switch
+            {
+                TunBox.Core.Models.DelayState.Ok => n.Model.LastLatency,
+                TunBox.Core.Models.DelayState.Testing => 1_000_000,
+                _ => 2_000_000,
+            }).ThenBy(n => n.Model.Name, StringComparer.OrdinalIgnoreCase).ToList(),
+            _ => matched.ToList(),
+        };
         for (var i = 0; i < want.Count; i++)
         {
             var at = VisibleNodes.IndexOf(want[i]);
@@ -240,32 +233,31 @@ public sealed class SubscriptionItem : ObservableObject
         }
         for (var i = VisibleNodes.Count - 1; i >= 0; i--)
             if (!want.Contains(VisibleNodes[i])) VisibleNodes.RemoveAt(i);
-        foreach (var g in Groups) g.IsOn = ReferenceEquals(g, chip);
-        Raise(nameof(VisibleCountText));
+        Raise(nameof(NodeCountText));
+        Raise(nameof(HasVisibleNodes));
     }
 
-    private string _filterNote = "";
-    public string FilterNote { get => _filterNote; private set { if (Set(ref _filterNote, value)) Raise(nameof(ShowFilterNote)); } }
-    public bool ShowFilterNote => _filterNote.Length > 0;
+    private string _autoUpdateChoice;
 
-    public string VisibleCountText
+    /// <summary>自动更新档位（分钟字符串；"0" = 手动）。改动立刻落盘，选完就是保存。</summary>
+    public string AutoUpdateChoice
     {
-        get
+        get => _autoUpdateChoice;
+        set
         {
-            var q = _searchText.Trim();
-            if (q.Length > 0) return ActiveGroup == null || ActiveGroup.Name.Length == 0
-                ? $"搜「{q}」：{VisibleNodes.Count} / {Nodes.Count} 个节点"
-                : $"搜「{q}」：{VisibleNodes.Count} / {Nodes.Count} 个节点 · {ActiveGroup.Name}";
-            return ActiveGroup == null || ActiveGroup.Name.Length == 0
-                ? $"{Nodes.Count} 个节点"
-                : $"{VisibleNodes.Count} / {Nodes.Count} 个节点 · {ActiveGroup.Name}";
+            if (!Set(ref _autoUpdateChoice, value ?? "0")) return;
+            AutoUpdateChanged?.Invoke(this, _autoUpdateChoice);
         }
     }
 
-    private bool _isExpanded = true;
-    public bool IsExpanded { get => _isExpanded; set => Set(ref _isExpanded, value); }
+    /// <summary>视图模型挂进来的回调：把档位写进设置并落盘（卡片自己摸不到管理器）。</summary>
+    public Action<SubscriptionItem, string>? AutoUpdateChanged { get; set; }
+
+    /// <summary>订阅是否启用了自动更新（图标提示用）。</summary>
+    public bool AutoUpdateOn => Model.AutoUpdateMinutes > 0;
 
     public string Name => string.IsNullOrWhiteSpace(Model.Name) ? Model.Url : Model.Name;
+    public string UrlText => Model.Url.Length > 0 ? Model.Url : Lang.T("Profile.UrlNone");
     public string Updated => Model.UpdatedAtMs > 0
         ? DateTimeOffset.FromUnixTimeMilliseconds(Model.UpdatedAtMs).LocalDateTime.ToString("MM-dd HH:mm")
         : "未更新";
@@ -274,7 +266,7 @@ public sealed class SubscriptionItem : ObservableObject
     {
         get
         {
-            if (Model.TotalBytes <= 0) return $"{Nodes.Count} 个节点";
+            if (Model.TotalBytes <= 0) return "";
             var used = Math.Max(0, Model.UploadBytes + Model.DownloadBytes);
             return $"{Fmt(used)} / {Fmt(Model.TotalBytes)}"
                 + (Model.ExpireAtMs > 0 ? " · " + DateTimeOffset.FromUnixTimeMilliseconds(Model.ExpireAtMs).LocalDateTime.ToString("yyyy-MM-dd 到期") : "");
@@ -291,8 +283,7 @@ public sealed class SubscriptionItem : ObservableObject
         }
     }
 
-    /// <summary>流量条颜色：健康 = 品牌蓝，用量 &gt;80% 转琥珀，&gt;95% 转红——
-    /// 让人不用读数字就知道「快用完了」。</summary>
+    /// <summary>流量条颜色：健康 = 品牌蓝，用量 &gt;80% 转琥珀，&gt;95% 转红。</summary>
     public System.Windows.Media.Brush TrafficRatioBrush
     {
         get
@@ -303,6 +294,8 @@ public sealed class SubscriptionItem : ObservableObject
             return BrandBrush;
         }
     }
+
+    public bool HasTraffic => Model.TotalBytes > 0;
 
     private static System.Windows.Media.SolidColorBrush B(byte r, byte g, byte b)
     {
@@ -321,6 +314,8 @@ public sealed class SubscriptionItem : ObservableObject
         Raise(nameof(Updated));
         Raise(nameof(TrafficRatio));
         Raise(nameof(TrafficRatioBrush));
+        Raise(nameof(AutoUpdateOn));
+        Raise(nameof(UrlText));
     }
 
     private static string Fmt(long b) => b switch
@@ -332,37 +327,7 @@ public sealed class SubscriptionItem : ObservableObject
     };
 }
 
-/// <summary>
-/// 订阅声明的一个代理组。点它是**筛选**：把这张订阅卡切到只显示该组的节点
-/// （用户要求的形态——之前点分组只测速，节点列表根本不动，等于没分组）。
-/// </summary>
-public sealed class GroupChip : ObservableObject
-{
-    /// <summary>所属订阅卡（chip 的 DataContext 只有它自己，点击事件要能找回父卡）。</summary>
-    public SubscriptionItem? Owner { get; internal set; }
-    public string Name { get; }
-    public string Kind { get; }
-    public List<string> Members { get; }
-
-    /// <summary>空名字 = 「全部节点」那颗伪分组（每张卡第一颗）。</summary>
-    public GroupChip(string name, string kind, IEnumerable<string> members)
-    {
-        Name = name;
-        Kind = kind;
-        Members = members.ToList();
-    }
-
-    public string DisplayName => Name.Length == 0 ? "全部节点" : Name;
-
-    private bool _isOn;
-    public bool IsOn { get => _isOn; set => Set(ref _isOn, value); }
-
-    public string Label => Kind.Length == 0
-        ? $"{DisplayName}（{Members.Count}）"
-        : $"{DisplayName}（{Kind} · {Members.Count}）";
-}
-
-/// <summary>连接表的一行。按 Id 复用实例、只刷新数字，用户的鼠标底下不会换行。</summary>
+/// <summary>请求表的一行。按 Id 复用实例、只刷新数字，用户的鼠标底下不会换行。</summary>
 public sealed class ConnectionItem : ObservableObject
 {
     public string Id { get; }
@@ -381,13 +346,29 @@ public sealed class ConnectionItem : ObservableObject
     private string _started = "";
     public string Started { get => _started; private set => Set(ref _started, value); }
     private long _upload;
-    public long Upload { get => _upload; private set => Set(ref _upload, value); }
+    public long Upload
+    {
+        get => _upload;
+        private set { if (Set(ref _upload, value)) Raise(nameof(UploadText)); }
+    }
     private long _download;
-    public long Download { get => _download; private set { if (Set(ref _download, value)) Raise(nameof(DownloadText)); } }
+    public long Download
+    {
+        get => _download;
+        private set { if (Set(ref _download, value)) Raise(nameof(DownloadText)); }
+    }
     public string DownloadText => FmtBytes(Download);
+    public string UploadText => FmtBytes(Upload);
+    private string _upSpeedText = "";
+    public string UpSpeedText { get => _upSpeedText; private set => Set(ref _upSpeedText, value); }
+    private string _downSpeedText = "";
+    public string DownSpeedText { get => _downSpeedText; private set => Set(ref _downSpeedText, value); }
     public DateTime StartAt { get; private set; }
 
-    public void Apply(Connection c, DateTime now)
+    private long _prevUpload = -1;
+    private long _prevDownload = -1;
+
+    public void Apply(Connection c, DateTime now, double seconds)
     {
         Target = c.Target;
         Chain = c.Chain;
@@ -396,8 +377,15 @@ public sealed class ConnectionItem : ObservableObject
         Protocol = c.Network.Length == 0 ? "" : c.Network.ToUpperInvariant() + (c.Port > 0 ? " " + c.Port : "");
         StartAt = c.Start == default ? DateTime.MinValue : c.Start.ToLocalTime();
         Started = c.Start == default ? "" : StartAt.ToString("HH:mm:ss");
+        // 首次见到的连接没有上一拍可差分，速率从 0 起，别拿「总量/时长」编一个假速率
+        var upSpeed = _prevUpload >= 0 && seconds > 0 ? Math.Max(0, c.Upload - _prevUpload) / seconds : 0;
+        var downSpeed = _prevDownload >= 0 && seconds > 0 ? Math.Max(0, c.Download - _prevDownload) / seconds : 0;
+        _prevUpload = c.Upload;
+        _prevDownload = c.Download;
         Upload = c.Upload;
         Download = c.Download;
+        UpSpeedText = FmtSpeed(upSpeed);
+        DownSpeedText = FmtSpeed(downSpeed);
     }
 
     internal static string FmtBytes(long b) => b switch
@@ -416,7 +404,7 @@ public sealed class ConnectionItem : ObservableObject
     };
 }
 
-/// <summary>主视图模型：页面共一份数据，导航只是切换显示哪一块。</summary>
+/// <summary>主视图模型：五个页面共一份数据，导航只是切换显示哪一块。</summary>
 public sealed class MainViewModel : ObservableObject, IDisposable
 {
     private readonly Workspace _workspace;
@@ -425,6 +413,29 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<NodeItem> Nodes { get; } = new();
     public ObservableCollection<SubscriptionItem> Subscriptions { get; } = new();
     public ObservableCollection<ConnectionItem> Connections { get; } = new();
+    /// <summary>请求表的筛选视图：搜索框只过滤显示，底层顺序不动。</summary>
+    public ICollectionView ConnectionsView { get; }
+
+    // ── 页面导航（对齐 FlClash：仪表盘 / 代理 / 请求 / 配置 / 设置） ──────
+    public const string PageDashboard = "仪表盘";
+    public const string PageProxies = "代理";
+    public const string PageRequests = "请求";
+    public const string PageSettings = "设置";
+
+    private string _activePage = PageDashboard;
+
+    /// <summary>当前页；页头大标题绑它。</summary>
+    public string ActivePage { get => _activePage; private set => Set(ref _activePage, value); }
+
+    /// <summary>页内跳转（仪表盘「查看请求」等）：窗口代码后置接到后翻页签。</summary>
+    public event Action<string>? NavigateRequested;
+
+    public RelayCommand GoToPageCommand { get; }
+
+    private void GoToPage(object? p)
+    {
+        if (p is string page && page.Length > 0) NavigateRequested?.Invoke(page);
+    }
 
     private NodeItem? _selectedNode;
     public NodeItem? SelectedNode
@@ -440,13 +451,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task SelectNodeAsync(NodeItem item)
     {
-        // 统一落在总出口 PROXY：与鸿蒙订阅页同口径，点了哪行哪行就是出口。
+        // 统一落在总出口 PROXY：点了哪张卡哪张卡就是出口。
         var ok = await _manager.SelectNodeAsync(item.Model.Name, "PROXY");
         // 内核拒了（Manager 已经把原因写进 LastError）：不假装选中，也不给用户瞎指一条路
-        if (!ok) { DetailText = _manager.LastError ?? $"内核没有接受这次切换：{item.Name}"; return; }
+        if (!ok) { DetailText = _manager.LastError ?? Lang.F("Msg.SwitchRejected", item.Name); return; }
         foreach (var n in Nodes) n.IsSelectedNow = ReferenceEquals(n, item);
         Raise(nameof(SelectedNode));
-        // 手点一个节点 = 退出自动优选（与鸿蒙端一致）
+        // 手点一个节点 = 退出自动优选
         Raise(nameof(SmartActive));
         Raise(nameof(SelectedEgressText));
     }
@@ -464,44 +475,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool SmartActive => SmartAvailable &&
         (_manager.Settings.SelectedNodeId.Length == 0 || _manager.Settings.SelectedNodeId == SmartEgressId);
 
-    public string SmartSubtitle => $"内核智能选点 · 按每条连接的目标自动择优 · {Nodes.Count} 个候选节点";
+    public string SmartSubtitle => Lang.F("Tip.SmartSubtitle", Nodes.Count);
 
-    /// <summary>首页「当前出口」：自动优选时显示组名，不假装是某个节点（内核的 now 也不会随每条连接变）。</summary>
-    /// <summary>首页「当前出口」：自动优选时显示组名，不假装是某个节点（内核的 now 也不会随每条连接变）。
-    /// 全局模式下 GLOBAL 跟着 PROXY 走（内核实测它也认代理组名），所以这个说法在两种模式下都成立。</summary>
+    /// <summary>仪表盘「当前出口」：自动优选时显示组名，不假装是某个节点。</summary>
     public string SelectedEgressText => SmartActive
         ? ClashConfigGenerator.SmartGroupName
         : SelectedNode?.Name ?? "还没选节点";
 
-    public AsyncRelayCommand SelectSmartCommand { get; }
-
-    /// <summary>手动查一次出口信息（卡片右上角那个刷新）。</summary>
-    public AsyncRelayCommand RefreshEgressCommand { get; }
-
-    /// <summary>把总出口交给 smart 组：PROXY 选到 ♻️ 自动选择，之后每条连接由模型决定走哪个节点。</summary>
-    private async Task SelectSmartAsync()
-    {
-        if (!SmartAvailable)
-        {
-            DetailText = "自动优选现在不可用：需要至少两个节点，并且内核的 LightGBM 模型在位。";
-            return;
-        }
-        var ok = await _manager.SelectNodeAsync(ClashConfigGenerator.SmartGroupName, "PROXY");
-        // SelectNodeAsync 按节点名找 id，smart 组不是节点所以找不到 —— 出口标记要自己写
-        _manager.Settings.SelectedNodeId = SmartEgressId;
-        _manager.SaveSettings();
-        foreach (var n in Nodes) n.IsSelectedNow = false;
-        Raise(nameof(SmartActive));
-        Raise(nameof(SelectedEgressText));
-        // 切换成功不播报：卡片「使用中」徽章 + 当前出口名就是反馈（用户点名：多余提示不要）
-        if (!ok) DetailText = "内核没接受切到自动优选（可能这份配置里还没发射 smart 组），点「连接」后重试。";
-    }
+    // ── 全局反馈条 ───────────────────────────────────────────────────────
 
     private string _detailText = "";
 
     /// <summary>
-    /// 底部状态条：报完就自己消失（3 秒）。以前它会一直挂着，
-    /// 用户下次看页面时满屏都是上一次操作的残留文字。
+    /// 底部状态条：报完就自己消失（3 秒）。
     /// </summary>
     public string DetailText
     {
@@ -539,8 +525,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool IsConnected { get => _isConnected; private set => Set(ref _isConnected, value); }
     public bool IsConnecting { get => _isConnecting; private set { if (Set(ref _isConnecting, value)) Raise(nameof(RingStateText)); } }
 
-    /// <summary>电源环中间那行字：只有 未连接 / 正在连接 / 已连接 三种，别写成一整句状态报告。</summary>
-    public string RingStateText => IsConnected ? "已连接" : IsConnecting ? "正在连接" : "未连接";
+    /// <summary>电源环中间那行字：只有 未连接 / 正在连接 / 已连接 三种。</summary>
+    public string RingStateText => IsConnected ? Lang.T("State.Connected") : IsConnecting ? Lang.T("State.Connecting") : Lang.T("State.Disconnected");
 
     private bool _isCoreAlive;
     public bool IsCoreAlive { get => _isCoreAlive; private set => Set(ref _isCoreAlive, value); }
@@ -551,6 +537,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _trafficText = "↑ 0 B/s   ↓ 0 B/s";
     public string TrafficText { get => _trafficText; private set => Set(ref _trafficText, value); }
 
+    private string _upSpeedText = "0 B/s";
+    public string UpSpeedText { get => _upSpeedText; private set => Set(ref _upSpeedText, value); }
+    private string _downSpeedText = "0 B/s";
+    public string DownSpeedText { get => _downSpeedText; private set => Set(ref _downSpeedText, value); }
+
+    /// <summary>速率采样（字节/秒）。流量图控件借窗口订阅它，VM 不持有控件。</summary>
+    public event Action<double, double>? SpeedSampled;
+
     // ── 命令 ─────────────────────────────────────────────────────────────
     public AsyncRelayCommand ToggleConnectCommand { get; }
     public AsyncRelayCommand TestAllCommand { get; }
@@ -558,12 +552,41 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public AsyncRelayCommand ApplySettingsCommand { get; }
     public AsyncRelayCommand SaveAllCommand { get; }
     public AsyncRelayCommand RefreshGeoCommand { get; }
+    public AsyncRelayCommand CloseAllConnectionsCommand { get; }
+    public AsyncRelayCommand UpdateAllCommand { get; }
+    public AsyncRelayCommand RunNetCheckCommand { get; }
+    public AsyncRelayCommand SaveOverrideCommand { get; }
     public RelayCommand SetModeCommand { get; }
+    public RelayCommand PauseToggleCommand { get; }
     public RelayCommand RemoveSubscriptionCommand { get; }
     public RelayCommand OpenLogCommand { get; }
+    public RelayCommand ViewConfigCommand { get; }
     public RelayCommand RestartAsAdminCommand { get; }
     public RelayCommand ExitCommand { get; }
     public RelayCommand ToggleTunCommand { get; }
+    public AsyncRelayCommand SelectSmartCommand { get; }
+
+    /// <summary>手动查一次出口信息（卡片右上角那个刷新）。</summary>
+    public AsyncRelayCommand RefreshEgressCommand { get; }
+
+    /// <summary>把总出口交给 smart 组：PROXY 选到 ♻️ 自动选择，之后每条连接由模型决定走哪个节点。</summary>
+    private async Task SelectSmartAsync()
+    {
+        if (!SmartAvailable)
+        {
+            DetailText = Lang.T("Msg.SmartUnavailable");
+            return;
+        }
+        var ok = await _manager.SelectNodeAsync(ClashConfigGenerator.SmartGroupName, "PROXY");
+        // SelectNodeAsync 按节点名找 id，smart 组不是节点所以找不到 —— 出口标记要自己写
+        _manager.Settings.SelectedNodeId = SmartEgressId;
+        _manager.SaveSettings();
+        foreach (var n in Nodes) n.IsSelectedNow = false;
+        Raise(nameof(SmartActive));
+        Raise(nameof(SelectedEgressText));
+        // 切换成功不播报：页签高亮 + 当前出口名就是反馈
+        if (!ok) DetailText = Lang.T("Msg.SmartRejected");
+    }
 
     private string _subscriptionInput = "";
     public string SubscriptionInput { get => _subscriptionInput; set => Set(ref _subscriptionInput, value); }
@@ -603,7 +626,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private string _dnsFeedback = "";
 
-    /// <summary>DNS 复写的逐行校验结果，写不进内核的那几条必须当场说出来。</summary>
+    /// <summary>DNS 覆写的逐行校验结果，写不进内核的那几条必须当场说出来。</summary>
     public string DnsFeedback { get => _dnsFeedback; private set => Set(ref _dnsFeedback, value); }
     private bool _rulesOn = true;
     public bool RulesOn { get => _rulesOn; set => Set(ref _rulesOn, value); }
@@ -621,12 +644,426 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string AppRoutingChoice { get => _appRoutingChoice; set => Set(ref _appRoutingChoice, value); }
     private bool _autoStartOn;
     public bool AutoStartOn { get => _autoStartOn; set => Set(ref _autoStartOn, value); }
-    private string _closeChoice = "ask";
+    private bool _startMinimizedOn;
+
+    /// <summary>静默启动：开机/快捷方式启动不开主窗口。选完立刻落盘（App 启动时读）。</summary>
+    public bool StartMinimizedOn
+    {
+        get => _startMinimizedOn;
+        set { if (Set(ref _startMinimizedOn, value)) { _manager.Settings.StartMinimized = value; _manager.SaveSettings(); } }
+    }
+
+    private string _tunStackChoice = "system";
+
+    /// <summary>TUN 协议栈（对齐 FlClash 的 TUN 设置）：system 快 / gvisor 兼容 / mixed 兼顾。随「保存设置」生效。</summary>
+    public string TunStackChoice { get => _tunStackChoice; set => Set(ref _tunStackChoice, value); }
+
+    private string _tunMtuText = "1500";
+
+    /// <summary>TUN 网卡 MTU（对齐 FlClash 的 TUN 高级项）。非法值在保存时归一回 1500。</summary>
+    public string TunMtuText { get => _tunMtuText; set => Set(ref _tunMtuText, value); }
+
+    private bool _tunStrictRoute;
+
+    /// <summary>严格路由：拒绝绕过 TUN 的流量（防漏，内网工具多时可能失联）。</summary>
+    public bool TunStrictRouteOn { get => _tunStrictRoute; set => Set(ref _tunStrictRoute, value); }
+
+    private bool _tunEinat;
+
+    /// <summary>端点独立 NAT（UDP 对称 NAT 兼容）。</summary>
+    public bool TunEinatOn { get => _tunEinat; set => Set(ref _tunEinat, value); }
+
+    private string _apiSecretText = "";
+
+    /// <summary>external-controller 的 Bearer 密钥；随「保存设置」生效。</summary>
+    public string ApiSecretText { get => _apiSecretText; set => Set(ref _apiSecretText, value); }
+
+    // ── 多语言（对齐 FlClash 的语言设置）────────────────────────────────
+
+    private string _languageChoice = "";
+
+    /// <summary>auto = 跟随系统；zh / en 手动锁定。切换即时生效并落盘。</summary>
+    public string LanguageChoice
+    {
+        get => _languageChoice;
+        set
+        {
+            if (!Set(ref _languageChoice, value)) return;
+            _manager.Settings.Language = value;
+            _manager.SaveSettings();
+            ApplyLanguage();
+        }
+    }
+
+    /// <summary>把语言应用到所有已打开的窗口（主窗口 + 对话框都读 Application 级字典）。</summary>
+    internal void ApplyLanguage()
+    {
+        if (System.Windows.Application.Current == null) return;
+        Lang.Apply(System.Windows.Application.Current.Resources, Lang.Resolve(_manager.Settings.Language));
+        RefreshLocalizedOptions();
+        // 静态拼接过的文案不重算（下一次触发时用新语言），动态绑定随字典自动换。
+    }
 
     /// <summary>
-    /// 选完立刻落盘。以前它只活在内存里，要等「应用设置」那颗按钮才写盘，
-    /// 而「常规」这张卡上没有那颗按钮 —— 于是用户反馈的「三个选择都没用，每次都缩到托盘」。
+    /// 语言字典就位后调用：VM 可能在字典挂上之前就构造好了（测试宿主 / 窗口构造顺序），
+    /// 那一刻捕获的本地化字符串是原始键名 —— 这里把这类缓存重算一遍。
     /// </summary>
+    internal void RefreshLocalizedOptions()
+    {
+        SyncTunStatus();
+        RebuildQuickEgress();
+        ApplyCardFilters();
+        Raise(nameof(SmartSubtitle));
+        Raise(nameof(SubscriptionCountText));
+        Raise(nameof(RequestsCountText));
+    }
+
+    // ── 全局快捷键（对齐 FlClash 的快捷键设置）──────────────────────────
+
+    /// <summary>快捷键改动后通知窗口重新注册（RegisterHotKey 挂在窗口消息循环上）。</summary>
+    public event Action? HotkeysChanged;
+
+    private string _hotkeyShow = "";
+    public string HotkeyShowText
+    {
+        get => _hotkeyShow;
+        set { var norm = Hotkeys.Normalize(value); if (Set(ref _hotkeyShow, norm)) SaveHotkey(norm, s => s.HotkeyShowWindow = norm); }
+    }
+
+    private string _hotkeyConnect = "";
+    public string HotkeyConnectText
+    {
+        get => _hotkeyConnect;
+        set { var norm = Hotkeys.Normalize(value); if (Set(ref _hotkeyConnect, norm)) SaveHotkey(norm, s => s.HotkeyToggleConnect = norm); }
+    }
+
+    private string _hotkeyTun = "";
+    public string HotkeyTunText
+    {
+        get => _hotkeyTun;
+        set { var norm = Hotkeys.Normalize(value); if (Set(ref _hotkeyTun, norm)) SaveHotkey(norm, s => s.HotkeyToggleTun = norm); }
+    }
+
+    private void SaveHotkey(string normalized, Action<TunBox.Core.Models.AppSettings> write)
+    {
+        write(_manager.Settings);
+        _manager.SaveSettings();
+        HotkeysChanged?.Invoke();
+        DetailText = normalized.Length == 0 ? "" : Lang.F("Set.Hotkey.Registered", normalized);
+    }
+
+    /// <summary>设置页捕获框的占位文案。</summary>
+    public string HotkeyPlaceholder => Lang.T("Set.Hotkey.Empty");
+
+    // ── 代理页排序（对齐 FlClash 的排序选项）────────────────────────────
+
+    private string _sortChoice = "default";
+
+    /// <summary>default = 保留测速后的排序历史；delay/name = 强制排序。</summary>
+    public string SortChoice
+    {
+        get => _sortChoice;
+        set
+        {
+            if (!Set(ref _sortChoice, value ?? "default")) return;
+            ApplyCardFilters();
+        }
+    }
+
+    private string _nodeSearchText = "";
+
+    /// <summary>节点搜索：所有订阅卡一起过滤，一个字就重筛（列表量级 ≤几百，够快）。</summary>
+    public string NodeSearchText
+    {
+        get => _nodeSearchText;
+        set { if (!Set(ref _nodeSearchText, value ?? "")) return; ApplyCardFilters(); }
+    }
+
+    private void ApplyCardFilters()
+    {
+        foreach (var card in Subscriptions) card.ApplyCardFilter(_nodeSearchText, _sortChoice);
+    }
+
+    // ── 仪表盘快捷出口（不进代理页直接切点）────────────────────────────
+
+    /// <summary>快捷出口下拉的选项：自动选择（可用时）+ 全部节点名。</summary>
+    public System.Collections.ObjectModel.ObservableCollection<string> QuickEgressOptions { get; } = new();
+
+    private string _quickEgressSelected = "";
+
+    /// <summary>下拉当前值；改了就真的切出口（smart 或具体节点）。</summary>
+    public string QuickEgressSelected
+    {
+        get => _quickEgressSelected;
+        set
+        {
+            if (!Set(ref _quickEgressSelected, value ?? "")) return;
+            if (value.Length == 0 || _rebuilding) return;
+            if (SmartActive && value == SmartOptionLabel) return;   // 已经是自动选择，别重复切
+            var node = Nodes.FirstOrDefault(n => n.Model.Name == value);
+            if (node != null) { SelectedNode = node; return; }
+            if (SmartAvailable && value == SmartOptionLabel) _ = SelectSmartAsync();
+        }
+    }
+
+    private string SmartOptionLabel => Lang.T("Proxy.Smart");
+
+    private void RebuildQuickEgress()
+    {
+        var want = new List<string>();
+        if (SmartAvailable) want.Add(SmartOptionLabel);
+        foreach (var n in Nodes) want.Add(n.Model.Name);
+        // 内容没变就别动集合：内核事件一秒好几次，每次都 Clear+重加会让下拉框闪烁
+        var changed = want.Count != QuickEgressOptions.Count
+                      || !want.SequenceEqual(QuickEgressOptions);
+        if (changed)
+        {
+            QuickEgressOptions.Clear();
+            foreach (var name in want) QuickEgressOptions.Add(name);
+        }
+        var keep = _quickEgressSelected;
+        var match = want.FirstOrDefault(x => x == keep)
+                    ?? (SmartActive ? SmartOptionLabel : SelectedNode?.Model.Name)
+                    ?? want.FirstOrDefault();
+        _quickEgressSelected = match ?? "";
+        if (changed || _quickEgressSelected != keep) Raise(nameof(QuickEgressSelected));
+    }
+
+    /// <summary>仪表盘端口卡的摘要行。</summary>
+    public string PortsSummaryText => Lang.F("Dash.PortsFormat",
+        _manager.Settings.MixedPort, _manager.Settings.HttpPort,
+        _manager.Settings.SocksPort, _manager.Settings.ApiPort);
+
+    // ── 配置页全部更新 ──────────────────────────────────────────────────
+
+    private bool _updatingAll;
+
+    public bool UpdatingAll { get => _updatingAll; private set { if (Set(ref _updatingAll, value)) Raise(nameof(UpdateAllLabel)); } }
+
+    public string UpdateAllLabel => UpdatingAll ? Lang.T("Profile.Updating") : Lang.T("Profile.UpdateAll");
+
+    private async Task UpdateAllAsync()
+    {
+        if (_updatingAll) return;
+        var targets = _manager.Subscriptions.Where(s => s.Url.Length > 0).ToList();
+        if (targets.Count == 0) { DetailText = Lang.T("Profile.None"); return; }
+        UpdatingAll = true;
+        try
+        {
+            var failed = 0;
+            foreach (var s in targets)
+                if (!await _manager.RefreshSubscriptionAsync(s.Id)) failed++;
+            RebuildLists();
+            DetailText = failed == 0
+                ? Lang.T("Msg.UpdateAllDone")
+                : Lang.F("Msg.UpdateAllPartial", targets.Count - failed, failed);
+        }
+        finally { UpdatingAll = false; }
+    }
+
+    // ── 工具页：Hosts / 覆写 / 网络检测 / 内核日志 ──────────────────────
+
+    private string _hostsText = "";
+
+    /// <summary>Hosts 编辑器的文本；一行一条「域名 IP」或「域名=IP」。随「保存覆写」一起落盘。</summary>
+    public string HostsText { get => _hostsText; set => Set(ref _hostsText, value); }
+
+    private string _hostsFeedback = "";
+    public string HostsFeedback { get => _hostsFeedback; private set => Set(ref _hostsFeedback, value); }
+
+    internal static List<KeyValuePair<string, string>> ParseHosts(string text, List<string>? problems = null)
+    {
+        var outPairs = new List<KeyValuePair<string, string>>();
+        var lines = text.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0 && !x.StartsWith('#')).ToList();
+        for (var i = 0; i < lines.Count; i++)
+        {
+            var line = lines[i];
+            var sep = line.IndexOfAny(new[] { ' ', '\t', '=', ':' });
+            if (sep <= 0 || sep == line.Length - 1)
+            {
+                problems?.Add(Lang.F("Tools.Hosts.LineBad", i + 1));
+                continue;
+            }
+            var host = line[..sep].Trim().TrimEnd('.');
+            var ip = line[(sep + 1)..].Trim();
+            if (host.Length == 0 || ip.Length == 0)
+            {
+                problems?.Add(Lang.F("Tools.Hosts.LineBad", i + 1));
+                continue;
+            }
+            outPairs.Add(new(host, ip));
+        }
+        return outPairs;
+    }
+
+    private bool _overrideEnabled;
+    public bool OverrideEnabledOn { get => _overrideEnabled; set => Set(ref _overrideEnabled, value); }
+
+    private string _overrideMergeText = "";
+    public string OverrideMergeText { get => _overrideMergeText; set => Set(ref _overrideMergeText, value); }
+
+    private string _overrideScriptText = "";
+    public string OverrideScriptText { get => _overrideScriptText; set => Set(ref _overrideScriptText, value); }
+
+    private async Task SaveOverrideAsync()
+    {
+        var s = _manager.Settings;
+        var problems = new List<string>();
+        var hosts = ParseHosts(HostsText, problems);
+        s.Hosts.Clear();
+        foreach (var (k, v) in hosts) s.Hosts[k] = v;
+        s.OverrideEnabled = OverrideEnabledOn;
+        s.OverrideMergeYaml = OverrideMergeText;
+        s.OverrideScript = OverrideScriptText;
+        _manager.SaveSettings();
+        HostsFeedback = problems.Count > 0 ? string.Join("；", problems.Take(4))
+            : Lang.F("Tools.Hosts.Feedback", hosts.Count);
+        // 覆写与 Hosts 都影响配置：让内核立刻热重载一份新的。
+        await ApplyChangesAsync("覆写");
+        if (_manager.LastOverrideNote is { Length: > 0 } note)
+            DetailText = Lang.F("Tools.Override.Warn", note);
+        else if (problems.Count == 0)
+            DetailText = Lang.T("Tools.Override.Ok");
+        if (!OverrideEnabledOn && (OverrideMergeText.Length > 0 || OverrideScriptText.Length > 0))
+            Raise(nameof(OverrideDisabledHint));
+    }
+
+    /// <summary>覆写开关没开但写了内容的提醒（编辑区顶部）。</summary>
+    public bool OverrideDisabledHint => !_overrideEnabled &&
+        (OverrideMergeText.Length > 0 || OverrideScriptText.Length > 0);
+
+    // ── 网络检测（对齐 FlClash 的网络检测）──────────────────────────────
+
+    public sealed record NetCheckRow(string Url)
+    {
+        public string DirectText { get; internal set; } = "";
+        public string ProxyText { get; internal set; } = "";
+    }
+
+    public System.Collections.ObjectModel.ObservableCollection<NetCheckRow> NetCheckRows { get; } = new();
+
+    /// <summary>测试接缝：网络检测的探针可以注入（测试不打真网）。</summary>
+    internal static Func<HttpClient, string, CancellationToken, Task<(bool Ok, int Ms)>> NetCheckProbe =
+        static async (client, url, ct) =>
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+            sw.Stop();
+            return (resp.IsSuccessStatusCode, (int)sw.ElapsedMilliseconds);
+        };
+
+    private static readonly string[] NetCheckUrls =
+    {
+        "https://www.gstatic.com/generate_204",
+        "https://github.com/robots.txt",
+        "https://www.baidu.com/favicon.ico",
+    };
+
+    private bool _netChecking;
+    public bool NetChecking { get => _netChecking; private set => Set(ref _netChecking, value); }
+
+    private async Task RunNetCheckAsync()
+    {
+        if (_netChecking) return;
+        NetCheckRows.Clear();
+        foreach (var url in NetCheckUrls) NetCheckRows.Add(new NetCheckRow(url));
+        NetChecking = true;
+        try
+        {
+            using var direct = new HttpClient(new HttpClientHandler { UseProxy = false }) { Timeout = TimeSpan.FromSeconds(5) };
+            using var proxied = _manager.Settings.SystemProxyPort() > 0
+                ? new HttpClient(new HttpClientHandler
+                {
+                    UseProxy = true,
+                    Proxy = new System.Net.WebProxy($"127.0.0.1:{_manager.Settings.SystemProxyPort()}"),
+                })
+                { Timeout = TimeSpan.FromSeconds(6) }
+                : null;
+            for (var i = 0; i < NetCheckRows.Count; i++)
+            {
+                var row = NetCheckRows[i];
+                row.DirectText = await ProbeAsync(direct, row.Url);
+                row.ProxyText = proxied == null
+                    ? Lang.T("Tools.NetCheck.CoreOff")
+                    : await ProbeAsync(proxied, row.Url);
+            }
+        }
+        finally { NetChecking = false; }
+    }
+
+    private async Task<string> ProbeAsync(HttpClient client, string url)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+            var (ok, ms) = await NetCheckProbe(client, url, cts.Token);
+            return ok ? $"{ms} ms" : Lang.T("Tools.NetCheck.Fail");
+        }
+        catch (OperationCanceledException) { return Lang.T("Tools.NetCheck.Timeout"); }
+        catch (Exception) { return Lang.T("Tools.NetCheck.Fail"); }
+    }
+
+    // ── 内核日志（工具页实时看）────────────────────────────────────────
+
+    private string _toolsLogText = "";
+    public string ToolsLogText { get => _toolsLogText; private set => Set(ref _toolsLogText, value); }
+
+    private long _logLength;
+
+    private void PollCoreLog()
+    {
+        try
+        {
+            var path = Path.Combine(_workspace.RuntimeDir, "core.log");
+            if (!File.Exists(path))
+            {
+                if (ToolsLogText.Length == 0) ToolsLogText = Lang.T("Tools.Log.Empty");
+                return;
+            }
+            var len = new FileInfo(path).Length;
+            if (len == _logLength && ToolsLogText.Length > 0) return;
+            _logLength = len;
+            using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            // 只读尾部 256KB：内核 info 日志一天也写不满这么多，够用户看现场了。
+            if (stream.Length > 256 * 1024) stream.Seek(-256 * 1024, SeekOrigin.End);
+            using var reader = new StreamReader(stream);
+            var text = reader.ReadToEnd();
+            var lines = text.Split('\n');
+            if (lines.Length > 400) text = string.Join('\n', lines[^400..]);
+            ToolsLogText = text.TrimEnd() is { Length: > 0 } t ? t : Lang.T("Tools.Log.Empty");
+        }
+        catch { /* 日志正被内核写：这一拍读不到就等下一拍 */ }
+    }
+
+    public void ClearToolsLog()
+    {
+        _logLength = 0;
+        ToolsLogText = "";
+    }
+
+    // ── 内核版本（关于 + 仪表盘端口卡旁边）──────────────────────────────
+
+    private string _coreVersionText = "";
+    public string CoreVersionText
+    {
+        get => _coreVersionText;
+        private set => Set(ref _coreVersionText, value);
+    }
+
+    private async Task FetchCoreVersionAsync()
+    {
+        if (!_manager.CoreAlive) { CoreVersionText = ""; return; }
+        if (CoreVersionText.Length > 0) return;
+        try { CoreVersionText = await _manager.Api.VersionAsync() ?? ""; } catch { /* 下一拍再试 */ }
+    }
+
+
+    // 系统代理不再有独立开关（用户钦定：只保留一个「代理连接」开关）。
+    // 语义 = 单开关总闸:连接即接管系统代理(ConnectNowAsync 里 EnsureSystemProxy),断开即放手(TryDisableProxy)。
+
+    private string _closeChoice = "ask";
+
+    /// <summary>选完立刻落盘。</summary>
     public string CloseChoice
     {
         get => _closeChoice;
@@ -648,7 +1085,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private string _themeChoice = "auto";
 
-    /// <summary>外观选择：auto=跟随系统，light/dark=手动锁定。改完立刻生效并落盘（同 CloseChoice 的教训）。</summary>
+    /// <summary>外观选择：auto=跟随系统，light/dark=手动锁定。改完立刻生效并落盘。</summary>
     public string ThemeChoice
     {
         get => _themeChoice;
@@ -701,12 +1138,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         .FirstOrDefault()?.InformationalVersion.Split('+')[0] ?? "0.0.0";
 
     public string SubscriptionCountText => Subscriptions.Count == 0
-        ? "还没有订阅" : $"{Subscriptions.Count} 条订阅 · {Nodes.Count} 个节点";
+        ? Lang.T("Profile.None") : Lang.F("Profile.CountFormat", Subscriptions.Count, Nodes.Count);
+
+    public string RequestsCountText => Connections.Count == 0
+        ? Lang.T("Req.None") : Lang.F("Req.CountFormat", Connections.Count);
 
     // ── 检查更新 ─────────────────────────────────────────────────────────
     // 设置页那颗「检查更新」：查 GitHub 上比当前版本新的 windows-v* Release。
-    // 仓库里鸿蒙端与 Windows 端共用一个 Releases 列表，所以只认 windows- 前缀的 tag，
-    // 绝不能拿 /releases/latest 一把抓（会抓到鸿蒙的 Release）。
 
     public AsyncRelayCommand CheckUpdateCommand { get; }
 
@@ -753,18 +1191,26 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _manager = new ConnectionManager(_workspace);
         _manager.Changed += OnManagerChanged;
 
+        ConnectionsView = CollectionViewSource.GetDefaultView(Connections);
+        ConnectionsView.Filter = o => o is ConnectionItem c && MatchesConnectionSearch(c);
+
         ToggleConnectCommand = new AsyncRelayCommand(_ => ToggleConnectAsync());
         TestAllCommand = new AsyncRelayCommand(_ => TestAllAsync(), _ => _manager.Nodes.Count > 0);
         ImportSubscriptionCommand = new AsyncRelayCommand(_ => ImportAsync());
         ApplySettingsCommand = new AsyncRelayCommand(_ => ApplySettingsAsync());
         SaveAllCommand = new AsyncRelayCommand(_ => SaveAllAsync());
         RefreshGeoCommand = new AsyncRelayCommand(_ => RefreshGeoAsync());
+        CloseAllConnectionsCommand = new AsyncRelayCommand(_ => CloseAllConnsAsync());
+        UpdateAllCommand = new AsyncRelayCommand(_ => UpdateAllAsync());
+        RunNetCheckCommand = new AsyncRelayCommand(_ => RunNetCheckAsync());
+        SaveOverrideCommand = new AsyncRelayCommand(_ => SaveOverrideAsync());
         SetModeCommand = new RelayCommand(p =>
         {
             var mode = (string?)p ?? "rule";
             _ = _manager.SetProxyModeAsync(mode);
             ProxyMode = mode;
         });
+        PauseToggleCommand = new RelayCommand(_ => UpdatesPaused = !UpdatesPaused);
         SelectSmartCommand = new AsyncRelayCommand(_ => SelectSmartAsync());
         RefreshEgressCommand = new AsyncRelayCommand(_ => QueryEgressAsync());
         CheckUpdateCommand = new AsyncRelayCommand(_ => CheckUpdateAsync());
@@ -772,11 +1218,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             if (p is SubscriptionItem item) _manager.RemoveSubscription(item.Model.Id);
         });
+        GoToPageCommand = new RelayCommand(GoToPage);
         OpenLogCommand = new RelayCommand(_ =>
         {
             var path = Path.Combine(_workspace.RuntimeDir, "core.log");
             if (File.Exists(path)) Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
-            else DetailText = "还没有内核日志：内核还没跑过一次。";
+            else DetailText = Lang.T("Msg.NoLog");
+        });
+        ViewConfigCommand = new RelayCommand(_ =>
+        {
+            var path = Path.Combine(_workspace.RuntimeDir, "config.yaml");
+            if (File.Exists(path)) Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+            else DetailText = Lang.T("Msg.NoLog");
         });
         RestartAsAdminCommand = new RelayCommand(_ => RestartElevated(), _ => !IsAdmin);
         ExitCommand = new RelayCommand(_ =>
@@ -791,12 +1244,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         });
         // 任何命令漏出来的异常都落到状态栏：不弹窗、也不再把进程带崩。
         foreach (var c in new[] { ToggleConnectCommand, TestAllCommand, ImportSubscriptionCommand,
-                                  ApplySettingsCommand, SaveAllCommand, RefreshGeoCommand })
+                                  ApplySettingsCommand, SaveAllCommand, RefreshGeoCommand,
+                                  CloseAllConnectionsCommand })
             c.Failed += OnCommandFailed;
 
         RebuildLists();
         SyncFromSettings();
         if (_manager.Nodes.Count > 0) _ = _manager.EnsureStandbyAsync();
+
+        // 订阅自动更新（对齐 FlClash 的「自动更新」）：每分钟看一眼哪些到了点，串行拉取。
+        _autoUpdateTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
+        _autoUpdateTimer.Tick += (_, _) => _ = RunDueAutoUpdatesAsync();
+        _autoUpdateTimer.Start();
     }
 
     // ── 状态同步 ─────────────────────────────────────────────────────────
@@ -804,8 +1263,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>命令里冒出来的异常：说人话落在状态栏，绝不弹模态窗。</summary>
     private void OnCommandFailed(Exception e)
         => DetailText = e is OperationCanceledException
-            ? "内核这一拍没应答（超时），再点一次试试。"
-            : "这一步没走完：" + e.Message;
+            ? Lang.T("Msg.TimeoutRetry")
+            : Lang.F("Msg.StepFailed", e.Message);
 
     private void SyncFromSettings()
     {
@@ -834,6 +1293,26 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _ => "all",
         };
         AutoStartOn = AutoStart.IsEnabled();
+        _startMinimizedOn = s.StartMinimized;
+        Raise(nameof(StartMinimizedOn));
+        TunStackChoice = string.IsNullOrEmpty(s.TunStack) ? "system" : s.TunStack;
+        TunMtuText = s.TunMtu.ToString();
+        TunStrictRouteOn = s.TunStrictRoute;
+        TunEinatOn = s.TunEndpointIndependentNat;
+        ApiSecretText = s.ApiSecret;
+        HostsText = string.Join("\n", s.Hosts.Select(kv =>
+            kv.Key.Contains(' ') ? $"\"{kv.Key}\" {kv.Value}" : $"{kv.Key} {kv.Value}"));
+        OverrideEnabledOn = s.OverrideEnabled;
+        OverrideMergeText = s.OverrideMergeYaml;
+        OverrideScriptText = s.OverrideScript;
+        _languageChoice = string.IsNullOrEmpty(s.Language) ? "auto" : s.Language;
+        Raise(nameof(LanguageChoice));
+        _hotkeyShow = s.HotkeyShowWindow;
+        _hotkeyConnect = s.HotkeyToggleConnect;
+        _hotkeyTun = s.HotkeyToggleTun;
+        Raise(nameof(HotkeyShowText));
+        Raise(nameof(HotkeyConnectText));
+        Raise(nameof(HotkeyTunText));
         // 直接落字段再通知：走 CloseChoice 的 setter 会在每次读档时回写一遍盘。
         _closeChoice = s.Close switch { CloseBehavior.Tray => "tray", CloseBehavior.Exit => "exit", _ => "ask" };
         Raise(nameof(CloseChoice));
@@ -849,20 +1328,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void SyncTunStatus()
     {
-        // 读界面上的开关（TunOn），不是设置里的旧值：用户一勾选，状态行就得跟着变，
-        // 不能等「应用设置」落盘之后才动（真机反馈：勾了还显示未启用）。
-        // 判据是我们自己的虚拟网卡，不是 Windows 右下角那个图标（它画的是物理链路）——
-        // 但这话不必说给用户听：他要的是状态，不是一段科普。
-        TunStatusText = !TunOn ? "未启用"
-            : _manager.TunActive ? "已接管"
-            : _manager.TunPending ? "内核正在建网卡…"
+        // 读界面上的开关（TunOn），不是设置里的旧值：用户一勾选，状态行就得跟着变。
+        // 判据是我们自己的虚拟网卡，不是 Windows 右下角那个图标（它画的是物理链路）。
+        TunStatusText = !TunOn ? Lang.T("Msg.TunOff")
+            : _manager.TunActive ? Lang.T("Msg.TunActive")
+            : _manager.TunPending ? Lang.T("Msg.TunPending")
             : _manager.State == TunnelState.Connected
-                ? (_manager.TunAdapterPresent() ? "网卡在，但没拿到默认路由" : "网卡没起来（看内核日志）")
-                : !IsAdmin ? "需要管理员：点下方按钮重启"
-                : "已打开：点「连接」时接管";
+                ? (_manager.TunAdapterPresent() ? Lang.T("Msg.TunNoRoute") : Lang.T("Msg.TunFailed"))
+                : !IsAdmin ? Lang.T("Msg.TunNeedAdmin")
+                : Lang.T("Msg.TunArmed");
     }
 
-    private void SyncGeoSummary()    {
+    private void SyncGeoSummary()
+    {
         var parts = new List<string>();
         foreach (var a in _manager.GeoAssets.Statuses)
         {
@@ -872,16 +1350,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         GeoSummaryText = parts.Count == 0 ? "分流库：还没开始下载" : string.Join("\n", parts);
     }
 
-    // ── 出口信息卡（首页，虚拟网卡与实时连接之间）───────────────────────
+    // ── 出口信息卡（仪表盘）──────────────────────────────────────────────
     // 这张卡的存在理由就是用户报的那件事：「我选的节点和我查到的 IP 不对应」。
-    // 走代理问一次出口 IP + 归属，再和直连问到的本机 IP 并排摆出来，对不对一眼就看穿。
+
     private EgressSnapshot _egress = EgressSnapshot.Empty;
     private bool _egressBusy;
     private string _egressStamp = "";
     private int _egressGeneration;
 
     public bool EgressBusy { get => _egressBusy; private set => Set(ref _egressBusy, value); }
-    public string EgressIpText => _egress.HasEgress ? _egress.EgressIp : (_egressBusy ? "查询中…" : "—");
+    public string EgressIpText => _egress.HasEgress ? _egress.EgressIp : (_egressBusy ? Lang.T("Tip.EgressBusy") : "—");
     public string EgressLocationText => _egress.HasEgress ? _egress.LocationText : "—";
     public string EgressCarrierText => _egress.HasEgress ? _egress.CarrierText : "—";
     public string LocalIpText => _egress.HasLocal ? _egress.LocalIp : "—";
@@ -892,10 +1370,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         get
         {
-            if (_egress.Error != null) return "查不到：" + _egress.Error;
-            if (_egress.SameAsLocal) return "出口 IP 与本机相同，这条连接没走代理（检查分流规则或换节点）";
-            if (!_egress.HasEgress) return IsConnected ? "" : "点「连接」之后才能查出口 IP";
-            return _egress.At == DateTime.MinValue ? "" : $" {_egress.At:HH:mm} 更新";
+            if (_egress.Error != null) return Lang.F("Msg.EgressQueryFail", _egress.Error);
+            if (_egress.SameAsLocal) return Lang.T("Msg.EgressSameAsLocal");
+            if (!_egress.HasEgress) return IsConnected ? "" : Lang.T("Msg.EgressNeedConnect");
+            return _egress.At == DateTime.MinValue ? "" : " " + Lang.F("Msg.EgressUpdated", _egress.At.ToString("HH:mm"));
         }
     }
 
@@ -947,9 +1425,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     /// <summary>
     /// 出口该变了就重查一次：连接上、换节点、切模式都算；连珠炮式的重建合并成一次。
-    /// 这里不用 CancellationTokenSource：上一版让 UI 线程 Cancel/Dispose 旧令牌、后台任务再 Dispose 一次，
-    /// 谁先谁后没有约定 —— 抢输了就是用户看到的「界面刷新出错：ObjectDisposedException」。
-    /// 改成只数代数：过期的那次自己走人，没有任何可被释放的对象。
+    /// 只数代数，不持有可被释放的对象：过期的那次自己走人。
     /// </summary>
     internal void RefreshEgressSoon()
     {
@@ -989,21 +1465,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 SyncTunStatus();
                 SyncGeoSummary();
                 foreach (var item in Nodes) item.Refresh();
-                // 导入完节点数变了，自动优选的可用性与候选数得跟着刷新
                 Raise(nameof(SmartAvailable));
                 Raise(nameof(SmartActive));
                 Raise(nameof(SmartSubtitle));
                 Raise(nameof(SelectedEgressText));
-                foreach (var c in new[] { TestAllCommand, ToggleConnectCommand }) c.Refresh();
-                // 断开的那一刻就把旧出口从卡上撤下来，别等 800ms 防抖：那格空档够用户截一张
-                // 「我没开代理却在走国外」的图出去。待命态重新查出口本来就不允许（EgressQueryable）。
+                Raise(nameof(PortsSummaryText));
+                if (_manager.LastOverrideNote is { Length: > 0 } ov) DetailText = Lang.F("Tools.Override.Warn", ov);
+                _ = FetchCoreVersionAsync();
+                foreach (var c in new[] { TestAllCommand, ToggleConnectCommand, TestAllCommand }) c.Refresh();
+                // 断开的那一刻就把旧出口从卡上撤下来，别等 800ms 防抖。
                 if (!IsConnected && _egress.HasEgress) { _egress = EgressSnapshot.Empty; RaiseEgress(); }
                 // 出口换了就该重新查一次出口 IP（连接、换节点、切模式都会走到这里，800ms 合并）
                 RefreshEgressSoon();
             }
             catch (Exception e)
             {
-                DetailText = "界面刷新出错：" + e.GetType().Name + " " + e.Message;
+                DetailText = Lang.F("Msg.UiCrash", e.GetType().Name, e.Message);
             }
         });
     }
@@ -1013,32 +1490,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     // ── 列表重建 ─────────────────────────────────────────────────────────
 
     /// <summary>
-    /// 节点行实例全项目只有一批（挂在总表 Nodes 上），订阅卡按 SubscriptionId 引用同一批
-    /// —— 测速结果刷新一次，展开的每一张卡都跟着变。
+    /// 节点实例全项目只有一批（挂在总表 Nodes 上），代理页网格与选中态引用同一批
+    /// —— 测速结果刷新一次，看得到的每一处都跟着变。
     ///
-    /// 关键：**重建必须保留上次的显示顺序和选中的分组**。内核事件一秒能来好几次，
-    /// 每次都 Clear + 按原序重加，界面上就是「刚排好的延迟顺序又弹回去了」
-    /// —— 用户反馈的「全部测速没生效」正是这个，而不是排序代码没跑。
+    /// 关键：**重建必须保留上次的显示顺序和选中的分组页签**。内核事件一秒能来好几次，
+    /// 每次都 Clear + 按原序重加，界面上就是「刚排好的延迟顺序又弹回去了」。
     /// </summary>
     private void RebuildLists()
     {
         var selectedName = SelectedNode?.Model.Name;
-        var keepGroup = new Dictionary<string, string>(StringComparer.Ordinal);
-        var keepExpanded = new Dictionary<string, bool>(StringComparer.Ordinal);
-        foreach (var card in Subscriptions)
-        {
-            if (card.ActiveGroup is { Name.Length: > 0 } g) keepGroup[card.Model.Id] = g.Name;
-            keepExpanded[card.Model.Id] = card.IsExpanded;
-        }
         var previousOrder = new Dictionary<string, int>(StringComparer.Ordinal);
         for (var i = 0; i < Nodes.Count; i++) previousOrder.TryAdd(Nodes[i].Model.Id, i);
+        var byIdCards = Subscriptions.ToDictionary(c => c.Model.Id, c => c);
 
         _rebuilding = true;
         try
         {
             Nodes.Clear();
-            Subscriptions.Clear();
-            var bySub = new Dictionary<string, List<NodeItem>>(StringComparer.Ordinal);
             foreach (var n in _manager.Nodes)
             {
                 var item = new NodeItem(n)
@@ -1046,29 +1514,46 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     IsSelectedNow = n.Id == _manager.Settings.SelectedNodeId,
                 };
                 Nodes.Add(item);
-                if (!bySub.TryGetValue(n.SubscriptionId, out var list)) bySub[n.SubscriptionId] = list = new List<NodeItem>();
-                list.Add(item);
             }
             ReorderBy(Nodes, previousOrder);
+
+            // 合并页：订阅卡**原地同步**——实例能复用就复用（按钮不闪、更新中的旋转动画不重启），
+            // 只有新增/删除的订阅才真正建/删卡。展开态与可见顺序照旧保留。
+            var keepExpanded = new Dictionary<string, bool>(StringComparer.Ordinal);
+            var keepVisibleOrder = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+            foreach (var card in Subscriptions)
+            {
+                keepExpanded[card.Model.Id] = card.IsExpanded;
+                var order = new Dictionary<string, int>(StringComparer.Ordinal);
+                for (var i = 0; i < card.VisibleNodes.Count; i++) order.TryAdd(card.VisibleNodes[i].Model.Id, i);
+                keepVisibleOrder[card.Model.Id] = order;
+            }
+
+            var wanted = new List<SubscriptionItem>();
             foreach (var s in _manager.Subscriptions)
             {
-                var card = new SubscriptionItem(s);
-                // 折叠态要活过每一次重建：用户收起来的卡，切个页面回来不能又弹开。
-                card.IsExpanded = !keepExpanded.TryGetValue(s.Id, out var expanded) || expanded;
-                if (bySub.TryGetValue(s.Id, out var list)) foreach (var item in list) card.Nodes.Add(item);
-                // 第一颗是「全部节点」：分组是筛选器，用户必须能一键回到不筛选的状态。
-                card.Groups.Add(new GroupChip("", "", card.Nodes.Select(n => n.Model.Name)) { Owner = card });
-                // 订阅声明的分组 → 点它筛选出该组的节点
-                foreach (var g in _manager.Groups.Where(g => g.SubscriptionId == s.Id))
-                    card.Groups.Add(new GroupChip(g.Name, g.GroupType, g.Members) { Owner = card });
-                if (keepGroup.TryGetValue(s.Id, out var name))
-                {
-                    var same = card.Groups.FirstOrDefault(x => x.Name == name);
-                    if (same != null) card.ActiveGroup = same;
-                }
-                card.ApplyFilter();
-                Subscriptions.Add(card);
+                if (!byIdCards.TryGetValue(s.Id, out var card))
+                    card = new SubscriptionItem(s) { AutoUpdateChanged = OnAutoUpdateChanged };
+                wanted.Add(card);
             }
+            foreach (var gone in Subscriptions.Except(wanted).ToList()) Subscriptions.Remove(gone);
+            for (var i = 0; i < wanted.Count; i++)
+            {
+                var card = wanted[i];
+                var at = Subscriptions.IndexOf(card);
+                if (at < 0) Subscriptions.Insert(i, card);
+                else if (at != i) Subscriptions.Move(at, i);
+            }
+            foreach (var s in _manager.Subscriptions)
+            {
+                var card = Subscriptions.First(c => c.Model.Id == s.Id);
+                if (keepExpanded.TryGetValue(s.Id, out var expanded)) card.IsExpanded = expanded;
+                SyncCardNodes(card, s.Id, keepVisibleOrder.TryGetValue(s.Id, out var prev) ? prev : null);
+                card.ApplyCardFilter(_nodeSearchText, _sortChoice);
+            }
+
+            RebuildQuickEgress();
+
             var match = Nodes.FirstOrDefault(x => x.Model.Name == selectedName)
                         ?? Nodes.FirstOrDefault(n => n.Model.Id == _manager.Settings.SelectedNodeId)
                         ?? Nodes.FirstOrDefault();
@@ -1076,8 +1561,28 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         finally { _rebuilding = false; }
         Raise(nameof(SubscriptionCountText));
+        Raise(nameof(RequestsCountText));
         Raise(nameof(Nodes));
     }
+
+    /// <summary>把一张订阅卡的节点集合同步成最新名单：能 Move 就 Move，不整表重建（节点网格不闪）。</summary>
+    private void SyncCardNodes(SubscriptionItem card, string subId, Dictionary<string, int>? order)
+    {
+        var want = Nodes_of(subId);
+        if (order != null)
+            want = want.OrderBy(n => order.TryGetValue(n.Model.Id, out var at) ? at : int.MaxValue).ToList();
+        for (var i = 0; i < want.Count; i++)
+        {
+            var at = card.Nodes.IndexOf(want[i]);
+            if (at < 0) card.Nodes.Insert(i, want[i]);
+            else if (at != i) card.Nodes.Move(at, i);
+        }
+        for (var i = card.Nodes.Count - 1; i >= 0; i--)
+            if (!want.Contains(card.Nodes[i])) card.Nodes.RemoveAt(i);
+    }
+
+    private System.Collections.Generic.List<NodeItem> Nodes_of(string subId)
+        => Nodes.Where(n => n.Model.SubscriptionId == subId).ToList();
 
     /// <summary>按上次的显示位置就地重排（用 Move，不重建集合）；新出现的节点保持原有相对顺序往后放。</summary>
     private static void ReorderBy(
@@ -1101,21 +1606,43 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (!_manager.CoreAlive && !await _manager.EnsureStandbyAsync())
         {
-            DetailText = _manager.LastError ?? "内核起不来，测不了速";
+            DetailText = _manager.LastError ?? Lang.T("Msg.CoreDeadTest");
             return;
         }
         item.Model.State = DelayState.Testing;
         item.Refresh();
         var r = await _manager.TestNodeAsync(item.Model.Name);
         item.Refresh();
-        // 延迟结果直接落在行上（数字 / 超时 / 不通），不再重复播报；节点凭空消失才需要解释
-        if (r == null) DetailText = "这个节点已经不在列表里了，先更新订阅。";
+        // 延迟结果直接落在卡上（数字 / 超时 / 不通），不再重复播报；节点凭空消失才需要解释
+        if (r == null) DetailText = Lang.T("Msg.NodeGone");
+    }
+
+    private static async Task ClearFlashSoonAsync(SubscriptionItem card)
+    {
+        try { await Task.Delay(1400).ConfigureAwait(true); } catch { }
+        card.UpdateFlash = false;
     }
 
     public async Task UpdateSubscriptionAsync(SubscriptionItem item)
     {
-        var ok = await _manager.RefreshSubscriptionAsync(item.Model.Id);
-        if (!ok) DetailText = _manager.LastError ?? "更新失败";
+        // 卡片实例可能在轮询重建时换过：按 Id 找当前挂在界面上的那张来转圈
+        var card = Subscriptions.FirstOrDefault(c => c.Model.Id == item.Model.Id) ?? item;
+        card.IsUpdating = true;
+        try
+        {
+            var ok = await _manager.RefreshSubscriptionAsync(item.Model.Id);
+            card.IsUpdating = false;
+            if (!ok)
+            {
+                // 失败:停止旋转,错误已在状态条;按钮可立即再点
+                DetailText = _manager.LastError ?? Lang.T("Msg.UpdateFailed");
+                return;
+            }
+            // 成功:绿勾回弹反馈,1.4s 后自动收掉
+            card.UpdateFlash = true;
+            _ = ClearFlashSoonAsync(card);
+        }
+        catch { card.IsUpdating = false; throw; }
         RebuildLists();
         Raise(nameof(SubscriptionCountText));
     }
@@ -1127,7 +1654,49 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Raise(nameof(SubscriptionCountText));
     }
 
-    // ── 首页动作 ─────────────────────────────────────────────────────────
+    private void OnAutoUpdateChanged(SubscriptionItem item, string choice)
+    {
+        if (!int.TryParse(choice, out var minutes)) return;
+        _manager.UpdateSubscriptionAutoUpdate(item.Model.Id, minutes);
+        DetailText = minutes > 0
+            ? Lang.F("Msg.AutoUpdateSet", item.Name, DescribeInterval(minutes))
+            : Lang.F("Msg.AutoUpdateOff", item.Name);
+    }
+
+    internal static string DescribeInterval(int minutes) => minutes switch
+    {
+        30 => Lang.T("Interval.Min30"),
+        60 => Lang.T("Interval.Hour"),
+        360 => Lang.T("Interval.Hour6"),
+        720 => Lang.T("Interval.Hour12"),
+        1440 => Lang.T("Interval.Day"),
+        _ => Lang.F("Interval.MinFormat", minutes),
+    };
+
+    // ── 订阅自动更新 ─────────────────────────────────────────────────────
+
+    private readonly System.Windows.Threading.DispatcherTimer _autoUpdateTimer;
+    private bool _autoUpdating;
+
+    private async Task RunDueAutoUpdatesAsync()
+    {
+        if (_autoUpdating || _manager.Subscriptions.Count == 0) return;
+        var due = _manager.DueForAutoUpdate(DateTimeOffset.Now);
+        if (due.Count == 0) return;
+        _autoUpdating = true;
+        try
+        {
+            foreach (var s in due)
+            {
+                var ok = await _manager.RefreshSubscriptionAsync(s.Id);
+                if (!ok) { DetailText = Lang.F("Msg.AutoUpdateFail", s.Name, _manager.LastError); break; }
+            }
+            RebuildLists();
+        }
+        finally { _autoUpdating = false; }
+    }
+
+    // ── 仪表盘动作 ───────────────────────────────────────────────────────
 
     private async Task ToggleConnectAsync()
     {
@@ -1138,95 +1707,93 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task<bool> ConnectNowAsync()
     {
         var ok = await _manager.ConnectAsync();
-        if (!ok) { DetailText = _manager.LastError ?? "连接失败"; return false; }
-        // 「连接」必须真的生效：系统代理写不进注册表要当场说出来，而不是让用户
-        // 以为主页那个「已接管流量」等于浏览器会走代理（真机反馈的「没生效」）。
-        if (_manager.Settings.SystemProxyEnabled && !_manager.EnsureSystemProxy())
-            DetailText = "内核已接管，但系统代理写不进注册表（可能被安全软件拦了）。"
-                + "可以手动给浏览器配 HTTP 代理 127.0.0.1:" + _manager.Settings.SystemProxyPort() + "，或检查安全软件设置。";
+        if (!ok) { DetailText = _manager.LastError ?? Lang.T("Msg.ConnectFailed"); return false; }
+        // 单开关语义:连接 = 内核接管 + 系统代理一并写上;断开路径上的 TryDisableProxy 负责放手。
+        if (!_manager.EnsureSystemProxy())
+            DetailText = Lang.F("Msg.SysProxyBlocked", _manager.Settings.SystemProxyPort());
         else
-            // 用户点名：分段耗时是排障信息，不该当成功文案刷给所有人看（想看去日志）。
-            DetailText = "已启动";
+            DetailText = Lang.T("Msg.Connected");
         return true;
     }
 
-    /// <summary>分组单独测速：只测这一组成员，结果写回模型，订阅页的节点行跟着变色。</summary>
-    /// <summary>把一张列表按「已测延迟升序，测速中/未测在后」实时上浮。用 Move，不重建集合，滚动位置不丢。</summary>
-    private static void SortByRank(
-        System.Collections.ObjectModel.ObservableCollection<NodeItem> list)
+    private async Task TestAllAsync()
     {
-        var ordered = list.OrderBy(SortRank).ToList();
-        for (var i = 0; i < ordered.Count; i++)
-        {
-            var at = list.IndexOf(ordered[i]);
-            if (at >= 0 && at != i) list.Move(at, i);
-        }
-    }
-
-    private void SortCardsByLatency()
-    {
-        SortByRank(Nodes);
-        // 两张列表都要排：界面绑的是 VisibleNodes（筛选后的那一屏），只排 Nodes 用户看不到变化。
-        foreach (var card in Subscriptions) SortByRank(card.VisibleNodes);
-    }
-
-    /// <summary>点分组 chip = 按该分组筛选节点（不是测速）。</summary>
-    public void SelectGroup(GroupChip? chip)
-    {
-        var card = chip?.Owner;
-        if (card == null || chip == null) return;
-        // 分组切换不播报：chip 高亮 + 列表当场变就是反馈
-        card.ActiveGroup = chip;
-    }
-
-    /// <summary>订阅卡上的 ⚡：只测当前页面显示的那一屏节点（选了分组就只测该组）。</summary>
-    public void TestSubscription(SubscriptionItem? card)
-    {
-        if (card == null || card.IsTesting) return;
-        _ = TestListCoreAsync(card, card.VisibleNodes.ToList(), $"「{card.Name}」这一页");
-    }
-
-    private async Task TestListCoreAsync(SubscriptionItem card, List<NodeItem> targets, string what)
-    {
-        if (targets.Count == 0) { DetailText = "这一页没有节点可测。"; return; }
         if (!_manager.CoreAlive && !await _manager.EnsureStandbyAsync())
         {
-            DetailText = _manager.LastError ?? "内核起不来，测不了速";
+            DetailText = _manager.LastError ?? Lang.T("Msg.CoreDeadTest");
             return;
         }
-        card.IsTesting = true;
-        try
+        var total = _manager.Nodes.Count;
+        var ok = await _manager.TestAllAsync(_ =>
         {
-            foreach (var t in targets)
+            Application.Current?.Dispatcher.BeginInvoke(() =>
             {
-                t.Model.State = DelayState.Testing;
-                t.Refresh();
-            }
-            // 测速过程不播报：行会自己变 ⚡、变色、按延迟上浮，看得见的不用再说一遍
-            SortCardsByLatency();
-            var results = await _manager.Api.DelayManyAsync(
-                targets.Select(t => t.Model.Name).ToList(), _manager.Settings.TestUrl,
-                onEach: r => Application.Current?.Dispatcher.BeginInvoke(() =>
-                {
-                    ApplyResult(r);
-                    SortCardsByLatency();
-                }));
-            SortCardsByLatency();
-            if (results.Count(r => r.Ok) == 0)
-                DetailText = $"{what}没有一个节点通：多半是测速地址不可达（设置里可换），或订阅过期。";
-        }
-        finally
+                foreach (var item in Nodes) item.Refresh();
+                SortVisibleByLatency();
+            });
+        });
+        if (ok == 0)
+            DetailText = Lang.F("Msg.TestNone", total + " ");
+        foreach (var item in Nodes) item.Refresh();
+    }
+
+    private async Task TestNodesAsync(List<NodeItem> targets, string what)
+    {
+        if (targets.Count == 0) { DetailText = Lang.T("Msg.PageEmpty"); return; }
+        if (!_manager.CoreAlive && !await _manager.EnsureStandbyAsync())
         {
-            card.IsTesting = false;
+            DetailText = _manager.LastError ?? Lang.T("Msg.CoreDeadTest");
+            return;
         }
+        foreach (var t in targets)
+        {
+            t.Model.State = DelayState.Testing;
+            t.Refresh();
+        }
+        // 测速过程不播报：卡会自己变 ⚡、变色、按延迟上浮，看得见的不用再说一遍
+        SortVisibleByLatency();
+        var results = await _manager.Api.DelayManyAsync(
+            targets.Select(t => t.Model.Name).ToList(), _manager.Settings.TestUrl,
+            onEach: r => Application.Current?.Dispatcher.BeginInvoke(() =>
+            {
+                ApplyResult(r);
+                SortVisibleByLatency();
+            }));
+        SortVisibleByLatency();
+        if (results.Count(r => r.Ok) == 0)
+            DetailText = Lang.F("Msg.TestNone", what);
     }
 
     private static int SortRank(NodeItem item) => item.Model.State switch
     {
         DelayState.Ok => item.Model.LastLatency,
         DelayState.Testing => 1_000_000,       // 正在测的跟在已出结果的后面
-        _ => 2_000_000,                        // 未测 / 超时 / 失败垫底（超时失败在 UI 上有红色区分）
+        _ => 2_000_000,                        // 未测 / 超时 / 失败垫底
     };
+
+    /// <summary>测完按延迟把每张订阅卡的可见列表就地重排（Move，不重建，滚动位置不丢）。</summary>
+    private void SortVisibleByLatency()
+    {
+        foreach (var card in Subscriptions)
+        {
+            var want = card.VisibleNodes.OrderBy(SortRank)
+                .ThenBy(n => n.Model.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            for (var i = 0; i < want.Count; i++)
+            {
+                var at = card.VisibleNodes.IndexOf(want[i]);
+                if (at >= 0 && at != i) card.VisibleNodes.Move(at, i);
+            }
+        }
+    }
+
+    /// <summary>点订阅卡上的测速：只测这张卡当前显示的节点（搜索过滤后的一屏）。</summary>
+    public void TestSubscription(SubscriptionItem? card)
+    {
+        if (card == null || card.IsUpdating) return;
+        var targets = card.VisibleNodes.ToList();
+        if (targets.Count == 0) { DetailText = Lang.T("Msg.PageEmpty"); return; }
+        _ = TestNodesAsync(targets, $"「{card.Name}」");
+    }
 
     /// <summary>单条测速结果写回节点模型。</summary>
     private void ApplyResult(DelayResult r)
@@ -1252,11 +1819,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         try
         {
             var ok = await _manager.ImportFileAsync(path);
-            if (!ok) DetailText = _manager.LastError ?? "导入失败";
+            if (!ok) DetailText = _manager.LastError ?? Lang.F("Msg.ImportFailed", "");
         }
         catch (Exception e)
         {
-            DetailText = "导入失败：" + e.GetType().Name + " " + e.Message;
+            DetailText = Lang.F("Msg.ImportFailed", e.GetType().Name + " " + e.Message);
         }
         finally
         {
@@ -1265,28 +1832,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private async Task TestAllAsync()
-    {
-        if (!_manager.CoreAlive && !await _manager.EnsureStandbyAsync())
-        {
-            DetailText = _manager.LastError ?? "内核起不来，测不了速";
-            return;
-        }
-        var total = _manager.Nodes.Count;
-        var ok = await _manager.TestAllAsync(_ =>
-        {
-            Application.Current?.Dispatcher.BeginInvoke(() =>
-            {
-                foreach (var item in Nodes) item.Refresh();
-                SortCardsByLatency();
-            });
-        });
-        if (ok == 0)
-            DetailText = $"{total} 个节点都没通。多半是测速地址不可达（设置里可换），或订阅过期。";
-        foreach (var item in Nodes) item.Refresh();
-    }
-
-    // ── 订阅页 ───────────────────────────────────────────────────────────
+    // ── 订阅导入 ─────────────────────────────────────────────────────────
 
     public Task ImportAsync(string input)
     {
@@ -1297,19 +1843,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task ImportAsync()
     {
         var input = SubscriptionInput.Trim();
-        if (input.Length == 0) { DetailText = "请输入订阅链接，或直接粘贴一批节点链接。"; return; }
+        if (input.Length == 0) { DetailText = Lang.T("Msg.ImportEmpty"); return; }
         try
         {
             var ok = await _manager.AddSubscriptionAsync(input);
             DetailText = !ok
-                ? (_manager.LastError ?? "导入失败")
-                : _manager.SaveWarning is { Length: > 0 } w ? "注意：" + w : "";
+                ? (_manager.LastError ?? Lang.T("Msg.ImportFailedPlain"))
+                : _manager.SaveWarning is { Length: > 0 } w ? Lang.F("Msg.SaveWarn", w) : "";
             if (ok) SubscriptionInput = "";
         }
         catch (Exception e)
         {
-            // 导入的任何错误都必须落在状态栏里：让它逃出去就是一串弹窗（用户实测的崩溃形态）
-            DetailText = "导入失败：" + e.GetType().Name + " " + e.Message;
+            // 导入的任何错误都必须落在状态栏里：让它逃出去就是一串弹窗
+            DetailText = Lang.F("Msg.ImportFailed", e.GetType().Name + " " + e.Message);
         }
         finally
         {
@@ -1327,14 +1873,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// 首页那颗开关的语义 = 别的客户端的总开关：**拨开就接管，拨回就放手**。
-    /// 以前它只把设置写进磁盘，用户还得再去点一次「连接」——那就是「点了没反应」。
+    /// 仪表盘那颗开关的语义 = 别的客户端的总开关：**拨开就接管，拨回就放手**。
     /// </summary>
     public async Task ApplySwitchAsync()
     {
         if (!TrySaveSettings()) return;
-        // 拨开 TUN 就直接接管（内核没跑就顺手起来），拨回去也只是不再走网卡 ——
-        // 系统代理跟着总开关走，不该让用户点完开关还要去点第二次。
         if (TunOn && !_manager.IsConnected) { await ConnectNowAsync(); return; }
         if (_manager.CoreAlive) await ApplyChangesAsync("开关");
     }
@@ -1343,22 +1886,28 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool TrySaveSettings()
     {
         var s = _manager.Settings;
-        if (!TryReadPort(MixedPortText, out var mixed)) { DetailText = "混合端口要填 0-65535 的整数（0 = 不监听）"; return false; }
-        if (!TryReadPort(HttpPortText, out var http)) { DetailText = "HTTP 端口要填 0-65535 的整数"; return false; }
-        if (!TryReadPort(SocksPortText, out var socks)) { DetailText = "SOCKS 端口要填 0-65535 的整数"; return false; }
-        if (!TryReadPort(ApiPortText, out var api)) { DetailText = "API 端口要填 1024-65535 的整数"; return false; }
+        if (!TryReadPort(MixedPortText, out var mixed)) { DetailText = Lang.T("Msg.PortMixed"); return false; }
+        if (!TryReadPort(HttpPortText, out var http)) { DetailText = Lang.T("Msg.PortHttp"); return false; }
+        if (!TryReadPort(SocksPortText, out var socks)) { DetailText = Lang.T("Msg.PortSocks"); return false; }
+        if (!TryReadPort(ApiPortText, out var api)) { DetailText = Lang.T("Msg.PortApi"); return false; }
         s.MixedPort = mixed;
         s.HttpPort = http;
         s.SocksPort = socks;
         s.ApiPort = api;
         s.AllowLan = AllowLan;
-        // 系统代理不再是给用户关的开关：点电源键启动 = 走系统代理，少一个「开了但没生效」的入口。
+        // 单开关总闸:系统代理恒随连接走,不再提供独立关闭项。
         s.SystemProxyEnabled = true;
         s.TunEnabled = TunOn;
+        s.TunStack = TunStackChoice is "gvisor" or "mixed" or "system" ? TunStackChoice : "system";
+        s.TunMtu = int.TryParse(TunMtuText.Trim(), out var mtu) && mtu is >= 1280 and <= 65535 ? mtu : 1500;
+        if (s.TunMtu.ToString() != TunMtuText.Trim()) TunMtuText = s.TunMtu.ToString();
+        s.TunStrictRoute = TunStrictRouteOn;
+        s.TunEndpointIndependentNat = TunEinatOn;
+        s.ApiSecret = ApiSecretText.Trim();
         var url = TestUrlText.Trim();
         if (url.Length == 0 || (!url.StartsWith("http://") && !url.StartsWith("https://")))
         {
-            DetailText = "测速地址要填完整的 http(s) 地址，否则延迟数字没有意义。";
+            DetailText = Lang.T("Msg.TestUrlInvalid");
             return false;
         }
         s.TestUrl = url;
@@ -1383,8 +1932,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             DnsFeedback = problems.Count > 0 ? string.Join("；", problems.Take(4)) : "";
             if (kept.Count == 0)
             {
-                DetailText = "DNS 复写至少要有一条能用的地址，否则内核会退回内置 DNS —— "
-                    + "要么填地址（如 223.5.5.5、tls://223.5.5.5:853、https://doh.pub/dns-query），要么关掉复写。";
+                DetailText = Lang.T("Msg.DnsEmpty");
                 return false;
             }
             s.DnsServers.Clear();
@@ -1402,7 +1950,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (want == AutoStart.IsEnabled()) return;
         var exe = Environment.ProcessPath;
         if (exe != null && !AutoStart.Set(want, exe))
-            DetailText = "开机自启没写上：注册表 Run 项被策略或安全软件拦了。";
+            DetailText = Lang.T("Msg.AutoStartBlocked");
         else AutoStartOn = AutoStart.IsEnabled();
     }
 
@@ -1447,8 +1995,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// 设置页右上角那颗「保存设置」：改完任意参数点一次就全存下并让内核生效，
-    /// 不再每张卡各放一颗按钮（用户数过：同一页六颗「应用设置」）。
+    /// 设置页右上角那颗「保存设置」：改完任意参数点一次就全存下并让内核生效。
     /// </summary>
     private async Task SaveAllAsync()
     {
@@ -1461,7 +2008,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task RefreshGeoAsync()
     {
         var landed = await _manager.RefreshGeoAsync();
-        if (!landed) DetailText = _manager.LastError ?? "分流库没有变化，或一个都没下到。";
+        if (!landed) DetailText = _manager.LastError ?? Lang.T("Msg.GeoNothing");
         SyncGeoSummary();
     }
 
@@ -1473,7 +2020,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         var ok = await _manager.ApplyChangesAsync();
         if (!ok)
-            DetailText = _manager.LastError ?? _manager.PendingConfigNote ?? $"{what}生效失败";
+            DetailText = _manager.LastError ?? _manager.PendingConfigNote ?? Lang.F("Msg.ApplyFailed", what);
         SyncTunStatus();
         SyncGeoSummary();
     }
@@ -1481,7 +2028,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void RestartElevated()
     {
         var exe = Environment.ProcessPath;
-        if (string.IsNullOrEmpty(exe)) { DetailText = "拿不到当前程序路径，无法提权重启。"; return; }
+        if (string.IsNullOrEmpty(exe)) { DetailText = Lang.T("Msg.ElevateNoPath"); return; }
         try
         {
             Process.Start(new ProcessStartInfo
@@ -1496,13 +2043,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception e)
         {
-            DetailText = "没有获得管理员授权（" + e.Message + "），虚拟网卡还用不了。";
+            DetailText = Lang.F("Msg.ElevateFail", e.Message);
         }
     }
 
-    // ── 连接页 ───────────────────────────────────────────────────────────
+    // ── 请求页 ───────────────────────────────────────────────────────────
 
-    private bool _onConnectionsPage;
     private System.Windows.Threading.DispatcherTimer? _poll;
     private bool _polling;
     private long _lastUp, _lastDown;
@@ -1510,12 +2056,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     internal bool IsPollingConnections => _poll != null;
 
+    /// <summary>窗口切页时调用：仪表盘（速率图）与请求页（表格）需要轮询，别的页不摊这份开销。</summary>
+    public const string PageTools = "工具";
+
     public void SetActiveTab(string? header)
     {
-        // 竖屏三页里「实时连接」并进了首页，所以轮询跟着首页走（只有看得见这张卡的时候才值得轮询）
-        _onConnectionsPage = header == "首页";
-        ShowSaveButton = header == "设置";
-        if (!_onConnectionsPage) { StopConnectionsPolling(); return; }
+        ActivePage = header ?? PageDashboard;
+        ShowSaveButton = header == PageSettings;
+        var poll = header == PageDashboard || header == PageRequests || header == PageTools;
+        if (header == PageTools) PollCoreLog();
+        if (!poll) { StopConnectionsPolling(); return; }
         StartConnectionsPolling();
     }
 
@@ -1524,24 +2074,45 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>右上角那颗悬浮「保存设置」只在设置页出现：它挂在滚动区外面，往下滑也不会被盖住。</summary>
     public bool ShowSaveButton { get => _showSaveButton; private set => Set(ref _showSaveButton, value); }
 
-    /// <summary>
-    /// 两张次要卡的折叠态放在视图模型里，不放控件上：TabControl 切页会把上一页的视觉树丢掉，
-    /// 绑在控件上的话切回来就弹开了（订阅卡的折叠态踩过同一个坑）。
-    /// </summary>
-    private bool _connectionsExpanded;
-    public bool ConnectionsExpanded { get => _connectionsExpanded; set => Set(ref _connectionsExpanded, value); }
+    // 设置页四节的折叠态放在视图模型里，不放控件上：TabControl 切页会把上一页的视觉树丢掉，
+    // 绑在控件上的话切回来就弹开了（订阅卡踩过同一个坑）。
+    private bool _generalExpanded;
+    public bool GeneralExpanded { get => _generalExpanded; set => Set(ref _generalExpanded, value); }
 
     private bool _portsExpanded;
     public bool PortsExpanded { get => _portsExpanded; set => Set(ref _portsExpanded, value); }
 
-    private bool _kernelExpanded;
-    public bool KernelExpanded { get => _kernelExpanded; set => Set(ref _kernelExpanded, value); }
-
     private bool _rulesExpanded;
     public bool RulesExpanded { get => _rulesExpanded; set => Set(ref _rulesExpanded, value); }
 
-    private bool _generalExpanded;
-    public bool GeneralExpanded { get => _generalExpanded; set => Set(ref _generalExpanded, value); }
+    private bool _kernelExpanded;
+    public bool KernelExpanded { get => _kernelExpanded; set => Set(ref _kernelExpanded, value); }
+
+    private string _connectionSearchText = "";
+
+    /// <summary>请求页搜索：按目标 / 进程 / 链 / 规则过滤（只过滤显示，不动底层列表）。</summary>
+    public string ConnectionSearchText
+    {
+        get => _connectionSearchText;
+        set { if (!Set(ref _connectionSearchText, value ?? "")) return; ConnectionsView.Refresh(); }
+    }
+
+    private bool MatchesConnectionSearch(ConnectionItem c)
+    {
+        var q = _connectionSearchText.Trim();
+        if (q.Length == 0) return true;
+        return c.Target.Contains(q, StringComparison.OrdinalIgnoreCase)
+               || c.Process.Contains(q, StringComparison.OrdinalIgnoreCase)
+               || c.Chain.Contains(q, StringComparison.OrdinalIgnoreCase)
+               || c.Rule.Contains(q, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool _updatesPaused;
+
+    /// <summary>暂停列表刷新（对齐 FlClash 的请求页暂停）：表不动了，顶栏速率照常走。</summary>
+    public bool UpdatesPaused { get => _updatesPaused; set { if (Set(ref _updatesPaused, value)) Raise(nameof(PauseLabel)); } }
+
+    public string PauseLabel => UpdatesPaused ? "继续刷新" : "暂停刷新";
 
     private void StartConnectionsPolling()
     {
@@ -1563,10 +2134,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void PollTick()
     {
         if (_polling) return;
+        if (ActivePage == PageTools) PollCoreLog();
         if (!_manager.CoreAlive)
         {
             Connections.Clear();
             TrafficText = "↑ 0 B/s ↓ 0 B/s";
+            UpSpeedText = "0 B/s";
+            DownSpeedText = "0 B/s";
+            Raise(nameof(RequestsCountText));
             return;
         }
         _polling = true;
@@ -1594,6 +2169,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _lastDown = snap.DownloadTotal;
         _lastPollAt = now;
 
+        UpSpeedText = ConnectionItem.FmtSpeed(up);
+        DownSpeedText = ConnectionItem.FmtSpeed(down);
+        SpeedSampled?.Invoke(up, down);
+
+        if (_updatesPaused) return;   // 暂停 = 表格冻在原地；速率与图照常
+
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var c in snap.Connections)
         {
@@ -1601,7 +2182,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             seen.Add(c.Id);
             var row = Connections.FirstOrDefault(x => x.Id == c.Id);
             if (row == null) { row = new ConnectionItem(c.Id); Connections.Add(row); }
-            row.Apply(c, now);
+            row.Apply(c, now, seconds);
         }
         for (var i = Connections.Count - 1; i >= 0; i--)
             if (!seen.Contains(Connections[i].Id)) Connections.RemoveAt(i);
@@ -1621,18 +2202,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
         }
 
-        // 紧凑格式：同一信息少占约三分之一宽，顶栏更不容易被截断（仍保住测试要求的长度）。
-        TrafficText = $"↑ {ConnectionItem.FmtSpeed(up)} ↓ {ConnectionItem.FmtSpeed(down)}"
-            + $" · 累计 {ConnectionItem.FmtBytes(snap.UploadTotal)}"
+        var total = Lang.T("Req.TrafficTotal");
+        TrafficText = $"↑ {UpSpeedText} ↓ {DownSpeedText}"
+            + $" · {total} {ConnectionItem.FmtBytes(snap.UploadTotal)}"
             + $" / {ConnectionItem.FmtBytes(snap.DownloadTotal)}";
-        // 连接数从顶栏挪到「实时连接」卡的标题上：顶栏要一直显示得下速率 + 累计，
-        // 再塞一段「· 34 条连接」最右边就被截掉（用户点名）。
-        Raise(nameof(ConnectionsHeader));
+        Raise(nameof(RequestsCountText));
     }
-
-    /// <summary>实时连接卡的标题：折叠着也能看见现在有几条。</summary>
-    public string ConnectionsHeader => Connections.Count > 0
-        ? $"实时连接（{Connections.Count}）" : "实时连接";
 
     public void CloseConnection(ConnectionItem? item)
     {
@@ -1643,6 +2218,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task CloseOneAsync(ConnectionItem item)
     {
         await _manager.Api.CloseConnectionAsync(item.Id);
+    }
+
+    private async Task CloseAllConnsAsync()
+    {
+        if (!_manager.CoreAlive) { DetailText = Lang.T("Msg.CoreNotRunning"); return; }
+        var ok = await _manager.Api.CloseAllConnectionsAsync();
+        if (!ok) DetailText = Lang.T("Msg.CloseAllRejected");
     }
 
     // ── 生命周期 ─────────────────────────────────────────────────────────
@@ -1665,8 +2247,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _manager.SaveSettings();
     }
 
+    /// <summary>窗口代码后置要直接读写设置（窗口记忆 / 快捷键注册）。</summary>
+    public TunBox.Core.Models.AppSettings ManagerSettings => _manager.Settings;
+
+    /// <summary>静默落盘：不给状态条添乱（窗口关闭时的一连串保存）。</summary>
+    public void SaveSettingsQuiet() => _manager.SaveSettings();
+
     // ── 测试接缝 ───────────────────────────────────────────────────────────
-    internal void SortForTests() => SortCardsByLatency();
+    internal void SortForTests() => SortVisibleByLatency();
     internal void RebuildForTests() => RebuildLists();
 
     public async Task ShutdownAsync()
@@ -1678,6 +2266,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         StopConnectionsPolling();
+        _autoUpdateTimer.Stop();
         _manager.Dispose();
     }
 }

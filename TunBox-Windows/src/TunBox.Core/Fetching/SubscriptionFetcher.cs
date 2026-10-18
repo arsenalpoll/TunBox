@@ -31,21 +31,29 @@ public static class SubscriptionFetcher
         long UploadBytes, long DownloadBytes, long TotalBytes, long ExpireAtMs,
         int UpdateIntervalMinutes, string Etag);
 
-    public static async Task<FetchResult> FetchAsync(string url, string? customUa, string etag, CancellationToken ct = default)
+    /// <param name="proxyPort">本机混合端口。直连网络不通(面板被墙)时自动改走
+    /// 127.0.0.1:该端口重试 —— 与 Verge「检查更新借自己的代理」同一思路。</param>
+    public static async Task<FetchResult> FetchAsync(string url, string? customUa, string etag,
+        CancellationToken ct = default, int proxyPort = 0)
     {
         var attempts = new List<string>();
         string? lastBody = null;
         string? lastUa = null;
         var sawRateLimit = 0;
+        var viaProxy = false;
 
         var chain = string.IsNullOrWhiteSpace(customUa) ? UaChain : new[] { customUa.Trim() };
-        foreach (var ua in chain)
+        for (var i = 0; i < chain.Length; i++)
         {
+            var ua = chain[i];
+            var retriedViaProxy = false;
+
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(20));
             try
             {
-                var (status, headers, body) = await RequestOnceAsync(url, ua, etag, cts.Token).ConfigureAwait(false);
+                var (status, headers, body) = await RequestOnceAsync(url, ua, etag, cts.Token,
+                    proxyPort: viaProxy ? proxyPort : 0).ConfigureAwait(false);
                 if (status == HttpStatusCode.NotModified)
                     return new FetchResult("", ua, NotModified: true, 0, 0, 0, 0, 0, ReadEtag(headers));
                 if (!IsSuccess(status))
@@ -76,7 +84,8 @@ public static class SubscriptionFetcher
                 // 自签证书的机场面板很常见：标准校验失败放宽重试一次，让用户自己决定要不要用这个地址。
                 try
                 {
-                    var (status, headers, body) = await RequestOnceAsync(url, ua, etag, cts.Token, acceptAnyCert: true).ConfigureAwait(false);
+                    var (status, headers, body) = await RequestOnceAsync(url, ua, etag, cts.Token,
+                        acceptAnyCert: true, proxyPort: viaProxy ? proxyPort : 0).ConfigureAwait(false);
                     if (IsSuccess(status) && body.Length > 0 && !LooksLikeWebPage(body))
                     {
                         var info = ParseUserInfo(headers);
@@ -90,7 +99,17 @@ public static class SubscriptionFetcher
             }
             catch (Exception e)
             {
-                attempts.Add($"{ua} → {e.Message}");
+                if (ct.IsCancellationRequested) throw;
+                attempts.Add($"{ua} → {e.Message}" + (viaProxy ? "（走代理）" : "（直连）"));
+                // 网络不通(超时/连接失败)且还没试过代理:改走本机混合端口,重试当前 UA。
+                // 机场面板域名直连不通是常态,用户的面板能用靠的就是代理本身。
+                if (!viaProxy && proxyPort > 0 && !retriedViaProxy && e is not ArgumentException)
+                {
+                    viaProxy = true;
+                    retriedViaProxy = true;
+                    attempts.Add($"→ 直连不通,改走本机代理 127.0.0.1:{proxyPort} 重试");
+                    i--;   // 同一个 UA 再试一次(这次走代理);retriedViaProxy 保证只退一次
+                }
             }
         }
 
@@ -126,12 +145,15 @@ public static class SubscriptionFetcher
     }
 
     private static async Task<(HttpStatusCode Status, HttpResponseHeaders? Headers, string Body)>
-        RequestOnceAsync(string url, string ua, string etag, CancellationToken ct, bool acceptAnyCert = false)
+        RequestOnceAsync(string url, string ua, string etag, CancellationToken ct,
+            bool acceptAnyCert = false, int proxyPort = 0)
     {
         // 拉订阅绝不能走自己刚开的系统代理（那等于让代理服务器拉它自己的订阅）。
         using var handler = new HttpClientHandler
         {
-            UseProxy = false,
+            // 默认直连;proxyPort > 0 = 已确认直连不通,借本机内核的混合端口走代理拉。
+            UseProxy = proxyPort > 0,
+            Proxy = proxyPort > 0 ? new WebProxy($"127.0.0.1:{proxyPort}") : null,
             AllowAutoRedirect = true,
             ServerCertificateCustomValidationCallback = acceptAnyCert
                 ? HttpClientHandler.DangerousAcceptAnyServerCertificateValidator

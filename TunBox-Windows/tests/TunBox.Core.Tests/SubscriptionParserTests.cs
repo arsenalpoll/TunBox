@@ -355,6 +355,31 @@ public class ClashConfigGeneratorTests
     }
 
     [Fact]
+    public void Include_all_and_filter_groups_expand_to_full_memberships()
+    {
+        // 机场主分组的常见写法：include-all / filter / exclude-filter。
+        // 不展开的话，UI 里 77 个节点的订阅点进主分组只剩显式列出的两三个。
+        var yaml = "proxies:\n"
+            + "  - {name: \"香港 IPLC 01\", type: ss, server: 1.2.3.4, port: 8389, cipher: aes-256-gcm, password: pw}\n"
+            + "  - {name: \"香港 IPLC 02\", type: ss, server: 1.2.3.5, port: 8389, cipher: aes-256-gcm, password: pw}\n"
+            + "  - {name: \"美国 01\", type: ss, server: 1.2.3.6, port: 8389, cipher: aes-256-gcm, password: pw}\n"
+            + "  - {name: \"日本 01\", type: ss, server: 1.2.3.7, port: 8389, cipher: aes-256-gcm, password: pw}\n"
+            + "proxy-groups:\n"
+            + "  - {name: 全部, type: select, include-all: true}\n"
+            + "  - {name: 亚洲, type: select, filter: \"(?i)香港|日本\"}\n"
+            + "  - {name: 非美国, type: select, include-all: true, exclude-filter: \"美国\"}\n";
+        var r = SubscriptionParser.Parse(yaml);
+        var all = r.Groups.First(g => g.Name == "全部");
+        Assert.Equal(4, all.Members.Count);
+        var asia = r.Groups.First(g => g.Name == "亚洲");
+        Assert.Equal(new[] { "日本 01", "香港 IPLC 01", "香港 IPLC 02" },
+            asia.Members.OrderBy(x => x, StringComparer.Ordinal).ToArray());
+        var notUs = r.Groups.First(g => g.Name == "非美国");
+        Assert.DoesNotContain("美国 01", notUs.Members);
+        Assert.Equal(3, notUs.Members.Count);
+    }
+
+    [Fact]
     public void OnlySelected_mode_flips_the_fallback_to_direct()
     {
         var s = Settings();

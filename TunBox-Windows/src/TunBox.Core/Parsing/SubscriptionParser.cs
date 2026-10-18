@@ -485,9 +485,41 @@ public static class SubscriptionParser
                 _ = int.TryParse(Val(map, "tolerance"), out var tol);
                 g.ToleranceMs = tol;
                 g.ExpectedStatus = Val(map, "expected-status");
+                g.IncludeAll = Val(map, "include-all") == "true" || Val(map, "include-all-proxies") == "true";
+                g.Filter = Val(map, "filter");
+                g.ExcludeFilter = Val(map, "exclude-filter");
                 if (map.Children.FirstOrDefault(c => Key(c) == "proxies").Value is YamlSequenceNode members)
                     foreach (var m in members) g.Members.Add(Val(m));
                 result.Groups.Add(g);
+            }
+
+            // include-all / filter 展开（mihomo 语义）。不展开的话，用这类写法的机场主分组
+            // 在界面上只剩显式列出的两三个成员 —— 「订阅 77 个节点、点进分组只有 2 个」就是这么来的。
+            // 现在就展开成显式名单：UI 分组筛选与生成的配置都按全量成员走。
+            var allNames = result.Nodes.Select(n => n.Name).ToList();
+            foreach (var g in result.Groups)
+            {
+                if (g.IncludeAll) g.Members.AddRange(allNames);
+                if (g.Filter.Length > 0)
+                {
+                    try
+                    {
+                        var rx = new Regex(g.Filter, RegexOptions.IgnoreCase);
+                        g.Members.AddRange(allNames.Where(n => rx.IsMatch(n)));
+                    }
+                    catch (ArgumentException) { /* 坏正则不拦导入，按显式成员走 */ }
+                }
+                if (g.ExcludeFilter.Length > 0)
+                {
+                    try
+                    {
+                        var rx = new Regex(g.ExcludeFilter, RegexOptions.IgnoreCase);
+                        g.Members.RemoveAll(n => rx.IsMatch(n));
+                    }
+                    catch (ArgumentException) { }
+                }
+                if (g.Members.Count != g.Members.Distinct().Count())
+                    g.Members = g.Members.Distinct().ToList();
             }
         }
     }

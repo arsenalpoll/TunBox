@@ -36,6 +36,8 @@ public sealed class Workspace
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        // 窗口位置记忆用 double.NaN 当「没设过」；不放开这个开关，每次保存设置都会炸。
+        NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals,
     };
 
     /// <summary>读写共用这一套参数；外面（测试、诊断）要解析同一份文件时也走这里。</summary>
