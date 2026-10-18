@@ -35,7 +35,13 @@
     <sys:String x:Key="L.Dash.ModeRule">规则</sys:String>
     <sys:String x:Key="L.Dash.ModeGlobal">全局</sys:String>
     <sys:String x:Key="L.Dash.ModeDirect">直连</sys:String>
-    <sys:String x:Key="L.Dash.CurrentEgress">当前出口 </sys:String>
+        <sys:String x:Key="L.Dash.CurrentEgress">当前出口 </sys:String>
+    <sys:String x:Key="L.Dash.CoreInfoTitle">Clash 信息</sys:String>
+    <sys:String x:Key="L.Dash.CoreVersion">内核版本</sys:String>
+    <sys:String x:Key="L.Dash.SysProxyAddr">系统代理地址</sys:String>
+    <sys:String x:Key="L.Dash.MixedPortLabel">混合代理端口</sys:String>
+    <sys:String x:Key="L.Dash.Uptime">运行时间</sys:String>
+    <sys:String x:Key="L.Dash.RulesCount">规则数量</sys:String>
     <sys:String x:Key="L.Dash.ConnectTitle">代理连接</sys:String>
     <sys:String x:Key="L.Dash.ConnectSwitchTip">拨上去接管流量，拨回来放手</sys:String>
     <sys:String x:Key="L.Dash.ConnectHint">连接后自动接管系统代理；断开自动放手。TUN 在下方单独开关。</sys:String>
@@ -155,6 +161,8 @@
     <sys:String x:Key="L.Tools.Log.Empty">还没有内核日志：内核没跑过或刚清空。</sys:String>
 
     <!-- 设置页 -->
+        <sys:String x:Key="L.Set.Section.Common">常用</sys:String>
+    <sys:String x:Key="L.Set.Section.OverrideHosts">覆写与 Hosts</sys:String>
     <sys:String x:Key="L.Set.Section.App">应用</sys:String>
     <sys:String x:Key="L.Set.Section.Network">网络配置</sys:String>
     <sys:String x:Key="L.Set.Section.Rules">分流规则</sys:String>

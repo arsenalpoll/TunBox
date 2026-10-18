@@ -327,6 +327,43 @@ public sealed class ControllerClient : IDisposable
         catch { return long.TryParse(node.ToJsonString().Trim('"'), out var v) ? v : 0; }
     }
 
+    /// <summary>
+    /// 各代理最近一次测延迟(GET /proxies 的 history 末条,mihomo 口径)。
+    /// Verge 显示的就是这份内核缓存的热连接结果;冷启动的 /delay 实测会多出
+    /// QUIC/TLS 握手,数字天然偏高 —— 所以回填用它,和 Verge 看到的一样。
+    /// </summary>
+    public async Task<Dictionary<string, int>> ProxiesHistoryAsync(CancellationToken ct = default)
+    {
+        var outDict = new Dictionary<string, int>(StringComparer.Ordinal);
+        try
+        {
+            var n = (await GetJsonAsync("/proxies", ct).ConfigureAwait(false))?["proxies"]?.AsObject();
+            if (n == null) return outDict;
+            foreach (var kv in n)
+            {
+                if (kv.Value?["history"] is not JsonArray hist || hist.Count == 0) continue;
+                foreach (var h in hist)
+                {
+                    var delay = h?["delay"]?.GetValue<int>() ?? 0;
+                    if (delay > 0) outDict[kv.Key] = delay;   // 末条有效值
+                }
+            }
+        }
+        catch { /* 内核未就绪:返回空表 */ }
+        return outDict;
+    }
+
+    /// <summary>当前生效的分流规则数量(GET /rules 的数组长度);内核未就绪返回 0。</summary>
+    public async Task<int> RulesCountAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var n = await GetJsonAsync("/rules", ct).ConfigureAwait(false);
+            return n?["rules"] is JsonArray arr ? arr.Count : 0;
+        }
+        catch { return 0; }
+    }
+
     public async Task<bool> CloseConnectionAsync(string id, CancellationToken ct = default)
     {
         try

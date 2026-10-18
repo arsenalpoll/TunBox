@@ -643,7 +643,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _appRoutingChoice = "all";
     public string AppRoutingChoice { get => _appRoutingChoice; set => Set(ref _appRoutingChoice, value); }
     private bool _autoStartOn;
-    public bool AutoStartOn { get => _autoStartOn; set => Set(ref _autoStartOn, value); }
+
+    /// <summary>拨上立即写注册表(常用卡直接外露,不该让人再去找「保存设置」);写失败自动回拨并说明。</summary>
+    public bool AutoStartOn
+    {
+        get => _autoStartOn;
+        set
+        {
+            if (!Set(ref _autoStartOn, value)) return;
+            var exe = Environment.ProcessPath;
+            if (exe != null && !AutoStart.Set(value, exe))
+            {
+                DetailText = Lang.T("Msg.AutoStartBlocked");
+                _autoStartOn = AutoStart.IsEnabled();
+                Raise(nameof(AutoStartOn));
+            }
+        }
+    }
     private bool _startMinimizedOn;
 
     /// <summary>静默启动：开机/快捷方式启动不开主窗口。选完立刻落盘（App 启动时读）。</summary>
@@ -718,48 +734,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Raise(nameof(RequestsCountText));
     }
 
-    // ── 全局快捷键（对齐 FlClash 的快捷键设置）──────────────────────────
+    private string _nodeSearchText = "";
 
-    /// <summary>快捷键改动后通知窗口重新注册（RegisterHotKey 挂在窗口消息循环上）。</summary>
-    public event Action? HotkeysChanged;
-
-    private string _hotkeyShow = "";
-    public string HotkeyShowText
+    /// <summary>节点搜索:所有订阅卡一起过滤,一个字就重筛(列表量级 ≤几百,够快)。</summary>
+    public string NodeSearchText
     {
-        get => _hotkeyShow;
-        set { var norm = Hotkeys.Normalize(value); if (Set(ref _hotkeyShow, norm)) SaveHotkey(norm, s => s.HotkeyShowWindow = norm); }
+        get => _nodeSearchText;
+        set { if (!Set(ref _nodeSearchText, value ?? "")) return; ApplyCardFilters(); }
     }
-
-    private string _hotkeyConnect = "";
-    public string HotkeyConnectText
-    {
-        get => _hotkeyConnect;
-        set { var norm = Hotkeys.Normalize(value); if (Set(ref _hotkeyConnect, norm)) SaveHotkey(norm, s => s.HotkeyToggleConnect = norm); }
-    }
-
-    private string _hotkeyTun = "";
-    public string HotkeyTunText
-    {
-        get => _hotkeyTun;
-        set { var norm = Hotkeys.Normalize(value); if (Set(ref _hotkeyTun, norm)) SaveHotkey(norm, s => s.HotkeyToggleTun = norm); }
-    }
-
-    private void SaveHotkey(string normalized, Action<TunBox.Core.Models.AppSettings> write)
-    {
-        write(_manager.Settings);
-        _manager.SaveSettings();
-        HotkeysChanged?.Invoke();
-        DetailText = normalized.Length == 0 ? "" : Lang.F("Set.Hotkey.Registered", normalized);
-    }
-
-    /// <summary>设置页捕获框的占位文案。</summary>
-    public string HotkeyPlaceholder => Lang.T("Set.Hotkey.Empty");
-
-    // ── 代理页排序（对齐 FlClash 的排序选项）────────────────────────────
 
     private string _sortChoice = "default";
 
-    /// <summary>default = 保留测速后的排序历史；delay/name = 强制排序。</summary>
+    /// <summary>default = 保留测速后的排序历史;delay/name = 强制排序。</summary>
     public string SortChoice
     {
         get => _sortChoice;
@@ -770,63 +756,85 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private string _nodeSearchText = "";
-
-    /// <summary>节点搜索：所有订阅卡一起过滤，一个字就重筛（列表量级 ≤几百，够快）。</summary>
-    public string NodeSearchText
-    {
-        get => _nodeSearchText;
-        set { if (!Set(ref _nodeSearchText, value ?? "")) return; ApplyCardFilters(); }
-    }
-
     private void ApplyCardFilters()
     {
         foreach (var card in Subscriptions) card.ApplyCardFilter(_nodeSearchText, _sortChoice);
     }
 
-    // ── 仪表盘快捷出口（不进代理页直接切点）────────────────────────────
+    // ── 仪表盘快捷出口（不进代理页直接切点；每项带实时延迟）────────────
 
-    /// <summary>快捷出口下拉的选项：自动选择（可用时）+ 全部节点名。</summary>
-    public System.Collections.ObjectModel.ObservableCollection<string> QuickEgressOptions { get; } = new();
+    /// <summary>下拉项:智能选项或节点包装。节点延迟直接绑 NodeItem(同一实例,测完自动刷新)。</summary>
+    public sealed class QuickEgressItem
+    {
+        public bool IsSmart { get; }
+        public NodeItem? Node { get; }
+        public QuickEgressItem(bool isSmart, NodeItem? node) { IsSmart = isSmart; Node = node; }
+        public string Name => IsSmart ? Lang.T("Proxy.Smart") : Node?.Model.Name ?? "";
+        public override string ToString() => Name;
+    }
 
-    private string _quickEgressSelected = "";
+    /// <summary>快捷出口下拉的选项:自动选择(可用时)+ 全部节点(带延迟)。</summary>
+    public System.Collections.ObjectModel.ObservableCollection<QuickEgressItem> QuickEgressOptions { get; } = new();
 
-    /// <summary>下拉当前值；改了就真的切出口（smart 或具体节点）。</summary>
-    public string QuickEgressSelected
+    private QuickEgressItem? _quickEgressSelected;
+
+    /// <summary>下拉当前值;改了就真的切出口(smart 或具体节点)。</summary>
+    public QuickEgressItem? QuickEgressSelected
     {
         get => _quickEgressSelected;
         set
         {
-            if (!Set(ref _quickEgressSelected, value ?? "")) return;
-            if (value.Length == 0 || _rebuilding) return;
-            if (SmartActive && value == SmartOptionLabel) return;   // 已经是自动选择，别重复切
-            var node = Nodes.FirstOrDefault(n => n.Model.Name == value);
-            if (node != null) { SelectedNode = node; return; }
-            if (SmartAvailable && value == SmartOptionLabel) _ = SelectSmartAsync();
+            if (ReferenceEquals(_quickEgressSelected, value)) return;
+            _quickEgressSelected = value;
+            Raise(nameof(QuickEgressSelected));
+            if (value == null || _rebuilding) return;
+            if (value.IsSmart) { if (!SmartActive) _ = SelectSmartAsync(); return; }
+            if (value.Node != null) SelectedNode = value.Node;
         }
     }
 
-    private string SmartOptionLabel => Lang.T("Proxy.Smart");
+    private readonly System.Collections.Generic.Dictionary<string, QuickEgressItem> _quickCache =
+        new(StringComparer.Ordinal);
 
     private void RebuildQuickEgress()
     {
-        var want = new List<string>();
-        if (SmartAvailable) want.Add(SmartOptionLabel);
-        foreach (var n in Nodes) want.Add(n.Model.Name);
-        // 内容没变就别动集合：内核事件一秒好几次，每次都 Clear+重加会让下拉框闪烁
-        var changed = want.Count != QuickEgressOptions.Count
-                      || !want.SequenceEqual(QuickEgressOptions);
-        if (changed)
+        // 包装实例按节点 Id 缓存复用:集合只做增删/移位,选中项不闪、下拉不收
+        QuickEgressItem SmartItem()
         {
-            QuickEgressOptions.Clear();
-            foreach (var name in want) QuickEgressOptions.Add(name);
+            if (!_quickCache.TryGetValue("<smart>", out var item))
+                _quickCache["<smart>"] = item = new QuickEgressItem(true, null);
+            return item;
         }
-        var keep = _quickEgressSelected;
-        var match = want.FirstOrDefault(x => x == keep)
-                    ?? (SmartActive ? SmartOptionLabel : SelectedNode?.Model.Name)
-                    ?? want.FirstOrDefault();
-        _quickEgressSelected = match ?? "";
-        if (changed || _quickEgressSelected != keep) Raise(nameof(QuickEgressSelected));
+
+        var want = new List<QuickEgressItem>();
+        if (SmartAvailable) want.Add(SmartItem());
+        foreach (var n in Nodes)
+        {
+            if (!_quickCache.TryGetValue(n.Model.Id, out var item))
+                _quickCache[n.Model.Id] = item = new QuickEgressItem(false, n);
+            want.Add(item);
+        }
+
+        var kept = QuickEgressOptions.ToHashSet();
+        for (var i = 0; i < want.Count; i++)
+        {
+            var at = QuickEgressOptions.IndexOf(want[i]);
+            if (at < 0) QuickEgressOptions.Insert(i, want[i]);
+            else if (at != i) QuickEgressOptions.Move(at, i);
+        }
+        for (var i = QuickEgressOptions.Count - 1; i >= 0; i--)
+            if (!kept.Contains(QuickEgressOptions[i]) && !want.Contains(QuickEgressOptions[i]))
+                QuickEgressOptions.RemoveAt(i);
+
+        // 选中项跟随当前出口:smart 优先,其次选中节点,再退第一项
+        var match = SmartActive && SmartAvailable ? SmartItem()
+            : SelectedNode != null && _quickCache.TryGetValue(SelectedNode.Model.Id, out var nodeItem) ? nodeItem
+            : want.FirstOrDefault();
+        if (!ReferenceEquals(_quickEgressSelected, match))
+        {
+            _quickEgressSelected = match;
+            Raise(nameof(QuickEgressSelected));
+        }
     }
 
     /// <summary>仪表盘端口卡的摘要行。</summary>
@@ -1041,7 +1049,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ToolsLogText = "";
     }
 
-    // ── 内核版本（关于 + 仪表盘端口卡旁边）──────────────────────────────
+    // ── 内核版本 + Clash 信息卡(运行时间/规则数量) ───────────────────────
 
     private string _coreVersionText = "";
     public string CoreVersionText
@@ -1050,11 +1058,69 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         private set => Set(ref _coreVersionText, value);
     }
 
-    private async Task FetchCoreVersionAsync()
+    private DateTime? _coreStartedAt;
+    private int _rulesCount;
+
+    public string ProxyAddrText => "127.0.0.1:" + _manager.Settings.MixedPort;
+
+    public string CoreUptimeText
     {
-        if (!_manager.CoreAlive) { CoreVersionText = ""; return; }
-        if (CoreVersionText.Length > 0) return;
-        try { CoreVersionText = await _manager.Api.VersionAsync() ?? ""; } catch { /* 下一拍再试 */ }
+        get
+        {
+            if (_coreStartedAt == null) return "—";
+            var t = DateTime.Now - _coreStartedAt.Value;
+            if (t < TimeSpan.Zero) t = TimeSpan.Zero;
+            return $"{(int)t.TotalHours}:{t.Minutes:00}:{t.Seconds:00}";
+        }
+    }
+
+    public string RulesCountText => _rulesCount > 0 ? _rulesCount.ToString() : "—";
+
+    private async Task FetchCoreInfoAsync()
+    {
+        if (!_manager.CoreAlive)
+        {
+            _coreStartedAt = null;
+            if (CoreVersionText.Length > 0) CoreVersionText = "";
+            if (_rulesCount > 0) { _rulesCount = 0; Raise(nameof(RulesCountText)); }
+            Raise(nameof(CoreUptimeText));
+            return;
+        }
+        _coreStartedAt ??= DateTime.Now;
+        if (CoreVersionText.Length == 0)
+        {
+            try { CoreVersionText = await _manager.Api.VersionAsync() ?? ""; } catch { /* 下一拍再试 */ }
+        }
+        if (_rulesCount == 0)
+        {
+            try
+            {
+                var count = await _manager.Api.RulesCountAsync();
+                if (count > 0) { _rulesCount = count; Raise(nameof(RulesCountText)); }
+            }
+            catch { /* 下一拍再试 */ }
+        }
+        // 回填内核缓存的延迟 history(Verge 同口径):只填「未测过」的节点,刚测完的 fresh 结果不动
+        if (Nodes.Any(n => n.Model.State == DelayState.Untested))
+        {
+            try
+            {
+                var hist = await _manager.Api.ProxiesHistoryAsync();
+                var changed = false;
+                foreach (var item in Nodes)
+                {
+                    if (item.Model.State != DelayState.Untested) continue;
+                    if (!hist.TryGetValue(item.Model.Name, out var delay) || delay <= 0) continue;
+                    item.Model.LastLatency = delay;
+                    item.Model.State = DelayState.Ok;
+                    item.Refresh();
+                    changed = true;
+                }
+                if (changed) SortVisibleByLatency();
+            }
+            catch { /* 下一拍再试 */ }
+        }
+        Raise(nameof(CoreUptimeText));
     }
 
 
@@ -1307,12 +1373,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OverrideScriptText = s.OverrideScript;
         _languageChoice = string.IsNullOrEmpty(s.Language) ? "auto" : s.Language;
         Raise(nameof(LanguageChoice));
-        _hotkeyShow = s.HotkeyShowWindow;
-        _hotkeyConnect = s.HotkeyToggleConnect;
-        _hotkeyTun = s.HotkeyToggleTun;
-        Raise(nameof(HotkeyShowText));
-        Raise(nameof(HotkeyConnectText));
-        Raise(nameof(HotkeyTunText));
         // 直接落字段再通知：走 CloseChoice 的 setter 会在每次读档时回写一遍盘。
         _closeChoice = s.Close switch { CloseBehavior.Tray => "tray", CloseBehavior.Exit => "exit", _ => "ask" };
         Raise(nameof(CloseChoice));
@@ -1471,7 +1531,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 Raise(nameof(SelectedEgressText));
                 Raise(nameof(PortsSummaryText));
                 if (_manager.LastOverrideNote is { Length: > 0 } ov) DetailText = Lang.F("Tools.Override.Warn", ov);
-                _ = FetchCoreVersionAsync();
+                _ = FetchCoreInfoAsync();
                 foreach (var c in new[] { TestAllCommand, ToggleConnectCommand, TestAllCommand }) c.Refresh();
                 // 断开的那一刻就把旧出口从卡上撤下来，别等 800ms 防抖。
                 if (!IsConnected && _egress.HasEgress) { _egress = EgressSnapshot.Empty; RaiseEgress(); }
@@ -1771,7 +1831,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _ => 2_000_000,                        // 未测 / 超时 / 失败垫底
     };
 
-    /// <summary>测完按延迟把每张订阅卡的可见列表就地重排（Move，不重建，滚动位置不丢）。</summary>
+    /// <summary>测完按延迟把每张订阅卡的可见列表与快捷出口就地重排（Move，不重建，滚动位置不丢）。
+    /// 边测边排:onEach 回调里走的就是这里,下拉顺序实时跟着延迟走。</summary>
     private void SortVisibleByLatency()
     {
         foreach (var card in Subscriptions)
@@ -1783,6 +1844,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 var at = card.VisibleNodes.IndexOf(want[i]);
                 if (at >= 0 && at != i) card.VisibleNodes.Move(at, i);
             }
+        }
+        var wantQuick = QuickEgressOptions
+            .OrderByDescending(q => q.IsSmart)                       // 智能选项恒居首
+            .ThenBy(q => q.Node == null ? int.MinValue : SortRank(q.Node))
+            .ToList();
+        for (var i = 0; i < wantQuick.Count; i++)
+        {
+            var at = QuickEgressOptions.IndexOf(wantQuick[i]);
+            if (at >= 0 && at != i) QuickEgressOptions.Move(at, i);
         }
     }
 
@@ -1943,15 +2013,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         return true;
     }
 
-    /// <summary>开机自启只在真的变了时写注册表：每次点开关都去碰 Run 项，容易被安全软件盯上。</summary>
+    /// <summary>保存路径上的兜底:开关已经是即时生效的,这里只校正界面与注册表的不一致。</summary>
     private void SyncAutoStart()
     {
-        var want = AutoStartOn;
-        if (want == AutoStart.IsEnabled()) return;
-        var exe = Environment.ProcessPath;
-        if (exe != null && !AutoStart.Set(want, exe))
-            DetailText = Lang.T("Msg.AutoStartBlocked");
-        else AutoStartOn = AutoStart.IsEnabled();
+        if (AutoStartOn == AutoStart.IsEnabled()) return;
+        AutoStartOn = AutoStart.IsEnabled();
     }
 
     private static bool TryReadPort(string text, out int port)
@@ -2021,6 +2087,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var ok = await _manager.ApplyChangesAsync();
         if (!ok)
             DetailText = _manager.LastError ?? _manager.PendingConfigNote ?? Lang.F("Msg.ApplyFailed", what);
+        _rulesCount = 0;   // 配置重载会改规则集:失效缓存,下一拍重新统计
         SyncTunStatus();
         SyncGeoSummary();
     }
@@ -2057,14 +2124,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     internal bool IsPollingConnections => _poll != null;
 
     /// <summary>窗口切页时调用：仪表盘（速率图）与请求页（表格）需要轮询，别的页不摊这份开销。</summary>
-    public const string PageTools = "工具";
-
     public void SetActiveTab(string? header)
     {
         ActivePage = header ?? PageDashboard;
         ShowSaveButton = header == PageSettings;
-        var poll = header == PageDashboard || header == PageRequests || header == PageTools;
-        if (header == PageTools) PollCoreLog();
+        var poll = header == PageDashboard || header == PageRequests || header == PageSettings;
+        if (header == PageSettings) PollCoreLog();
         if (!poll) { StopConnectionsPolling(); return; }
         StartConnectionsPolling();
     }
@@ -2087,6 +2152,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private bool _kernelExpanded;
     public bool KernelExpanded { get => _kernelExpanded; set => Set(ref _kernelExpanded, value); }
+
+    private bool _overrideHostsExpanded;
+    public bool OverrideHostsExpanded { get => _overrideHostsExpanded; set => Set(ref _overrideHostsExpanded, value); }
 
     private string _connectionSearchText = "";
 
@@ -2134,7 +2202,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void PollTick()
     {
         if (_polling) return;
-        if (ActivePage == PageTools) PollCoreLog();
+        if (ActivePage == PageSettings) PollCoreLog();
+        if (ActivePage == PageDashboard) Raise(nameof(CoreUptimeText));
         if (!_manager.CoreAlive)
         {
             Connections.Clear();

@@ -62,7 +62,7 @@
                             <Border x:Name="t" Background="Transparent" CornerRadius="10" Padding="15,11" Margin="0,3">
                                 <StackPanel Orientation="Horizontal">
                                     <TextBlock x:Name="g" Text="{TemplateBinding Tag}" FontFamily="Segoe MDL2 Assets"
-                                               FontSize="17" VerticalAlignment="Center"
+                                               FontSize="17" FontWeight="Bold" VerticalAlignment="Center"
                                                Foreground="{StaticResource TextMuted}"/>
                                     <TextBlock x:Name="l" Text="{TemplateBinding Header}" FontSize="14.5"
                                                FontWeight="Bold" Margin="11,0,0,0" VerticalAlignment="Center"
@@ -125,42 +125,6 @@
                 </Setter>
             </Style>
 
-            <!-- 快捷键捕获框：空时浮一层占位提示，按下组合键落字 -->
-            <Style x:Key="HotkeyBox" TargetType="TextBox">
-                <Setter Property="IsReadOnly" Value="True"/>
-                <Setter Property="Cursor" Value="Hand"/>
-                <Setter Property="MinWidth" Value="150"/>
-                <Setter Property="Template">
-                    <Setter.Value>
-                        <ControlTemplate TargetType="TextBox">
-                            <Grid>
-                                <Border x:Name="bd" CornerRadius="8" BorderThickness="1"
-                                        Background="{TemplateBinding Background}"
-                                        BorderBrush="{TemplateBinding BorderBrush}">
-                                    <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"
-                                                  VerticalAlignment="Center"/>
-                                </Border>
-                                <TextBlock x:Name="watermark" Margin="10,0,0,0" VerticalAlignment="Center"
-                                           FontSize="12" IsHitTestVisible="False"
-                                           Foreground="{StaticResource TextMuted}"
-                                           Text="{Binding HotkeyPlaceholder}"/>
-                            </Grid>
-                            <ControlTemplate.Triggers>
-                                <Trigger Property="Text" Value="">
-                                    <Setter TargetName="watermark" Property="Visibility" Value="Visible"/>
-                                    <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Line}"/>
-                                </Trigger>
-                                <Trigger Property="IsKeyboardFocused" Value="True">
-                                    <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Brand}"/>
-                                </Trigger>
-                                <Trigger SourceName="bd" Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource InputHoverLine}"/>
-                                </Trigger>
-                            </ControlTemplate.Triggers>
-                        </ControlTemplate>
-                    </Setter.Value>
-                </Setter>
-            </Style>
         </ResourceDictionary>
     </Window.Resources>
 
@@ -259,9 +223,9 @@
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
                 <!-- 连接卡:主开关 + 出站模式 + 系统代理(合并) -->
@@ -328,8 +292,6 @@
                             </UniformGrid>
                         </Border>
 
-                        <TextBlock Text="{DynamicResource L.Dash.ConnectHint}" FontSize="12" Margin="0,12,0,0"
-                                   Foreground="{StaticResource TextMuted}"/>
                     </StackPanel>
                 </Border>
 
@@ -356,7 +318,7 @@
                 </Border>
 
                 <!-- TUN -->
-                <Border Grid.Row="1" Grid.Column="0" Style="{StaticResource Card}" VerticalAlignment="Top">
+                <Border Grid.Row="1" Grid.Column="0" Style="{StaticResource Card}" VerticalAlignment="Stretch">
                     <StackPanel>
                         <Grid>
                             <TextBlock Text="{DynamicResource L.Dash.TunTitle}" Style="{StaticResource SectionTitle}"
@@ -374,24 +336,112 @@
                 </Border>
 
                 <!-- 快捷出口 -->
-                <Border Grid.Row="1" Grid.Column="2" Style="{StaticResource Card}" VerticalAlignment="Top">
+                <Border Grid.Row="1" Grid.Column="2" Style="{StaticResource Card}" VerticalAlignment="Stretch">
                     <StackPanel>
                         <Grid>
                             <TextBlock Text="{DynamicResource L.Dash.QuickSwitch}" Style="{StaticResource SectionTitle}"
                                        ToolTip="{DynamicResource L.Dash.QuickSwitchTip}"/>
-                            <TextBlock Text="{Binding PortsSummaryText}" FontSize="12"
-                                       HorizontalAlignment="Right" VerticalAlignment="Center"
-                                       Foreground="{StaticResource TextMuted}"/>
+                            <!-- 就地测速:测完下拉按延迟自动排序 -->
+                            <Button Style="{StaticResource GhostButton}" Padding="8,4" HorizontalAlignment="Right"
+                                    VerticalAlignment="Center" Command="{Binding TestAllCommand}"
+                                    ToolTip="{DynamicResource L.Proxy.TestAllTip}">
+                                <TextBlock Text="&#x26A1;" FontSize="13" Foreground="#D97706"/>
+                            </Button>
                         </Grid>
                         <ComboBox ItemsSource="{Binding QuickEgressOptions}"
                                   SelectedItem="{Binding QuickEgressSelected}"
                                   Margin="0,8,0,0"
-                                  ToolTip="{DynamicResource L.Dash.QuickSwitchTip}"/>
+                                  ToolTip="{DynamicResource L.Dash.QuickSwitchTip}">
+                            <ComboBox.ItemTemplate>
+                                <!-- 名称占星号列(超长截断),延迟靠右;右侧留出下拉箭头的位置 -->
+                                <DataTemplate>
+                                    <Grid Margin="0,0,26,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Grid.Column="0" Text="{Binding Name}" FontSize="13.5"
+                                                   Foreground="{StaticResource TextMain}"
+                                                   TextTrimming="CharacterEllipsis" Margin="0,0,10,0"/>
+                                        <TextBlock Grid.Column="1" Text="{Binding Node.LatencyText}"
+                                                   FontSize="12" FontWeight="SemiBold"
+                                                   Foreground="{Binding Node.LatencyBrush}"/>
+                                    </Grid>
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
                     </StackPanel>
                 </Border>
 
                 <!-- 出口信息 -->
-                <Border Grid.Row="2" Grid.Column="2" Style="{StaticResource Card}" VerticalAlignment="Top">
+                                <!-- Clash 信息:内核版本 / 代理地址 / 运行时间 / 规则数量 -->
+                <Border Grid.Row="2" Grid.Column="0" Style="{StaticResource Card}" VerticalAlignment="Stretch">
+                    <StackPanel>
+                        <Grid>
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <Border Width="30" Height="30" CornerRadius="8" Background="#FFF3E0"
+                                        VerticalAlignment="Center">
+                                    <TextBlock Text="&#xE945;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                               Foreground="#D97706" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </Border>
+                                <TextBlock Text="{DynamicResource L.Dash.CoreInfoTitle}" FontSize="16" FontWeight="SemiBold"
+                                           Foreground="{StaticResource TextMain}" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                            </StackPanel>
+                        </Grid>
+                        <Grid Margin="0,10,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="{DynamicResource L.Dash.CoreVersion}" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,6"/>
+                            <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding CoreVersionText}" FontSize="12.5"
+                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}" Margin="0,0,0,6"
+                                       HorizontalAlignment="Right">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding CoreVersionText}" Value="">
+                                                <Setter Property="Text" Value="—"/>
+                                                <Setter Property="FontWeight" Value="Normal"/>
+                                                <Setter Property="Foreground" Value="{StaticResource TextMuted}"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="{DynamicResource L.Dash.SysProxyAddr}" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,6"/>
+                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding ProxyAddrText}" FontSize="12.5"
+                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}" Margin="0,0,0,6"
+                                       HorizontalAlignment="Right"/>
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="{DynamicResource L.Dash.MixedPortLabel}" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,6"/>
+                            <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding MixedPortText}" FontSize="12.5"
+                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}" Margin="0,0,0,6"
+                                       HorizontalAlignment="Right"/>
+                            <TextBlock Grid.Row="3" Grid.Column="0" Text="{DynamicResource L.Dash.Uptime}" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,6"/>
+                            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding CoreUptimeText}" FontSize="12.5"
+                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}" Margin="0,0,0,6"
+                                       HorizontalAlignment="Right"/>
+                            <TextBlock Grid.Row="4" Grid.Column="0" Text="{DynamicResource L.Dash.RulesCount}" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,0"/>
+                            <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding RulesCountText}" FontSize="12.5"
+                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}"
+                                       HorizontalAlignment="Right"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+<Border Grid.Row="2" Grid.Column="2" Style="{StaticResource Card}" VerticalAlignment="Stretch">
                     <StackPanel>
                         <Grid>
                             <TextBlock Text="{DynamicResource L.Dash.EgressTitle}" Style="{StaticResource SectionTitle}"
@@ -782,108 +832,13 @@
             </DockPanel>
         </TabItem>
 
-        <!-- ── 工具（网络检测 / Hosts / 覆写 / 内核日志）───────────────── -->
-        <TabItem Header="{DynamicResource L.Nav.Tools}" Tag="&#xE945;" Style="{StaticResource SideNav}">
-            <StackPanel>
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <Grid>
-                            <TextBlock Text="{DynamicResource L.Tools.NetCheck}" Style="{StaticResource SectionTitle}"/>
-                            <Button Content="{DynamicResource L.Tools.NetCheck.Start}" Style="{StaticResource GhostButton}"
-                                    Padding="12,6" HorizontalAlignment="Right" Command="{Binding RunNetCheckCommand}"
-                                    ToolTip="{DynamicResource L.Tools.NetCheckTip}"/>
-                        </Grid>
-                        <ListView ItemsSource="{Binding NetCheckRows}" BorderThickness="0" Background="Transparent"
-                                  Foreground="{StaticResource TextMain}">
-                            <ListView.View>
-                                <GridView AllowsColumnReorder="False">
-                                    <GridViewColumn Header="{DynamicResource L.Tools.NetCheck.Col.Url}" Width="330"
-                                                    DisplayMemberBinding="{Binding Url}"/>
-                                    <GridViewColumn Header="{DynamicResource L.Tools.NetCheck.Col.Direct}" Width="120"
-                                                    DisplayMemberBinding="{Binding DirectText}"/>
-                                    <GridViewColumn Header="{DynamicResource L.Tools.NetCheck.Col.Proxy}" Width="120"
-                                                    DisplayMemberBinding="{Binding ProxyText}"/>
-                                </GridView>
-                            </ListView.View>
-                        </ListView>
-                        <TextBlock Text="{DynamicResource L.Tools.NetCheckTip}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
-                    </StackPanel>
-                </Border>
-
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <TextBlock Text="{DynamicResource L.Tools.Hosts}" Style="{StaticResource SectionTitle}"/>
-                        <TextBox Text="{Binding HostsText, UpdateSourceTrigger=PropertyChanged}"
-                                 AcceptsReturn="True" MinHeight="72" MaxHeight="160"
-                                 FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"
-                                 VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
-                                 ToolTip="{DynamicResource L.Tools.Hosts.Tip}"/>
-                        <TextBlock Text="{Binding HostsFeedback}" Style="{StaticResource Hint}" Margin="0,6,0,0"
-                                   Foreground="{StaticResource Warn}"/>
-                    </StackPanel>
-                </Border>
-
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <Grid>
-                            <TextBlock Text="{DynamicResource L.Tools.Override}" Style="{StaticResource SectionTitle}"/>
-                            <CheckBox Content="{DynamicResource L.Tools.Override.Enable}" HorizontalAlignment="Right"
-                                      VerticalAlignment="Center" IsChecked="{Binding OverrideEnabledOn}"/>
-                        </Grid>
-                        <TextBlock Text="{DynamicResource L.Tools.Override.Disabled}" Style="{StaticResource Hint}"
-                                   Foreground="{StaticResource Warn}" Margin="0,6,0,0"
-                                   Visibility="{Binding OverrideDisabledHint, Converter={StaticResource BoolVis}}"/>
-                        <TextBlock Text="{DynamicResource L.Tools.Override.Merge}" FontWeight="Bold" FontSize="12.5"
-                                   Foreground="{StaticResource TextMain}" Margin="0,10,0,0"/>
-                        <TextBox Text="{Binding OverrideMergeText, UpdateSourceTrigger=PropertyChanged}"
-                                 AcceptsReturn="True" MinHeight="72" MaxHeight="180"
-                                 FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"
-                                 VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
-                                 ToolTip="{DynamicResource L.Tools.Override.MergeTip}"/>
-                        <TextBlock Text="{DynamicResource L.Tools.Override.MergeTip}" Style="{StaticResource Hint}" Margin="0,4,0,0"/>
-                        <TextBlock Text="{DynamicResource L.Tools.Override.Script}" FontWeight="Bold" FontSize="12.5"
-                                   Foreground="{StaticResource TextMain}" Margin="0,10,0,0"/>
-                        <TextBox Text="{Binding OverrideScriptText, UpdateSourceTrigger=PropertyChanged}"
-                                 AcceptsReturn="True" MinHeight="72" MaxHeight="180"
-                                 FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"
-                                 VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
-                                 ToolTip="{DynamicResource L.Tools.Override.ScriptTip}"/>
-                        <TextBlock Text="{DynamicResource L.Tools.Override.ScriptTip}" Style="{StaticResource Hint}" Margin="0,4,0,0"/>
-                        <Button Content="{DynamicResource L.Tools.Override.Save}" Style="{StaticResource GhostButton}"
-                                Padding="12,6" Margin="0,10,0,0" HorizontalAlignment="Left"
-                                Command="{Binding SaveOverrideCommand}"
-                                ToolTip="{DynamicResource L.Tools.Override.SaveTip}"/>
-                    </StackPanel>
-                </Border>
-
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <Grid>
-                            <TextBlock Text="{DynamicResource L.Tools.Log}" Style="{StaticResource SectionTitle}"/>
-                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                                <Button Content="{DynamicResource L.Tools.Log.OpenFile}" Style="{StaticResource QuietButton}"
-                                        Padding="10,5" FontSize="12" Command="{Binding OpenLogCommand}"/>
-                                <Button Content="{DynamicResource L.Tools.Log.Clear}" Style="{StaticResource QuietButton}"
-                                        Padding="10,5" FontSize="12" Margin="6,0,0,0" Click="OnClearLogClick"/>
-                            </StackPanel>
-                        </Grid>
-                        <TextBox Text="{Binding ToolsLogText, Mode=OneWay}" IsReadOnly="True" MinHeight="180" MaxHeight="320"
-                                 FontFamily="Consolas, Microsoft YaHei UI" FontSize="11.5" Margin="0,8,0,0"
-                                 VerticalScrollBarVisibility="Auto" TextWrapping="NoWrap"
-                                 AcceptsReturn="True" VerticalContentAlignment="Top"/>
-                    </StackPanel>
-                </Border>
-            </StackPanel>
-        </TabItem>
-
         <!-- ── 设置 ───────────────────────────────────────────────────── -->
         <TabItem Header="{DynamicResource L.Nav.Settings}" Tag="&#xE713;" Style="{StaticResource SideNav}">
             <StackPanel>
+                <!-- 常用:一眼可见,不折叠 -->
                 <Border Style="{StaticResource Card}">
-                    <Expander IsExpanded="{Binding GeneralExpanded, Mode=TwoWay}"
-                              Header="{DynamicResource L.Set.Section.App}" FontSize="16" FontWeight="SemiBold"
-                              Foreground="{StaticResource TextMain}">
-                        <StackPanel Margin="0,8,0,0">
+                    <StackPanel>
+                        <TextBlock Text="{DynamicResource L.Set.Section.Common}" Style="{StaticResource SectionTitle}"/>
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
@@ -918,54 +873,24 @@
                                 <ComboBoxItem Content="{DynamicResource L.Set.Close.Tray}" Tag="tray"/>
                                 <ComboBoxItem Content="{DynamicResource L.Set.Close.Exit}" Tag="exit"/>
                             </ComboBox>
-                            <CheckBox Content="{DynamicResource L.Set.AutoStart}" Margin="0,12,0,0" IsChecked="{Binding AutoStartOn}"/>
-                            <CheckBox Content="{DynamicResource L.Set.SilentStart}" Margin="0,8,0,0"
-                                      IsChecked="{Binding StartMinimizedOn}"
-                                      ToolTip="{DynamicResource L.Set.SilentStartTip}"/>
-
-                            <TextBlock Text="{DynamicResource L.Set.Hotkeys}" FontWeight="Bold" FontSize="12.5"
-                                       Foreground="{StaticResource TextMain}" Margin="0,14,0,2"/>
-                            <TextBlock Text="{DynamicResource L.Set.HotkeysTip}" Style="{StaticResource Hint}"/>
-                            <Grid Margin="0,8,0,0">
+                            <Grid Margin="0,14,0,0">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="*"/>
                                 </Grid.ColumnDefinitions>
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-                                </Grid.RowDefinitions>
-                                <Grid Grid.Row="0" Grid.Column="0" Margin="0,0,16,8">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="*"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Text="{DynamicResource L.Set.Hotkey.Show}" VerticalAlignment="Center"
-                                               Foreground="{StaticResource TextMain}" Margin="0,0,10,0"/>
-                                    <TextBox Grid.Column="1" Style="{StaticResource HotkeyBox}"
-                                             Text="{Binding HotkeyShowText, Mode=OneWay}"
-                                             Tag="HotkeyShowText" PreviewKeyDown="OnHotkeyKeyDown"/>
+                                <Grid Grid.Column="0" Margin="0,0,16,0">
+                                    <TextBlock Text="{DynamicResource L.Set.AutoStart}" VerticalAlignment="Center"
+                                               Foreground="{StaticResource TextMain}"/>
+                                    <ToggleButton HorizontalAlignment="Right" IsChecked="{Binding AutoStartOn}"
+                                                  Style="{StaticResource Switch}"/>
                                 </Grid>
-                                <Grid Grid.Row="0" Grid.Column="1" Margin="0,0,0,8">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="*"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Text="{DynamicResource L.Set.Hotkey.Connect}" VerticalAlignment="Center"
-                                               Foreground="{StaticResource TextMain}" Margin="0,0,10,0"/>
-                                    <TextBox Grid.Column="1" Style="{StaticResource HotkeyBox}"
-                                             Text="{Binding HotkeyConnectText, Mode=OneWay}"
-                                             Tag="HotkeyConnectText" PreviewKeyDown="OnHotkeyKeyDown"/>
-                                </Grid>
-                                <Grid Grid.Row="1" Grid.Column="0">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto"/>
-                                        <ColumnDefinition Width="*"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Text="{DynamicResource L.Set.Hotkey.Tun}" VerticalAlignment="Center"
-                                               Foreground="{StaticResource TextMain}" Margin="0,0,10,0"/>
-                                    <TextBox Grid.Column="1" Style="{StaticResource HotkeyBox}"
-                                             Text="{Binding HotkeyTunText, Mode=OneWay}"
-                                             Tag="HotkeyTunText" PreviewKeyDown="OnHotkeyKeyDown"/>
+                                <Grid Grid.Column="1">
+                                    <TextBlock Text="{DynamicResource L.Set.SilentStart}" VerticalAlignment="Center"
+                                               Foreground="{StaticResource TextMain}"
+                                               ToolTip="{DynamicResource L.Set.SilentStartTip}"/>
+                                    <ToggleButton HorizontalAlignment="Right" IsChecked="{Binding StartMinimizedOn}"
+                                                  Style="{StaticResource Switch}"
+                                                  ToolTip="{DynamicResource L.Set.SilentStartTip}"/>
                                 </Grid>
                             </Grid>
 
@@ -977,8 +902,8 @@
                                            VerticalAlignment="Center" Margin="10,0,0,0"
                                            TextTrimming="CharacterEllipsis"/>
                             </StackPanel>
-                        </StackPanel>
-                    </Expander>
+                        
+                    </StackPanel>
                 </Border>
 
                 <Border Style="{StaticResource Card}">
@@ -1151,6 +1076,98 @@
                             </StackPanel>
                         </StackPanel>
                     </Expander>
+                </Border>
+
+                <!-- 工具合并进设置:网络检测 / Hosts / 覆写 / 内核日志 -->
+                <Border Style="{StaticResource Card}">
+                    <StackPanel>
+                        <Grid>
+                            <TextBlock Text="{DynamicResource L.Tools.NetCheck}" Style="{StaticResource SectionTitle}"/>
+                            <Button Content="{DynamicResource L.Tools.NetCheck.Start}" Style="{StaticResource GhostButton}"
+                                    Padding="12,6" HorizontalAlignment="Right" Command="{Binding RunNetCheckCommand}"
+                                    ToolTip="{DynamicResource L.Tools.NetCheckTip}"/>
+                        </Grid>
+                        <ListView ItemsSource="{Binding NetCheckRows}" BorderThickness="0" Background="Transparent"
+                                  Foreground="{StaticResource TextMain}">
+                            <ListView.View>
+                                <GridView AllowsColumnReorder="False">
+                                    <GridViewColumn Header="{DynamicResource L.Tools.NetCheck.Col.Url}" Width="330"
+                                                    DisplayMemberBinding="{Binding Url}"/>
+                                    <GridViewColumn Header="{DynamicResource L.Tools.NetCheck.Col.Direct}" Width="120"
+                                                    DisplayMemberBinding="{Binding DirectText}"/>
+                                    <GridViewColumn Header="{DynamicResource L.Tools.NetCheck.Col.Proxy}" Width="120"
+                                                    DisplayMemberBinding="{Binding ProxyText}"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                        <TextBlock Text="{DynamicResource L.Tools.NetCheckTip}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- 覆写与 Hosts:高级项,收纳 -->
+                <Border Style="{StaticResource Card}">
+                    <Expander IsExpanded="{Binding OverrideHostsExpanded, Mode=TwoWay}"
+                              Header="{DynamicResource L.Set.Section.OverrideHosts}" FontSize="16" FontWeight="SemiBold"
+                              Foreground="{StaticResource TextMain}">
+                        <StackPanel Margin="0,8,0,0">
+                        <TextBlock Text="{DynamicResource L.Tools.Hosts}" Style="{StaticResource SectionTitle}"/>
+                        <TextBox Text="{Binding HostsText, UpdateSourceTrigger=PropertyChanged}"
+                                 AcceptsReturn="True" MinHeight="72" MaxHeight="160"
+                                 FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"
+                                 VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
+                                 ToolTip="{DynamicResource L.Tools.Hosts.Tip}"/>
+                        <TextBlock Text="{Binding HostsFeedback}" Style="{StaticResource Hint}" Margin="0,6,0,0"
+                                   Foreground="{StaticResource Warn}"/>
+                    
+                        <Grid>
+                            <TextBlock Text="{DynamicResource L.Tools.Override}" Style="{StaticResource SectionTitle}"/>
+                            <CheckBox Content="{DynamicResource L.Tools.Override.Enable}" HorizontalAlignment="Right"
+                                      VerticalAlignment="Center" IsChecked="{Binding OverrideEnabledOn}"/>
+                        </Grid>
+                        <TextBlock Text="{DynamicResource L.Tools.Override.Disabled}" Style="{StaticResource Hint}"
+                                   Foreground="{StaticResource Warn}" Margin="0,6,0,0"
+                                   Visibility="{Binding OverrideDisabledHint, Converter={StaticResource BoolVis}}"/>
+                        <TextBlock Text="{DynamicResource L.Tools.Override.Merge}" FontWeight="Bold" FontSize="12.5"
+                                   Foreground="{StaticResource TextMain}" Margin="0,10,0,0"/>
+                        <TextBox Text="{Binding OverrideMergeText, UpdateSourceTrigger=PropertyChanged}"
+                                 AcceptsReturn="True" MinHeight="72" MaxHeight="180"
+                                 FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"
+                                 VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
+                                 ToolTip="{DynamicResource L.Tools.Override.MergeTip}"/>
+                        <TextBlock Text="{DynamicResource L.Tools.Override.MergeTip}" Style="{StaticResource Hint}" Margin="0,4,0,0"/>
+                        <TextBlock Text="{DynamicResource L.Tools.Override.Script}" FontWeight="Bold" FontSize="12.5"
+                                   Foreground="{StaticResource TextMain}" Margin="0,10,0,0"/>
+                        <TextBox Text="{Binding OverrideScriptText, UpdateSourceTrigger=PropertyChanged}"
+                                 AcceptsReturn="True" MinHeight="72" MaxHeight="180"
+                                 FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"
+                                 VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
+                                 ToolTip="{DynamicResource L.Tools.Override.ScriptTip}"/>
+                        <TextBlock Text="{DynamicResource L.Tools.Override.ScriptTip}" Style="{StaticResource Hint}" Margin="0,4,0,0"/>
+                        <Button Content="{DynamicResource L.Tools.Override.Save}" Style="{StaticResource GhostButton}"
+                                Padding="12,6" Margin="0,10,0,0" HorizontalAlignment="Left"
+                                Command="{Binding SaveOverrideCommand}"
+                                ToolTip="{DynamicResource L.Tools.Override.SaveTip}"/>
+                    
+                        </StackPanel>
+                    </Expander>
+                </Border>
+
+                <Border Style="{StaticResource Card}">
+                    <StackPanel>
+                        <Grid>
+                            <TextBlock Text="{DynamicResource L.Tools.Log}" Style="{StaticResource SectionTitle}"/>
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                <Button Content="{DynamicResource L.Tools.Log.OpenFile}" Style="{StaticResource QuietButton}"
+                                        Padding="10,5" FontSize="12" Command="{Binding OpenLogCommand}"/>
+                                <Button Content="{DynamicResource L.Tools.Log.Clear}" Style="{StaticResource QuietButton}"
+                                        Padding="10,5" FontSize="12" Margin="6,0,0,0" Click="OnClearLogClick"/>
+                            </StackPanel>
+                        </Grid>
+                        <TextBox Text="{Binding ToolsLogText, Mode=OneWay}" IsReadOnly="True" MinHeight="180" MaxHeight="320"
+                                 FontFamily="Consolas, Microsoft YaHei UI" FontSize="11.5" Margin="0,8,0,0"
+                                 VerticalScrollBarVisibility="Auto" TextWrapping="NoWrap"
+                                 AcceptsReturn="True" VerticalContentAlignment="Top"/>
+                    </StackPanel>
                 </Border>
 
                 <Border Style="{StaticResource Card}">

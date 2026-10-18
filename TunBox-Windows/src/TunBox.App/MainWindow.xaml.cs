@@ -43,7 +43,6 @@ public partial class MainWindow : Window
         // 仪表盘的速率图：采样事件 → 图表（窗口关了要摘掉，VM 比窗口活得久）
         ViewModel.SpeedSampled += OnSpeedSampled;
         ViewModel.NavigateRequested += OnNavigateRequested;
-        ViewModel.HotkeysChanged += ReapplyHotkeys;
         try
         {
             // 任务栏/标题栏的大图标从磁盘上的 ico 取：WPF 对多帧 ico 取帧的大小
@@ -77,80 +76,7 @@ public partial class MainWindow : Window
     {
         ViewModel.SpeedSampled -= OnSpeedSampled;
         ViewModel.NavigateRequested -= OnNavigateRequested;
-        ViewModel.HotkeysChanged -= ReapplyHotkeys;
-        if (_source != null)
-        {
-            _source.RemoveHook(WndProc);
-            Hotkeys.UnregisterAll(_source.Handle);
-            _source = null;
-        }
         base.OnClosed(e);
-    }
-
-    // ── 全局快捷键 ───────────────────────────────────────────────────────
-
-    private HwndSource? _source;
-
-    protected override void OnSourceInitialized(EventArgs e)
-    {
-        base.OnSourceInitialized(e);
-        _source = (HwndSource)PresentationSource.FromVisual(this)!;
-        _source.AddHook(WndProc);
-        ReapplyHotkeys();
-    }
-
-    private void ReapplyHotkeys()
-    {
-        if (_source == null) return;
-        var failed = Hotkeys.Apply(_source.Handle, ViewModel.ManagerSettings);
-        if (failed.Count > 0)
-            ViewModel.DetailText = Lang.F("Set.Hotkey.Taken", string.Join(", ", failed));
-    }
-
-    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
-    {
-        if (msg != Hotkeys.WM_HOTKEY) return IntPtr.Zero;
-        handled = true;
-        switch (wParam.ToInt32())
-        {
-            case Hotkeys.IdShow:
-                if (Application.Current is App appShow) appShow.ShowMainWindow();
-                break;
-            case Hotkeys.IdConnect:
-                _ = ViewModel.ToggleConnectCommand.ExecuteAsync(null);
-                break;
-            case Hotkeys.IdTun:
-                ViewModel.TunOn = !ViewModel.TunOn;
-                _ = ViewModel.ApplySwitchAsync();
-                break;
-        }
-        return IntPtr.Zero;
-    }
-
-    /// <summary>设置页的快捷键捕获框：按下的组合键直接成为该槽位的快捷键，Esc 清除。</summary>
-    private void OnHotkeyKeyDown(object sender, KeyEventArgs e)
-    {
-        if (sender is not FrameworkElement { Tag: string slot } box) return;
-        if (e.Key == Key.Escape)
-        {
-            SetHotkeyProperty(slot, "");
-            e.Handled = true;
-            return;
-        }
-        var spec = Hotkeys.FromKeyEvent(e.Key == Key.System ? e.SystemKey : e.Key, Keyboard.Modifiers);
-        if (spec == null) return;   // 纯修饰键：等真正的键
-        SetHotkeyProperty(slot, spec);
-        e.Handled = true;
-    }
-
-    private void SetHotkeyProperty(string slot, string value)
-    {
-        switch (slot)
-        {
-            case "HotkeyShowText": ViewModel.HotkeyShowText = value; break;
-            case "HotkeyConnectText": ViewModel.HotkeyConnectText = value; break;
-            case "HotkeyTunText": ViewModel.HotkeyTunText = value; break;
-        }
     }
 
     // ── 窗口位置/尺寸记忆 ────────────────────────────────────────────────

@@ -35,7 +35,13 @@
     <sys:String x:Key="L.Dash.ModeRule">Rule</sys:String>
     <sys:String x:Key="L.Dash.ModeGlobal">Global</sys:String>
     <sys:String x:Key="L.Dash.ModeDirect">Direct</sys:String>
-    <sys:String x:Key="L.Dash.CurrentEgress">Egress </sys:String>
+        <sys:String x:Key="L.Dash.CurrentEgress">Egress </sys:String>
+    <sys:String x:Key="L.Dash.CoreInfoTitle">Clash Info</sys:String>
+    <sys:String x:Key="L.Dash.CoreVersion">Core</sys:String>
+    <sys:String x:Key="L.Dash.SysProxyAddr">System proxy</sys:String>
+    <sys:String x:Key="L.Dash.MixedPortLabel">Mixed port</sys:String>
+    <sys:String x:Key="L.Dash.Uptime">Uptime</sys:String>
+    <sys:String x:Key="L.Dash.RulesCount">Rules</sys:String>
     <sys:String x:Key="L.Dash.ConnectTitle">Connection</sys:String>
     <sys:String x:Key="L.Dash.ConnectSwitchTip">Flip on to take over traffic, off to release</sys:String>
     <sys:String x:Key="L.Dash.ConnectHint">Connecting also applies the system proxy; disconnecting releases it. TUN has its own switch below.</sys:String>
@@ -155,6 +161,8 @@
     <sys:String x:Key="L.Tools.Log.Empty">No core log yet: the core hasn't run or it was just cleared.</sys:String>
 
     <!-- Settings -->
+        <sys:String x:Key="L.Set.Section.Common">Common</sys:String>
+    <sys:String x:Key="L.Set.Section.OverrideHosts">Override &amp; Hosts</sys:String>
     <sys:String x:Key="L.Set.Section.App">App</sys:String>
     <sys:String x:Key="L.Set.Section.Network">Network</sys:String>
     <sys:String x:Key="L.Set.Section.Rules">Routing Rules</sys:String>

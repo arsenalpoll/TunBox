@@ -79,7 +79,7 @@ public class UiTests
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "TunBox", "ui-" + tag + "-" + Guid.NewGuid().ToString("N")[..6]);
 
-    private static readonly string[] Pages = { "仪表盘", "代理", "请求", "工具", "设置" };
+    private static readonly string[] Pages = { "仪表盘", "代理", "请求", "设置" };
 
     /// <summary>
     /// 命令里冒出来的异常（真机：热重载超时抛 TaskCanceledException → 「未处理的异常」弹窗）
@@ -132,7 +132,8 @@ public class UiTests
         var xaml = File.ReadAllText(FindSourceFile("MainWindow.xaml"));
         var owners = new[] { typeof(MainViewModel), typeof(NodeItem),
                               typeof(SubscriptionItem), typeof(ConnectionItem),
-                              typeof(MainViewModel.NetCheckRow) };
+                              typeof(MainViewModel.NetCheckRow),
+                              typeof(MainViewModel.QuickEgressItem) };
         var unknown = new List<string>();
         foreach (Match m in Regex.Matches(xaml,
                      @"\{Binding\s+(?:Path=)?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"))
@@ -709,7 +710,6 @@ public class UiTests
         Assert.Contains("AutoUpdateChoice", xaml);
         Assert.Contains("local:TrafficChart", xaml);
         Assert.Contains("LanguageChoice", xaml);                  // 多语言
-        Assert.Contains("HotkeyShowText", xaml);                  // 全局快捷键
         Assert.Contains("OverrideMergeText", xaml);               // 覆写
         Assert.Contains("HostsText", xaml);                       // Hosts
         Assert.Contains("RunNetCheckCommand", xaml);              // 网络检测
@@ -813,7 +813,7 @@ public class UiTests
 
                 string? TopDown()
                 {
-                    var known = new[] { "应用", "网络配置", "分流规则", "内核" };
+                    var known = new[] { "网络配置", "分流规则", "内核", "覆写与 Hosts" };
                     var cards = Descendants(window).OfType<System.Windows.Controls.Border>()
                         .Where(b => b.Child is System.Windows.Controls.Expander
                             && known.Contains(((System.Windows.Controls.Expander)b.Child).Header as string))
@@ -859,7 +859,7 @@ public class UiTests
             WpfHost.PumpUntil(() => window.ActualWidth > 100);
             try
             {
-                foreach (var title in new[] { "代理连接", "虚拟网卡（TUN）", "实时速率", "出口信息", "快捷出口" })
+                foreach (var title in new[] { "代理连接", "虚拟网卡（TUN）", "实时速率", "快捷出口", "出口信息", "Clash 信息" })
                 {
                     var found = Descendants(window).OfType<System.Windows.Controls.TextBlock>()
                         .Any(t => t.Text == title);
@@ -1039,31 +1039,6 @@ public class UiTests
         Assert.Equal("zh", readback.again);
     }
 
-    /// <summary>快捷键组合键解析与规范化；无效写法直接拒绝。</summary>
-    [Fact]
-    public void Hotkey_specs_parse_and_normalize()
-    {
-        var home = TempHome("hotkey");
-        var parsed = WpfHost.OnUi(() =>
-        {
-            var vm = new MainViewModel(new Workspace(home));
-            vm.HotkeyConnectText = "ctrl+alt+p";
-            var ok = Hotkeys.Parse(vm.HotkeyConnectText) is { } p
-                && (p.Modifiers & 0x2) != 0 && (p.Modifiers & 0x1) != 0 && p.VirtualKey == 0x50;
-            return (vm.HotkeyConnectText, ok,
-                Hotkeys.Parse("P") is null,
-                Hotkeys.Parse("Ctrl+Shift+F5") is not null,
-                Hotkeys.Parse("Ctrl+Ctrl") is null);
-        }).Result;
-
-        try { Directory.Delete(home, true); } catch { }
-        Assert.Equal("Ctrl+Alt+P", parsed.Item1);
-        Assert.True(parsed.Item2, "修饰键与键码没解析对");
-        Assert.True(parsed.Item3, "无修饰键的单键不该被接受");
-        Assert.True(parsed.Item4, "F 键组合没被接受");
-        Assert.True(parsed.Item5, "重复修饰键不该被接受");
-    }
-
     /// <summary>覆写引擎：Merge 深合并 + Script 覆写都作用于最终配置；关掉开关 = 原样通过；脚本报错不拖垮生成。</summary>
     [Fact]
     public void Override_merge_and_script_transform_the_config()
@@ -1184,9 +1159,10 @@ public class UiTests
                 "ss://YWVzLTI1Ni1nY206cEBzcw==@1.1.1.1:8389#HK%2001\n"
                 + "ss://YWVzLTI1Ni1nY206cEBzcw==@2.2.2.2:8389#HK%2002");
             WpfHost.PumpUntil(() => vm.Nodes.Count > 0);
-            var hasSmartNow = vm.QuickEgressOptions.Contains(Lang.T("Proxy.Smart"));
-            var hasNodeNow = vm.QuickEgressOptions.Contains("HK 02");
-            vm.QuickEgressSelected = "HK 02";
+            var hasSmartNow = vm.QuickEgressOptions.Any(o => o.IsSmart);
+            var hasNodeNow = vm.QuickEgressOptions.Any(o => o.Node is { Name: "HK 02" });
+            var pick = vm.QuickEgressOptions.First(o => o.Node is { Name: "HK 02" });
+            vm.QuickEgressSelected = pick;
             WpfHost.PumpUntil(() => vm.SelectedNode is { Name: "HK 02" }, 4000);
             return (hasSmartNow, hasNodeNow, vm.SelectedNode?.Name ?? "");
         }).Result;

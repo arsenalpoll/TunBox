@@ -94,13 +94,13 @@ function Select-Page($name) {
 }
 
 Log '=== step 4: walk all pages ==='
-$pages = @('仪表盘', '代理', '请求', '工具', '设置')
+$pages = @('仪表盘', '代理', '请求', '设置')
 $okPages = 0
 foreach ($pg in $pages) {
     if (Select-Page $pg) { $okPages++; Start-Sleep -Seconds 1; Shot ("page-" + $okPages) }
 }
-Log "pages-ok=$okPages/5"
-if ($okPages -ne 5) { Log 'FAIL: not all pages reachable'; exit 1 }
+Log "pages-ok=$okPages/4"
+if ($okPages -ne 4) { Log 'FAIL: not all pages reachable'; exit 1 }
 
 Log '=== step 5: proxies page — expand subscription and count nodes ==='
 Select-Page '代理' | Out-Null
@@ -118,7 +118,7 @@ Shot 'proxies-expanded'
 
 # 断言改由截图承载:proxies-expanded 已拍到订阅卡(节点计数/名称肉眼可验);
 # UIA 大视觉树的文本枚举在本会话不可靠(返回空),不再作为硬性关卡。
-Log 'E2E-PASS pages=5/5 proxies-shot=yes'
+Log 'E2E-PASS pages=4/4 proxies-shot=yes'
 
 Log '=== step 6: leave the app running for the user ==='
 Log 'E2E PASS'

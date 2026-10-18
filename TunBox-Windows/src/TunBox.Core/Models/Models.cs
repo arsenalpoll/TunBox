@@ -148,7 +148,9 @@ public sealed class AppSettings
     public List<string> DnsServers { get; set; } = new();
     public string CoreLogLevel { get; set; } = "info";
     /// <summary>国内可达性好的测速地址：gstatic 不通时整屏节点会一起报红。</summary>
-    public string TestUrl { get; set; } = "http://cp.cloudflare.com/generate_204";
+    /// <summary>默认测速地址与 Clash Verge 同款(gstatic generate_204):HTTPS、全球可达,
+    /// 与主流客户端的延迟口径一致;老配置里的 cp.cloudflare 会在加载时自动迁移。</summary>
+    public string TestUrl { get; set; } = "https://www.gstatic.com/generate_204";
     public List<string> CustomRules { get; set; } = new();
     public List<string> ForceProxySites { get; set; } = new();
     public List<string> ForceDirectSites { get; set; } = new();

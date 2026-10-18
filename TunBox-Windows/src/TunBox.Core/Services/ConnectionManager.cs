@@ -64,6 +64,13 @@ public sealed class ConnectionManager : IDisposable
         // 老数据里跨订阅重复的 id 在启动这一刻就治好并落盘（否则 PROXY 成员表会少节点，
         // 用户点那些节点就被内核拒「proxy not exist」）。
         if (EnsureUniqueIds(_lib.Nodes)) PersistNodes();
+        // 老默认测速地址迁移:cp.cloudflare 的延迟口径与 Verge(gstatic)差一截,
+        // 用户看到「Verge 几十毫秒、TunBox 两百多」多半是它;只迁移从未改过的默认值。
+        if (Settings.TestUrl == "http://cp.cloudflare.com/generate_204")
+        {
+            Settings.TestUrl = "https://www.gstatic.com/generate_204";
+            PersistSettings();
+        }
         Api.Configure(Settings.ApiPort, Settings.ApiSecret);
         // 先把随程序发布的 LightGBM 模型放进内核 home：不放到时候 smart 组不发射，
         // 界面上「自动选择」这一条会凭空消失（要等第一次 BuildConfig 才补上，太晚了）。
