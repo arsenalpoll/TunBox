@@ -1,5 +1,5 @@
 /**
- * 设置中心（2026-10-17 UI 重构：Nexus 设计令牌版）
+ * 设置中心（2026-10-18 UI 精简：隐藏网络重连 / 故障切换 / 诊断三项高级选项）
  *
  * 职责：把第二阶段新增的设置项以分组形式呈现，读写均走既有服务：
  *   - 读取：SettingsService.load() → AppSettings（页面首次进入取持久化真实值）
@@ -9,6 +9,12 @@
  * 约束：本文件只调用既有服务的公开接口，不修改 Orchestrator/AppSettings/SettingsService。
  * 2026-10-17 用户要求：设置页不再暴露「重连退避上限」三档时间 —— 编排器固定用
  * 内置最优默认 8s（RECONNECT_MAX_MS），用户只需控制「自动重连」开关。
+ *
+ * 2026-10-18 用户要求：简化设置，不要让用户选择复杂的配置项
+ * - 网络重连 → 默认开启，完全隐藏
+ * - 故障切换 → 默认开启，完全隐藏（3 次失败即切换、60 秒冷却为最优值）
+ * - 诊断自检 → 默认开启，完全隐藏（自动修复、最多 2 步）
+ * 用户感知：无感保障连接质量，无需任何配置。
  */
 import { router, promptAction } from '@kit.ArkUI';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
@@ -57,21 +63,12 @@ export struct SettingsView {
   @State appRoutingSummary: string = '正在读取应用分流…';
   /** 广告拦截规则状态（原首页「规则模式」卡片迁入，语义与首页 rulesStatusText 一致） */
   @State adRulesSummary: string = '正在读取规则状态…';
-  // ── 网络重连 ──
-  @State autoReconnect: boolean = true;
-  // ── 故障切换 ──
-  @State failoverEnabled: boolean = true;
-  @State failoverThreshold: number = 3;
-  @State failoverCooldown: number = 60;
   // ── 选点 ──
   @State autoSelectMode: string = AutoSelectModes.MANUAL;
   @State currentNodeName: string = '';
   @State switchReason: string = '';
   @State switchFrom: string = '';
   @State switchTo: string = '';
-  // ── 诊断 ──
-  @State healthEnabled: boolean = true;
-  @State repairMaxSteps: number = 2;
   // ── 数据与规则（geo 资产） ──
   @State geoAssets: GeoAssetStatus[] = [];
   @State assetSource: string = 'auto';
@@ -112,13 +109,7 @@ export struct SettingsView {
     this.settings = await SettingsService.load();
     this.refreshAppRoutingSummary();
     // 每次进入：从持久化读取真实值回填（缺字段/脏值由 AppSettings.fromJson 兜底）
-    this.autoReconnect = this.settings.autoReconnectOnNetworkChange;
-    this.failoverEnabled = this.settings.failoverEnabled;
-    this.failoverThreshold = this.settings.failoverFailureThreshold;
-    this.failoverCooldown = this.settings.failoverCooldownSec;
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
-    this.healthEnabled = this.settings.healthCheckEnabled;
-    this.repairMaxSteps = this.settings.healthRepairMaxSteps;
     this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
     this.assetSource = this.settings.assetSource;
     this.refreshGeoStatuses();
@@ -182,82 +173,15 @@ export struct SettingsView {
     this.switchTo = this.orchestrator.lastFailoverToName();
   }
 
-  /** UTF/模型双重夹取：本函数为 UI 侧夹取（保存时 SettingsService 再夹一次） */
-  private clampInt(v: number, min: number, max: number, def: number): number {
-    if (typeof v !== 'number' || !Number.isFinite(v)) {
-      return def;
-    }
-    const i = Math.floor(v);
-    if (i < min) {
-      return min;
-    }
-    if (i > max) {
-      return max;
-    }
-    return i;
-  }
-
-  /** 落盘 + 轻量反馈（每项改动即时保存） */
-  private persist(): void {
-    this.settings.autoReconnectOnNetworkChange = this.autoReconnect;
-    this.settings.failoverEnabled = this.failoverEnabled;
-    this.settings.failoverFailureThreshold = this.failoverThreshold;
-    this.settings.failoverCooldownSec = this.failoverCooldown;
-    this.settings.autoSelectMode = AutoSelectModes.normalize(this.autoSelectMode);
-    this.settings.healthCheckEnabled = this.healthEnabled;
-    this.settings.healthRepairMaxSteps = this.repairMaxSteps;
+  /** 订阅配额提醒开关 */
+  private setQuotaNotify(v: boolean): void {
+    this.quotaNotifyEnabled = v;
+    this.settings.quotaNotifyEnabled = v;
     SettingsService.save(this.settings).then((): void => {
       promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
     }).catch((): void => {
       promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
     });
-  }
-
-  // ── 各设置项交互 ──────────────────────────────────────────────────
-
-  private onAutoReconnectChange(v: boolean): void {
-    this.autoReconnect = v;
-    this.persist();
-  }
-
-  private onFailoverEnabledChange(v: boolean): void {
-    this.failoverEnabled = v;
-    this.persist();
-  }
-
-  private stepThreshold(delta: number): void {
-    const before = this.failoverThreshold;
-    this.failoverThreshold = this.clampInt(before + delta, 1, 10, 3);
-    if (this.failoverThreshold === before) {
-      promptAction.showToast({ message: $r('app.string.settings_clamp_toast') });
-      return;
-    }
-    this.persist();
-  }
-
-  private stepCooldown(delta: number): void {
-    const before = this.failoverCooldown;
-    this.failoverCooldown = this.clampInt(before + delta, 0, 3600, 60);
-    if (this.failoverCooldown === before) {
-      promptAction.showToast({ message: $r('app.string.settings_clamp_toast') });
-      return;
-    }
-    this.persist();
-  }
-
-  private onHealthEnabledChange(v: boolean): void {
-    this.healthEnabled = v;
-    this.persist();
-  }
-
-  private stepRepair(delta: number): void {
-    const before = this.repairMaxSteps;
-    this.repairMaxSteps = this.clampInt(before + delta, 0, 3, 2);
-    if (this.repairMaxSteps === before) {
-      promptAction.showToast({ message: $r('app.string.settings_clamp_toast') });
-      return;
-    }
-    this.persist();
   }
 
   // ── 数据与规则（geo 资产管理） ────────────────────────────────────
@@ -300,16 +224,6 @@ export struct SettingsView {
     }
     this.assetSource = source;
     this.settings.assetSource = source;
-    SettingsService.save(this.settings).then((): void => {
-      promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
-    }).catch((): void => {
-      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
-    });
-  }
-
-  private setQuotaNotify(v: boolean): void {
-    this.quotaNotifyEnabled = v;
-    this.settings.quotaNotifyEnabled = v;
     SettingsService.save(this.settings).then((): void => {
       promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
     }).catch((): void => {
@@ -403,48 +317,9 @@ export struct SettingsView {
             .border({ width: 1, color: TunBoxColors.cardBorder })
             .onClick(() => router.pushUrl({ url: 'pages/RulesPage' }))
 
-            // ── 网络重连（2026-10-17：只保留「自动重连」开关，退避上限固定最优默认 8s）──
-            Column({ space: 12 }) {
-              this.SectionHeader($r('app.media.ic_refresh'), $r('app.string.settings_network_reconnect_title'))
-              this.ToggleRow($r('app.string.settings_auto_reconnect_label'),
-                $r('app.string.settings_auto_reconnect_desc'),
-                this.autoReconnect, (v: boolean): void => this.onAutoReconnectChange(v))
-            }
-            .width('100%').padding(TunBoxGeometry.cardPadding)
-            .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
-
-            // ── 故障切换 ──
-            Column({ space: 12 }) {
-              this.SectionHeader($r('app.media.ic_swap'), $r('app.string.settings_failover_title'))
-              this.ToggleRow($r('app.string.settings_failover_enable_label'),
-                $r('app.string.settings_failover_enable_desc'),
-                this.failoverEnabled, (v: boolean): void => this.onFailoverEnabledChange(v))
-              this.StepperRow($r('app.string.settings_failover_threshold_label'),
-                $r('app.string.settings_failover_threshold_desc'),
-                this.failoverThreshold, false,
-                (delta: number): void => this.stepThreshold(delta))
-              this.StepperRow($r('app.string.settings_failover_cooldown_label'),
-                $r('app.string.settings_failover_cooldown_desc'),
-                this.failoverCooldown, true,
-                (delta: number): void => this.stepCooldown(delta))
-            }
-            .width('100%').padding(TunBoxGeometry.cardPadding)
-            .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
-
-            // ── 诊断 ──
+            // ── 诊断（保留订阅配额提醒）──
             Column({ space: 12 }) {
               this.SectionHeader($r('app.media.ic_shield'), $r('app.string.settings_diagnostics_title'))
-              this.ToggleRow($r('app.string.settings_health_enable_label'),
-                $r('app.string.settings_health_enable_desc'),
-                this.healthEnabled, (v: boolean): void => this.onHealthEnabledChange(v))
-              this.StepperRow($r('app.string.settings_health_repair_steps_label'),
-                $r('app.string.settings_health_repair_steps_desc'),
-                this.repairMaxSteps, false,
-                (delta: number): void => this.stepRepair(delta))
               Divider().color(TunBoxColors.cardBorder)
               Column({ space: 4 }) {
                 Row() {
@@ -581,58 +456,6 @@ export struct SettingsView {
     }
     .width('100%')
     .alignItems(VerticalAlign.Center)
-  }
-
-  @Builder
-  ToggleRow(label: Resource, desc: Resource, isOn: boolean, onChange: (v: boolean) => void) {
-    Column({ space: 4 }) {
-      Row() {
-        Text(label).fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: isOn })
-          .selectedColor(TunBoxColors.primary)
-          .onChange(onChange)
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-      Text(desc).fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-    }
-    .width('100%')
-  }
-
-  @Builder
-  StepperRow(label: Resource, desc: Resource, value: number, useSeconds: boolean,
-    onStep: (delta: number) => void) {
-    Column({ space: 4 }) {
-      Row() {
-        Text(label).fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
-        Row({ space: 0 }) {
-          Stack({ alignContent: Alignment.Center }) {
-            Image($r('app.media.ic_minus')).width(15).height(15).fillColor(TunBoxColors.textPrimary)
-          }
-          .width(34).height(30)
-          .borderRadius(8).backgroundColor(TunBoxColors.surfaceSubtle)
-          .border({ width: 1, color: TunBoxColors.cardBorder })
-          .onClick(() => onStep(-1))
-          Text(useSeconds ? $r('app.string.settings_seconds_value', value) : `${value}`)
-            .fontSize(14).fontColor(TunBoxColors.textPrimary)
-            .constraintSize({ minWidth: 62 })
-            .textAlign(TextAlign.Center)
-            .padding({ left: 6, right: 6 })
-          Stack({ alignContent: Alignment.Center }) {
-            Image($r('app.media.ic_plus')).width(15).height(15).fillColor(TunBoxColors.textPrimary)
-          }
-          .width(34).height(30)
-          .borderRadius(8).backgroundColor(TunBoxColors.surfaceSubtle)
-          .border({ width: 1, color: TunBoxColors.cardBorder })
-          .onClick(() => onStep(1))
-        }
-        .alignItems(VerticalAlign.Center)
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-      Text(desc).fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-    }
-    .width('100%')
   }
 
 }
