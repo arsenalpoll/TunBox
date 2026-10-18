@@ -158,17 +158,24 @@ public static class ClashConfigGenerator
         if (tunOn)
         {
             lines.Add($"  device: {TunDeviceName}");
-            lines.Add("  stack: system");
+            // 协议栈用户可选（对齐 FlClash 的 TUN 设置）：system 快、gvisor 兼容性好、mixed 兼顾。
+            // 非法值在 StackSlug 里归一回 system，别让内核拒收整份配置。
+            lines.Add($"  stack: {StackSlug(settings.TunStack)}");
             lines.Add("  auto-route: true");
             lines.Add("  auto-detect-interface: true");
+            // 严格路由：拒绝绕过 TUN 的流量（防漏；内网工具多时可关）。
+            lines.Add($"  strict-route: {(settings.TunStrictRoute ? "true" : "false")}");
+            // 端点独立 NAT：UDP 对称 NAT 场景的兼容选项，默认关。
+            lines.Add($"  endpoint-independent-nat: {(settings.TunEndpointIndependentNat ? "true" : "false")}");
             lines.Add("  dns-hijack:");
             lines.Add("    - any:53");
             // 9000 是默认值，走 Wi-Fi / 二级隧道时容易踩分片，1500 最稳。
-            lines.Add("  mtu: 1500");
+            var mtu = settings.TunMtu is >= 1280 and <= 65535 ? settings.TunMtu : 1500;
+            lines.Add($"  mtu: {mtu}");
         }
         lines.Add("");
 
-        var hosts = NormalizeHosts(proxyHosts);
+        var hosts = NormalizeHosts(proxyHosts ?? settings.Hosts);
         if (hosts.Count > 0)
         {
             lines.Add("hosts:");
@@ -312,6 +319,14 @@ public static class ClashConfigGenerator
         && !name.Contains('#') && !name.Contains('"') && !name.Contains('\'');
 
     public static ProxyDropStats LastDropStats { get; private set; } = new();
+
+    /// <summary>TUN 协议栈的合法值。设置里存的是用户选项，写进配置前在这里归一化。</summary>
+    public static string StackSlug(string? raw) => raw switch
+    {
+        "gvisor" => "gvisor",
+        "mixed" => "mixed",
+        _ => "system",
+    };
 
     public static string KindSlug(ProxyKind kind) => kind switch
     {

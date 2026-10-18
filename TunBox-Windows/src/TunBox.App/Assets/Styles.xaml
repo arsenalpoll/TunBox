@@ -50,7 +50,7 @@
     <Style x:Key="Card" TargetType="Border">
         <Setter Property="Background" Value="{StaticResource CardBg}"/>
         <Setter Property="CornerRadius" Value="16"/>
-        <Setter Property="Padding" Value="16"/>
+        <Setter Property="Padding" Value="18"/>
         <Setter Property="Margin" Value="0,0,0,12"/>
         <Setter Property="BorderBrush" Value="{StaticResource CardLine}"/>
         <Setter Property="BorderThickness" Value="1"/>
@@ -66,6 +66,8 @@
         <Setter Property="Foreground" Value="White"/>
         <Setter Property="BorderThickness" Value="0"/>
         <Setter Property="Padding" Value="14,8"/>
+        <!-- Clash Verge 的按钮字重是 500：强调但不吼 -->
+        <Setter Property="FontWeight" Value="SemiBold"/>
         <Setter Property="Cursor" Value="Hand"/>
         <Setter Property="Template">
             <Setter.Value>
@@ -349,6 +351,37 @@
         </Setter>
     </Style>
 
+    <!-- 大号开关（52×30）：连接这类主开关用；小开关（44×26）留给设置行 -->
+    <Style x:Key="SwitchLarge" TargetType="ToggleButton">
+        <Setter Property="Width" Value="52"/>
+        <Setter Property="Height" Value="30"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ToggleButton">
+                    <Border x:Name="track" CornerRadius="15" Background="{StaticResource TrackBg}">
+                        <Ellipse x:Name="knob" Width="24" Height="24" Fill="White"
+                                 HorizontalAlignment="Left" Margin="3,0,0,0">
+                            <Ellipse.Effect>
+                                <DropShadowEffect Color="{StaticResource ShadowColor}" Opacity="0.18" BlurRadius="5" ShadowDepth="1" Direction="270"/>
+                            </Ellipse.Effect>
+                        </Ellipse>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="track" Property="Background" Value="{StaticResource TrackOn}"/>
+                            <Setter TargetName="knob" Property="HorizontalAlignment" Value="Right"/>
+                            <Setter TargetName="knob" Property="Margin" Value="0,0,3,0"/>
+                        </Trigger>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="track" Property="Opacity" Value="0.9"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <!-- 滚动条与提示气泡：默认的宽滚动条 + 系统色 ToolTip 是这套圆角卡片里最「老 Windows」的两块。
          macOS 的滚动条是贴边细条，只在滚动时才显形，这里取它的宽度与配色。 -->
     <Style x:Key="ScrollThumb" TargetType="Thumb">
@@ -427,14 +460,54 @@
         </Setter>
     </Style>
 
+    <!-- 表格（请求页 / 网络检测）：FlClash、Verge 一系的桌面表格——
+         表头无立体感、细底线下的小标题；行悬停浅灰、选中品牌浅底，全行圆角。 -->
+    <Style TargetType="GridViewColumnHeader">
+        <Setter Property="OverridesDefaultStyle" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="GridViewColumnHeader">
+                    <Border Background="{StaticResource CardBg}" BorderBrush="{StaticResource Line}"
+                            BorderThickness="0,0,0,1" Padding="10,8,6,8">
+                        <TextBlock Text="{TemplateBinding Content}" FontSize="12" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextMuted}"/>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style TargetType="ListViewItem">
+        <Setter Property="Foreground" Value="{StaticResource TextMain}"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListViewItem">
+                    <Border x:Name="row" Background="Transparent" CornerRadius="7" Padding="10,7" Margin="0,1">
+                        <GridViewRowPresenter Content="{TemplateBinding Content}"
+                                              Columns="{TemplateBinding GridView.ColumnCollection}"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="row" Property="Background" Value="{StaticResource NavHover}"/>
+                        </Trigger>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="row" Property="Background" Value="{StaticResource BrandSoft}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <Style x:Key="Hint" TargetType="TextBlock">
         <Setter Property="Foreground" Value="{StaticResource TextMuted}"/>
-        <Setter Property="FontSize" Value="11.5"/>
+        <Setter Property="FontSize" Value="12"/>
         <Setter Property="TextWrapping" Value="Wrap"/>
     </Style>
     <Style x:Key="SectionTitle" TargetType="TextBlock">
-        <Setter Property="FontWeight" Value="Bold"/>
-        <Setter Property="FontSize" Value="14"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="FontSize" Value="16"/>
         <Setter Property="Foreground" Value="{StaticResource TextMain}"/>
         <Setter Property="Margin" Value="0,0,0,8"/>
     </Style>

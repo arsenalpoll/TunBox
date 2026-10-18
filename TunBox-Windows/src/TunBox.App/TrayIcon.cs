@@ -30,6 +30,12 @@ public sealed class TrayIcon : IDisposable
     public event Action? ShowRequested;
     public event Action? ExitRequested;
 
+    /// <summary>托盘快捷开关：点「连接/断开」转发给视图模型。</summary>
+    public event Action? ToggleConnectRequested;
+
+    /// <summary>菜单第一项的动态文案（连接 / 断开连接），App 在弹出菜单时算好。</summary>
+    public Func<string>? ToggleLabel { get; set; }
+
     private IntPtr _hwnd;
     private HwndSource? _source;
     private IntPtr _hicon;
@@ -132,12 +138,19 @@ public sealed class TrayIcon : IDisposable
     private void ShowMenu()
     {
         var menu = new System.Windows.Controls.ContextMenu();
-        var show = new System.Windows.Controls.MenuItem { Header = "显示主界面" };
+        var toggle = new System.Windows.Controls.MenuItem
+        {
+            Header = ToggleLabel?.Invoke() ?? TunBox.App.Lang.T("Tray.Connect"),
+            FontWeight = System.Windows.FontWeights.SemiBold,
+        };
+        toggle.Click += (_, _) => ToggleConnectRequested?.Invoke();
+        var show = new System.Windows.Controls.MenuItem { Header = TunBox.App.Lang.T("Tray.Show") };
         show.Click += (_, _) => ShowRequested?.Invoke();
-        var exit = new System.Windows.Controls.MenuItem { Header = "退出 TunBox" };
+        var exit = new System.Windows.Controls.MenuItem { Header = TunBox.App.Lang.T("Tray.Exit") };
         exit.Click += (_, _) => ExitRequested?.Invoke();
-        menu.Items.Add(show);
+        menu.Items.Add(toggle);
         menu.Items.Add(new System.Windows.Controls.Separator());
+        menu.Items.Add(show);
         menu.Items.Add(exit);
         menu.Placement = System.Windows.Controls.Primitives.PlacementMode.AbsolutePoint;
         GetCursorPos(out var pt);

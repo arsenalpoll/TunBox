@@ -140,8 +140,8 @@ export class ClashConfigGenerator {
     lines.push('mixed-port: ' + mixedPort);
     lines.push('external-controller: 127.0.0.1:' + apiPort);
     lines.push('secret: "' + apiSecret + '"');
-    // 代理模式（upstream settings.proxyMode）：rule=规则 / global=全局
-    lines.push('mode: ' + (settings.proxyMode === 'global' ? 'global' : 'rule'));
+    // 代理模式（upstream settings.proxyMode）：rule=规则 / global=全局 / direct=直连
+    lines.push('mode: ' + (settings.proxyMode === 'global' ? 'global' : (settings.proxyMode === 'direct' ? 'direct' : 'rule')));
     // 内核日志级别可调（诊断排查时临时调到 debug/info；默认 warning 减少稳态 I/O）。
     // 白名单外的值一律回落 warning，防止脏设置写出非法 YAML。
     const level = (settings.coreLogLevel ?? '').trim().toLowerCase();

@@ -68,7 +68,7 @@ export class ThemeService {
     const dark = ThemeService.isDark();
     // 窗口底色与页面背景同色：状态栏/底部系统导航区透出的就是这一层，
     // 不同色会与页面内容形成分割感。
-    win.setWindowBackgroundColor(dark ? '#171B22' : '#F7F8FA');
+    win.setWindowBackgroundColor(dark ? '#171B22' : '#F4F6FB');
     await win.setWindowSystemBarProperties({
       statusBarColor: '#00000000',
       statusBarContentColor: dark ? '#F5F7FF' : '#171B2A',

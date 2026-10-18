@@ -150,9 +150,14 @@ const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
 const HEARTBEAT_STALE_MS = 15000;
 /** 同一状态同步周期内复用文件探针，避免 heartbeat/start-ok 被重复同步读取。 */
 const STATE_PROBE_CACHE_MS = 120;
-/** API readiness 快速起步并有上限退避，总超时仍由调用方 deadline 决定。 */
+/**
+ * API readiness 快速起步并有上限退避，总超时仍由调用方 deadline 决定。
+ * 2026-10-17 启动速度：探针上限 300ms → 150ms —— 内核已就绪但还没被探测到的
+ * 「检测滞后」上限从 300ms 砍半（探针成本是 fs.stat + 回环 HTTP，未就绪时连接
+ * 被拒立即返回，加倍探测频率的代价可忽略）。
+ */
 const READINESS_INITIAL_DELAY_MS = 40;
-const READINESS_MAX_DELAY_MS = 300;
+const READINESS_MAX_DELAY_MS = 150;
 /** Two-second traffic sampling reduces /connections allocations and UI redraws. */
 const TRAFFIC_POLL_INTERVAL_MS = 2000;
 /** 测速内核停扩展的重试次数与间隔：停失败必须重试，或至少让下次启动能正确重建 */
@@ -2321,6 +2326,35 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.disconnectRequested = false;
     const seq = ++this.connectSeq;
 
+    // 性能（2026-10-17 启动速度）：secret 读盘提前发起，与下面的节点检查/意图落盘/
+    // 旧隧道拆除并行推进 —— 串行等于白等一次 preferences 往返；await 仍在原语义位置。
+    const secretTask: Promise<string> = SettingsService.getApiSecret()
+      .catch((e: Object): string => {
+        AppLogger.warn(TAG, `api secret read failed: ${AppLogger.errText(e)}`);
+        return '';
+      });
+    const connectT0 = Date.now();
+    let tPrep = 0;
+    let tPrelaunch = 0;
+    let tLaunch = 0;
+    let tReady = 0;
+
+    // ── 冷启动 hydration 竞态保护（2026-10-17 真机日志实证）─────────────────
+    // 完全退出重进后 ~1.4s 内点连接：SubscriptionService 的进程级 hydrate
+    // （凭据迁移 + 节点回填，真机实测 +1133ms 才完成）尚未结束 → subs.nodes
+    // 为空或节点尚缺凭据/原始 YAML → 误入下方「零节点/无有效节点」分支，
+    // 串行重拉全部订阅（此刻无隧道、订阅域名直连 15s 超时 × 重试）→
+    // connect timing prep 实测 38s；同进程第二次连接仅 0.6s。
+    // init() 进程内记忆化：已完成立即返回、进行中等待完成、失败放行
+    // 走下方既有校验与报错，不改变任何语义，只是不再抢跑。
+    if (this.context !== null) {
+      try {
+        await subs.init(this.context);
+      } catch (e) {
+        AppLogger.warn(TAG, `subs hydration wait failed: ${AppLogger.errText(e)}`);
+      }
+    }
+
     // ── 硬门禁：一个节点都没有时，绝不拉起 VPN 扩展 ─────────────────────────
     // 全新安装的典型路径：订阅已添加但尚未拉取成功 → subs.nodes 为空。
     // 旧实现不做拦截，直接生成一份 1861 字节的空壳配置拉起扩展，内核在
@@ -2411,7 +2445,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
       // API secret 保持稳定(首次生成后复用): 每次重连都换 secret 会让其他页面
       // 持有的旧 secret 全部 401, 延迟测试/节点切换集体失败(表现全是"超时")。
-      const savedSecret = await SettingsService.getApiSecret();
+      const savedSecret = await secretTask;
       if (savedSecret.length > 0) {
         this.apiSecret = savedSecret;
       } else {
@@ -2455,6 +2489,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       } else {
         AppLogger.info(TAG, 'no live tunnel to tear down; skip 400ms extension-exit grace');
       }
+      tPrep = Date.now() - connectT0;
 
       // geoip.metadb 缺失/损坏时降级生成（不含 GEOIP 规则、不含 dns.fallback）,
       // 避免内核在 config.Parse 阶段联网下载 MMDB 失败导致启动卡死;
@@ -2515,8 +2550,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.info(TAG, `doh stale refresh skipped: ${AppLogger.errText(e)}`);
       });
       let proxyHosts: Record<string, string> = {};
+      // 性能（2026-10-17 启动速度）：本次目标节点的入口域名已 pin（缓存命中）时，
+      // 其余备用域名的解析只是锦上添花 —— 预算从 6s 收紧到 1.5s；目标域名未 pin
+      // 时仍保留 6s（必须先 pin 住要连的节点，防投毒优先）。
+      const priorityDomain: string = priorityDomains.length > 0 ? priorityDomains[0] : '';
+      const priorityPinned: boolean = await DoHResolver.hasUsablePin(priorityDomain);
+      const dohBudgetMs: number = (priorityDomain.length > 0 && !priorityPinned) ? 6000 : 1500;
       try {
-        proxyHosts = await DoHResolver.resolveMany(serverDomains, 6000, priorityDomains);
+        proxyHosts = await DoHResolver.resolveMany(serverDomains, dohBudgetMs, priorityDomains);
       } catch (e) {
         proxyHosts = {};
         AppLogger.warn(TAG, `proxy-server DoH pre-resolution failed: ${AppLogger.errText(e)}`);
@@ -2538,6 +2579,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 与 DoH 预解析**并行**：两者互不依赖（端口探测只 bind/close 本地回环，
       // DoH 只发 HTTPS 查询），串行等于白等两段。
       await portsTask;
+      tPrelaunch = Date.now() - connectT0;
       // ── 内核 smart 组（自动选择）────────────────────────────────────────
       // 只有「用户选了自动模式」且「Model.bin 已就绪」才声明 type: smart。
       // 模型缺失时若仍声明，内核 GetModel() 会在启动路径同步下载 github 上的
@@ -2565,9 +2607,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.info(TAG, 'auto mode but Model.bin not ready; using app-side selection '
           + '(smart group disabled this session; downloading in background)');
       }
+      const configGenT0 = Date.now();
       const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
         this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups, ruleProviderReady, useSmart,
         subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
+      AppLogger.info(TAG, `config generated: ${Date.now() - configGenT0}ms (${yaml.length} bytes)`);
       // 缓存本次连接的配置输入，供规则/站点热重载复用（不重跑 DoH、不重建隧道）。
       this.lastProxyHosts = proxyHosts;
       this.lastUseGeoip = useGeoip;
@@ -2652,6 +2696,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
             + '请稍等几秒后再点连接；反复出现请重启手机清除驻留进程');
         }
       }
+      tLaunch = Date.now() - connectT0;
 
       this.api.resetTrafficBaseline();
       this.api.setEndpoint(this.apiPort, this.apiSecret);
@@ -2727,19 +2772,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         }
         throw new Error('Clash API 未就绪（30s 超时）：VPN 扩展未上报启动结果，请重试或反馈日志');
       }
+      tReady = Date.now() - connectT0;
 
-      // 选中节点。
-      // auto 模式且 smart 组已声明时**不要**把 PROXY 钉到具体节点 —— 那会让内核
-      // 的按连接智能选点彻底失效（PROXY 指向谁就整条隧道走谁）。此时把 PROXY
-      // 指向 smart 组本身，由内核按目标特征在组内动态选点。
-      const pinSmartGroup = useSmart && settings.autoSelectMode === AutoSelectModes.AUTO;
-      const selected = await this.api.selectNode(
-        pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name);
-      if (!selected) {
-        AppLogger.warn(TAG, `selectNode(${pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name})`
-          + ' failed; keep default PROXY first node');
-      }
-
+      // ── 性能（2026-10-17 启动速度）：先上屏「已连接」，再做节点钉选 ──
+      // 生成的配置已把本次目标节点排在 PROXY 组首位（groupSelected unshift），
+      // 内核冷启动默认选中的就是它；selectNode 只是纠正内核 store-selections
+      // 记忆的兜底。旧实现把 PUT /proxies 的内核往返 await 在 state=CONNECTED
+      // 之前，「已连接」要等这次调用才上屏（真机 100–500ms）。改为上屏后补钉选，
+      // 失败只记日志 —— 语义不变（钉选失败回落 PROXY 组首位节点）。
       if (seq !== this.connectSeq) {
         await this.disconnectInternal(intentGeneration);
         return false; // 已被更新的连接请求取代
@@ -2753,6 +2793,23 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 重连成功 → 取消挂起的退避定时器并复位尝试计数（禁止重连风暴）
       this.reconnectAttempts = 0;
       this.cancelReconnect('connected');
+      // auto 模式且 smart 组已声明时**不要**把 PROXY 钉到具体节点 —— 那会让内核
+      // 的按连接智能选点彻底失效（PROXY 指向谁就整条隧道走谁）。此时把 PROXY
+      // 指向 smart 组本身，由内核按目标特征在组内动态选点。不阻塞上屏。
+      const pinSmartGroup = useSmart && settings.autoSelectMode === AutoSelectModes.AUTO;
+      this.api.selectNode(pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name)
+        .then((selected: boolean): void => {
+          if (!selected) {
+            AppLogger.warn(TAG, `selectNode(${pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name})`
+              + ' failed; keep default PROXY first node');
+          }
+        })
+        .catch((e: Object): void => {
+          AppLogger.warn(TAG, `selectNode rejected: ${AppLogger.errText(e)}`);
+        });
+      this.notify();
+      AppLogger.info(TAG, `connect timing: prep=${tPrep}ms prelaunch=${tPrelaunch}ms`
+        + ` launch=${tLaunch}ms ready=${tReady}ms total=${Date.now() - connectT0}ms`);
       // 连接快照升格为 connected：同代写入。期间若用户已推进新代次（又点了
       // 断开或连接）则放弃写入 —— 绝不用旧结果覆盖更新的用户意图。
       const committed = await this.updateSessionSnapshot(intentGeneration, true, 'connected',

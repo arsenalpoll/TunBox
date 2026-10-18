@@ -36,6 +36,7 @@ const CORE_LOG_LEVELS: string[] = ['all', 'debug', 'info', 'warning', 'error'];
 
 @Component
 export struct DiagnosticsSheet {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @Prop diag: AppDiagnostics | null = null;
   onRefresh: () => void = () => {};
   onClose: () => void = () => {};

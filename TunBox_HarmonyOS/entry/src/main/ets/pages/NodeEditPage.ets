@@ -3,6 +3,7 @@
  * 移植自 upstream: SSRVPN_Android/lib/screens/node_edit_screen.dart
  */
 import { router, promptAction } from '@kit.ArkUI';
+import { TunBoxMotion } from '../theme/TunBoxTokens';
 import { util } from '@kit.ArkTS';
 import { Ui } from '../theme/UiTokens';
 import { ProxyNode, ProxyNodeType } from '../commons/models/ProxyNode';
@@ -12,6 +13,7 @@ import { SettingsService } from '../commons/services/SettingsService';
 @Entry
 @Component
 struct NodeEditPage {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @State name: string = '';
   @State server: string = '';
   @State port: string = '';
@@ -111,14 +113,22 @@ struct NodeEditPage {
     Stack() {
       Column()
         .width('100%').height('100%')
-        .linearGradient({ angle: 135, colors: Ui.backdropColors })
+        .backgroundColor(Ui.background)
         // 背景延伸到状态栏/底部导航条之下, 消除底部白条
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
         Row() {
-          Text('←')
-            .fontSize(22).fontColor(Ui.textPrimary)
+          Row() {
+            Image($r('app.media.ic_arrow_left'))
+              .width(20).height(20)
+              .fillColor(Ui.textPrimary)
+          }
+          .width(36).height(36)
+          .justifyContent(FlexAlign.Center)
+          .alignItems(VerticalAlign.Center)
+          .borderRadius(18)
+          .backgroundColor(Ui.surfaceMuted)
             .onClick(() => router.back())
           Blank()
           Text('编辑节点')
@@ -140,15 +150,8 @@ struct NodeEditPage {
                   .onChange((v: string) => { this.rawImport = v; })
                   .height(88)
                   .borderRadius(14)
-                  .backgroundColor(Ui.surfaceTranslucent)
-                  .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-                    colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-                  })
-                  .backgroundEffect({
-                    radius: Ui.glassControlBlurRadius,
-                    saturation: Ui.glassControlSaturation,
-                    brightness: Ui.glassControlBrightness
-                  })
+                  .backgroundColor(Ui.inputBackground)
+                  .borderWidth(1)
                   .borderWidth(1)
                   .borderColor(Ui.glassEdge)
                   .fontColor(Ui.textPrimary)
@@ -156,15 +159,8 @@ struct NodeEditPage {
                 Button('解析并填充')
                   .width('100%')
                   .height(44)
-                  .backgroundColor(Ui.surfaceTranslucent)
-                  .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-                    colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-                  })
-                  .backgroundEffect({
-                    radius: Ui.glassControlBlurRadius,
-                    saturation: Ui.glassControlSaturation,
-                    brightness: Ui.glassControlBrightness
-                  })
+                  .backgroundColor(Ui.inputBackground)
+                  .borderWidth(1)
                   .borderWidth(1)
                   .borderColor(Ui.glassEdge)
                   .fontColor(Ui.textViolet)
@@ -174,16 +170,10 @@ struct NodeEditPage {
               .width('100%')
               .padding(18)
               .borderRadius(22)
-              .backgroundColor(Ui.surfaceTranslucent)
-              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-              .backgroundEffect({
-                radius: Ui.glassBlurRadius,
-                saturation: Ui.glassSaturationSoft,
-                brightness: Ui.glassBrightnessSoft
-              })
+              .backgroundColor(Ui.surface)
+              .borderWidth(1)
               .borderWidth(1)
               .borderColor(Ui.glassEdge)
-              .shadow({ radius: 32, color: Ui.shadow, offsetY: 16 })
             }
 
             Column({ space: 12 }) {
@@ -191,49 +181,42 @@ struct NodeEditPage {
                 Text('节点信息').fontSize(13).fontColor(Ui.textTertiary)
                 TextInput({ placeholder: '节点名称', text: this.name })
                   .onChange((v: string) => { this.name = v; })
-                  .height(46).borderRadius(12).backgroundColor(Ui.surfaceTranslucent)
-                  .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-                  .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+                  .height(46).borderRadius(12).backgroundColor(Ui.inputBackground)
+                  .borderWidth(1)
                   .borderWidth(1).borderColor(Ui.glassEdge).fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary)
                 TextInput({ placeholder: '服务器地址', text: this.server })
                   .onChange((v: string) => { this.server = v; })
-                  .height(46).borderRadius(12).backgroundColor(Ui.surfaceTranslucent)
-                  .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-                  .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+                  .height(46).borderRadius(12).backgroundColor(Ui.inputBackground)
+                  .borderWidth(1)
                   .borderWidth(1).borderColor(Ui.glassEdge).fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary)
                 TextInput({ placeholder: '端口', text: this.port })
                   .onChange((v: string) => { this.port = v; })
-                  .height(46).borderRadius(12).backgroundColor(Ui.surfaceTranslucent)
-                  .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-                  .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+                  .height(46).borderRadius(12).backgroundColor(Ui.inputBackground)
+                  .borderWidth(1)
                   .borderWidth(1).borderColor(Ui.glassEdge).fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary)
                 TextInput({ placeholder: '密码', text: this.password })
                   .onChange((v: string) => { this.password = v; })
                   .type(InputType.Password)
-                  .height(46).borderRadius(12).backgroundColor(Ui.surfaceTranslucent)
-                  .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-                  .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+                  .height(46).borderRadius(12).backgroundColor(Ui.inputBackground)
+                  .borderWidth(1)
                   .borderWidth(1).borderColor(Ui.glassEdge).fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary)
                 Row({ space: 8 }) {
                   TextInput({ placeholder: '加密方法', text: this.method })
                     .onChange((v: string) => { this.method = v; })
-                    .height(46).borderRadius(12).backgroundColor(Ui.surfaceTranslucent)
-                    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-                    .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+                    .height(46).borderRadius(12).backgroundColor(Ui.inputBackground)
+                    .borderWidth(1)
                     .borderWidth(1).borderColor(Ui.glassEdge)
                     .fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary).layoutWeight(1)
                   TextInput({ placeholder: '协议', text: this.protocol })
                     .onChange((v: string) => { this.protocol = v; })
-                    .height(46).borderRadius(12).backgroundColor(Ui.surfaceTranslucent)
-                    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-                    .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+                    .height(46).borderRadius(12).backgroundColor(Ui.inputBackground)
+                    .borderWidth(1)
                     .borderWidth(1).borderColor(Ui.glassEdge)
                     .fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary).layoutWeight(1)
                   TextInput({ placeholder: '混淆', text: this.obfs })
                     .onChange((v: string) => { this.obfs = v; })
-                    .height(46).borderRadius(12).backgroundColor(Ui.surfaceTranslucent)
-                    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-                    .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+                    .height(46).borderRadius(12).backgroundColor(Ui.inputBackground)
+                    .borderWidth(1)
                     .borderWidth(1).borderColor(Ui.glassEdge)
                     .fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary).layoutWeight(1)
                 }
@@ -241,32 +224,20 @@ struct NodeEditPage {
               }
               TextInput({ placeholder: '端口跳跃（可选，如 1000-2000 或 1000,2000,3000）', text: this.portsHopping })
                 .onChange((v: string) => { this.portsHopping = v; })
-                .height(46).borderRadius(12).backgroundColor(Ui.surfaceTranslucent)
-                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-                .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+                .height(46).borderRadius(12).backgroundColor(Ui.inputBackground)
+                .borderWidth(1)
                 .borderWidth(1).borderColor(Ui.glassEdge)
                 .fontColor(Ui.textPrimary).placeholderColor(Ui.textTertiary).width('100%')
               .width('100%')
               .padding(18)
               .borderRadius(22)
-              .backgroundColor(Ui.surfaceTranslucent)
-              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-              .backgroundEffect({
-                radius: Ui.glassBlurRadius,
-                saturation: Ui.glassSaturationSoft,
-                brightness: Ui.glassBrightnessSoft
-              })
+              .backgroundColor(Ui.surface)
+              .borderWidth(1)
               .borderWidth(1)
               .borderColor(Ui.glassEdge)
-              .shadow({
-                radius: Ui.glassShadowRadius,
-                color: Ui.shadow,
-                offsetY: Ui.glassShadowOffsetY
-              })
             }
           }
           .padding({ left: 18, right: 18, bottom: 40 })
-          .constraintSize({ maxWidth: Ui.pageMaxWidth })
           .width('100%')
         }
         .layoutWeight(1)
@@ -278,10 +249,11 @@ struct NodeEditPage {
     .width('100%').height('100%')
   }
 
+  /** 路由推入式子页统一转场：水平滑动 + 淡入淡出（与页签切换同规格，见 TunBoxMotion） */
   pageTransition() {
-    PageTransitionEnter({ duration: 360, curve: Curve.EaseInOut })
-      .translate({ x: '4%', y: 0 }).opacity(0.68)
-    PageTransitionExit({ duration: 300, curve: Curve.EaseInOut })
-      .translate({ x: '2%', y: 0 }).opacity(0.72)
+    PageTransitionEnter({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: TunBoxMotion.slidePercent, y: 0 }).opacity(0)
+    PageTransitionExit({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: `-${TunBoxMotion.slidePercent}`, y: 0 }).opacity(0)
   }
 }

@@ -2,8 +2,21 @@
   "app": {
     // 命令行 hvigor 无法使用 DevEco 加密密码串，signingConfigs 保持空（产 unsigned 包），
     // 签名一律走仓库根 sign-nexus-package.ps1（材料在 AGC通用证书目录，不入库）。
-    // test 分支的调试签名材料在 git 历史（release merge 前的提交）里，需要时恢复。
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\Administrator\\.ohos\\config\\default_TunBox_HarmonyOS_dxKCNw3ssq7dB3_GqPmpFO39lRyYOC8zNAj-A_ubn-Y=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B7AAF62F08F00E9DF5C1132E321DDB58AD426AB2E5FA888BD087977DF95773DB41EBAC65EF70C7F",
+          "profile": "C:\\Users\\Administrator\\.ohos\\config\\default_TunBox_HarmonyOS_dxKCNw3ssq7dB3_GqPmpFO39lRyYOC8zNAj-A_ubn-Y=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\Administrator\\.ohos\\config\\default_TunBox_HarmonyOS_dxKCNw3ssq7dB3_GqPmpFO39lRyYOC8zNAj-A_ubn-Y=.p12",
+          "storePassword": "0000001BCE3C344DA55B022C78AB04AD95E2A78F45C181994993FF8A2BBB9592FAD891F0A032A1A85D13AA"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",
@@ -13,7 +26,8 @@
         // 「开启沉浸光感，要确保应用的targetSDKVersion不低于26.0.0」）。
         // 本机 SDK 为 HarmonyOS 26.0.0(105)，compatibleSdkVersion 保持 6.1.1(24) 向下兼容。
         "targetSdkVersion": "26.0.0",
-        "runtimeOS": "HarmonyOS"
+        "runtimeOS": "HarmonyOS",
+        "signingConfig": "default"
       }
     ],
     "buildModeSet": [

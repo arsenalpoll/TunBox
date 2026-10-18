@@ -1,13 +1,13 @@
 /**
- * 订阅卡片
- * 移植自 upstream: packages/ssrvpn_shared/lib/widgets/ssrvpn_subscription_view.dart
- *                ssrvpn_subscription_connection_card.dart / ssrvpn_subscription_header.dart
+ * 订阅卡片 —— 视觉按《TunBox-UI重构笔记》§1.3 卡片配方（纯白底 + 1vp #E5EDF8 描边 + 圆角 18），
+ * 动作按钮改文档的圆角胶囊（弱化底 / 圆角 10）。刷新·编辑·删除回调逻辑不变。
  */
 import { Ui } from '../theme/UiTokens';
 import { Subscription } from '../commons/models/Subscription';
 
 @Component
 export struct SubscriptionCard {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @Prop sub: Subscription | null = null;
   @Prop darkMode: boolean = true;
   @Prop active: boolean = false;
@@ -33,10 +33,11 @@ export struct SubscriptionCard {
           if (this.active) {
             Text('当前')
               .fontSize(11)
-              .fontColor(Color.White)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Ui.primary)
               .backgroundColor(Ui.primaryBlueFill)
-              .borderRadius(8)
-              .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+              .borderRadius(100)
+              .padding({ left: 10, right: 10, top: 3, bottom: 3 })
           }
         }
         .width('100%')
@@ -48,47 +49,44 @@ export struct SubscriptionCard {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
 
-        Row() {
+        Row({ space: 8 }) {
           Text(`节点 ${this.sub.nodeCount}`)
-            .fontSize(13)
+            .fontSize(12)
             .fontColor(Ui.textSecondary)
           Blank()
           Text('刷新')
-            .fontSize(13)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
             .fontColor(Ui.primary)
+            .backgroundColor(Ui.surfaceMuted)
+            .borderRadius(10)
+            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
             .onClick(() => this.onRefresh(this.subId()))
-            .padding({ left: 12, right: 6 })
           Text('编辑')
-            .fontSize(13)
-            .fontColor(Ui.primary)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Ui.textSecondary)
+            .backgroundColor(Ui.surfaceMuted)
+            .borderRadius(10)
+            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
             .onClick(() => this.onEdit(this.subId()))
-            .padding({ left: 6, right: 6 })
           Text('删除')
-            .fontSize(13)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
             .fontColor(Ui.error)
+            .backgroundColor(Ui.surfaceMuted)
+            .borderRadius(10)
+            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
             .onClick(() => this.onDelete(this.subId()))
-            .padding({ left: 6, right: 12 })
         }
         .width('100%')
       }
       .width('100%')
       .padding(16)
-      .borderRadius(Ui.cardRadius)
-      .backgroundColor(Ui.surfaceTranslucent)
-      .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-      .backgroundEffect({
-        radius: Ui.glassBlurRadius,
-        saturation: Ui.glassSaturationSoft,
-        brightness: Ui.glassBrightnessSoft
-      })
-      .borderWidth(1)
-      .borderColor(Ui.glassEdge)
-      .shadow({
-        radius: this.active ? 30 : 24,
-        color: this.active ? Ui.glassGlow : Ui.shadow,
-        offsetX: 0,
-        offsetY: this.active ? 10 : 12
-      })
+      .borderRadius(18)
+      .backgroundColor(Ui.surface)
+      .borderWidth(this.active ? 1.5 : 1)
+      .borderColor(this.active ? Ui.primary : Ui.glassEdge)
     }
   }
 }

@@ -178,7 +178,7 @@ export class AppSettings {
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
   testLatencyUrl: string = 'http://www.gstatic.com/generate_204';
-  /** 代理模式：rule = 规则 / global = 全局（对应 upstream settings.proxyMode） */
+  /** 代理模式：rule = 规则 / global = 全局 / direct = 直连（对应 upstream settings.proxyMode） */
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default'=订阅默认顺序, 'auto'=按最近测速结果, 'manual'=手动固定顺序 */
   nodeSortMode: string = 'default';
@@ -337,7 +337,8 @@ export class AppSettings {
       ? (j.testLatencyUrl === 'https://www.gstatic.com/generate_204'
         ? 'http://www.gstatic.com/generate_204' : j.testLatencyUrl)
       : 'http://www.gstatic.com/generate_204';
-    s.proxyMode = j.proxyMode === 'global' ? 'global' : 'rule';
+    const parsedMode: string = j.proxyMode;
+    s.proxyMode = (parsedMode === 'global' || parsedMode === 'direct') ? parsedMode : 'rule';
     s.nodeSortMode = NodeSortModes.normalize(j.nodeSortMode);
     s.nodeSortSnapshot = typeof j.nodeSortSnapshot === 'string' ? j.nodeSortSnapshot : '';
     s.proxyGroupSelections = typeof j.proxyGroupSelections === 'string' ? j.proxyGroupSelections : '';

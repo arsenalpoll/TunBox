@@ -6,6 +6,7 @@ import { NodeCountryPolicy } from '../commons/services/PublicIpService';
 
 @Component
 export struct CountryFlagIcon {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @Prop nodeName: string = '';
   @Prop iconSize: number = 22;
 

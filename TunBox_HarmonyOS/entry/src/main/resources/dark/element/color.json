@@ -1,65 +1,248 @@
 {
   "color": [
-    { "name": "start_window_background", "value": "#171B22" },
-    { "name": "brand_primary", "value": "#6C8FFF" },
-    { "name": "ui_background", "value": "#171B22" },
-    { "name": "ui_background_raised", "value": "#16213A" },
-    { "name": "ui_surface", "value": "#8F1E293B" },
-    { "name": "ui_surface_strong", "value": "#BA1E293B" },
-    { "name": "ui_surface_translucent", "value": "#7A1E293B" },
-    { "name": "ui_surface_muted", "value": "#661E293B" },
-    { "name": "ui_glass_highlight", "value": "#5CFFFFFF" },
-    { "name": "ui_glass_highlight_soft", "value": "#22FFFFFF" },
-    { "name": "ui_tile_fill", "value": "#8A1E293B" },
-    { "name": "ui_tile_gloss", "value": "#8A1E293B" },
-    { "name": "ui_tile_deep", "value": "#8A1E293B" },
-    { "name": "ui_glass_edge", "value": "#4FFFFFFF" },
-    { "name": "ui_glass_glow", "value": "#424F7CFF" },
-    { "name": "ui_input_background", "value": "#151D2B" },
-    { "name": "ui_primary", "value": "#8A84FF" },
-    { "name": "ui_primary_blue", "value": "#3675FF" },
-    { "name": "ui_primary_blue_fill", "value": "#2E64E6" },
-    { "name": "ui_accent", "value": "#20C8B4" },
-    { "name": "ui_success", "value": "#29C978" },
-    { "name": "ui_warning", "value": "#F3B83F" },
-    { "name": "ui_error", "value": "#E35D6A" },
-    { "name": "ui_text_primary", "value": "#F5F7FF" },
-    { "name": "ui_text_secondary", "value": "#A7AFC2" },
-    { "name": "ui_text_tertiary", "value": "#929BB1" },
-    { "name": "ui_text_on_brand", "value": "#FFFFFF" },
-    { "name": "ui_text_blue", "value": "#6E9BFF" },
-    { "name": "ui_text_error", "value": "#F07984" },
-    { "name": "ui_text_violet", "value": "#9E99FF" },
-    { "name": "ui_border", "value": "#3AFFFFFF" },
-    { "name": "ui_border_strong", "value": "#66FFFFFF" },
-    { "name": "ui_button_disabled", "value": "#49536C" },
-    { "name": "ui_overlay", "value": "#99000000" },
-    { "name": "ui_shadow", "value": "#38000000" },
-    { "name": "ui_nav_background", "value": "#8A1E293B" },
-    { "name": "ui_selected_background", "value": "#336E9BFF" },
-    { "name": "ui_status_tint", "value": "#293675FF" },
-    { "name": "ui_power_glow_active", "value": "#4029C978" },
-    { "name": "ui_power_glow_idle", "value": "#1C8A84FF" },
-    { "name": "ui_power_ring_active", "value": "#9E29C978" },
-    { "name": "ui_power_ring_idle", "value": "#478A84FF" },
-    { "name": "ui_power_inner_active", "value": "#3329C978" },
-    { "name": "ui_power_inner_idle", "value": "#202B4B" },
-    { "name": "ui_backdrop_start", "value": "#171B22" },
-    { "name": "ui_backdrop_middle", "value": "#171B22" },
-    { "name": "ui_backdrop_end", "value": "#171B22" },
-    { "name": "form_background", "value": "#181B2E" },
-    { "name": "form_text_primary", "value": "#F5F7FF" },
-    { "name": "form_text_secondary", "value": "#A7B0C5" },
-    { "name": "form_status_connected", "value": "#44D29B" },
-    { "name": "form_status_busy", "value": "#F5A524" },
-    { "name": "form_status_failed", "value": "#FF6B6B" },
-    { "name": "form_status_idle", "value": "#A7B0C5" },
-    { "name": "form_panel_background", "value": "#22263B" },
-    { "name": "form_refresh_background", "value": "#303A60" },
-    { "name": "form_button_background", "value": "#5278FF" },
-    { "name": "form_button_disabled", "value": "#49536C" },
-    { "name": "form_button_text", "value": "#FFFFFF" },
-    { "name": "form_download_speed", "value": "#66A3FF" },
-    { "name": "form_upload_speed", "value": "#44D29B" }
+    {
+      "name": "start_window_background",
+      "value": "#0B1220"
+    },
+    {
+      "name": "brand_primary",
+      "value": "#3D7DFF"
+    },
+    {
+      "name": "ui_background",
+      "value": "#0B1220"
+    },
+    {
+      "name": "ui_background_raised",
+      "value": "#101A2E"
+    },
+    {
+      "name": "ui_surface",
+      "value": "#C7141C2E"
+    },
+    {
+      "name": "ui_surface_strong",
+      "value": "#D9141C2E"
+    },
+    {
+      "name": "ui_surface_translucent",
+      "value": "#C7141C2E"
+    },
+    {
+      "name": "ui_surface_muted",
+      "value": "#0C1220"
+    },
+    {
+      "name": "ui_glass_highlight",
+      "value": "#24345A"
+    },
+    {
+      "name": "ui_glass_highlight_soft",
+      "value": "#1C2A46"
+    },
+    {
+      "name": "ui_tile_fill",
+      "value": "#16223A"
+    },
+    {
+      "name": "ui_tile_gloss",
+      "value": "#16223A"
+    },
+    {
+      "name": "ui_tile_deep",
+      "value": "#16223A"
+    },
+    {
+      "name": "ui_glass_edge",
+      "value": "#24344F"
+    },
+    {
+      "name": "ui_glass_glow",
+      "value": "#260A59F7"
+    },
+    {
+      "name": "ui_input_background",
+      "value": "#0C1220"
+    },
+    {
+      "name": "ui_primary",
+      "value": "#3D7DFF"
+    },
+    {
+      "name": "ui_primary_blue",
+      "value": "#3D7DFF"
+    },
+    {
+      "name": "ui_primary_blue_fill",
+      "value": "#2E3D7DFF"
+    },
+    {
+      "name": "ui_accent",
+      "value": "#34D399"
+    },
+    {
+      "name": "ui_success",
+      "value": "#2FD98F"
+    },
+    {
+      "name": "ui_warning",
+      "value": "#FFB020"
+    },
+    {
+      "name": "ui_error",
+      "value": "#FF6B5E"
+    },
+    {
+      "name": "ui_text_primary",
+      "value": "#E8EEF8"
+    },
+    {
+      "name": "ui_text_secondary",
+      "value": "#A0AEC2"
+    },
+    {
+      "name": "ui_text_tertiary",
+      "value": "#6E7F99"
+    },
+    {
+      "name": "ui_text_on_brand",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "ui_text_blue",
+      "value": "#6FA0FF"
+    },
+    {
+      "name": "ui_text_error",
+      "value": "#FF6B5E"
+    },
+    {
+      "name": "ui_text_violet",
+      "value": "#6FA0FF"
+    },
+    {
+      "name": "ui_border",
+      "value": "#24344F"
+    },
+    {
+      "name": "ui_border_strong",
+      "value": "#2C4470"
+    },
+    {
+      "name": "ui_button_disabled",
+      "value": "#3A4A66"
+    },
+    {
+      "name": "ui_overlay",
+      "value": "#6605080F"
+    },
+    {
+      "name": "ui_shadow",
+      "value": "#260A59F7"
+    },
+    {
+      "name": "ui_nav_background",
+      "value": "#CC16223A"
+    },
+    {
+      "name": "ui_selected_background",
+      "value": "#1B2A4A"
+    },
+    {
+      "name": "ui_status_tint",
+      "value": "#330A59F7"
+    },
+    {
+      "name": "ui_power_glow_active",
+      "value": "#332FD98F"
+    },
+    {
+      "name": "ui_power_glow_idle",
+      "value": "#330A59F7"
+    },
+    {
+      "name": "ui_power_ring_active",
+      "value": "#992FD98F"
+    },
+    {
+      "name": "ui_power_ring_idle",
+      "value": "#4D3D7DFF"
+    },
+    {
+      "name": "ui_power_inner_active",
+      "value": "#332FD98F"
+    },
+    {
+      "name": "ui_power_inner_idle",
+      "value": "#1B2A4A"
+    },
+    {
+      "name": "ui_backdrop_start",
+      "value": "#0B1220"
+    },
+    {
+      "name": "ui_backdrop_middle",
+      "value": "#0B1220"
+    },
+    {
+      "name": "ui_backdrop_end",
+      "value": "#0B1220"
+    },
+    {
+      "name": "form_background",
+      "value": "#0B1220"
+    },
+    {
+      "name": "form_text_primary",
+      "value": "#E8EEF8"
+    },
+    {
+      "name": "form_text_secondary",
+      "value": "#A0AEC2"
+    },
+    {
+      "name": "form_status_connected",
+      "value": "#2FD98F"
+    },
+    {
+      "name": "form_status_busy",
+      "value": "#FFB020"
+    },
+    {
+      "name": "form_status_failed",
+      "value": "#FF6B5E"
+    },
+    {
+      "name": "form_status_idle",
+      "value": "#A0AEC2"
+    },
+    {
+      "name": "form_panel_background",
+      "value": "#16223A"
+    },
+    {
+      "name": "form_refresh_background",
+      "value": "#1B2A4A"
+    },
+    {
+      "name": "form_button_background",
+      "value": "#3D7DFF"
+    },
+    {
+      "name": "form_button_disabled",
+      "value": "#3A4A66"
+    },
+    {
+      "name": "form_button_text",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "form_download_speed",
+      "value": "#6FA0FF"
+    },
+    {
+      "name": "form_upload_speed",
+      "value": "#2FD98F"
+    }
   ]
 }

@@ -18,26 +18,27 @@ public sealed class EditDialog : Window
         {
             Source = new System.Uri("/TunBox;component/Assets/Styles.xaml", System.UriKind.Relative),
         });
-        Title = "编辑订阅";
+        Lang.EnsureApplied(Lang.Resolve(new TunBox.Core.Storage.Workspace().LoadSettings().Language));
+        Title = Lang.T("Dlg.Edit.Title");
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         Width = 430;
         SizeToContent = SizeToContent.Height;
         Background = TryFindResource("PageBg") as System.Windows.Media.Brush ?? System.Windows.Media.Brushes.White;
         FontFamily = new System.Windows.Media.FontFamily("Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI");
-        FontSize = 13;
+        FontSize = 14;
 
         var panel = new StackPanel { Margin = new Thickness(20, 16, 20, 16) };
         panel.Children.Add(new TextBlock
         {
-            Text = "编辑订阅",
-            FontSize = 16,
-            FontWeight = FontWeights.Bold,
+            Text = Lang.T("Dlg.Edit.Title"),
+            FontSize = 17,
+            FontWeight = FontWeights.SemiBold,
             Foreground = TryFindResource("TextMain") as System.Windows.Media.Brush ?? System.Windows.Media.Brushes.Black,
         });
 
         panel.Children.Add(new TextBlock
         {
-            Text = "订阅名称",
+            Text = Lang.T("Dlg.Edit.Name"),
             FontWeight = FontWeights.SemiBold,
             Margin = new Thickness(0, 14, 0, 6),
             Foreground = TryFindResource("TextMain") as System.Windows.Media.Brush ?? System.Windows.Media.Brushes.Black,
@@ -47,7 +48,7 @@ public sealed class EditDialog : Window
 
         panel.Children.Add(new TextBlock
         {
-            Text = "订阅链接（本地导入的订阅没有链接，留空即可）",
+            Text = Lang.T("Dlg.Edit.Url"),
             FontWeight = FontWeights.SemiBold,
             Margin = new Thickness(0, 12, 0, 6),
             Foreground = TryFindResource("TextMain") as System.Windows.Media.Brush ?? System.Windows.Media.Brushes.Black,
@@ -61,11 +62,11 @@ public sealed class EditDialog : Window
             HorizontalAlignment = HorizontalAlignment.Right,
             Margin = new Thickness(0, 16, 0, 0),
         };
-        var ok = new Button { Content = "保存", Width = 92, IsDefault = true };
+        var ok = new Button { Content = Lang.T("Common.Save"), Width = 92, IsDefault = true };
         ok.Click += (_, _) => DialogResult = true;
         var cancel = new Button
         {
-            Content = "取消",
+            Content = Lang.T("Common.Cancel"),
             Width = 80,
             Style = TryFindResource("QuietButton") as Style,
             IsCancel = true,

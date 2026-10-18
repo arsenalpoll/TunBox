@@ -1,7 +1,7 @@
 /**
- * 节点选择卡片
- * 移植自 upstream: packages/ssrvpn_shared/lib/widgets/ssrvpn_node_selection_node_card.dart
- * 延迟着色规则：<200 绿 / <500 警告黄 / 失败 红，与 upstream 一致。
+ * 节点选择卡片 —— 视觉按《TunBox-UI重构笔记》§3.2 节点卡配方：
+ * 纯白底 + 1vp 描边 + 圆角 16，选中态描边 1.5 品牌蓝 + 品牌浅底；延迟数字加粗。
+ * 数据与回调（onSelect）逻辑不变。
  */
 import { Ui, LatencyStyle } from '../theme/UiTokens';
 import { ProxyNode } from '../commons/models/ProxyNode';
@@ -10,6 +10,7 @@ import { CountryFlagIcon } from './CountryFlagIcon';
 
 @Component
 export struct NodeCard {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @Prop node: ProxyNode | null = null;
   @Prop darkMode: boolean = true;
   @Prop selected: boolean = false;
@@ -38,13 +39,13 @@ export struct NodeCard {
         CountryFlagIcon({ nodeName: this.node.name, iconSize: 20 })
         Column({ space: 2 }) {
           Text(NodeCountryPolicy.displayName(this.node.name))
-            .fontSize(15)
+            .fontSize(14)
             .fontWeight(FontWeight.Medium)
             .fontColor(this.selected ? Ui.primary : Ui.textPrimary)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           Text(`${this.node.server}:${this.node.port}`)
-            .fontSize(12)
+            .fontSize(11)
             .fontColor(Ui.textTertiary)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -53,33 +54,22 @@ export struct NodeCard {
         .alignItems(HorizontalAlign.Start)
 
         Text(this.latencyText())
-          .fontSize(13)
+          .fontSize(12)
+          .fontWeight(FontWeight.Bold)
           .fontColor(this.latencyColor())
 
         if (this.selected) {
-          Text('✓')
-            .fontSize(16)
-            .fontColor(Ui.primary)
+          Image($r('app.media.ic_check'))
+            .width(16).height(16)
+            .fillColor(Ui.primary)
         }
       }
       .width('100%')
       .padding(14)
-      .borderRadius(Ui.cardRadius)
-      .backgroundColor(this.selected ? Ui.surfaceStrong : Ui.surfaceTranslucent)
-      .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, { colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT })
-      .backgroundEffect({
-        radius: Ui.glassBlurRadius,
-        saturation: Ui.glassSaturationSoft,
-        brightness: Ui.glassBrightnessSoft
-      })
+      .borderRadius(16)
+      .backgroundColor(this.selected ? Ui.selectedBackground : Ui.surface)
       .borderWidth(this.selected ? 1.5 : 1)
       .borderColor(this.selected ? Ui.primary : Ui.glassEdge)
-      .shadow({
-        radius: this.selected ? 30 : 24,
-        color: this.selected ? Ui.glassGlow : Ui.shadow,
-        offsetX: 0,
-        offsetY: this.selected ? 10 : 12
-      })
       .onClick(() => {
         if (this.node !== null) {
           this.onSelect(this.node);

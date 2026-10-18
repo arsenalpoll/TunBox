@@ -6,7 +6,9 @@
  * 操作：单条点击关闭（带确认）、一键关闭全部；展示流量/规则链/出口节点/持续时间。
  */
 import { router, promptAction } from '@kit.ArkUI';
+import { TunBoxMotion } from '../theme/TunBoxTokens';
 import { Ui } from '../theme/UiTokens';
+import { TopNavBar } from '../components/TopNavBar';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
@@ -19,6 +21,7 @@ const POLL_INTERVAL_MS = 2000;
 @Entry
 @Component
 struct ConnectionsPage {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @State entries: ConnectionEntry[] = [];
   @State reachable: boolean = true;
   @State refreshing: boolean = false;
@@ -29,7 +32,8 @@ struct ConnectionsPage {
   private pollTimer: number = -1;
 
   onPageShow(): void {
-    this.bootstrap();
+    // 入场转场期间不抢 UI 线程：首帧建表延到转场之后（2026-10-17 用户反馈进入页面卡顿）
+    setTimeout((): void => { this.bootstrap(); }, 240);
   }
 
   aboutToDisappear(): void {
@@ -150,30 +154,26 @@ struct ConnectionsPage {
   build() {
     Stack() {
       Column().width('100%').height('100%')
-        .linearGradient({ angle: 135, colors: Ui.backdropColors })
+        .backgroundColor(Ui.background)
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       Column() {
-        // ── 顶栏 ──
-        Row() {
-          Text('←').fontSize(22).fontColor(Ui.textPrimary).padding({ left: 4, right: 10 })
-            .onClick(() => router.back())
-          Text('实时连接').fontSize(18).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-          Blank()
-          Text('关闭全部')
-            .fontSize(13)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(this.entries.length > 0 ? Ui.error : Ui.textTertiary)
-            .padding({ left: 10, right: 8, top: 8, bottom: 8 })
-            .onClick(() => {
-              if (this.entries.length > 0) {
-                this.closeAll();
-              }
-            })
-          Text(this.refreshing ? '…' : '刷新')
-            .fontSize(14).fontColor(Ui.primary)
-            .padding({ left: 6, right: 4, top: 8, bottom: 8 })
-            .onClick(() => this.refreshOnce())
-        }.width('100%').height(48).padding({ left: 14, right: 14 })
+        // ── 顶栏（文档 §2.1 TopNavBar，右侧保留既有「关闭全部 / 刷新」入口）──
+        TopNavBar({ title: '实时连接', hasBack: true }) {
+          Row({ space: 10 }) {
+            Text('关闭全部')
+              .fontSize(13)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(this.entries.length > 0 ? Ui.error : Ui.textTertiary)
+              .onClick(() => {
+                if (this.entries.length > 0) {
+                  this.closeAll();
+                }
+              })
+            Text(this.refreshing ? '刷新中' : '刷新')
+              .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Ui.primary)
+              .onClick(() => this.refreshOnce())
+          }
+        }
 
         Text(`活动连接 ${this.entries.length} 条`)
           .fontSize(12).fontColor(Ui.textTertiary).width('100%').padding({ left: 18, right: 18 })
@@ -185,8 +185,8 @@ struct ConnectionsPage {
               .fontSize(12).fontColor(Ui.textSecondary)
           }
           .width('100%').padding(18).margin({ left: 18, right: 18, top: 14 })
-          .borderRadius(20).backgroundColor(Ui.surfaceMuted)
-          .borderWidth(1).borderColor(Ui.border)
+          .borderRadius(22).backgroundColor(Ui.surface)
+          .borderWidth(1).borderColor(Ui.glassEdge)
           .alignItems(HorizontalAlign.Start)
           Blank().layoutWeight(1)
         } else if (this.entries.length === 0) {
@@ -196,8 +196,8 @@ struct ConnectionsPage {
               .fontSize(11).fontColor(Ui.textTertiary)
           }
           .width('100%').padding(24).margin({ left: 18, right: 18, top: 14 })
-          .borderRadius(20).backgroundColor(Ui.surfaceMuted)
-          .borderWidth(1).borderColor(Ui.border)
+          .borderRadius(22).backgroundColor(Ui.surface)
+          .borderWidth(1).borderColor(Ui.glassEdge)
           Blank().layoutWeight(1)
         } else {
           List({ space: 8 }) {
@@ -209,8 +209,8 @@ struct ConnectionsPage {
                       .fontSize(10).fontWeight(FontWeight.Bold)
                       .fontColor(entry.network === 'udp' ? Ui.warning : Ui.textBlue)
                       .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                      .borderRadius(8)
-                      .backgroundColor(Ui.inputBackground)
+                      .borderRadius(6)
+                      .backgroundColor(Ui.surfaceMuted)
                     Text(this.titleOf(entry))
                       .fontSize(13).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
                       .layoutWeight(1).maxLines(1)
@@ -235,16 +235,17 @@ struct ConnectionsPage {
                     }
                     Text('断开')
                       .fontSize(11).fontWeight(FontWeight.Bold).fontColor(Ui.error)
-                      .padding({ left: 8, right: 4, top: 2, bottom: 2 })
+                      .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+                      .borderRadius(10).backgroundColor(Ui.statusTint)
                       .onClick(() => this.closeEntry(entry))
                   }.width('100%')
                 }
                 .width('100%')
-                .padding(12)
+                .padding(14)
                 .borderRadius(16)
-                .backgroundColor(Ui.surfaceMuted)
+                .backgroundColor(Ui.surface)
                 .borderWidth(1)
-                .borderColor(Ui.border)
+                .borderColor(Ui.glassEdge)
               }
             }, (entry: ConnectionEntry) => entry.id)
           }
@@ -256,10 +257,11 @@ struct ConnectionsPage {
     }.width('100%').height('100%')
   }
 
+  /** 路由推入式子页统一转场：水平滑动 + 淡入淡出（与页签切换同规格，见 TunBoxMotion） */
   pageTransition() {
-    PageTransitionEnter({ duration: 360, curve: Curve.EaseInOut })
-      .translate({ x: '4%', y: 0 }).opacity(0.68)
-    PageTransitionExit({ duration: 300, curve: Curve.EaseInOut })
-      .translate({ x: '2%', y: 0 }).opacity(0.72)
+    PageTransitionEnter({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: TunBoxMotion.slidePercent, y: 0 }).opacity(0)
+    PageTransitionExit({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: `-${TunBoxMotion.slidePercent}`, y: 0 }).opacity(0)
   }
 }

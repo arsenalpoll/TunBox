@@ -1,0 +1,363 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+    <!-- 简体中文（默认语言）。键以 L. 开头；英文版键集必须一致（UiTests 有守卫）。 -->
+
+    <!-- 侧栏 -->
+    <sys:String x:Key="L.Nav.Dashboard">仪表盘</sys:String>
+    <sys:String x:Key="L.Nav.Proxies">代理</sys:String>
+    <sys:String x:Key="L.Nav.Requests">请求</sys:String>
+    <sys:String x:Key="L.Nav.Profiles">配置</sys:String>
+    <sys:String x:Key="L.Nav.Tools">工具</sys:String>
+    <sys:String x:Key="L.Nav.Settings">设置</sys:String>
+    <sys:String x:Key="L.Nav.Exit">退出</sys:String>
+    <sys:String x:Key="L.Nav.ExitTip">退出 TunBox：结束程序与内核进程；只想收起来请点窗口 X</sys:String>
+
+    <!-- 通用 -->
+    <sys:String x:Key="L.Common.SaveSettings">保存设置</sys:String>
+    <sys:String x:Key="L.Common.SaveSettingsTip">保存这一页改过的所有设置并让内核生效</sys:String>
+    <sys:String x:Key="L.Common.Refresh">刷新</sys:String>
+    <sys:String x:Key="L.Common.RefreshTip">重新查一次出口 IP 与本机 IP</sys:String>
+    <sys:String x:Key="L.Common.Update">更新</sys:String>
+    <sys:String x:Key="L.Common.Disconnect">断开</sys:String>
+    <sys:String x:Key="L.Common.Cancel">取消</sys:String>
+    <sys:String x:Key="L.Common.Confirm">确定</sys:String>
+    <sys:String x:Key="L.Common.Save">保存</sys:String>
+    <sys:String x:Key="L.Common.Import">导入</sys:String>
+    <sys:String x:Key="L.Common.Open">打开</sys:String>
+
+    <!-- 状态词 -->
+    <sys:String x:Key="L.State.Connected">已连接</sys:String>
+    <sys:String x:Key="L.State.Connecting">正在连接</sys:String>
+    <sys:String x:Key="L.State.Disconnected">未连接</sys:String>
+
+    <!-- 仪表盘 -->
+    <sys:String x:Key="L.Dash.ModeRule">规则</sys:String>
+    <sys:String x:Key="L.Dash.ModeGlobal">全局</sys:String>
+    <sys:String x:Key="L.Dash.ModeDirect">直连</sys:String>
+    <sys:String x:Key="L.Dash.CurrentEgress">当前出口 </sys:String>
+    <sys:String x:Key="L.Dash.ConnectTitle">代理连接</sys:String>
+    <sys:String x:Key="L.Dash.ConnectSwitchTip">拨上去接管流量，拨回来放手</sys:String>
+    <sys:String x:Key="L.Dash.ConnectHint">连接后自动接管系统代理；断开自动放手。TUN 在下方单独开关。</sys:String>
+    <sys:String x:Key="L.Dash.NoEgress">还没选节点</sys:String>
+    <sys:String x:Key="L.Dash.TunTitle">虚拟网卡（TUN）</sys:String>
+    <sys:String x:Key="L.Dash.TunRestartAdmin">以管理员身份重启</sys:String>
+    <sys:String x:Key="L.Dash.SysProxyTitle">系统代理</sys:String>
+    <sys:String x:Key="L.Dash.SysProxyHint">把代理写进系统（WinINet），浏览器等认系统设置的应用自动走 TunBox。</sys:String>
+    <sys:String x:Key="L.Dash.QuickSwitch">快捷出口</sys:String>
+    <sys:String x:Key="L.Dash.QuickSwitchTip">不进代理页，直接把总出口切到选中的节点</sys:String>
+    <sys:String x:Key="L.Dash.RateTitle">实时速率</sys:String>
+    <sys:String x:Key="L.Dash.EgressTitle">出口信息</sys:String>
+    <sys:String x:Key="L.Dash.EgressIp">出口 IP</sys:String>
+    <sys:String x:Key="L.Dash.Location">位置</sys:String>
+    <sys:String x:Key="L.Dash.Carrier">运营商</sys:String>
+    <sys:String x:Key="L.Dash.LocalIp">本机 IP</sys:String>
+    <sys:String x:Key="L.Dash.CopyIpTip">点击复制出口 IP</sys:String>
+    <sys:String x:Key="L.Dash.ConnsTitle">实时连接</sys:String>
+    <sys:String x:Key="L.Dash.ViewRequests">查看请求</sys:String>
+    <sys:String x:Key="L.Dash.ViewRequestsTip">打开请求页，逐条查看与断开</sys:String>
+    <sys:String x:Key="L.Dash.PortsTitle">端口</sys:String>
+    <sys:String x:Key="L.Dash.PortsFormat">混合 {0} · HTTP {1} · SOCKS {2} · API {3}</sys:String>
+    <sys:String x:Key="L.Dash.PortsHint">在「设置 → 网络配置」里可改</sys:String>
+
+    <!-- 代理页 -->
+    <sys:String x:Key="L.Proxy.SearchTip">按名称搜索节点；和左边的分组筛选叠加</sys:String>
+    <sys:String x:Key="L.Proxy.TestGroup">测速本组</sys:String>
+    <sys:String x:Key="L.Proxy.TestAll">全部测速</sys:String>
+    <sys:String x:Key="L.Proxy.TestGroupTip">只测当前显示的节点；测完按延迟从低到高排</sys:String>
+    <sys:String x:Key="L.Proxy.TestAllTip">测所有节点，边测边按延迟排序</sys:String>
+    <sys:String x:Key="L.Proxy.AllGroups">全部节点</sys:String>
+    <sys:String x:Key="L.Proxy.Smart">自动选择</sys:String>
+    <sys:String x:Key="L.Proxy.SmartLabel">自动选择（内核智能选点）</sys:String>
+    <sys:String x:Key="L.Proxy.Sort">排序</sys:String>
+    <sys:String x:Key="L.Proxy.Sort.Default">默认顺序</sys:String>
+    <sys:String x:Key="L.Proxy.Sort.Delay">按延迟</sys:String>
+    <sys:String x:Key="L.Proxy.Sort.Name">按名称</sys:String>
+    <sys:String x:Key="L.Proxy.GroupEmptyNote">「{0}」里一个节点都没对上（机场可能改了成员名），先按全部节点显示。</sys:String>
+    <sys:String x:Key="L.Proxy.CountSearch">搜「{0}」：{1} / {2} 个节点{3}</sys:String>
+    <sys:String x:Key="L.Proxy.CountAll">{0} / {1} 个节点{2}</sys:String>
+    <sys:String x:Key="L.Proxy.CardEmpty">这条订阅还没有节点，或搜索没对上任何节点。</sys:String>
+
+    <!-- 请求页 -->
+    <sys:String x:Key="L.Req.SearchTip">按目标 / 进程 / 链 / 规则过滤，清空即恢复全部</sys:String>
+    <sys:String x:Key="L.Req.None">暂无活动连接</sys:String>
+    <sys:String x:Key="L.Req.CountFormat">共 {0} 条连接</sys:String>
+    <sys:String x:Key="L.Req.Pause">暂停刷新</sys:String>
+    <sys:String x:Key="L.Req.Resume">继续刷新</sys:String>
+    <sys:String x:Key="L.Req.PauseTip">暂停/继续列表刷新；顶栏速率不受影响</sys:String>
+    <sys:String x:Key="L.Req.CloseAll">断开全部</sys:String>
+    <sys:String x:Key="L.Req.CloseAllTip">让内核关掉当前全部连接</sys:String>
+    <sys:String x:Key="L.Req.Col.Target">目标</sys:String>
+    <sys:String x:Key="L.Req.Col.Rule">规则</sys:String>
+    <sys:String x:Key="L.Req.Col.Chain">链</sys:String>
+    <sys:String x:Key="L.Req.Col.Process">进程</sys:String>
+    <sys:String x:Key="L.Req.Col.Protocol">协议</sys:String>
+    <sys:String x:Key="L.Req.Col.UpSpeed">↑ 速率</sys:String>
+    <sys:String x:Key="L.Req.Col.DownSpeed">↓ 速率</sys:String>
+    <sys:String x:Key="L.Req.Col.UpTotal">↑ 累计</sys:String>
+    <sys:String x:Key="L.Req.Col.DownTotal">↓ 累计</sys:String>
+    <sys:String x:Key="L.Req.Col.Start">开始</sys:String>
+    <sys:String x:Key="L.Req.TrafficTotal">累计</sys:String>
+
+    <!-- 配置页 -->
+    <sys:String x:Key="L.Profile.CountFormat">{0} 条订阅 · {1} 个节点</sys:String>
+    <sys:String x:Key="L.Profile.None">还没有订阅</sys:String>
+    <sys:String x:Key="L.Profile.Import">＋ 导入订阅</sys:String>
+    <sys:String x:Key="L.Profile.ImportTip">导入订阅：链接 / 本地 yaml 文件 / 粘贴节点</sys:String>
+    <sys:String x:Key="L.Profile.UpdateAll">全部更新</sys:String>
+    <sys:String x:Key="L.Profile.Updating">更新中…</sys:String>
+    <sys:String x:Key="L.Profile.UpdateAllTip">按顺序更新每一条订阅；单条失败不影响其余</sys:String>
+    <sys:String x:Key="L.Profile.UrlNone">本地导入（无链接）</sys:String>
+    <sys:String x:Key="L.Profile.UpdatedNever">未更新</sys:String>
+    <sys:String x:Key="L.Profile.AutoUpdateTip">自动更新间隔；选完立刻生效</sys:String>
+    <sys:String x:Key="L.Profile.Manual">手动更新</sys:String>
+    <sys:String x:Key="L.Profile.Every30">每 30 分钟</sys:String>
+    <sys:String x:Key="L.Profile.Hourly">每 1 小时</sys:String>
+    <sys:String x:Key="L.Profile.Every6">每 6 小时</sys:String>
+    <sys:String x:Key="L.Profile.Every12">每 12 小时</sys:String>
+    <sys:String x:Key="L.Profile.Daily">每天</sys:String>
+    <sys:String x:Key="L.Profile.UpdateNowTip">立即更新订阅</sys:String>
+    <sys:String x:Key="L.Profile.EditTip">编辑订阅（名称 / 链接）</sys:String>
+    <sys:String x:Key="L.Profile.DeleteTip">删除订阅</sys:String>
+    <sys:String x:Key="L.Profile.EmptyHint">还没有订阅：点右上角「＋ 导入订阅」，支持链接、本地 yaml 文件，或直接粘贴一批节点。</sys:String>
+
+    <!-- 工具页 -->
+    <sys:String x:Key="L.Tools.NetCheck">网络检测</sys:String>
+    <sys:String x:Key="L.Tools.NetCheckTip">分别用直连与当前代理端口探测；勾选站点不可达说明该走/不该走代理</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Start">开始检测</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Stop">停止</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Col.Url">检测地址</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Col.Direct">直连</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Col.Proxy">走代理</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Idle">—</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Running">检测中…</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Timeout">超时</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Fail">不通</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.CoreOff">内核没在跑</sys:String>
+    <sys:String x:Key="L.Tools.Hosts">Hosts 静态表</sys:String>
+    <sys:String x:Key="L.Tools.Hosts.Tip">一行一条：域名 IP 或 域名=IP。写进最终配置的 hosts 段，内核解析优先用它。</sys:String>
+    <sys:String x:Key="L.Tools.Hosts.Feedback">共 {0} 条生效。</sys:String>
+    <sys:String x:Key="L.Tools.Hosts.LineBad">第 {0} 行没收下（要写成「域名 IP」或「域名=IP」）</sys:String>
+    <sys:String x:Key="L.Tools.Override">覆写</sys:String>
+    <sys:String x:Key="L.Tools.Override.Enable">启用覆写（作用于最终生成的配置）</sys:String>
+    <sys:String x:Key="L.Tools.Override.Merge">Merge 覆写（YAML）</sys:String>
+    <sys:String x:Key="L.Tools.Override.MergeTip">深合并进最终配置：映射递归合并、数组整体替换、标量覆盖。</sys:String>
+    <sys:String x:Key="L.Tools.Override.Script">Script 覆写（JS）</sys:String>
+    <sys:String x:Key="L.Tools.Override.ScriptTip">function main(config) { ...; return config; }——config 是最终配置对象；超时 5 秒。</sys:String>
+    <sys:String x:Key="L.Tools.Override.Save">保存覆写并生效</sys:String>
+    <sys:String x:Key="L.Tools.Override.SaveTip">保存两段覆写并让内核热重载</sys:String>
+    <sys:String x:Key="L.Tools.Override.Ok">覆写已保存并让内核生效。</sys:String>
+    <sys:String x:Key="L.Tools.Override.Warn">覆写警告：{0}</sys:String>
+    <sys:String x:Key="L.Tools.Override.Disabled">覆写开关没打开：写好了也不会生效</sys:String>
+    <sys:String x:Key="L.Tools.Log">内核日志</sys:String>
+    <sys:String x:Key="L.Tools.Log.OpenFile">打开文件</sys:String>
+    <sys:String x:Key="L.Tools.Log.Clear">清屏</sys:String>
+    <sys:String x:Key="L.Tools.Log.Empty">还没有内核日志：内核没跑过或刚清空。</sys:String>
+
+    <!-- 设置页 -->
+    <sys:String x:Key="L.Set.Section.App">应用</sys:String>
+    <sys:String x:Key="L.Set.Section.Network">网络配置</sys:String>
+    <sys:String x:Key="L.Set.Section.Rules">分流规则</sys:String>
+    <sys:String x:Key="L.Set.Section.Kernel">内核</sys:String>
+    <sys:String x:Key="L.Set.Appearance">外观</sys:String>
+    <sys:String x:Key="L.Set.AppearanceTip">跟随系统 / 浅色 / 深色；改完立刻生效并记住</sys:String>
+    <sys:String x:Key="L.Set.Theme.Auto">跟随系统</sys:String>
+    <sys:String x:Key="L.Set.Theme.Light">浅色</sys:String>
+    <sys:String x:Key="L.Set.Theme.Dark">深色</sys:String>
+    <sys:String x:Key="L.Set.Language">语言 / Language</sys:String>
+    <sys:String x:Key="L.Set.LanguageTip">界面语言；切换立即生效</sys:String>
+    <sys:String x:Key="L.Set.Lang.Auto">跟随系统</sys:String>
+    <sys:String x:Key="L.Set.Lang.Zh">简体中文</sys:String>
+    <sys:String x:Key="L.Set.Lang.En">English</sys:String>
+    <sys:String x:Key="L.Set.CloseBehavior">关闭主窗口时</sys:String>
+    <sys:String x:Key="L.Set.CloseBehaviorTip">选完立刻记住，不用点保存</sys:String>
+    <sys:String x:Key="L.Set.Close.Ask">每次都问我</sys:String>
+    <sys:String x:Key="L.Set.Close.Tray">缩到系统托盘</sys:String>
+    <sys:String x:Key="L.Set.Close.Exit">直接退出 TunBox</sys:String>
+    <sys:String x:Key="L.Set.AutoStart">开机自动启动</sys:String>
+    <sys:String x:Key="L.Set.SilentStart">静默启动（启动时不开主窗口，留在托盘）</sys:String>
+    <sys:String x:Key="L.Set.SilentStartTip">开机自启与手动启动都生效；从托盘或再运行一次唤回主窗口</sys:String>
+    <sys:String x:Key="L.Set.Hotkeys">全局快捷键</sys:String>
+    <sys:String x:Key="L.Set.HotkeysTip">点击输入框后直接按下组合键；Esc 清除。留空 = 不启用。</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Show">打开主窗口</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Connect">连接 / 断开</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.SysProxy">切换系统代理</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Tun">切换 TUN</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Empty">未设置（点击输入）</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Registered">快捷键 {0} 已生效。</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Taken">快捷键 {0} 注册失败（可能被其他程序占用）。</sys:String>
+    <sys:String x:Key="L.Set.CheckUpdate">检查更新</sys:String>
+    <sys:String x:Key="L.Set.Update.Checking">正在检查更新…</sys:String>
+    <sys:String x:Key="L.Set.Update.Latest">已是最新版本（v{0}）。</sys:String>
+    <sys:String x:Key="L.Set.Update.Found">发现新版本 v{0}，正在打开下载页…</sys:String>
+    <sys:String x:Key="L.Set.Update.Fail">检查更新失败：连不上 GitHub，检查网络后稍后再试。</sys:String>
+    <sys:String x:Key="L.Set.MixedPort">混合（HTTP+SOCKS）</sys:String>
+    <sys:String x:Key="L.Set.HttpPort">HTTP（0 = 不监听）</sys:String>
+    <sys:String x:Key="L.Set.SocksPort">SOCKS（0 = 不监听）</sys:String>
+    <sys:String x:Key="L.Set.ApiPort">控制 API</sys:String>
+    <sys:String x:Key="L.Set.ApiSecret">控制密钥</sys:String>
+    <sys:String x:Key="L.Set.ApiSecretTip">external-controller 的 Bearer 密钥；改完点「保存设置」，别的程序访问 API 时要带上它</sys:String>
+    <sys:String x:Key="L.Set.TunStack">TUN 协议栈</sys:String>
+    <sys:String x:Key="L.Set.TunStackTip">system 性能最好；gvisor 对第三方软件兼容性最好；mixed 兼顾两者。改完点「保存设置」让内核生效</sys:String>
+    <sys:String x:Key="L.Set.Stack.System">system（推荐）</sys:String>
+    <sys:String x:Key="L.Set.Stack.Gvisor">gvisor（兼容）</sys:String>
+    <sys:String x:Key="L.Set.Stack.Mixed">mixed</sys:String>
+    <sys:String x:Key="L.Set.TunMtu">TUN MTU</sys:String>
+    <sys:String x:Key="L.Set.TunMtuTip">默认 1500；走 Wi-Fi / 二级隧道踩分片时调小到 1400 以下试试</sys:String>
+    <sys:String x:Key="L.Set.TunStrictRoute">严格路由（拒绝绕过 TUN 的流量）</sys:String>
+    <sys:String x:Key="L.Set.TunStrictRouteTip">防漏更狠；内网工具、虚拟机多时可能失联</sys:String>
+    <sys:String x:Key="L.Set.TunEinat">端点独立 NAT（UDP 兼容）</sys:String>
+    <sys:String x:Key="L.Set.TunEinatTip">UDP 对称 NAT 场景的兼容选项，默认关</sys:String>
+    <sys:String x:Key="L.Set.AllowLan">允许局域网其他设备连接</sys:String>
+    <sys:String x:Key="L.Set.Ipv6">启用 IPv6（解析与出口都支持 v6）</sys:String>
+    <sys:String x:Key="L.Set.Ipv6Tip">入口没有 v6 时开着只会多问一次 AAAA；要访问纯 v6 站点再开</sys:String>
+    <sys:String x:Key="L.Set.SysProxyCheck">系统代理（连接后写进系统，关掉立即放手）</sys:String>
+    <sys:String x:Key="L.Set.DnsOverride">DNS 覆写（接管解析）</sys:String>
+    <sys:String x:Key="L.Set.DnsOverrideTip">只替换解析用的 nameserver；关掉就用内置（阿里 + 腾讯 DoT）</sys:String>
+    <sys:String x:Key="L.Set.DnsServersTip">一行一个：223.5.5.5、tls://223.5.5.5:853、https://doh.pub/dns-query</sys:String>
+    <sys:String x:Key="L.Set.RulesEnable">启用分流规则</sys:String>
+    <sys:String x:Key="L.Set.AdRules">去广告（HyperADRules）</sys:String>
+    <sys:String x:Key="L.Set.GeoLib">分流库</sys:String>
+    <sys:String x:Key="L.Set.ForceDirect">强制直连站点</sys:String>
+    <sys:String x:Key="L.Set.ForceProxy">强制代理站点</sys:String>
+    <sys:String x:Key="L.Set.CustomRules">自定义规则</sys:String>
+    <sys:String x:Key="L.Set.CustomRulesTip">一行一条：类型,值,策略，如 DOMAIN-SUFFIX,example.com,REJECT</sys:String>
+    <sys:String x:Key="L.Set.AppRouting">应用分流</sys:String>
+    <sys:String x:Key="L.Set.AppRouting.All">全部应用按规则</sys:String>
+    <sys:String x:Key="L.Set.AppRouting.Include">仅所选应用走代理</sys:String>
+    <sys:String x:Key="L.Set.AppRouting.Exclude">所选应用直连（绕过）</sys:String>
+    <sys:String x:Key="L.Set.AppProcessesTip">进程名，逗号或换行分隔，如 ChatGPT.exe, WeChat.exe；也可点右边从已装应用里挑</sys:String>
+    <sys:String x:Key="L.Set.PickApps">从已装应用选…</sys:String>
+    <sys:String x:Key="L.Set.PickAppsTip">扫描开始菜单和已安装程序，勾选后自动填进程名</sys:String>
+    <sys:String x:Key="L.Set.TestUrl">测速地址</sys:String>
+    <sys:String x:Key="L.Set.TestUrlTip">默认 cp.cloudflare.com 国内可达；换成 gstatic 之类，一整排节点会一起报红</sys:String>
+    <sys:String x:Key="L.Set.LogLevel">日志级别</sys:String>
+    <sys:String x:Key="L.Set.LogLevel.Info">info（推荐）</sys:String>
+    <sys:String x:Key="L.Set.LogLevel.Debug">debug（排查用）</sys:String>
+    <sys:String x:Key="L.Set.Sniffer">嗅探域名（sniffer）</sys:String>
+    <sys:String x:Key="L.Set.SmartGroup">smart 组自动优选</sys:String>
+    <sys:String x:Key="L.Set.OpenLog">打开内核日志</sys:String>
+    <sys:String x:Key="L.Set.ViewConfig">查看最终配置</sys:String>
+    <sys:String x:Key="L.Set.ViewConfigTip">打开内核实际加载的 config.yaml（含覆写结果）</sys:String>
+    <sys:String x:Key="L.Set.About">关于</sys:String>
+    <sys:String x:Key="L.Set.About.Core">内核版本</sys:String>
+    <sys:String x:Key="L.Set.About.Repo">开源地址</sys:String>
+    <sys:String x:Key="L.Set.About.CoreUnknown">未运行（启动后显示）</sys:String>
+
+    <!-- 托盘 -->
+    <sys:String x:Key="L.Tray.Show">显示主界面</sys:String>
+    <sys:String x:Key="L.Tray.Exit">退出 TunBox</sys:String>
+    <sys:String x:Key="L.Tray.Connect">连接</sys:String>
+    <sys:String x:Key="L.Tray.Disconnect">断开连接</sys:String>
+    <sys:String x:Key="L.Tray.BalloonTitle">TunBox 正在后台运行</sys:String>
+    <sys:String x:Key="L.Tray.BalloonText">点托盘图标或再运行一次 TunBox 都能唤回主窗口。要彻底退出请用托盘菜单里的「退出」。</sys:String>
+
+    <!-- 对话框 -->
+    <sys:String x:Key="L.Dlg.Import.Title">导入订阅</sys:String>
+    <sys:String x:Key="L.Dlg.Import.Subtitle">订阅链接、本地配置文件，或直接粘贴节点链接，任选其一</sys:String>
+    <sys:String x:Key="L.Dlg.Import.UrlLabel">订阅链接或节点链接</sys:String>
+    <sys:String x:Key="L.Dlg.Import.UrlPlaceholder">https://example.com/api/subscribe?token=…&#x0a;ss://… 或 vless://…（粘贴时每行一条）</sys:String>
+    <sys:String x:Key="L.Dlg.Import.Or">或者</sys:String>
+    <sys:String x:Key="L.Dlg.Import.FileLabel">本地配置文件（yaml / conf）</sys:String>
+    <sys:String x:Key="L.Dlg.Import.PickFile">选择文件…</sys:String>
+    <sys:String x:Key="L.Dlg.Import.DragHint">也可以把文件直接拖进这个窗口。</sys:String>
+    <sys:String x:Key="L.Dlg.Import.UaHint">导入后会依次尝试 Clash Verge / mihomo 等主流客户端的 User-Agent；失败时显示面板返回的原文。</sys:String>
+    <sys:String x:Key="L.Dlg.Import.Go">导入</sys:String>
+    <sys:String x:Key="L.Dlg.Import.FileTooBig">文件超过 4MB，不像订阅配置。</sys:String>
+    <sys:String x:Key="L.Dlg.Import.BadExt">只支持 .yaml / .yml / .conf / .txt 文件。</sys:String>
+    <sys:String x:Key="L.Dlg.Import.Nothing">先填订阅链接（或节点链接），选一个文件，或把文件拖进来。</sys:String>
+    <sys:String x:Key="L.Dlg.Import.FileFilter">订阅配置 (yaml|yml|conf|txt)|*.yaml;*.yml;*.conf;*.txt|所有文件|*.*</sys:String>
+    <sys:String x:Key="L.Dlg.Edit.Title">编辑订阅</sys:String>
+    <sys:String x:Key="L.Dlg.Edit.Name">订阅名称</sys:String>
+    <sys:String x:Key="L.Dlg.Edit.Url">订阅链接（本地导入的订阅没有链接，留空即可）</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Title">从已安装应用选择</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Subtitle">勾选要纳入应用分流的应用，确定后会把它们的进程名并回文本框</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Search">搜索应用名…</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.SelectAll">全选</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.ClearAll">清空</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Ok">确定</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Scanning">正在扫描已安装的应用…</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.None">没扫到可列出的应用，可以直接在主界面手动填进程名。</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Count">共 {0} 个应用，已勾选 {1} 个</sys:String>
+
+    <sys:String x:Key="L.Tip.TestingNode">正在测这个节点…</sys:String>
+    <sys:String x:Key="L.Tip.TestOne">点击只测这一个节点（{0}:{1}）</sys:String>
+    <sys:String x:Key="L.Tip.SmartSubtitle">内核智能选点 · 按每条连接的目标自动择优 · {0} 个候选节点</sys:String>
+    <sys:String x:Key="L.Tip.EgressBusy">查询中…</sys:String>
+    <sys:String x:Key="L.Interval.Min30">30 分钟</sys:String>
+    <sys:String x:Key="L.Interval.Hour">1 小时</sys:String>
+    <sys:String x:Key="L.Interval.Hour6">6 小时</sys:String>
+    <sys:String x:Key="L.Interval.Hour12">12 小时</sys:String>
+    <sys:String x:Key="L.Interval.Day">24 小时</sys:String>
+    <sys:String x:Key="L.Interval.MinFormat">{0} 分钟</sys:String>
+
+    <!-- 提示文案（代码里经 Lang.F 取） -->
+    <sys:String x:Key="L.Msg.ImportEmpty">请输入订阅链接，或直接粘贴一批节点链接。</sys:String>
+    <sys:String x:Key="L.Msg.ImportFailed">导入失败：{0}</sys:String>
+    <sys:String x:Key="L.Msg.ImportFailedPlain">导入失败</sys:String>
+    <sys:String x:Key="L.Msg.SaveWarn">注意：{0}</sys:String>
+    <sys:String x:Key="L.Msg.ImportParseFail">解析失败：{0}</sys:String>
+    <sys:String x:Key="L.Msg.CoreDeadTest">内核起不来，测不了速</sys:String>
+    <sys:String x:Key="L.Msg.NodeGone">这个节点已经不在列表里了，先更新订阅。</sys:String>
+    <sys:String x:Key="L.Msg.TestNone">{0}没有一个节点通：多半是测速地址不可达（设置里可换），或订阅过期。</sys:String>
+    <sys:String x:Key="L.Msg.PageEmpty">这里没有节点可测。</sys:String>
+    <sys:String x:Key="L.Msg.SmartUnavailable">自动优选现在不可用：需要至少两个节点，并且内核的 LightGBM 模型在位。</sys:String>
+    <sys:String x:Key="L.Msg.SmartRejected">内核没接受切到自动优选（可能这份配置里还没发射 smart 组），点「连接」后重试。</sys:String>
+    <sys:String x:Key="L.Msg.SmartNoTest">自动选择是内核按每条连接自己择优，不需要测速；要看候选节点的延迟，切到对应分组。</sys:String>
+    <sys:String x:Key="L.Msg.SwitchRejected">内核没有接受这次切换：{0}</sys:String>
+    <sys:String x:Key="L.Msg.Connected">已启动</sys:String>
+    <sys:String x:Key="L.Msg.ConnectFailed">连接失败</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyBlocked">内核已接管，但系统代理写不进注册表（可能被安全软件拦了）。可以手动给浏览器配 HTTP 代理 127.0.0.1:{0}，或检查安全软件设置。</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyManual">系统代理写不进注册表（可能被安全软件拦了），可以手动配置 HTTP 代理 127.0.0.1:{0}。</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyToggleFail">系统代理没切过去：{0}</sys:String>
+    <sys:String x:Key="L.Msg.PortMixed">混合端口要填 0-65535 的整数（0 = 不监听）</sys:String>
+    <sys:String x:Key="L.Msg.PortHttp">HTTP 端口要填 0-65535 的整数</sys:String>
+    <sys:String x:Key="L.Msg.PortSocks">SOCKS 端口要填 0-65535 的整数</sys:String>
+    <sys:String x:Key="L.Msg.PortApi">API 端口要填 1024-65535 的整数</sys:String>
+    <sys:String x:Key="L.Msg.TestUrlInvalid">测速地址要填完整的 http(s) 地址，否则延迟数字没有意义。</sys:String>
+    <sys:String x:Key="L.Msg.DnsEmpty">DNS 覆写至少要有一条能用的地址，否则内核会退回内置 DNS —— 要么填地址（如 223.5.5.5、tls://223.5.5.5:853、https://doh.pub/dns-query），要么关掉覆写。</sys:String>
+    <sys:String x:Key="L.Msg.AutoStartBlocked">开机自启没写上：注册表 Run 项被策略或安全软件拦了。</sys:String>
+    <sys:String x:Key="L.Msg.ElevateNoPath">拿不到当前程序路径，无法提权重启。</sys:String>
+    <sys:String x:Key="L.Msg.ElevateFail">没有获得管理员授权（{0}），虚拟网卡还用不了。</sys:String>
+    <sys:String x:Key="L.Msg.CoreNotRunning">内核没在跑：现在没有连接可断。</sys:String>
+    <sys:String x:Key="L.Msg.CloseAllRejected">内核没有接受这次「断开全部」，稍后再试。</sys:String>
+    <sys:String x:Key="L.Msg.TimeoutRetry">内核这一拍没应答（超时），再点一次试试。</sys:String>
+    <sys:String x:Key="L.Msg.StepFailed">这一步没走完：{0}</sys:String>
+    <sys:String x:Key="L.Msg.UiCrash">界面刷新出错：{0} {1}</sys:String>
+    <sys:String x:Key="L.Msg.NoLog">还没有内核日志：内核还没跑过一次。</sys:String>
+    <sys:String x:Key="L.Msg.GeoNothing">分流库没有变化，或一个都没下到。</sys:String>
+    <sys:String x:Key="L.Msg.ApplyFailed">{0}生效失败</sys:String>
+    <sys:String x:Key="L.Msg.UpdateFailed">更新失败</sys:String>
+    <sys:String x:Key="L.Msg.AutoUpdateFail">自动更新「{0}」失败：{1}</sys:String>
+    <sys:String x:Key="L.Msg.AutoUpdateSet">「{0}」将每 {1} 自动更新一次。</sys:String>
+    <sys:String x:Key="L.Msg.AutoUpdateOff">「{0}」已改为只手动更新。</sys:String>
+    <sys:String x:Key="L.Msg.UpdateAllDone">全部订阅更新完成。</sys:String>
+    <sys:String x:Key="L.Msg.UpdateAllPartial">更新完成：{0} 成功，{1} 失败。</sys:String>
+    <sys:String x:Key="L.Msg.CopyIp">已复制出口 IP：{0}</sys:String>
+    <sys:String x:Key="L.Msg.SubNameEmpty">订阅名称不能为空。</sys:String>
+    <sys:String x:Key="L.Msg.EgressQueryFail">查不到：{0}</sys:String>
+    <sys:String x:Key="L.Msg.EgressSameAsLocal">出口 IP 与本机相同，这条连接没走代理（检查分流规则或换节点）</sys:String>
+    <sys:String x:Key="L.Msg.EgressNeedConnect">点「连接」之后才能查出口 IP</sys:String>
+    <sys:String x:Key="L.Msg.EgressUpdated">{0} 更新</sys:String>
+    <sys:String x:Key="L.Msg.TunOff">未启用</sys:String>
+    <sys:String x:Key="L.Msg.TunActive">已接管</sys:String>
+    <sys:String x:Key="L.Msg.TunPending">内核正在建网卡…</sys:String>
+    <sys:String x:Key="L.Msg.TunNoRoute">网卡在，但没拿到默认路由</sys:String>
+    <sys:String x:Key="L.Msg.TunFailed">网卡没起来（看内核日志）</sys:String>
+    <sys:String x:Key="L.Msg.TunNeedAdmin">需要管理员：点下方按钮重启</sys:String>
+    <sys:String x:Key="L.Msg.TunArmed">已打开：点「连接」时接管</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyOff">未启用</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyTaking">已接管</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyArmed">已打开：点「连接」后接管</sys:String>
+    <sys:String x:Key="L.Msg.LogNoChange">日志没有更新。</sys:String>
+    <sys:String x:Key="L.Msg.NodesOne">1 个节点</sys:String>
+    <sys:String x:Key="L.Msg.NodesFormat">{0} 个节点</sys:String>
+    <sys:String x:Key="L.Msg.CloseAskTray">关闭窗口后缩到系统托盘继续运行吗？
+
+「是」= 缩到托盘，「否」= 退出 TunBox，进程和内核都结束。</sys:String>
+    <sys:String x:Key="L.Msg.CloseAskExit">系统托盘不可用：现在关闭窗口就会退出 TunBox。确定退出吗？</sys:String>
+    <sys:String x:Key="L.Msg.AlreadyRunning">TunBox 已经在运行（托盘图标可能被 Win11 收进了溢出区，点托盘小箭头找找）。</sys:String>
+    <sys:String x:Key="L.Msg.CrashBox">出现未处理的异常（已记录到 {0}）：
+{1}</sys:String>
+    <sys:String x:Key="L.Msg.CrashBoxRepeat">同类异常反复出现，后续不再弹窗。完整记录在 {0}</sys:String>
+</ResourceDictionary>

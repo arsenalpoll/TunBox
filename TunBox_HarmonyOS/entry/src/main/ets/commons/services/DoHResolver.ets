@@ -122,6 +122,19 @@ export class DoHResolver {
     return pin.ip;
   }
 
+  /**
+   * 连接路径判据（2026-10-17 启动速度）：该域名是否已有可用 pin。
+   * 命中时 ConnectionOrchestrator 可把连接期 DoH 预算从 6s 收紧到 1.5s ——
+   * 关键节点已 pin，其余备用域名晚点解析无碍。
+   */
+  static async hasUsablePin(domain: string): Promise<boolean> {
+    if (domain.length === 0) {
+      return false;
+    }
+    await DoHResolver.ensureLoaded();
+    return DoHResolver.cachedIp(domain.toLowerCase()).length > 0;
+  }
+
   static async resolveMany(domains: string[], budgetMs: number = 6000,
     priorityDomains: string[] = []): Promise<Record<string, string>> {
     await DoHResolver.ensureLoaded();

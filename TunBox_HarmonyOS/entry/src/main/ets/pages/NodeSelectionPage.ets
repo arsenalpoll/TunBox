@@ -9,6 +9,7 @@
  * （旧实现真机表现为慢、成批假超时，以及"点了测速像没反应"）。
  */
 import { router, promptAction } from '@kit.ArkUI';
+import { TunBoxMotion } from '../theme/TunBoxTokens';
 import { Ui, LatencyStyle, NodeDisplay } from '../theme/UiTokens';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { Subscription } from '../commons/models/Subscription';
@@ -98,12 +99,9 @@ struct NodeDeleteDialog {
         .fontSize(13).fontColor(Ui.textSecondary)
       Row({ space: 12 }) {
         Button('取消')
-          .layoutWeight(1).backgroundColor(Ui.surfaceTranslucent).fontColor(Ui.textSecondary)
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-          })
-          .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
-          .borderWidth(1).borderColor(Ui.glassEdge)
+          .layoutWeight(1).backgroundColor(Ui.surfaceMuted).fontColor(Ui.textSecondary)
+          .borderRadius(14)
+          .borderWidth(1).borderColor(Ui.border)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -121,7 +119,7 @@ struct NodeDeleteDialog {
       .width('100%')
     }
     .padding(22)
-    .borderRadius(20)
+    .borderRadius(26)
     // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
     // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
     // 不透明背景色、背景模糊（COMPONENT_THICK）、backgroundEffect 与自定义 shadow
@@ -133,6 +131,7 @@ struct NodeDeleteDialog {
 @Entry
 @Component
 struct NodeSelectionPage {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @State nodes: NodeRow[] = [];
   @State groupRows: ProxyGroupRow[] = [];
   @State expandedGroupKeys: string[] = [];
@@ -222,11 +221,12 @@ struct NodeSelectionPage {
 
   onPageShow(): void {
     this.pageActive = true;
+    // 入场转场期间不抢 UI 线程（原 32ms 会让读盘/建表与转场同帧）
     setTimeout(() => {
       if (this.pageActive) {
         this.bootstrap();
       }
-    }, 32);
+    }, 240);
   }
 
   /**
@@ -1415,20 +1415,36 @@ struct NodeSelectionPage {
     });
   }
 
+  /** 路由推入式子页统一转场：水平滑动 + 淡入淡出（与页签切换同规格，见 TunBoxMotion） */
+  pageTransition() {
+    PageTransitionEnter({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: TunBoxMotion.slidePercent, y: 0 }).opacity(0)
+    PageTransitionExit({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: `-${TunBoxMotion.slidePercent}`, y: 0 }).opacity(0)
+  }
+
   build() {
     Stack() {
       Column()
         .width('100%').height('100%')
-        .linearGradient({ angle: 135, colors: Ui.backdropColors })
+        .backgroundColor(Ui.background)
         // 背景延伸到状态栏/底部导航条之下, 消除底部白条
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
         // ── 顶栏（对齐原版: 返回 + 当前节点 + 刷新/闪电图标组） ──
         Row() {
-          Text('←')
-            .fontSize(22).fontColor(Ui.textPrimary)
-            .onClick(() => router.back())
+          Row() {
+            Image($r('app.media.ic_arrow_left'))
+              .width(20).height(20)
+              .fillColor(Ui.textPrimary)
+          }
+          .width(36).height(36)
+          .justifyContent(FlexAlign.Center)
+          .alignItems(VerticalAlign.Center)
+          .borderRadius(18)
+          .backgroundColor(Ui.surfaceMuted)
+          .onClick(() => router.back())
           Row({ space: 7 }) {
             CountryFlagIcon({
               nodeName: this.selectedName.length > 0 ? this.selectedName : 'UN',
@@ -1447,15 +1463,38 @@ struct NodeSelectionPage {
           .margin({ left: 12, right: 12 })
           // 刷新 + 排序方式 + 测速（测速中变成「进度 + 取消」）
           Row({ space: 10 }) {
-            Text(this.refreshing ? `◌ ${this.refreshDone}/${this.refreshTotal}` : '⟳')
-              .fontSize(this.refreshing ? 16 : 22)
-              .fontColor(this.refreshing ? Ui.primary : Ui.textPrimary)
-              .onClick(() => this.refreshNodes())
-            Text(this.sortMode === NodeSortModes.AUTO ? '⇅'
-              : (this.sortMode === NodeSortModes.MANUAL ? '🔒' : '↕'))
-              .fontSize(20)
-              .fontColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.textPrimary : Ui.primary)
-              .onClick(() => this.cycleSortMode())
+            Row() {
+              Image($r('app.media.ic_refresh'))
+                .width(20).height(20)
+                .fillColor(this.refreshing ? Ui.primary : Ui.textPrimary)
+            }
+            .width(36).height(36)
+            .justifyContent(FlexAlign.Center)
+            .alignItems(VerticalAlign.Center)
+            .borderRadius(18)
+            .backgroundColor(Ui.surfaceMuted)
+            .onClick(() => this.refreshNodes())
+            if (this.refreshing) {
+              Text(`${this.refreshDone}/${this.refreshTotal}`)
+                .fontSize(11)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(Ui.primary)
+            }
+            Row({ space: 4 }) {
+              Image(this.sortMode === NodeSortModes.MANUAL
+                ? $r('app.media.ic_lock') : $r('app.media.ic_sort'))
+                .width(16).height(16)
+                .fillColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.textPrimary : Ui.primary)
+              Text(this.sortMode === NodeSortModes.AUTO ? '自动排序'
+                : (this.sortMode === NodeSortModes.MANUAL ? '手动固定' : '默认顺序'))
+                .fontSize(11)
+                .fontColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.textSecondary : Ui.primary)
+            }
+            .height(36)
+            .padding({ left: 10, right: 10 })
+            .borderRadius(18)
+            .backgroundColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.surfaceMuted : Ui.primaryBlueFill)
+            .onClick(() => this.cycleSortMode())
             // 组测一起出结果（约 3 秒），进度条没有意义——已去掉（用户要求）。
             // 通道（内核/凭证）不可用时明确告诉用户原因。
             Row({ space: 8 }) {
@@ -1465,16 +1504,33 @@ struct NodeSelectionPage {
                   .fontColor(Ui.warning)
               }
               // 测试中「测全部」变成转圈反馈（用户要求）：不然以为没点上
-              Text(this.batchTesting ? '◌' : '测全部')
-                .fontSize(this.batchTesting ? 18 : 14)
-                .fontWeight(FontWeight.Medium)
-                .fontColor(this.batchTesting ? Ui.primary : Ui.textPrimary)
+              if (this.batchTesting) {
+                LoadingProgress().width(20).height(20).color(Ui.primary)
+                  .onClick(() => this.testAll())
+              } else {
+                Row({ space: 5 }) {
+                  Image($r('app.media.ic_bolt'))
+                    .width(14).height(14)
+                    .fillColor(Ui.primary)
+                  Text('测全部')
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(Ui.primary)
+                }
+                .height(36)
+                .padding({ left: 12, right: 12 })
+                .borderRadius(18)
+                .backgroundColor(Ui.primaryBlueFill)
+                .borderWidth(1)
+                .borderColor(Ui.borderStrong)
                 .onClick(() => this.testAll())
+              }
             }
           }
         }
         .width('100%')
-        .padding({ left: 18, right: 18, top: 10, bottom: 6 })
+        .height(56)
+        .padding({ left: 16, right: 16 })
 
         // ── 订阅筛选 chips ──
         if (this.subChips.length > 0) {
@@ -1482,12 +1538,13 @@ struct NodeSelectionPage {
             Row({ space: 8 }) {
               Text('全部')
                 .fontSize(13)
-                .fontColor(!this.smartView && this.filterSubId.length === 0 ? Ui.textPrimary : Ui.textSecondary)
-                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                .borderRadius(16)
-                .backgroundColor(!this.smartView && this.filterSubId.length === 0 ? Ui.selectedBackground : Ui.surfaceTranslucent)
+                .fontWeight(!this.smartView && this.filterSubId.length === 0 ? FontWeight.Bold : FontWeight.Medium)
+                .fontColor(!this.smartView && this.filterSubId.length === 0 ? Ui.primary : Ui.textSecondary)
+                .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+                .borderRadius(100)
+                .backgroundColor(!this.smartView && this.filterSubId.length === 0 ? Ui.primaryBlueFill : Ui.surfaceMuted)
                 .borderWidth(1)
-                .borderColor(!this.smartView && this.filterSubId.length === 0 ? Ui.primary : Ui.border)
+                .borderColor(!this.smartView && this.filterSubId.length === 0 ? Ui.borderStrong : Ui.border)
                 .onClick(() => {
                   this.exitSmartView();
                   this.filterSubId = '';
@@ -1498,23 +1555,25 @@ struct NodeSelectionPage {
               if (this.smartSelectable()) {
                 Text('自动选择')
                   .fontSize(13)
-                  .fontColor(this.smartView ? Ui.textPrimary : Ui.textSecondary)
-                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                  .borderRadius(16)
-                  .backgroundColor(this.smartView ? Ui.selectedBackground : Ui.surfaceTranslucent)
+                  .fontWeight(this.smartView ? FontWeight.Bold : FontWeight.Medium)
+                  .fontColor(this.smartView ? Ui.primary : Ui.textSecondary)
+                  .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+                  .borderRadius(100)
+                  .backgroundColor(this.smartView ? Ui.primaryBlueFill : Ui.surfaceMuted)
                   .borderWidth(1)
-                  .borderColor(this.smartView ? Ui.primary : Ui.border)
+                  .borderColor(this.smartView ? Ui.borderStrong : Ui.border)
                   .onClick(() => this.enterSmartView())
               }
               ForEach(this.subChips, (chip: SubChip) => {
                 Text(chip.name)
                   .fontSize(13)
-                  .fontColor(!this.smartView && this.filterSubId === chip.id ? Ui.textPrimary : Ui.textSecondary)
-                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                  .borderRadius(16)
-                  .backgroundColor(!this.smartView && this.filterSubId === chip.id ? Ui.selectedBackground : Ui.surfaceTranslucent)
+                  .fontWeight(!this.smartView && this.filterSubId === chip.id ? FontWeight.Bold : FontWeight.Medium)
+                  .fontColor(!this.smartView && this.filterSubId === chip.id ? Ui.primary : Ui.textSecondary)
+                  .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+                  .borderRadius(100)
+                  .backgroundColor(!this.smartView && this.filterSubId === chip.id ? Ui.primaryBlueFill : Ui.surfaceMuted)
                   .borderWidth(1)
-                  .borderColor(!this.smartView && this.filterSubId === chip.id ? Ui.primary : Ui.border)
+                  .borderColor(!this.smartView && this.filterSubId === chip.id ? Ui.borderStrong : Ui.border)
                   .onClick(() => {
                     this.exitSmartView();
                     this.filterSubId = chip.id;
@@ -1532,9 +1591,10 @@ struct NodeSelectionPage {
 
         // ── 选点模式说明：明确区分「手动固定」与「自动排序」，澄清自动切换不会覆盖手动选择 ──
         Row({ space: 6 }) {
-          Text(this.autoSelectMode === AutoSelectModes.AUTO ? '⚡' : '🔒')
-            .fontSize(12)
-            .fontColor(this.autoSelectMode === AutoSelectModes.AUTO ? Ui.warning : Ui.textSecondary)
+          Image(this.autoSelectMode === AutoSelectModes.AUTO
+            ? $r('app.media.ic_bolt') : $r('app.media.ic_lock'))
+            .width(14).height(14)
+            .fillColor(this.autoSelectMode === AutoSelectModes.AUTO ? Ui.warning : Ui.textSecondary)
           Text(this.autoSelectMode === AutoSelectModes.AUTO
             ? $r('app.string.node_mode_auto_banner')
             : $r('app.string.node_mode_manual_banner'))
@@ -1544,12 +1604,8 @@ struct NodeSelectionPage {
         }
         .width('100%')
         .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-        .borderRadius(12)
-        .backgroundColor(Ui.surfaceTranslucent)
-        .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-          colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-        })
-        .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+        .borderRadius(14)
+        .backgroundColor(Ui.surface)
         .borderWidth(1)
         .borderColor(Ui.glassEdge)
         .margin({ left: 18, right: 18, top: 10 })
@@ -1559,7 +1615,9 @@ struct NodeSelectionPage {
         // 此前这里还有一行「排序：自动排序（按测速结果）」与横幅重复，已移除。
         if (this.nodes.length === 0) {
           Column({ space: 12 }) {
-            Text(this.smartView ? '⚡' : '🖧').fontSize(46).fontColor(Ui.textTertiary)
+            Image(this.smartView ? $r('app.media.ic_bolt') : $r('app.media.ic_network'))
+              .width(46).height(46)
+              .fillColor(Ui.textTertiary)
             Text(this.smartEmptyTitle())
               .fontSize(15).fontColor(Ui.textSecondary)
             if (this.smartView) {
@@ -1577,11 +1635,10 @@ struct NodeSelectionPage {
               ListItem() {
                 Column({ space: 7 }) {
                   Row({ space: 10 }) {
-                    Text(this.isGroupExpanded(groupRow.group) ? '⌄' : '›')
-                      .fontSize(22)
-                      .fontColor(Ui.primary)
-                      .width(24)
-                      .textAlign(TextAlign.Center)
+                    Image(this.isGroupExpanded(groupRow.group)
+                      ? $r('app.media.ic_chevron_down') : $r('app.media.ic_arrow_right'))
+                      .width(18).height(18)
+                      .fillColor(Ui.primary)
                     Column({ space: 2 }) {
                       Text(groupRow.group.name)
                         .fontSize(16)
@@ -1597,9 +1654,9 @@ struct NodeSelectionPage {
                     .alignItems(HorizontalAlign.Start)
                   }
                   .width('100%')
-                  .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-                  .borderRadius(15)
-                  .backgroundColor(Ui.surfaceStrong)
+                  .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+                  .borderRadius(18)
+                  .backgroundColor(Ui.surface)
                   .borderWidth(1)
                   .borderColor(Ui.glassEdge)
                   .onClick(() => this.toggleGroup(groupRow.group))
@@ -1608,11 +1665,9 @@ struct NodeSelectionPage {
                     // 自动选择、故障转移、负载均衡等策略作为 selector 的同级可选项。
                     ForEach(groupRow.strategyGroups, (strategy: ProxyGroup) => {
                       Row({ space: 10 }) {
-                        Text('⚙')
-                          .fontSize(18)
-                          .fontColor(Ui.primary)
-                          .width(24)
-                          .textAlign(TextAlign.Center)
+                        Image($r('app.media.ic_tune'))
+                          .width(18).height(18)
+                          .fillColor(Ui.primary)
                         Column({ space: 2 }) {
                           Text(strategy.name)
                             .fontSize(14)
@@ -1626,15 +1681,16 @@ struct NodeSelectionPage {
                         }
                         .layoutWeight(1)
                         .alignItems(HorizontalAlign.Start)
-                        Text(this.selectedStrategyName(groupRow.group) === strategy.name ? '✓' : '›')
-                          .fontSize(20)
-                          .fontColor(this.selectedStrategyName(groupRow.group) === strategy.name
+                        Image(this.selectedStrategyName(groupRow.group) === strategy.name
+                          ? $r('app.media.ic_check') : $r('app.media.ic_arrow_right'))
+                          .width(18).height(18)
+                          .fillColor(this.selectedStrategyName(groupRow.group) === strategy.name
                             ? Ui.primary : Ui.textTertiary)
                       }
                       .width('100%')
-                      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-                      .borderRadius(12)
-                      .backgroundColor(Ui.surfaceTranslucent)
+                      .padding({ left: 14, right: 14, top: 11, bottom: 11 })
+                      .borderRadius(14)
+                      .backgroundColor(Ui.surfaceMuted)
                       .borderWidth(1)
                       .borderColor(Ui.glassEdge)
                       .onClick(() => this.selectStrategy(groupRow.group, strategy))
@@ -1666,8 +1722,9 @@ struct NodeSelectionPage {
         } else {
           TextInput({ placeholder: '搜索节点名…', text: this.searchText })
             .onChange((value: string) => { this.searchText = value; })
-            .height(38).fontSize(13)
-            .backgroundColor('#FFFFFF1F').borderRadius(12)
+            .height(42).fontSize(13)
+            .backgroundColor(Ui.inputBackground).borderRadius(14)
+            .borderWidth(1).borderColor(Ui.border)
             .padding({ left: 12, right: 12 })
             .margin({ left: 18, right: 18, top: 4 })
           List({ space: 7, scroller: this.listScroller }) {
@@ -1718,12 +1775,7 @@ struct NodeSelectionPage {
       .fontColor(color)
       .padding({ left: 6, right: 6, top: 1, bottom: 1 })
       .borderRadius(6)
-      .backgroundColor(Ui.surfaceTranslucent)
-      .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-        colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-      })
-      .borderWidth(1)
-      .borderColor(Ui.glassEdge)
+      .backgroundColor(Ui.statusTint)
   }
 
   /**
@@ -1772,7 +1824,9 @@ struct NodeSelectionPage {
   SmartCard(row: NodeRow) {
     Row() {
       Row({ space: 12 }) {
-        Text('♻️').fontSize(24).width(26).textAlign(TextAlign.Center)
+        Image($r('app.media.ic_radar'))
+          .width(22).height(22)
+          .fillColor(row.node.name === this.selectedName ? Ui.primary : Ui.textSecondary)
         Column({ space: 3 }) {
           Text('自动选择')
             .fontSize(16)
@@ -1794,22 +1848,17 @@ struct NodeSelectionPage {
       .layoutWeight(1)
       .onClick(() => this.selectNode(row.node))
 
-      Text('✓')
-        .fontSize(20)
-        .fontColor(Ui.primary)
+      Image($r('app.media.ic_check'))
+        .width(18).height(18)
+        .fillColor(Ui.primary)
         .width(24)
-        .textAlign(TextAlign.Center)
         .opacity(row.node.name === this.selectedName ? 1 : 0)
     }
     .width('100%')
-    .padding({ left: 14, right: 6, top: 7, bottom: 7 })
-    .borderRadius(17)
-    .backgroundColor(row.node.name === this.selectedName ? Ui.surfaceStrong : Ui.surfaceTranslucent)
-    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-    })
-    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
-    .borderWidth(1)
+    .padding({ left: 14, right: 6, top: 10, bottom: 10 })
+    .borderRadius(16)
+    .backgroundColor(row.node.name === this.selectedName ? Ui.primaryBlueFill : Ui.surface)
+    .borderWidth(row.node.name === this.selectedName ? 1.5 : 1)
     .borderColor(row.node.name === this.selectedName ? Ui.primary : Ui.glassEdge)
   }
 
@@ -1845,9 +1894,9 @@ struct NodeSelectionPage {
                   .fontWeight(FontWeight.Bold)
                   .fontColor(LatencyStyle.recordColor(LatencyController.recordFor(row.node.name), Date.now()))
               }
-              Text('↻')
-                .fontSize(14)
-                .fontColor(Ui.textSecondary)
+              Image($r('app.media.ic_refresh'))
+                .width(14).height(14)
+                .fillColor(Ui.textSecondary)
                 .padding({ left: 2, right: 6 })
                 .onClick(() => this.testOne(row.node))
             }
@@ -1867,22 +1916,17 @@ struct NodeSelectionPage {
       .layoutWeight(1)
       .onClick(() => this.selectNode(row.node))
 
-      Text('✓')
-        .fontSize(20)
-        .fontColor(Ui.primary)
+      Image($r('app.media.ic_check'))
+        .width(18).height(18)
+        .fillColor(Ui.primary)
         .width(24)
-        .textAlign(TextAlign.Center)
         .opacity(row.node.name === this.selectedName ? 1 : 0)
     }
     .width('100%')
-    .padding({ left: 14, right: 6, top: 7, bottom: 7 })
-    .borderRadius(17)
-    .backgroundColor(row.node.name === this.selectedName ? Ui.surfaceStrong : Ui.surfaceTranslucent)
-    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-    })
-    .backgroundEffect({ radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft })
-    .borderWidth(1)
+    .padding({ left: 14, right: 6, top: 10, bottom: 10 })
+    .borderRadius(16)
+    .backgroundColor(row.node.name === this.selectedName ? Ui.primaryBlueFill : Ui.surface)
+    .borderWidth(row.node.name === this.selectedName ? 1.5 : 1)
     .borderColor(row.node.name === this.selectedName ? Ui.primary : Ui.glassEdge)
   }
 

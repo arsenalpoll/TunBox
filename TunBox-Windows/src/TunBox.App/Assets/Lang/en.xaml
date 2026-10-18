@@ -1,0 +1,361 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+    <!-- English。键集必须与 zh.xaml 完全一致（UiTests 有守卫测试）。 -->
+
+    <!-- Sidebar -->
+    <sys:String x:Key="L.Nav.Dashboard">Dashboard</sys:String>
+    <sys:String x:Key="L.Nav.Proxies">Proxies</sys:String>
+    <sys:String x:Key="L.Nav.Requests">Requests</sys:String>
+    <sys:String x:Key="L.Nav.Profiles">Profiles</sys:String>
+    <sys:String x:Key="L.Nav.Tools">Tools</sys:String>
+    <sys:String x:Key="L.Nav.Settings">Settings</sys:String>
+    <sys:String x:Key="L.Nav.Exit">Exit</sys:String>
+    <sys:String x:Key="L.Nav.ExitTip">Exit TunBox: quits the app and the core. To just hide, click the window X</sys:String>
+
+    <!-- Common -->
+    <sys:String x:Key="L.Common.SaveSettings">Save Settings</sys:String>
+    <sys:String x:Key="L.Common.SaveSettingsTip">Save every change on this page and apply them to the core</sys:String>
+    <sys:String x:Key="L.Common.Refresh">Refresh</sys:String>
+    <sys:String x:Key="L.Common.RefreshTip">Query the egress IP and local IP again</sys:String>
+    <sys:String x:Key="L.Common.Update">Update</sys:String>
+    <sys:String x:Key="L.Common.Disconnect">Close</sys:String>
+    <sys:String x:Key="L.Common.Cancel">Cancel</sys:String>
+    <sys:String x:Key="L.Common.Confirm">OK</sys:String>
+    <sys:String x:Key="L.Common.Save">Save</sys:String>
+    <sys:String x:Key="L.Common.Import">Import</sys:String>
+    <sys:String x:Key="L.Common.Open">Open</sys:String>
+
+    <!-- States -->
+    <sys:String x:Key="L.State.Connected">Connected</sys:String>
+    <sys:String x:Key="L.State.Connecting">Connecting…</sys:String>
+    <sys:String x:Key="L.State.Disconnected">Disconnected</sys:String>
+
+    <!-- Dashboard -->
+    <sys:String x:Key="L.Dash.ModeRule">Rule</sys:String>
+    <sys:String x:Key="L.Dash.ModeGlobal">Global</sys:String>
+    <sys:String x:Key="L.Dash.ModeDirect">Direct</sys:String>
+    <sys:String x:Key="L.Dash.CurrentEgress">Egress </sys:String>
+    <sys:String x:Key="L.Dash.ConnectTitle">Connection</sys:String>
+    <sys:String x:Key="L.Dash.ConnectSwitchTip">Flip on to take over traffic, off to release</sys:String>
+    <sys:String x:Key="L.Dash.ConnectHint">Connecting also applies the system proxy; disconnecting releases it. TUN has its own switch below.</sys:String>
+    <sys:String x:Key="L.Dash.NoEgress">no node selected</sys:String>
+    <sys:String x:Key="L.Dash.TunTitle">Virtual NIC (TUN)</sys:String>
+    <sys:String x:Key="L.Dash.TunRestartAdmin">Restart as administrator</sys:String>
+    <sys:String x:Key="L.Dash.SysProxyTitle">System Proxy</sys:String>
+    <sys:String x:Key="L.Dash.SysProxyHint">Writes the proxy into Windows (WinINet) so browsers and other system-aware apps go through TunBox.</sys:String>
+    <sys:String x:Key="L.Dash.QuickSwitch">Quick Egress</sys:String>
+    <sys:String x:Key="L.Dash.QuickSwitchTip">Switch the outbound to the selected node without opening the Proxies page</sys:String>
+    <sys:String x:Key="L.Dash.RateTitle">Live Speed</sys:String>
+    <sys:String x:Key="L.Dash.EgressTitle">Egress Info</sys:String>
+    <sys:String x:Key="L.Dash.EgressIp">Egress IP</sys:String>
+    <sys:String x:Key="L.Dash.Location">Location</sys:String>
+    <sys:String x:Key="L.Dash.Carrier">Carrier</sys:String>
+    <sys:String x:Key="L.Dash.LocalIp">Local IP</sys:String>
+    <sys:String x:Key="L.Dash.CopyIpTip">Click to copy the egress IP</sys:String>
+    <sys:String x:Key="L.Dash.ConnsTitle">Connections</sys:String>
+    <sys:String x:Key="L.Dash.ViewRequests">Open Requests</sys:String>
+    <sys:String x:Key="L.Dash.ViewRequestsTip">Open the Requests page to inspect and close connections</sys:String>
+    <sys:String x:Key="L.Dash.PortsTitle">Ports</sys:String>
+    <sys:String x:Key="L.Dash.PortsFormat">Mixed {0} · HTTP {1} · SOCKS {2} · API {3}</sys:String>
+    <sys:String x:Key="L.Dash.PortsHint">Change them in Settings → Network</sys:String>
+
+    <!-- Proxies -->
+    <sys:String x:Key="L.Proxy.SearchTip">Search nodes by name; combines with the group filter</sys:String>
+    <sys:String x:Key="L.Proxy.TestGroup">Test Group</sys:String>
+    <sys:String x:Key="L.Proxy.TestAll">Test All</sys:String>
+    <sys:String x:Key="L.Proxy.TestGroupTip">Test only the visible nodes; sorted by delay afterwards</sys:String>
+    <sys:String x:Key="L.Proxy.TestAllTip">Test every node, sorting as results arrive</sys:String>
+    <sys:String x:Key="L.Proxy.AllGroups">All Nodes</sys:String>
+    <sys:String x:Key="L.Proxy.Smart">Auto Select</sys:String>
+    <sys:String x:Key="L.Proxy.SmartLabel">Auto Select (core smart picking)</sys:String>
+    <sys:String x:Key="L.Proxy.Sort">Sort</sys:String>
+    <sys:String x:Key="L.Proxy.Sort.Default">Default order</sys:String>
+    <sys:String x:Key="L.Proxy.Sort.Delay">By delay</sys:String>
+    <sys:String x:Key="L.Proxy.Sort.Name">By name</sys:String>
+    <sys:String x:Key="L.Proxy.GroupEmptyNote">No member of "{0}" matched (the provider may have renamed members); showing all nodes instead.</sys:String>
+    <sys:String x:Key="L.Proxy.CountSearch">Search "{0}": {1} / {2} nodes{3}</sys:String>
+    <sys:String x:Key="L.Proxy.CountAll">{0} / {1} nodes{2}</sys:String>
+    <sys:String x:Key="L.Proxy.CardEmpty">No nodes in this profile, or the search matched none.</sys:String>
+
+    <!-- Requests -->
+    <sys:String x:Key="L.Req.SearchTip">Filter by target / process / chain / rule; clear to show all</sys:String>
+    <sys:String x:Key="L.Req.None">No active connections</sys:String>
+    <sys:String x:Key="L.Req.CountFormat">{0} connections</sys:String>
+    <sys:String x:Key="L.Req.Pause">Pause</sys:String>
+    <sys:String x:Key="L.Req.Resume">Resume</sys:String>
+    <sys:String x:Key="L.Req.PauseTip">Pause/resume the table; header speed keeps running</sys:String>
+    <sys:String x:Key="L.Req.CloseAll">Close All</sys:String>
+    <sys:String x:Key="L.Req.CloseAllTip">Ask the core to close every active connection</sys:String>
+    <sys:String x:Key="L.Req.Col.Target">Target</sys:String>
+    <sys:String x:Key="L.Req.Col.Rule">Rule</sys:String>
+    <sys:String x:Key="L.Req.Col.Chain">Chain</sys:String>
+    <sys:String x:Key="L.Req.Col.Process">Process</sys:String>
+    <sys:String x:Key="L.Req.Col.Protocol">Proto</sys:String>
+    <sys:String x:Key="L.Req.Col.UpSpeed">↑ Speed</sys:String>
+    <sys:String x:Key="L.Req.Col.DownSpeed">↓ Speed</sys:String>
+    <sys:String x:Key="L.Req.Col.UpTotal">↑ Total</sys:String>
+    <sys:String x:Key="L.Req.Col.DownTotal">↓ Total</sys:String>
+    <sys:String x:Key="L.Req.Col.Start">Start</sys:String>
+    <sys:String x:Key="L.Req.TrafficTotal">total</sys:String>
+
+    <!-- Profiles -->
+    <sys:String x:Key="L.Profile.CountFormat">{0} profiles · {1} nodes</sys:String>
+    <sys:String x:Key="L.Profile.None">No profiles yet</sys:String>
+    <sys:String x:Key="L.Profile.Import">＋ Import</sys:String>
+    <sys:String x:Key="L.Profile.ImportTip">Import a profile: URL / local yaml file / paste nodes</sys:String>
+    <sys:String x:Key="L.Profile.UpdateAll">Update All</sys:String>
+    <sys:String x:Key="L.Profile.Updating">Updating…</sys:String>
+    <sys:String x:Key="L.Profile.UpdateAllTip">Update every profile in order; one failure doesn't stop the rest</sys:String>
+    <sys:String x:Key="L.Profile.UrlNone">Local import (no URL)</sys:String>
+    <sys:String x:Key="L.Profile.UpdatedNever">Never updated</sys:String>
+    <sys:String x:Key="L.Profile.AutoUpdateTip">Auto-update interval; takes effect immediately</sys:String>
+    <sys:String x:Key="L.Profile.Manual">Manual</sys:String>
+    <sys:String x:Key="L.Profile.Every30">Every 30 min</sys:String>
+    <sys:String x:Key="L.Profile.Hourly">Hourly</sys:String>
+    <sys:String x:Key="L.Profile.Every6">Every 6 h</sys:String>
+    <sys:String x:Key="L.Profile.Every12">Every 12 h</sys:String>
+    <sys:String x:Key="L.Profile.Daily">Daily</sys:String>
+    <sys:String x:Key="L.Profile.UpdateNowTip">Update this profile now</sys:String>
+    <sys:String x:Key="L.Profile.EditTip">Edit profile (name / URL)</sys:String>
+    <sys:String x:Key="L.Profile.DeleteTip">Delete profile</sys:String>
+    <sys:String x:Key="L.Profile.EmptyHint">No profiles yet: click "＋ Import" in the top right — URL, local yaml file, or paste a batch of nodes.</sys:String>
+
+    <!-- Tools -->
+    <sys:String x:Key="L.Tools.NetCheck">Network Check</sys:String>
+    <sys:String x:Key="L.Tools.NetCheckTip">Probes each URL directly and through the local proxy port; unreachable rows tell you where the problem is</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Start">Start</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Stop">Stop</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Col.Url">URL</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Col.Direct">Direct</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Col.Proxy">Via Proxy</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Idle">—</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Running">Testing…</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Timeout">Timeout</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.Fail">Failed</sys:String>
+    <sys:String x:Key="L.Tools.NetCheck.CoreOff">Core not running</sys:String>
+    <sys:String x:Key="L.Tools.Hosts">Hosts</sys:String>
+    <sys:String x:Key="L.Tools.Hosts.Tip">One entry per line: "domain IP" or "domain=IP". Written into the hosts section of the final config.</sys:String>
+    <sys:String x:Key="L.Tools.Hosts.Feedback">{0} entries active.</sys:String>
+    <sys:String x:Key="L.Tools.Hosts.LineBad">Line {0} rejected (use "domain IP" or "domain=IP")</sys:String>
+    <sys:String x:Key="L.Tools.Override">Override</sys:String>
+    <sys:String x:Key="L.Tools.Override.Enable">Enable override (applies to the final generated config)</sys:String>
+    <sys:String x:Key="L.Tools.Override.Merge">Merge override (YAML)</sys:String>
+    <sys:String x:Key="L.Tools.Override.MergeTip">Deep-merged into the final config: maps merge recursively, arrays and scalars are replaced.</sys:String>
+    <sys:String x:Key="L.Tools.Override.Script">Script override (JS)</sys:String>
+    <sys:String x:Key="L.Tools.Override.ScriptTip">function main(config) { ...; return config; } — config is the final config object; 5s timeout.</sys:String>
+    <sys:String x:Key="L.Tools.Override.Save">Save &amp; Apply</sys:String>
+    <sys:String x:Key="L.Tools.Override.SaveTip">Save both override blocks and hot-reload the core</sys:String>
+    <sys:String x:Key="L.Tools.Override.Ok">Override saved and applied to the core.</sys:String>
+    <sys:String x:Key="L.Tools.Override.Warn">Override warning: {0}</sys:String>
+    <sys:String x:Key="L.Tools.Override.Disabled">The override switch is off: saved text will not take effect</sys:String>
+    <sys:String x:Key="L.Tools.Log">Core Log</sys:String>
+    <sys:String x:Key="L.Tools.Log.OpenFile">Open file</sys:String>
+    <sys:String x:Key="L.Tools.Log.Clear">Clear</sys:String>
+    <sys:String x:Key="L.Tools.Log.Empty">No core log yet: the core hasn't run or it was just cleared.</sys:String>
+
+    <!-- Settings -->
+    <sys:String x:Key="L.Set.Section.App">App</sys:String>
+    <sys:String x:Key="L.Set.Section.Network">Network</sys:String>
+    <sys:String x:Key="L.Set.Section.Rules">Routing Rules</sys:String>
+    <sys:String x:Key="L.Set.Section.Kernel">Core</sys:String>
+    <sys:String x:Key="L.Set.Appearance">Appearance</sys:String>
+    <sys:String x:Key="L.Set.AppearanceTip">Follow system / light / dark; applies immediately and is remembered</sys:String>
+    <sys:String x:Key="L.Set.Theme.Auto">Follow system</sys:String>
+    <sys:String x:Key="L.Set.Theme.Light">Light</sys:String>
+    <sys:String x:Key="L.Set.Theme.Dark">Dark</sys:String>
+    <sys:String x:Key="L.Set.Language">Language / 语言</sys:String>
+    <sys:String x:Key="L.Set.LanguageTip">UI language; applies immediately</sys:String>
+    <sys:String x:Key="L.Set.Lang.Auto">Follow system</sys:String>
+    <sys:String x:Key="L.Set.Lang.Zh">简体中文</sys:String>
+    <sys:String x:Key="L.Set.Lang.En">English</sys:String>
+    <sys:String x:Key="L.Set.CloseBehavior">When closing the window</sys:String>
+    <sys:String x:Key="L.Set.CloseBehaviorTip">Remembered immediately, no save needed</sys:String>
+    <sys:String x:Key="L.Set.Close.Ask">Ask every time</sys:String>
+    <sys:String x:Key="L.Set.Close.Tray">Minimize to tray</sys:String>
+    <sys:String x:Key="L.Set.Close.Exit">Exit TunBox</sys:String>
+    <sys:String x:Key="L.Set.AutoStart">Launch at startup</sys:String>
+    <sys:String x:Key="L.Set.SilentStart">Silent start (no main window, stays in tray)</sys:String>
+    <sys:String x:Key="L.Set.SilentStartTip">Applies to both startup and manual launch; reopen from the tray or by running TunBox again</sys:String>
+    <sys:String x:Key="L.Set.Hotkeys">Global Hotkeys</sys:String>
+    <sys:String x:Key="L.Set.HotkeysTip">Click a box then press the combo; Esc clears it. Empty = disabled.</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Show">Show window</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Connect">Connect / Disconnect</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.SysProxy">Toggle system proxy</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Tun">Toggle TUN</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Empty">Not set (click to capture)</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Registered">Hotkey {0} is now active.</sys:String>
+    <sys:String x:Key="L.Set.Hotkey.Taken">Hotkey {0} failed to register (taken by another app?).</sys:String>
+    <sys:String x:Key="L.Set.CheckUpdate">Check updates</sys:String>
+    <sys:String x:Key="L.Set.Update.Checking">Checking for updates…</sys:String>
+    <sys:String x:Key="L.Set.Update.Latest">Up to date (v{0}).</sys:String>
+    <sys:String x:Key="L.Set.Update.Found">New version v{0} found, opening the download page…</sys:String>
+    <sys:String x:Key="L.Set.Update.Fail">Update check failed: cannot reach GitHub. Check your network and try again.</sys:String>
+    <sys:String x:Key="L.Set.MixedPort">Mixed (HTTP+SOCKS)</sys:String>
+    <sys:String x:Key="L.Set.HttpPort">HTTP (0 = off)</sys:String>
+    <sys:String x:Key="L.Set.SocksPort">SOCKS (0 = off)</sys:String>
+    <sys:String x:Key="L.Set.ApiPort">Control API</sys:String>
+    <sys:String x:Key="L.Set.ApiSecret">API secret</sys:String>
+    <sys:String x:Key="L.Set.ApiSecretTip">Bearer secret for external-controller; apply with "Save Settings". Other programs must send it when calling the API</sys:String>
+    <sys:String x:Key="L.Set.TunStack">TUN stack</sys:String>
+    <sys:String x:Key="L.Set.TunStackTip">system is fastest; gvisor has the best compatibility with third-party software; mixed balances both. Save Settings to apply</sys:String>
+    <sys:String x:Key="L.Set.Stack.System">system (recommended)</sys:String>
+    <sys:String x:Key="L.Set.Stack.Gvisor">gvisor (compatible)</sys:String>
+    <sys:String x:Key="L.Set.Stack.Mixed">mixed</sys:String>
+    <sys:String x:Key="L.Set.TunMtu">TUN MTU</sys:String>
+    <sys:String x:Key="L.Set.TunMtuTip">1500 by default; try below 1400 if Wi-Fi / secondary tunnels cause fragmentation</sys:String>
+    <sys:String x:Key="L.Set.TunStrictRoute">Strict route (refuse traffic that bypasses TUN)</sys:String>
+    <sys:String x:Key="L.Set.TunStrictRouteTip">Stronger leak protection; may break LAN tools and VMs</sys:String>
+    <sys:String x:Key="L.Set.TunEinat">Endpoint-independent NAT (UDP)</sys:String>
+    <sys:String x:Key="L.Set.TunEinatTip">Compatibility option for symmetric-NAT UDP; off by default</sys:String>
+    <sys:String x:Key="L.Set.AllowLan">Allow LAN devices to connect</sys:String>
+    <sys:String x:Key="L.Set.Ipv6">Enable IPv6 (resolve and egress)</sys:String>
+    <sys:String x:Key="L.Set.Ipv6Tip">With no v6 uplink it only adds AAAA queries; enable for v6-only sites</sys:String>
+    <sys:String x:Key="L.Set.SysProxyCheck">System proxy (written on connect, removed instantly when off)</sys:String>
+    <sys:String x:Key="L.Set.DnsOverride">DNS override (take over resolving)</sys:String>
+    <sys:String x:Key="L.Set.DnsOverrideTip">Replaces nameservers only; off = built-in (Ali + Tencent DoT)</sys:String>
+    <sys:String x:Key="L.Set.DnsServersTip">One per line: 223.5.5.5, tls://223.5.5.5:853, https://doh.pub/dns-query</sys:String>
+    <sys:String x:Key="L.Set.RulesEnable">Enable routing rules</sys:String>
+    <sys:String x:Key="L.Set.AdRules">Ad blocking (HyperADRules)</sys:String>
+    <sys:String x:Key="L.Set.GeoLib">Rule sets</sys:String>
+    <sys:String x:Key="L.Set.ForceDirect">Force direct sites</sys:String>
+    <sys:String x:Key="L.Set.ForceProxy">Force proxy sites</sys:String>
+    <sys:String x:Key="L.Set.CustomRules">Custom rules</sys:String>
+    <sys:String x:Key="L.Set.CustomRulesTip">One per line: TYPE,value,policy, e.g. DOMAIN-SUFFIX,example.com,REJECT</sys:String>
+    <sys:String x:Key="L.Set.AppRouting">Per-app routing</sys:String>
+    <sys:String x:Key="L.Set.AppRouting.All">All apps follow rules</sys:String>
+    <sys:String x:Key="L.Set.AppRouting.Include">Only selected apps go through proxy</sys:String>
+    <sys:String x:Key="L.Set.AppRouting.Exclude">Selected apps bypass (direct)</sys:String>
+    <sys:String x:Key="L.Set.AppProcessesTip">Process names, comma or newline separated, e.g. ChatGPT.exe, WeChat.exe; or pick from installed apps</sys:String>
+    <sys:String x:Key="L.Set.PickApps">Pick installed apps…</sys:String>
+    <sys:String x:Key="L.Set.PickAppsTip">Scans the Start menu and installed programs; checked ones fill the process list</sys:String>
+    <sys:String x:Key="L.Set.TestUrl">Latency test URL</sys:String>
+    <sys:String x:Key="L.Set.TestUrlTip">cp.cloudflare.com works in CN by default; gstatic-style URLs may fail wholesale</sys:String>
+    <sys:String x:Key="L.Set.LogLevel">Log level</sys:String>
+    <sys:String x:Key="L.Set.LogLevel.Info">info (recommended)</sys:String>
+    <sys:String x:Key="L.Set.LogLevel.Debug">debug (troubleshooting)</sys:String>
+    <sys:String x:Key="L.Set.Sniffer">Domain sniffing (sniffer)</sys:String>
+    <sys:String x:Key="L.Set.SmartGroup">Smart group auto select</sys:String>
+    <sys:String x:Key="L.Set.OpenLog">Open core log</sys:String>
+    <sys:String x:Key="L.Set.ViewConfig">View final config</sys:String>
+    <sys:String x:Key="L.Set.ViewConfigTip">Open the config.yaml the core actually loads (with overrides applied)</sys:String>
+    <sys:String x:Key="L.Set.About">About</sys:String>
+    <sys:String x:Key="L.Set.About.Core">Core version</sys:String>
+    <sys:String x:Key="L.Set.About.Repo">Source code</sys:String>
+    <sys:String x:Key="L.Set.About.CoreUnknown">not running (shown after start)</sys:String>
+
+    <!-- Tray -->
+    <sys:String x:Key="L.Tray.Show">Show Main Window</sys:String>
+    <sys:String x:Key="L.Tray.Exit">Exit TunBox</sys:String>
+    <sys:String x:Key="L.Tray.Connect">Connect</sys:String>
+    <sys:String x:Key="L.Tray.Disconnect">Disconnect</sys:String>
+    <sys:String x:Key="L.Tray.BalloonTitle">TunBox is running in the background</sys:String>
+    <sys:String x:Key="L.Tray.BalloonText">Click the tray icon or run TunBox again to bring back the main window. To quit completely, use "Exit" in the tray menu.</sys:String>
+
+    <!-- Dialogs -->
+    <sys:String x:Key="L.Dlg.Import.Title">Import Profile</sys:String>
+    <sys:String x:Key="L.Dlg.Import.Subtitle">Subscription URL, local config file, or paste node links — any one of them</sys:String>
+    <sys:String x:Key="L.Dlg.Import.UrlLabel">Subscription or node URL</sys:String>
+    <sys:String x:Key="L.Dlg.Import.UrlPlaceholder">https://example.com/api/subscribe?token=…&#x0a;ss://… or vless://… (one per line)</sys:String>
+    <sys:String x:Key="L.Dlg.Import.Or">or</sys:String>
+    <sys:String x:Key="L.Dlg.Import.FileLabel">Local config file (yaml / conf)</sys:String>
+    <sys:String x:Key="L.Dlg.Import.PickFile">Choose file…</sys:String>
+    <sys:String x:Key="L.Dlg.Import.DragHint">You can also drag a file into this window.</sys:String>
+    <sys:String x:Key="L.Dlg.Import.UaHint">Tries mainstream User-Agents (Clash Verge / mihomo …) in order; the panel's raw response is shown on failure.</sys:String>
+    <sys:String x:Key="L.Dlg.Import.Go">Import</sys:String>
+    <sys:String x:Key="L.Dlg.Import.FileTooBig">The file is over 4MB — unlikely to be a subscription config.</sys:String>
+    <sys:String x:Key="L.Dlg.Import.BadExt">Only .yaml / .yml / .conf / .txt files are supported.</sys:String>
+    <sys:String x:Key="L.Dlg.Import.Nothing">Fill in a URL, pick a file, or drag one in first.</sys:String>
+    <sys:String x:Key="L.Dlg.Import.FileFilter">Subscription config (yaml|yml|conf|txt)|*.yaml;*.yml;*.conf;*.txt|All files|*.*</sys:String>
+    <sys:String x:Key="L.Dlg.Edit.Title">Edit Profile</sys:String>
+    <sys:String x:Key="L.Dlg.Edit.Name">Profile name</sys:String>
+    <sys:String x:Key="L.Dlg.Edit.Url">Profile URL (leave empty for local imports)</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Title">Pick Installed Apps</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Subtitle">Check the apps to include in per-app routing; their process names will be filled back into the box</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Search">Search apps…</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.SelectAll">Select all</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.ClearAll">Clear</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Ok">OK</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Scanning">Scanning installed apps…</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.None">No apps found; you can type process names manually instead.</sys:String>
+    <sys:String x:Key="L.Dlg.Picker.Count">{0} apps, {1} checked</sys:String>
+
+    <sys:String x:Key="L.Tip.TestingNode">Testing this node…</sys:String>
+    <sys:String x:Key="L.Tip.TestOne">Click to test just this node ({0}:{1})</sys:String>
+    <sys:String x:Key="L.Tip.SmartSubtitle">Core smart picking · chooses per connection target · {0} candidates</sys:String>
+    <sys:String x:Key="L.Tip.EgressBusy">Querying…</sys:String>
+    <sys:String x:Key="L.Interval.Min30">30 minutes</sys:String>
+    <sys:String x:Key="L.Interval.Hour">1 hour</sys:String>
+    <sys:String x:Key="L.Interval.Hour6">6 hours</sys:String>
+    <sys:String x:Key="L.Interval.Hour12">12 hours</sys:String>
+    <sys:String x:Key="L.Interval.Day">24 hours</sys:String>
+    <sys:String x:Key="L.Interval.MinFormat">{0} minutes</sys:String>
+
+    <!-- Messages (fetched from code via Lang.F) -->
+    <sys:String x:Key="L.Msg.ImportEmpty">Enter a subscription URL or paste a batch of node links first.</sys:String>
+    <sys:String x:Key="L.Msg.ImportFailed">Import failed: {0}</sys:String>
+    <sys:String x:Key="L.Msg.ImportFailedPlain">Import failed</sys:String>
+    <sys:String x:Key="L.Msg.SaveWarn">Note: {0}</sys:String>
+    <sys:String x:Key="L.Msg.ImportParseFail">Parse failed: {0}</sys:String>
+    <sys:String x:Key="L.Msg.CoreDeadTest">Core won't start; cannot test latency</sys:String>
+    <sys:String x:Key="L.Msg.NodeGone">This node is gone from the list; update the profile first.</sys:String>
+    <sys:String x:Key="L.Msg.TestNone">{0}: no node got through. The test URL may be unreachable (changeable in Settings), or the profile expired.</sys:String>
+    <sys:String x:Key="L.Msg.PageEmpty">No nodes to test here.</sys:String>
+    <sys:String x:Key="L.Msg.SmartUnavailable">Auto select is unavailable: it needs at least two nodes and the core's LightGBM model in place.</sys:String>
+    <sys:String x:Key="L.Msg.SmartRejected">The core refused the switch to auto select (the smart group may not be emitted yet); click Connect and retry.</sys:String>
+    <sys:String x:Key="L.Msg.SmartNoTest">Auto select lets the core pick per connection; no test needed. Switch to a group to see candidates' latency.</sys:String>
+    <sys:String x:Key="L.Msg.SwitchRejected">The core refused this switch: {0}</sys:String>
+    <sys:String x:Key="L.Msg.Connected">Started</sys:String>
+    <sys:String x:Key="L.Msg.ConnectFailed">Connect failed</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyBlocked">Core is up, but the system proxy couldn't be written (security software may block it). Set the HTTP proxy 127.0.0.1:{0} manually, or check your antivirus.</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyManual">Couldn't write the system proxy (security software may block it); set the HTTP proxy 127.0.0.1:{0} manually.</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyToggleFail">System proxy switch failed: {0}</sys:String>
+    <sys:String x:Key="L.Msg.PortMixed">Mixed port must be an integer 0-65535 (0 = off)</sys:String>
+    <sys:String x:Key="L.Msg.PortHttp">HTTP port must be an integer 0-65535</sys:String>
+    <sys:String x:Key="L.Msg.PortSocks">SOCKS port must be an integer 0-65535</sys:String>
+    <sys:String x:Key="L.Msg.PortApi">API port must be an integer 1024-65535</sys:String>
+    <sys:String x:Key="L.Msg.TestUrlInvalid">The test URL must be a full http(s) address, or the latency numbers are meaningless.</sys:String>
+    <sys:String x:Key="L.Msg.DnsEmpty">DNS override needs at least one usable server, otherwise the core falls back to its built-in DNS — enter addresses (223.5.5.5, tls://223.5.5.5:853, https://doh.pub/dns-query) or turn the override off.</sys:String>
+    <sys:String x:Key="L.Msg.AutoStartBlocked">Couldn't write autostart: the Run key is blocked by policy or security software.</sys:String>
+    <sys:String x:Key="L.Msg.ElevateNoPath">Can't get the current program path; cannot restart elevated.</sys:String>
+    <sys:String x:Key="L.Msg.ElevateFail">Administrator consent not granted ({0}); TUN stays unavailable.</sys:String>
+    <sys:String x:Key="L.Msg.CoreNotRunning">Core isn't running: nothing to close.</sys:String>
+    <sys:String x:Key="L.Msg.CloseAllRejected">The core refused "close all"; try again shortly.</sys:String>
+    <sys:String x:Key="L.Msg.TimeoutRetry">The core didn't answer in time (timeout); try once more.</sys:String>
+    <sys:String x:Key="L.Msg.StepFailed">Step didn't finish: {0}</sys:String>
+    <sys:String x:Key="L.Msg.UiCrash">UI refresh error: {0} {1}</sys:String>
+    <sys:String x:Key="L.Msg.NoLog">No core log yet: the core hasn't run once.</sys:String>
+    <sys:String x:Key="L.Msg.GeoNothing">Rule sets unchanged, or nothing was downloaded.</sys:String>
+    <sys:String x:Key="L.Msg.ApplyFailed">{0} failed to apply</sys:String>
+    <sys:String x:Key="L.Msg.UpdateFailed">Update failed</sys:String>
+    <sys:String x:Key="L.Msg.AutoUpdateFail">Auto-update "{0}" failed: {1}</sys:String>
+    <sys:String x:Key="L.Msg.AutoUpdateSet">"{0}" will auto-update every {1}.</sys:String>
+    <sys:String x:Key="L.Msg.AutoUpdateOff">"{0}" is now manual-only.</sys:String>
+    <sys:String x:Key="L.Msg.UpdateAllDone">All profiles updated.</sys:String>
+    <sys:String x:Key="L.Msg.UpdateAllPartial">Done: {0} succeeded, {1} failed.</sys:String>
+    <sys:String x:Key="L.Msg.CopyIp">Egress IP copied: {0}</sys:String>
+    <sys:String x:Key="L.Msg.SubNameEmpty">Profile name cannot be empty.</sys:String>
+    <sys:String x:Key="L.Msg.EgressQueryFail">Unavailable: {0}</sys:String>
+    <sys:String x:Key="L.Msg.EgressSameAsLocal">Egress IP equals the local IP — this connection isn't going through the proxy (check rules or switch node)</sys:String>
+    <sys:String x:Key="L.Msg.EgressNeedConnect">Click Connect before querying the egress IP</sys:String>
+    <sys:String x:Key="L.Msg.EgressUpdated">updated {0}</sys:String>
+    <sys:String x:Key="L.Msg.TunOff">Off</sys:String>
+    <sys:String x:Key="L.Msg.TunActive">Taking over</sys:String>
+    <sys:String x:Key="L.Msg.TunPending">Core is creating the NIC…</sys:String>
+    <sys:String x:Key="L.Msg.TunNoRoute">NIC exists but has no default route</sys:String>
+    <sys:String x:Key="L.Msg.TunFailed">NIC didn't come up (see core log)</sys:String>
+    <sys:String x:Key="L.Msg.TunNeedAdmin">Admin required: restart below</sys:String>
+    <sys:String x:Key="L.Msg.TunArmed">On: takes over on Connect</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyOff">Off</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyTaking">Taking over</sys:String>
+    <sys:String x:Key="L.Msg.SysProxyArmed">On: takes over after Connect</sys:String>
+    <sys:String x:Key="L.Msg.LogNoChange">Log unchanged.</sys:String>
+    <sys:String x:Key="L.Msg.NodesOne">1 node</sys:String>
+    <sys:String x:Key="L.Msg.NodesFormat">{0} nodes</sys:String>
+    <sys:String x:Key="L.Msg.CloseAskTray">Minimize to tray and keep running? Yes = tray, No = exit TunBox (processes and core included).</sys:String>
+    <sys:String x:Key="L.Msg.CloseAskExit">Tray is unavailable: closing the window now exits TunBox. Quit?</sys:String>
+    <sys:String x:Key="L.Msg.AlreadyRunning">TunBox is already running (the tray icon may be in the Win11 overflow area).</sys:String>
+    <sys:String x:Key="L.Msg.CrashBox">Unhandled exception (logged to {0}):
+{1}</sys:String>
+    <sys:String x:Key="L.Msg.CrashBoxRepeat">The same exception keeps occurring; no more dialogs. Full log at {0}</sys:String>
+</ResourceDictionary>

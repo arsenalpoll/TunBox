@@ -47,6 +47,9 @@ public sealed class ConnectionManager : IDisposable
     /// <summary>热重载没谈拢时留下的那句话，UI 拿来解释「为什么还要下次连接才生效」。</summary>
     public string? PendingConfigNote { get; private set; }
 
+    /// <summary>本轮配置生成时覆写环节的警告（Merge/Script 没生效的原因）；null = 覆写全部生效。</summary>
+    public string? LastOverrideNote { get; private set; }
+
     private NodeLibrary _lib;
 
     public ConnectionManager(Workspace workspace)
@@ -124,6 +127,32 @@ public sealed class ConnectionManager : IDisposable
         return true;
     }
 
+    /// <summary>设定某条订阅的自动更新间隔（分钟，0 = 手动）。立即落盘，不需要别的「保存」动作。</summary>
+    public bool UpdateSubscriptionAutoUpdate(string id, int minutes)
+    {
+        var sub = _lib.Subscriptions.FirstOrDefault(s => s.Id == id);
+        if (sub == null) return false;
+        sub.AutoUpdateMinutes = Math.Clamp(minutes, 0, 60 * 24 * 7);
+        PersistNodes();
+        return true;
+    }
+
+    /// <summary>
+    /// 到期该自动更新的订阅（对齐 FlClash 的「自动更新」）。间隔来自用户在配置页选的档位；
+    /// UpdatedAtMs 在每次成功拉取时刷新，所以「上次更新 + 间隔 ≤ 现在」就是要拉。
+    /// </summary>
+    public List<Subscription> DueForAutoUpdate(DateTimeOffset now)
+    {
+        var due = new List<Subscription>();
+        foreach (var s in _lib.Subscriptions)
+        {
+            if (s.AutoUpdateMinutes <= 0 || s.Url.Length == 0) continue;
+            var last = DateTimeOffset.FromUnixTimeMilliseconds(s.UpdatedAtMs);
+            if (now - last >= TimeSpan.FromMinutes(s.AutoUpdateMinutes)) due.Add(s);
+        }
+        return due;
+    }
+
     /// <summary>从本地 yaml/yml/txt/conf 文件导入：内容就是订阅原文，名字用文件名。</summary>
     public async Task<bool> ImportFileAsync(string path, CancellationToken ct = default)
     {
@@ -178,7 +207,8 @@ public sealed class ConnectionManager : IDisposable
         }
         try
         {
-            var fetched = await SubscriptionFetcher.FetchAsync(sub.Url, sub.CustomUserAgent, sub.Etag, ct).ConfigureAwait(false);
+            var viaPort = CoreAlive && Settings.MixedPort > 0 ? Settings.MixedPort : 0;
+            var fetched = await SubscriptionFetcher.FetchAsync(sub.Url, sub.CustomUserAgent, sub.Etag, ct, viaPort).ConfigureAwait(false);
             if (fetched.NotModified)
             {
                 sub.UpdatedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -229,7 +259,8 @@ public sealed class ConnectionManager : IDisposable
             var content = input;
             if (isUrl)
             {
-                var fetched = await SubscriptionFetcher.FetchAsync(input, null, "", ct).ConfigureAwait(false);
+                var viaPort = CoreAlive && Settings.MixedPort > 0 ? Settings.MixedPort : 0;
+                var fetched = await SubscriptionFetcher.FetchAsync(input, null, "", ct, viaPort).ConfigureAwait(false);
                 content = fetched.Body;
                 ApplyUserInfo(sub, fetched);
                 sub.Etag = fetched.Etag;
@@ -655,10 +686,13 @@ public sealed class ConnectionManager : IDisposable
         _ws.EnsureSmartModelInPlace();
         // 内核即将启动这一刻没人映射着库文件，把下载好但没换掉的库换上。
         GeoAssets.ApplyPendingSwaps();
-        var generator = ClashConfigGenerator.Generate(_lib.Nodes, _lib.Groups, Settings, _ws.DetectGates(),
+        var generated = ClashConfigGenerator.Generate(_lib.Nodes, _lib.Groups, Settings, _ws.DetectGates(),
             tunOverride: tunForcedOff ? false : null);
         LastDrop = ClashConfigGenerator.LastDropStats;
-        return generator;
+        // 覆写最后上：Merge / Script 都拿「已生成的最终配置」动手，出错就跳过并留下原因。
+        var overridden = ConfigOverride.Apply(generated, Settings);
+        LastOverrideNote = overridden.Note;
+        return overridden.Yaml;
     }
 
     // ── 后台补件（分流库）────────────────────────────────────────────────

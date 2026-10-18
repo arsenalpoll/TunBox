@@ -1,10 +1,14 @@
+using System.Diagnostics;
 using System.IO;
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using TunBox.App;
 using TunBox.Core.Models;
+using TunBox.Core.Services;
 
 namespace TunBox.App;
 
@@ -17,18 +21,29 @@ public partial class MainWindow : Window
     /// <summary>可注入视图模型：默认构造会落到用户真实的 %APPDATA%\TunBox，测试必须能注入。</summary>
     public MainWindow(MainViewModel? viewModel)
     {
-        // 暗色覆盖必须在 InitializeComponent 之前合并：StaticResource 在 XAML 解析时取值。
+        // 先建 VM（注入优先）：主题与语言都按「这一份」设置来，测试注入的设置不能被真实盘上的覆盖。
+        ViewModel = viewModel ?? new MainViewModel();
         try
         {
-            var workspace = new TunBox.Core.Storage.Workspace();
-            var settings = workspace.LoadSettings();
+            var settings = ViewModel.ManagerSettings;
+            // 暗色覆盖必须在 InitializeComponent 之前合并：StaticResource 在 XAML 解析时取值。
             if (ThemeManager.ShouldBeDark(settings.DarkTheme))
                 ThemeManager.ApplyDark(Resources);
         }
         catch { /* 设置读不到就按系统偏好 */ }
         InitializeComponent();
-        ViewModel = viewModel ?? new MainViewModel();
+        // 语言是 DynamicResource，在 InitializeComponent 之后应用也能立即解析。
+        try
+        {
+            Lang.EnsureApplied(Lang.Resolve(ViewModel.ManagerSettings.Language));
+            ViewModel.RefreshLocalizedOptions();   // VM 可能在字典挂上前就构造好了
+        }
+        catch { /* 语言字典挂不上就按默认中文 */ }
         DataContext = ViewModel;
+        // 仪表盘的速率图：采样事件 → 图表（窗口关了要摘掉，VM 比窗口活得久）
+        ViewModel.SpeedSampled += OnSpeedSampled;
+        ViewModel.NavigateRequested += OnNavigateRequested;
+        ViewModel.HotkeysChanged += ReapplyHotkeys;
         try
         {
             // 任务栏/标题栏的大图标从磁盘上的 ico 取：WPF 对多帧 ico 取帧的大小
@@ -43,7 +58,139 @@ public partial class MainWindow : Window
                     new Uri("pack://application:,,,/Assets/tunbox.ico"));
         }
         catch { /* 图标失败不影响功能 */ }
+        RestoreWindowPlacement();
     }
+
+    // ── 速率图与导航 ─────────────────────────────────────────────────────
+
+    /// <summary>速率采样 → 仪表盘速率图（VM 只发事件，不摸控件）。</summary>
+    private void OnSpeedSampled(double up, double down) => RateChart.Push(up, down);
+
+    /// <summary>页内跳转（仪表盘「查看请求」等）→ 翻到对应页签。</summary>
+    private void OnNavigateRequested(string page)
+    {
+        var tab = Shell.Items.OfType<TabItem>().FirstOrDefault(t => (t.Header as string) == page);
+        if (tab != null) tab.IsSelected = true;
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        ViewModel.SpeedSampled -= OnSpeedSampled;
+        ViewModel.NavigateRequested -= OnNavigateRequested;
+        ViewModel.HotkeysChanged -= ReapplyHotkeys;
+        if (_source != null)
+        {
+            _source.RemoveHook(WndProc);
+            Hotkeys.UnregisterAll(_source.Handle);
+            _source = null;
+        }
+        base.OnClosed(e);
+    }
+
+    // ── 全局快捷键 ───────────────────────────────────────────────────────
+
+    private HwndSource? _source;
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        _source = (HwndSource)PresentationSource.FromVisual(this)!;
+        _source.AddHook(WndProc);
+        ReapplyHotkeys();
+    }
+
+    private void ReapplyHotkeys()
+    {
+        if (_source == null) return;
+        var failed = Hotkeys.Apply(_source.Handle, ViewModel.ManagerSettings);
+        if (failed.Count > 0)
+            ViewModel.DetailText = Lang.F("Set.Hotkey.Taken", string.Join(", ", failed));
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg != Hotkeys.WM_HOTKEY) return IntPtr.Zero;
+        handled = true;
+        switch (wParam.ToInt32())
+        {
+            case Hotkeys.IdShow:
+                if (Application.Current is App appShow) appShow.ShowMainWindow();
+                break;
+            case Hotkeys.IdConnect:
+                _ = ViewModel.ToggleConnectCommand.ExecuteAsync(null);
+                break;
+            case Hotkeys.IdTun:
+                ViewModel.TunOn = !ViewModel.TunOn;
+                _ = ViewModel.ApplySwitchAsync();
+                break;
+        }
+        return IntPtr.Zero;
+    }
+
+    /// <summary>设置页的快捷键捕获框：按下的组合键直接成为该槽位的快捷键，Esc 清除。</summary>
+    private void OnHotkeyKeyDown(object sender, KeyEventArgs e)
+    {
+        if (sender is not FrameworkElement { Tag: string slot } box) return;
+        if (e.Key == Key.Escape)
+        {
+            SetHotkeyProperty(slot, "");
+            e.Handled = true;
+            return;
+        }
+        var spec = Hotkeys.FromKeyEvent(e.Key == Key.System ? e.SystemKey : e.Key, Keyboard.Modifiers);
+        if (spec == null) return;   // 纯修饰键：等真正的键
+        SetHotkeyProperty(slot, spec);
+        e.Handled = true;
+    }
+
+    private void SetHotkeyProperty(string slot, string value)
+    {
+        switch (slot)
+        {
+            case "HotkeyShowText": ViewModel.HotkeyShowText = value; break;
+            case "HotkeyConnectText": ViewModel.HotkeyConnectText = value; break;
+            case "HotkeyTunText": ViewModel.HotkeyTunText = value; break;
+        }
+    }
+
+    // ── 窗口位置/尺寸记忆 ────────────────────────────────────────────────
+
+    private void RestoreWindowPlacement()
+    {
+        try
+        {
+            var s = ViewModel.ManagerSettings;
+            if (s.WindowWidth is >= 400 and <= 10000) Width = s.WindowWidth;
+            if (s.WindowHeight is >= 300 and <= 10000) Height = s.WindowHeight;
+            if (s.WindowMaximized) WindowState = WindowState.Maximized;
+            else if (!double.IsNaN(s.WindowLeft) && !double.IsNaN(s.WindowTop))
+            {
+                Left = s.WindowLeft;
+                Top = s.WindowTop;
+            }
+        }
+        catch { /* 记忆坏了就用默认位置 */ }
+    }
+
+    private void SaveWindowPlacement()
+    {
+        try
+        {
+            var s = ViewModel.ManagerSettings;
+            s.WindowMaximized = WindowState == WindowState.Maximized;
+            if (WindowState == WindowState.Normal)
+            {
+                s.WindowWidth = ActualWidth;
+                s.WindowHeight = ActualHeight;
+                s.WindowLeft = Left;
+                s.WindowTop = Top;
+            }
+            ViewModel.SaveSettingsQuiet();
+        }
+        catch { /* 记不上就算了 */ }
+    }
+
+    // ── 页面事件 ─────────────────────────────────────────────────────────
 
     /// <summary>「＋」导入：链接 / 本地文件 / 粘贴节点（对话框里三选一）。</summary>
     private async void OnImportClick(object sender, RoutedEventArgs e)
@@ -58,20 +205,13 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>首页的开关：拨一下就把「保存 + 立刻接管/放手」整条路走完，不用再去点「连接」。</summary>
+    /// <summary>仪表盘的开关：拨一下就把「保存 + 立刻接管/放手」整条路走完。</summary>
     private async void OnToggleApply(object sender, RoutedEventArgs e)
     {
         await ViewModel.ApplySwitchAsync();
     }
 
-    /// <summary>点分组 chip = 按该分组筛选节点。直接调视图模型，不走命令绑定（绑定失败是静默的，踩过）。</summary>
-    private void OnGroupChipClick(object sender, RoutedEventArgs e)
-    {
-        if (sender is FrameworkElement { DataContext: GroupChip chip })
-            ViewModel.SelectGroup(chip);
-    }
-
-    /// <summary>订阅卡上的 ⚡：只测当前页面显示的那一屏节点。</summary>
+    /// <summary>点订阅卡上的测速：只测这张卡当前显示的节点。直接调视图模型，不走命令绑定（绑定失败是静默的，踩过）。</summary>
     private void OnTestSubClick(object sender, RoutedEventArgs e)
     {
         if (sender is FrameworkElement { DataContext: SubscriptionItem item })
@@ -85,7 +225,7 @@ public partial class MainWindow : Window
         var dialog = new EditDialog(item.Name, item.Model.Url) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         var (name, url) = dialog.Values;
-        if (name.Length == 0) { ViewModel.DetailText = "订阅名称不能为空。"; return; }
+        if (name.Length == 0) { ViewModel.DetailText = Lang.T("Msg.SubNameEmpty"); return; }
         ViewModel.EditSubscription(item, name, url);
     }
 
@@ -102,7 +242,7 @@ public partial class MainWindow : Window
         ViewModel.AppProcesses = string.Join(", ", existing.OrderBy(n => n, StringComparer.CurrentCulture));
     }
 
-    /// <summary>页签切换 → 连接页要轮询，别的页不该摊上这份开销。</summary>
+    /// <summary>页签切换 → 连接页/工具页要轮询，别的页不该摊上这份开销。</summary>
     private void OnTabChanged(object sender, SelectionChangedEventArgs e)
     {
         if (sender is TabControl { SelectedItem: TabItem tab })
@@ -110,14 +250,14 @@ public partial class MainWindow : Window
     }
 
     /// <summary>点节点行 = 把出口切到这一行。</summary>
-    private void OnNodeRowClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    private void OnNodeRowClick(object sender, MouseButtonEventArgs e)
     {
         if (sender is FrameworkElement { DataContext: NodeItem item })
             ViewModel.SelectedNode = item;
     }
 
     /// <summary>点延迟数字 = 只测这一个节点。</summary>
-    private void OnLatencyClick(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    private void OnLatencyClick(object sender, MouseButtonEventArgs e)
     {
         if (sender is FrameworkElement { DataContext: NodeItem item })
         {
@@ -145,19 +285,38 @@ public partial class MainWindow : Window
     }
 
     /// <summary>点出口 IP = 复制到剪贴板。测试环境没有剪贴板也无所谓：失败静默。</summary>
-    private void OnCopyEgressIp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    private void OnCopyEgressIp(object sender, MouseButtonEventArgs e)
     {
         var ip = ViewModel.EgressIpText;
         if (ip.Length == 0) return;
-        try { Clipboard.SetText(ip); ViewModel.DetailText = "已复制出口 IP：" + ip; }
+        try { Clipboard.SetText(ip); ViewModel.DetailText = Lang.F("Msg.CopyIp", ip); }
         catch { /* 剪贴板被拦不挡其它流程 */ }
+    }
+
+    /// <summary>工具页清空日志显示（不动磁盘上的文件）。</summary>
+    private void OnClearLogClick(object sender, RoutedEventArgs e) => ViewModel.ClearToolsLog();
+
+    /// <summary>关于页的开源地址。</summary>
+    private void OnOpenRepoClick(object sender, MouseButtonEventArgs e)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "https://" + UpdateChecker.Repo.Replace("github.com/", ""),
+                UseShellExecute = true,
+            });
+        }
+        catch { /* 浏览器打不开就算了 */ }
     }
 
     /// <summary>
     /// 点 X 的去向：问一次并记住，或者按记住的选择走。托盘不可用时不给「缩到托盘」这个选项。
+    /// 顺手把窗口位置/尺寸记住（下次打开还原）。
     /// </summary>
     protected override void OnClosing(CancelEventArgs e)
     {
+        SaveWindowPlacement();
         if (Application.Current is not App app || app.IsExiting)
         {
             base.OnClosing(e);
@@ -169,8 +328,7 @@ public partial class MainWindow : Window
         {
             var allowTray = app.TrayAvailable;
             var result = MessageBox.Show(this,
-                allowTray ? "关闭窗口后缩到系统托盘继续运行吗？\n\n「是」= 缩到托盘，「否」= 退出 TunBox，进程和内核都结束。"
-                          : "系统托盘不可用：现在关闭窗口就会退出 TunBox。确定退出吗？",
+                allowTray ? Lang.T("Msg.CloseAskTray") : Lang.T("Msg.CloseAskExit"),
                 "TunBox", MessageBoxButton.YesNo, MessageBoxImage.Question);
             choice = result == MessageBoxResult.Yes ? (allowTray ? "tray" : "exit") : "cancel";
             if (choice == "cancel") return;

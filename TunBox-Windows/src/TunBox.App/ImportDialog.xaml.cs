@@ -34,6 +34,7 @@ public partial class ImportDialog : Window
     public ImportDialog()
     {
         InitializeComponent();
+        Lang.EnsureApplied(Lang.Resolve(new TunBox.Core.Storage.Workspace().LoadSettings().Language));
         Loaded += (_, _) =>
         {
             DialogFit.ToOwner(this);
@@ -48,12 +49,12 @@ public partial class ImportDialog : Window
     {
         var dialog = new Microsoft.Win32.OpenFileDialog
         {
-            Filter = "订阅配置 (yaml|yml|conf|txt)|*.yaml;*.yml;*.conf;*.txt|所有文件|*.*",
+            Filter = Lang.T("Dlg.Import.FileFilter"),
         };
         if (dialog.ShowDialog(this) != true) return;
         if (new FileInfo(dialog.FileName).Length > 4_000_000)
         {
-            MessageBox.Show(this, "文件超过 4MB，不像订阅配置。", "TunBox", MessageBoxButton.OK, MessageBoxImage.Warning);
+            MessageBox.Show(this, Lang.T("Dlg.Import.FileTooBig"), "TunBox", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
         _pickedFile = dialog.FileName;
@@ -71,7 +72,7 @@ public partial class ImportDialog : Window
                 && !path.EndsWith(".conf", StringComparison.OrdinalIgnoreCase)
                 && !path.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
             {
-                MessageBox.Show(this, "只支持 .yaml / .yml / .conf / .txt 文件。", "TunBox",
+                MessageBox.Show(this, Lang.T("Dlg.Import.BadExt"), "TunBox",
                     MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
@@ -94,7 +95,7 @@ public partial class ImportDialog : Window
         }
         else
         {
-            MessageBox.Show(this, "先填订阅链接（或节点链接），选一个文件，或把文件拖进来。", "TunBox",
+            MessageBox.Show(this, Lang.T("Dlg.Import.Nothing"), "TunBox",
                 MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }

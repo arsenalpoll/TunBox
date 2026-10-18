@@ -1,23 +1,28 @@
 /**
- * Nexus 速率折线 —— 对齐开发文档 §4.2
- * 归一化坐标系（基线 46/52，振幅 36/52，26 点滑动窗口），按组件实测宽高缩放，
- * 平板等宽屏下折线铺满全宽，不再只占左半边。
+ * 首页实时速率曲线 —— 对齐《TunBox-UI重构笔记》§3.1「实时速率波动波浪」
+ *
+ * 归一化坐标系（基线 46/52，振幅 36/52，26 点滑动窗口），按组件实测宽高缩放；
+ * 配色改为文档色板：曲线品牌蓝 #0A59F7，面积品牌蓝弱化填充。
  */
-import { Nx, NexusSizes } from '../theme/NexusTokens';
+import { TunBoxColors } from '../theme/TunBoxTokens';
+import { ThemeService } from '../theme/ThemeService';
+import { NexusSizes } from '../theme/NexusTokens';
 
 @Component
 export struct RateChart {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @Prop points: number[] = [];
   @Prop isConnected: boolean = false;
   @State private chartW: number = NexusSizes.rateChartW;
   @State private chartH: number = NexusSizes.rateChartH;
 
   private lineColor(): ResourceColor {
-    return this.isConnected ? Nx.success() : Nx.accent();
+    return TunBoxColors.primary;
   }
 
   private areaColor(): ResourceColor {
-    return this.isConnected ? 'rgba(16, 185, 129, 0.10)' : Nx.areaBlue();
+    const rgb = ThemeService.isDark() ? '59, 130, 246' : '10, 89, 247';
+    return this.isConnected ? `rgba(${rgb}, 0.14)` : `rgba(${rgb}, 0.08)`;
   }
 
   private baseRatio(): number {
@@ -66,7 +71,7 @@ export struct RateChart {
         .fill(Color.Transparent)
     }
     .width('100%')
-    .height(52)
+    .height(48)
     .onAreaChange((_old: Area, cur: Area) => {
       const w = Number(cur.width);
       const h = Number(cur.height);

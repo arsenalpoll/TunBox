@@ -1,6 +1,8 @@
 import { router, promptAction } from '@kit.ArkUI';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { Ui } from '../theme/UiTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
+import { TopNavBar } from '../components/TopNavBar';
 import { AppSettings } from '../commons/models/AppSettings';
 import { AppRoutingCustomApp, AppRoutingPolicy } from '../commons/services/AppRoutingPolicy';
 import { SettingsService } from '../commons/services/SettingsService';
@@ -50,6 +52,7 @@ struct RoutingInputDialog {
 @Entry
 @Component
 struct AppRoutingPage {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @State mode: string = 'all';
   @State included: string[] = [];
   @State excluded: string[] = [];
@@ -70,7 +73,8 @@ struct AppRoutingPage {
     autoCancel: false
   });
 
-  aboutToAppear(): void { this.load(); }
+  // 入场转场期间不抢 UI 线程：读配置延到转场之后（2026-10-17 用户反馈进入页面卡顿）
+  aboutToAppear(): void { setTimeout((): void => { this.load(); }, 240); }
 
   private async load(): Promise<void> {
     try {
@@ -257,119 +261,176 @@ struct AppRoutingPage {
 
   onBackPress(): boolean { this.back(); return true; }
 
+  /** 应用图标底色：按 bundleName 稳定哈希从文档 §1.1 色板的浅色底里固定取一。
+   * 三个浅色底均为设计令牌（深色模式有对应派生值），取色确定、与勾选态无关。 */
+  private iconBg(name: string): ResourceColor {
+    let hash: number = 0;
+    for (let i = 0; i < name.length; i++) {
+      hash = (hash * 31 + name.charCodeAt(i)) % 9973;
+    }
+    const palette: ResourceColor[] = [
+      TunBoxColors.primaryLight,
+      TunBoxColors.successLight,
+      TunBoxColors.dangerLight
+    ];
+    return palette[hash % palette.length];
+  }
+
+  /** 三段模式条分段（文档 §3.3：选中块 surfaceCard 底 / 圆角 8 / primary Bold；模式值与判定逻辑不变） */
   @Builder
   ModeChip(mode: string, label: string) {
-    Text(label).fontSize(13).fontWeight(this.mode === mode ? FontWeight.Bold : FontWeight.Normal)
-      .fontColor(this.mode === mode ? Ui.textBlue : Ui.textSecondary)
-      .padding({ top: 12, bottom: 12 }).layoutWeight(1).textAlign(TextAlign.Center).borderRadius(13)
-      .backgroundColor(this.mode === mode ? Ui.selectedBackground : Color.Transparent)
+    Text(label).fontSize(13)
+      .fontWeight(this.mode === mode ? FontWeight.Bold : FontWeight.Normal)
+      .fontColor(this.mode === mode ? TunBoxColors.primary : TunBoxColors.textSecondary)
+      .padding({ top: 8, bottom: 8 }).layoutWeight(1).textAlign(TextAlign.Center).borderRadius(8)
+      .backgroundColor(this.mode === mode ? TunBoxColors.surfaceCard : Color.Transparent)
       .onClick(() => this.selectMode(mode))
   }
 
+  /** 路由推入式子页统一转场：水平滑动 + 淡入淡出（与页签切换同规格，见 TunBoxMotion） */
+  pageTransition() {
+    PageTransitionEnter({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: TunBoxMotion.slidePercent, y: 0 }).opacity(0)
+    PageTransitionExit({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: `-${TunBoxMotion.slidePercent}`, y: 0 }).opacity(0)
+  }
+
   build() {
-    Stack() {
-      Column().width('100%').height('100%').linearGradient({ angle: 135, colors: Ui.backdropColors })
+    Stack({ alignContent: Alignment.Bottom }) {
+      // 底层背景列（文档 §1：系统全局底色，深浅色经 TunBoxColors 解析；不再用渐变/玻璃底）
+      Column().width('100%').height('100%').linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      Column({ space: 12 }) {
-        Row() {
-          Text('‹').fontSize(30).fontColor(Ui.textPrimary).padding({ left: 8, right: 18 }).onClick(() => this.back())
-          Text('应用分流').fontSize(20).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-          Blank()
-          Button(this.busy ? '请稍候' : '保存').fontSize(14)
-            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
-            .enabled(this.ready && !this.busy && this.dirty)
-            .onClick(() => this.save())
-        }.width('100%').height(50)
-        Row({ space: 4 }) {
-          this.ModeChip('all', '所有应用')
-          this.ModeChip('exclude', '排除所选')
-          this.ModeChip('include', '仅限所选')
-        }.width('100%').padding(4).borderRadius(17).backgroundColor(Ui.inputBackground).enabled(this.ready && !this.busy)
-        Column({ space: 7 }) {
-          Text(this.needsReview ? '旧名单存在冲突，请先明确选择一种模式'
-            : this.mode === 'all' ? '所有应用进入 VPN'
-            : `${this.mode === 'include' ? '仅接管' : '已排除'} ${this.current().length} 个应用`)
-            .fontSize(16).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary).width('100%')
-          Text(this.mode === 'all' ? '两份名单仍保留，但当前均不启用。'
-            : this.mode === 'include' ? '仅所选应用进入 VPN，其余应用直接联网。' : '所选应用直接联网，其余应用进入 VPN。')
-            .fontSize(12).fontColor(Ui.textSecondary).width('100%')
-          Text('进入 VPN 后仍按规则 / 全局模式处理，不代表强制走代理节点。')
-            .fontSize(11).fontColor(Ui.textTertiary).width('100%')
-        }.width('100%').padding(16).borderRadius(20)
-          .backgroundColor(Ui.surfaceTranslucent)
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-          })
-          .backgroundEffect({
-            radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
-          })
-          .borderWidth(1).borderColor(Ui.glassEdge)
-          .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
-        Text('当前 SDK 不支持读取完整安装列表。以下是常用目录与手动名单，不代表本机已安装；字形为名称标识，并非应用图标。')
-          .fontSize(11).fontColor(Ui.textTertiary).width('100%')
-        TextInput({ text: this.query, placeholder: '搜索名称或鸿蒙包名' })
-          .fontColor(Ui.textPrimary).backgroundColor(Ui.inputBackground).height(42)
-          .onChange((v: string) => { this.query = v; this.rebuild(); })
-        Row({ space: 12 }) {
-          Text(this.selectedOnly ? `已选择 (${this.current().length}) ▾` : `可用目录 (${this.rows.length}) ▾`)
-            .fontColor(Ui.textBlue).fontSize(13).onClick(() => { this.selectedOnly = !this.selectedOnly; this.rebuild(); })
-          Blank()
-          Text(this.nameSort ? '名称排序' : '已选置顶').fontSize(12).fontColor(Ui.textSecondary)
-            .onClick(() => { this.nameSort = !this.nameSort; this.rebuild(); })
-        }.width('100%')
-        List({ space: 8 }) {
-          ForEach(this.rows, (row: RoutingRow) => {
-            ListItem() {
-              Row({ space: 12 }) {
-                Text(row.label.substring(0, 1)).fontSize(20).fontColor(Ui.textBlue)
-                  .width(42).height(42).textAlign(TextAlign.Center).borderRadius(13).backgroundColor(Ui.selectedBackground)
-                Column({ space: 4 }) {
-                  Text(row.label).fontSize(15).fontWeight(FontWeight.Medium).fontColor(Ui.textPrimary).maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  Text(row.bundleName).fontSize(11).fontColor(Ui.textSecondary).maxLines(2).wordBreak(WordBreak.BREAK_ALL)
-                  Text(row.source).fontSize(10).fontColor(Ui.textTertiary)
-                  Text('移除条目').fontSize(11).fontColor(Ui.textBlue)
-                    .padding({ top: 5, bottom: 5 }).onClick(() => this.removeEntry(row.bundleName))
-                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                Checkbox({ name: row.bundleName }).select(row.selected).selectedColor(Ui.primaryBlueFill)
-                  .enabled(this.mode !== 'all' && !this.busy).onChange((checked: boolean) => {
-                    // guard 必须查实时名单状态（rebuild 每次 new 新 row 对象，
-                    // ForEach 复用组件时闭包捕获的可能是旧对象）
-                    if (checked !== this.current().includes(row.bundleName)) { this.toggle(row.bundleName); }
-                  })
-              }.width('100%').padding(12).borderRadius(18)
-                .backgroundColor(Ui.surfaceTranslucent)
-                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-                  colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-                })
-                .backgroundEffect({
-                  radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
-                })
-                .borderWidth(1).borderColor(Ui.glassEdge)
-                .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
-            }
-          }, (row: RoutingRow) => `${row.bundleName}:${row.selected}`)
-          if (this.rows.length === 0) {
-            ListItem() { Text('没有匹配项，可手动添加鸿蒙包名。').fontColor(Ui.textSecondary).padding(22) }
+      Column() {
+        // 顶部导航（文档 §2.1）：返回接既有 back()（含未保存草稿确认），rightSlot 承载既有「保存」按钮
+        TopNavBar({ title: '应用分流', hasBack: true, onBack: (): void => { this.back(); } }) {
+          Row({ space: 8 }) {
+            Button(this.busy ? '请稍候' : '保存').fontSize(14)
+              .backgroundColor(TunBoxColors.primary).fontColor(TunBoxColors.textOnPrimary)
+              .borderRadius(TunBoxGeometry.controlRadius)
+              .enabled(this.ready && !this.busy && this.dirty)
+              .onClick(() => { this.save(); })
           }
-        }.width('100%').layoutWeight(1).scrollBar(BarState.Auto)
-        if (this.resultText.length > 0) { Text(this.resultText).fontSize(12).fontColor(Ui.textBlue).width('100%') }
-        Row({ space: 8 }) {
-          Button('＋ 添加 / 导入').fontSize(12).layoutWeight(2)
-            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
+        }
+        Column({ space: 12 }) {
+          // 三段分流模式条（文档 §3.3：整条 92% 宽 / controlTrackSoft 轨道 / 圆角 12 / padding 4；
+          // 模式值 'all' | 'exclude' | 'include'、判定与保存格式全部沿用既有实现，只替换标签文案）
+          Row({ space: 4 }) {
+            this.ModeChip('all', '全部代理')
+            this.ModeChip('exclude', '排除所选 (分流直连)')
+            this.ModeChip('include', '仅限所选')
+          }.width('92%').padding(4).borderRadius(12).backgroundColor(TunBoxColors.controlTrackSoft)
+            .alignSelf(ItemAlign.Center)
+            .enabled(this.ready && !this.busy)
+          // 既有模式说明卡（文案与判定不变；视觉换成描边卡配方，去掉玻璃/模糊/backgroundEffect/阴影）
+          Column({ space: 7 }) {
+            Text(this.needsReview ? '旧名单存在冲突，请先明确选择一种模式'
+              : this.mode === 'all' ? '所有应用进入 VPN'
+              : `${this.mode === 'include' ? '仅接管' : '已排除'} ${this.current().length} 个应用`)
+              .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).width('100%')
+            Text(this.mode === 'all' ? '两份名单仍保留，但当前均不启用。'
+              : this.mode === 'include' ? '仅所选应用进入 VPN，其余应用直接联网。' : '所选应用直接联网，其余应用进入 VPN。')
+              .fontSize(12).fontColor(TunBoxColors.textSecondary).width('100%')
+            Text('进入 VPN 后仍按规则 / 全局模式处理，不代表强制走代理节点。')
+              .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+          }.width('100%').padding(16).borderRadius(TunBoxGeometry.cardRadiusSmall)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+          Text('当前 SDK 不支持读取完整安装列表。以下是常用目录与手动名单，不代表本机已安装；字形为名称标识，并非应用图标。')
+            .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+          // 搜索框（文档 §3.3：高 42 / surfaceCard 底 / 圆角 14 / 描边 cardBorder / 前置 ic_search 16 textMuted；
+          // 搜索过滤逻辑不变）
+          Row({ space: 8 }) {
+            Image($r('app.media.ic_search')).width(16).height(16).fillColor(TunBoxColors.textMuted)
+            TextInput({ text: this.query, placeholder: '搜索应用名称或鸿蒙包名 (BundleName)...' })
+              .fontSize(14).fontColor(TunBoxColors.textPrimary).placeholderColor(TunBoxColors.textMuted)
+              .backgroundColor(Color.Transparent).padding(0).height('100%').layoutWeight(1)
+              .onChange((v: string) => { this.query = v; this.rebuild(); })
+          }.width('100%').height(42).padding({ left: 12, right: 12 })
+            .backgroundColor(TunBoxColors.surfaceCard).borderRadius(TunBoxGeometry.controlRadius)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+          // 既有过滤行（切换逻辑不变；'▾' 文字符号去掉）
+          Row({ space: 12 }) {
+            Text(this.selectedOnly ? `已选择 (${this.current().length})` : `可用目录 (${this.rows.length})`)
+              .fontColor(TunBoxColors.primary).fontSize(13)
+              .onClick(() => { this.selectedOnly = !this.selectedOnly; this.rebuild(); })
+            Blank()
+            Text(this.nameSort ? '名称排序' : '已选置顶').fontSize(12).fontColor(TunBoxColors.textSecondary)
+              .onClick(() => { this.nameSort = !this.nameSort; this.rebuild(); })
+          }.width('100%')
+          // 应用行（文档 §3.3：44 方形首字图标 / 应用名 15 Bold + 类别来源 chip /
+          // bundleName 11 textMuted 单行省略 / 右侧 Checkbox select 色 primary；
+          // 勾选 guard、移除条目入口、ForEach 键均沿用既有实现）
+          List({ space: 10 }) {
+            ForEach(this.rows, (row: RoutingRow) => {
+              ListItem() {
+                Row({ space: 12 }) {
+                  Text(row.label.substring(0, 1)).fontSize(17).fontWeight(FontWeight.Bold)
+                    .fontColor(TunBoxColors.primary)
+                    .width(44).height(44).textAlign(TextAlign.Center).borderRadius(12)
+                    .backgroundColor(this.iconBg(row.bundleName))
+                  Column({ space: 4 }) {
+                    Row({ space: 6 }) {
+                      Text(row.label).fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+                      Text(row.source).fontSize(10).fontColor(TunBoxColors.textSecondary).maxLines(1)
+                        .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                        .backgroundColor(TunBoxColors.chipBg).borderRadius(4)
+                    }.width('100%')
+                    Text(row.bundleName).fontSize(11).fontColor(TunBoxColors.textMuted).maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
+                    Text('移除条目').fontSize(11).fontColor(TunBoxColors.primary)
+                      .padding({ top: 5, bottom: 5 }).onClick(() => this.removeEntry(row.bundleName))
+                  }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                  Checkbox({ name: row.bundleName }).select(row.selected).selectedColor(TunBoxColors.primary)
+                    .enabled(this.mode !== 'all' && !this.busy).onChange((checked: boolean) => {
+                      // guard 必须查实时名单状态（rebuild 每次 new 新 row 对象，
+                      // ForEach 复用组件时闭包捕获的可能是旧对象）
+                      if (checked !== this.current().includes(row.bundleName)) { this.toggle(row.bundleName); }
+                    })
+                }.width('100%').padding(14).borderRadius(18)
+                  .backgroundColor(TunBoxColors.surfaceCard)
+                  .border({ width: 1, color: TunBoxColors.cardBorder })
+              }
+            }, (row: RoutingRow) => `${row.bundleName}:${row.selected}`)
+            if (this.rows.length === 0) {
+              ListItem() { Text('没有匹配项，可手动添加鸿蒙包名。').fontSize(13).fontColor(TunBoxColors.textSecondary).padding(22) }
+            }
+          }.width('100%').layoutWeight(1).scrollBar(BarState.Auto)
+          if (this.resultText.length > 0) { Text(this.resultText).fontSize(12).fontColor(TunBoxColors.primary).width('100%') }
+        }.width('100%').layoutWeight(1).padding({
+          left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8
+        }).width('100%')
+        // 底部固定操作 Dock（文档 §3.3）：既有辅助行保留在主按钮上方（11~12 字号）；
+        // 按钮回调与可用条件（ready && !busy && mode !== 'all'）不变
+        Column({ space: 8 }) {
+          Row({ space: 16 }) {
+            Text('全选当前结果').fontSize(12).fontColor(TunBoxColors.primary).onClick(() => this.selectVisible(true))
+            Text('取消当前结果').fontSize(12).fontColor(TunBoxColors.textSecondary).onClick(() => this.selectVisible(false))
+            Blank()
+            Text(this.dirty ? '草稿未保存' : '无未保存更改').fontSize(11).fontColor(TunBoxColors.textMuted)
+          }.width('100%').enabled(this.ready && !this.busy && this.mode !== 'all')
+          Row({ space: 12 }) {
+            Button() {
+              Row({ space: 6 }) {
+                Image($r('app.media.ic_plus')).width(16).height(16).fillColor(TunBoxColors.textOnPrimary)
+                Text('添加/导入应用').fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textOnPrimary)
+              }
+            }
+            .layoutWeight(1).height(46).backgroundColor(TunBoxColors.primary)
+            .borderRadius(TunBoxGeometry.controlRadius)
             .onClick(() => this.inputDialog.open())
-          Button('导出').fontSize(12).layoutWeight(1)
-            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
-            .onClick(() => this.exportList())
-        }.width('100%').enabled(this.ready && !this.busy && this.mode !== 'all')
-        Row({ space: 16 }) {
-          Text('全选当前结果').fontSize(12).fontColor(Ui.textBlue).onClick(() => this.selectVisible(true))
-          Text('取消当前结果').fontSize(12).fontColor(Ui.textSecondary).onClick(() => this.selectVisible(false))
-          Blank()
-          Text(this.dirty ? '草稿未保存' : '无未保存更改').fontSize(10).fontColor(Ui.textTertiary)
-        }.width('100%').enabled(this.ready && !this.busy && this.mode !== 'all')
-      }.width('100%').height('100%').padding({ left: 18, right: 18, top: 8, bottom: 16 })
-        .constraintSize({ maxWidth: Ui.pageMaxWidth })
+            Button('导出规则').height(46).padding({ left: 20, right: 20 })
+              .fontSize(14).fontWeight(FontWeight.Medium)
+              .fontColor(TunBoxColors.primary).backgroundColor(TunBoxColors.primaryLight)
+              .borderRadius(TunBoxGeometry.controlRadius)
+              .onClick(() => this.exportList())
+          }.width('100%').enabled(this.ready && !this.busy && this.mode !== 'all')
+        }.width('100%').padding({
+          left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 10, bottom: 24
+        }).backgroundColor(TunBoxColors.surfaceCard)
+          .border({ width: { top: 1 }, color: TunBoxColors.cardBorder })
+          .width('100%')
+      }.width('100%').height('100%')
     }.width('100%').height('100%')
   }
 }
