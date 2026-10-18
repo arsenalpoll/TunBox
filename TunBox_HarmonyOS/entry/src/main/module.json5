@@ -19,6 +19,8 @@
     "requestPermissions": [
       { "name": "ohos.permission.INTERNET" },
       { "name": "ohos.permission.GET_NETWORK_INFO" },
+      // 启动按钮按下触觉反馈（CelestialPowerOrb）：system_grant 普通权限，安装即授予
+      { "name": "ohos.permission.VIBRATE" },
       { "name": "ohos.permission.KEEP_BACKGROUND_RUNNING", "reason": "$string:bg_task_reason", "usedScene": { "abilities": ["EntryAbility", "VpnExtensionAbility"], "when": "inuse" } }
       // 权限最小化（2026-10-07 评审）：GET_BUNDLE_INFO 已移除 —— 唯一消费方 AppInfo 使用
       // bundleManager.getBundleInfoForSelfSync 读取自身版本号（官方未标注需要权限，官方示例均不声明）。

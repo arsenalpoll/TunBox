@@ -426,7 +426,8 @@ export class ClashApiService {
   /** 切换运行时代理模式（全局/规则）：PUT /configs（mihomo 中 PUT 与 PATCH 同为 updateConfigs） */
   async setMode(mode: string): Promise<boolean> {
     const payload: Record<string, string> = {};
-    payload['mode'] = mode === 'global' ? 'global' : 'rule';
+    // mihomo 原生支持 mode: rule / global / direct（2026-10-17 用户要求主页提供直连按钮）
+    payload['mode'] = (mode === 'global' || mode === 'direct') ? mode : 'rule';
     return this.putConfigs(payload, 'setMode');
   }
 

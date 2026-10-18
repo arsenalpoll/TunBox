@@ -1,6 +1,8 @@
 import { router, promptAction } from '@kit.ArkUI';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { Ui } from '../theme/UiTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
+import { TopNavBar } from '../components/TopNavBar';
 import { SettingsService } from '../commons/services/SettingsService';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { SiteRoutingPolicy } from '../commons/services/SiteRoutingPolicy';
@@ -39,6 +41,7 @@ struct SiteInputDialog {
 @Entry
 @Component
 struct SiteRoutingPage {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @State kind: string = 'proxy';
   @State proxy: string[] = [];
   @State direct: string[] = [];
@@ -61,7 +64,8 @@ struct SiteRoutingPage {
     builder: SiteInputDialog({ onAdd: (text: string): boolean => this.add(text) }), autoCancel: false
   });
 
-  aboutToAppear(): void { this.load(); }
+  // 入场转场期间不抢 UI 线程：读配置延到转场之后（2026-10-17 用户反馈进入页面卡顿）
+  aboutToAppear(): void { setTimeout((): void => { this.load(); }, 240); }
   private async load(): Promise<void> {
     try {
       const params = router.getParams() as SitePageParams;
@@ -197,108 +201,162 @@ struct SiteRoutingPage {
   }
   onBackPress(): boolean { this.back(); return true; }
 
+  /** 三态策略胶囊（文档 §3.5：圆点 + 数量；选中 primaryLight 底 + primary 加粗，
+   * 未选中 surfaceSubtle 底 + textSecondary；kind 值与判定逻辑不变） */
   @Builder
   KindChip(kind: string, label: string, count: number) {
-    Text(`${label} ${count}`).fontSize(13).fontWeight(FontWeight.Medium).layoutWeight(1)
-      .textAlign(TextAlign.Center).padding({ top: 12, bottom: 12 }).borderRadius(14)
-      .fontColor(this.kind === kind ? Ui.textBlue : Ui.textSecondary)
-      .backgroundColor(this.kind === kind ? Ui.selectedBackground : Color.Transparent).onClick(() => this.switchKind(kind))
+    Row({ space: 6 }) {
+      Circle({ width: 6, height: 6 })
+        .fill(kind === 'direct' ? TunBoxColors.success : kind === 'block' ? TunBoxColors.danger : TunBoxColors.primary)
+      Text(`${label} ${count}`).fontSize(12)
+        .fontWeight(this.kind === kind ? FontWeight.Bold : FontWeight.Normal)
+        .fontColor(this.kind === kind ? TunBoxColors.primary : TunBoxColors.textSecondary)
+    }
+    .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+    .borderRadius(12)
+    .backgroundColor(this.kind === kind ? TunBoxColors.primaryLight : TunBoxColors.surfaceSubtle)
+    .onClick(() => this.switchKind(kind))
   }
+
+  /** 路由推入式子页统一转场：水平滑动 + 淡入淡出（与页签切换同规格，见 TunBoxMotion） */
+  pageTransition() {
+    PageTransitionEnter({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: TunBoxMotion.slidePercent, y: 0 }).opacity(0)
+    PageTransitionExit({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: `-${TunBoxMotion.slidePercent}`, y: 0 }).opacity(0)
+  }
+
   build() {
-    Stack() {
-      Column().width('100%').height('100%').linearGradient({ angle: 135, colors: Ui.backdropColors })
+    Stack({ alignContent: Alignment.Bottom }) {
+      // 底层背景列（文档 §1：系统全局底色，深浅色经 TunBoxColors 解析；不再用渐变/玻璃底）
+      Column().width('100%').height('100%').linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      Column({ space: 12 }) {
-        Row() {
-          Text('‹').fontSize(30).fontColor(Ui.textPrimary).padding({ left: 8, right: 18 }).onClick(() => this.back())
-          Text('网站分流').fontSize(20).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-          Blank()
-          Button(this.busy ? '请稍候' : '保存').fontSize(14)
-            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
-            .enabled(this.ready && !this.busy && this.dirty).onClick(() => this.save())
-        }.height(50).width('100%')
-        Row({ space: 4 }) {
-          this.KindChip('proxy', '强制代理', this.proxy.length)
-          this.KindChip('direct', '强制直连', this.direct.length)
-          this.KindChip('block', '强制拦截', this.block.length)
-        }.padding(4).width('100%').borderRadius(17).backgroundColor(Ui.inputBackground).enabled(this.ready && !this.busy)
-        Column({ space: 6 }) {
-          Text(this.kind === 'direct' ? '以下网站使用直连策略'
-            : this.kind === 'block' ? '以下网站将被拦截（DNS 层拒绝）' : '以下网站使用代理策略')
-            .fontSize(16).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-          Text(this.kind === 'block'
-            ? '拦截名单在 DNS 解析层直接拒绝这些域名（含子域名），不建立连接。与代理/直连名单互斥，同名冲突需移除一侧。'
-            : '三份名单同时生效，切换标签不会关闭其他两份。规则匹配域名及子域名；同名冲突需移除一侧。绕过 VPN 的应用不受此设置影响。')
-            .fontSize(12).fontColor(Ui.textSecondary)
-          Text('勾选仅用于批量操作，不是启用开关。网站规则位于广告 / 自定义规则之后；网站名单之间重叠时直连优先。')
-            .fontSize(11).fontColor(Ui.textTertiary)
-        }.width('100%').padding(16).alignItems(HorizontalAlign.Start).borderRadius(20)
-          .backgroundColor(Ui.surfaceTranslucent)
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-          })
-          .backgroundEffect({
-            radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
-          })
-          .borderWidth(1).borderColor(Ui.glassEdge)
-          .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
-        TextInput({ text: this.query, placeholder: '搜索域名' }).height(42).fontColor(Ui.textPrimary).backgroundColor(Ui.inputBackground)
-          .onChange((value: string) => { this.query = value; this.rebuild(); })
-        Row() {
-          Text(this.selectedOnly ? `已勾选 ${this.selected.length} ▾` : `当前名单 ${this.current().length} ▾`).fontSize(13).fontColor(Ui.textBlue)
-            .onClick(() => { this.selectedOnly = !this.selectedOnly; this.rebuild(); })
-          Blank()
-          Text(this.alphabetical ? '域名排序' : '已选置顶').fontSize(12).fontColor(Ui.textSecondary)
-            .onClick(() => { this.alphabetical = !this.alphabetical; this.rebuild(); })
-        }.width('100%')
-        List({ space: 8 }) {
-          ForEach(this.visible, (domain: string) => {
-            ListItem() {
-              Row({ space: 10 }) {
-                Text(this.kind === 'direct' ? '↘' : '↗').fontSize(20).fontColor(Ui.textBlue)
-                Column({ space: 4 }) {
-                  Text(domain || '（空域名）').fontSize(15).fontColor(Ui.textPrimary).wordBreak(WordBreak.BREAK_ALL)
-                  if (this.other().includes(domain) || SiteRoutingPolicy.domainError(domain).length > 0) {
-                    Text(this.other().includes(domain) ? '两份名单重复，请移除一侧' : '格式无效，请移除后重新添加').fontSize(11).fontColor(Ui.textError)
-                  }
-                  Text('移除').fontSize(11).fontColor(Ui.textBlue).padding({ top: 5, bottom: 5 }).onClick(() => this.remove([domain]))
-                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                Checkbox({ name: domain }).select(this.selected.includes(domain)).selectedColor(Ui.primaryBlueFill)
-                  .onChange((value: boolean) => { if (value !== this.selected.includes(domain)) { this.toggle(domain); } })
-              }.padding(14).width('100%').borderRadius(18)
-                .backgroundColor(Ui.surfaceTranslucent)
-                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-                  colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-                })
-                .backgroundEffect({
-                  radius: Ui.glassBlurRadius, saturation: Ui.glassSaturationSoft, brightness: Ui.glassBrightnessSoft
-                })
-                .borderWidth(1).borderColor(Ui.glassEdge)
-                .shadow({ radius: 24, color: Ui.shadow, offsetY: 10 })
-            }
-          }, (domain: string) => `${domain}:${this.selected.includes(domain)}`)
-          if (this.visible.length === 0) {
-            ListItem() { Text('没有匹配的网站，可点击下方添加 / 导入。').fontSize(13).fontColor(Ui.textSecondary).padding(22) }
+      Column() {
+        // 顶部导航（文档 §2.1）：返回接既有 back()（含未保存草稿确认），rightSlot 承载既有「保存」按钮
+        TopNavBar({ title: '网站分流策略', hasBack: true, onBack: (): void => { this.back(); } }) {
+          Row({ space: 8 }) {
+            Button(this.busy ? '请稍候' : '保存').fontSize(14)
+              .backgroundColor(TunBoxColors.primary).fontColor(TunBoxColors.textOnPrimary)
+              .borderRadius(TunBoxGeometry.controlRadius)
+              .enabled(this.ready && !this.busy && this.dirty)
+              .onClick(() => { this.save(); })
           }
-        }.layoutWeight(1).width('100%').enabled(this.ready && !this.busy)
-        if (this.notice.length > 0) { Text(this.notice).fontSize(11).fontColor(Ui.textBlue).width('100%') }
-        Row({ space: 8 }) {
-          Button('＋ 添加 / 导入').fontSize(12).layoutWeight(2)
-            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
+        }
+        Column({ space: 12 }) {
+          // 三态策略胶囊（文档 §3.5：强制代理 N / 强制直连 N / 强制拦截 N，N 为真实数量）
+          Row({ space: 8 }) {
+            this.KindChip('proxy', '强制代理', this.proxy.length)
+            this.KindChip('direct', '强制直连', this.direct.length)
+            this.KindChip('block', '强制拦截', this.block.length)
+          }.width('92%')
+            .alignSelf(ItemAlign.Center)
+            .enabled(this.ready && !this.busy)
+          // 既有说明卡（文案与判定不变；视觉换成描边卡配方，去掉玻璃/模糊/backgroundEffect/阴影）
+          Column({ space: 6 }) {
+            Text(this.kind === 'direct' ? '以下网站使用直连策略'
+              : this.kind === 'block' ? '以下网站将被拦截（DNS 层拒绝）' : '以下网站使用代理策略')
+              .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+            Text(this.kind === 'block'
+              ? '拦截名单在 DNS 解析层直接拒绝这些域名（含子域名），不建立连接。与代理/直连名单互斥，同名冲突需移除一侧。'
+              : '三份名单同时生效，切换标签不会关闭其他两份。规则匹配域名及子域名；同名冲突需移除一侧。绕过 VPN 的应用不受此设置影响。')
+              .fontSize(12).fontColor(TunBoxColors.textSecondary)
+            Text('勾选仅用于批量操作，不是启用开关。网站规则位于广告 / 自定义规则之后；网站名单之间重叠时直连优先。')
+              .fontSize(11).fontColor(TunBoxColors.textMuted)
+          }.width('100%').padding(16).alignItems(HorizontalAlign.Start).borderRadius(TunBoxGeometry.cardRadiusSmall)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+          // 既有搜索框（过滤逻辑不变；视觉改令牌配方：高 42 / surfaceCard / 圆角 14 / 描边 / 前置 ic_search）
+          Row({ space: 8 }) {
+            Image($r('app.media.ic_search')).width(16).height(16).fillColor(TunBoxColors.textMuted)
+            TextInput({ text: this.query, placeholder: '搜索域名' })
+              .fontSize(14).fontColor(TunBoxColors.textPrimary).placeholderColor(TunBoxColors.textMuted)
+              .backgroundColor(Color.Transparent).padding(0).height('100%').layoutWeight(1)
+              .onChange((value: string) => { this.query = value; this.rebuild(); })
+          }.width('100%').height(42).padding({ left: 12, right: 12 })
+            .backgroundColor(TunBoxColors.surfaceCard).borderRadius(TunBoxGeometry.controlRadius)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+          // 既有过滤行（切换逻辑不变；'▾' 文字符号去掉）
+          Row() {
+            Text(this.selectedOnly ? `已勾选 ${this.selected.length}` : `当前名单 ${this.current().length}`).fontSize(13)
+              .fontColor(TunBoxColors.primary)
+              .onClick(() => { this.selectedOnly = !this.selectedOnly; this.rebuild(); })
+            Blank()
+            Text(this.alphabetical ? '域名排序' : '已选置顶').fontSize(12).fontColor(TunBoxColors.textSecondary)
+              .onClick(() => { this.alphabetical = !this.alphabetical; this.rebuild(); })
+          }.width('100%')
+          // 规则行（文档 §3.5：Checkbox + 域名 14 Bold + 类型标签 9 primary primaryLight 圆角 4 +
+          // 校验错误行 11 danger + 右侧删除 ic_delete 16 textMuted；行卡 surfaceCard / 圆角 18 / 描边 cardBorder；
+          // 勾选 guard、移除确认、ForEach 键均沿用既有实现）
+          List({ space: 10 }) {
+            ForEach(this.visible, (domain: string) => {
+              ListItem() {
+                Row({ space: 10 }) {
+                  Checkbox({ name: domain }).select(this.selected.includes(domain)).selectedColor(TunBoxColors.primary)
+                    .onChange((value: boolean) => { if (value !== this.selected.includes(domain)) { this.toggle(domain); } })
+                  Column({ space: 4 }) {
+                    Row({ space: 6 }) {
+                      Text(domain || '（空域名）').fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                        .wordBreak(WordBreak.BREAK_ALL).layoutWeight(1)
+                      Text(this.kind === 'direct' ? '直连' : this.kind === 'block' ? '拦截' : '代理')
+                        .fontSize(9).fontColor(TunBoxColors.primary)
+                        .backgroundColor(TunBoxColors.primaryLight).borderRadius(4).padding(2)
+                    }.width('100%')
+                    if (this.other().includes(domain) || SiteRoutingPolicy.domainError(domain).length > 0) {
+                      Text(this.other().includes(domain) ? '两份名单重复，请移除一侧' : '格式无效，请移除后重新添加')
+                        .fontSize(11).fontColor(TunBoxColors.danger)
+                    }
+                  }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                  Button() {
+                    Image($r('app.media.ic_delete')).width(16).height(16).fillColor(TunBoxColors.textMuted)
+                  }.type(ButtonType.Normal).backgroundColor(Color.Transparent)
+                    .onClick(() => this.remove([domain]))
+                }.padding(14).width('100%').borderRadius(18)
+                  .backgroundColor(TunBoxColors.surfaceCard)
+                  .border({ width: 1, color: TunBoxColors.cardBorder })
+              }
+            }, (domain: string) => `${domain}:${this.selected.includes(domain)}`)
+            if (this.visible.length === 0) {
+              ListItem() { Text('没有匹配的网站，可点击下方添加 / 导入。').fontSize(13).fontColor(TunBoxColors.textSecondary).padding(22) }
+            }
+          }.layoutWeight(1).width('100%').enabled(this.ready && !this.busy)
+          if (this.notice.length > 0) { Text(this.notice).fontSize(11).fontColor(TunBoxColors.primary).width('100%') }
+        }.width('100%').layoutWeight(1).padding({
+          left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8
+        }).width('100%')
+        // 底部固定操作 Dock（文档 §3.5）：既有辅助行（全选/取消/移除 N 项 + 草稿状态）保留在主按钮上方；
+        // 回调与可用条件（ready && !busy）不变
+        Column({ space: 8 }) {
+          Row({ space: 10 }) {
+            Text('全选结果').fontSize(12).fontColor(TunBoxColors.primary).onClick(() => {
+              this.selected = SiteRoutingPolicy.normalizeList(this.selected.concat(this.visible)); this.rebuild();
+            })
+            Text('取消勾选').fontSize(12).fontColor(TunBoxColors.textSecondary).onClick(() => { this.selected = []; this.rebuild(); })
+            Text(`移除 ${this.selected.length} 项`).fontSize(12).fontColor(TunBoxColors.primary).onClick(() => this.remove(this.selected.slice()))
+            Blank()
+            Text(this.dirty ? '草稿未保存' : '无未保存更改').fontSize(10).fontColor(TunBoxColors.textMuted)
+          }.width('100%').enabled(this.ready && !this.busy)
+          Row({ space: 12 }) {
+            Button() {
+              Row({ space: 6 }) {
+                Image($r('app.media.ic_plus')).width(16).height(16).fillColor(TunBoxColors.textOnPrimary)
+                Text('添加/导入').fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textOnPrimary)
+              }
+            }
+            .layoutWeight(1).height(46).backgroundColor(TunBoxColors.primary)
+            .borderRadius(TunBoxGeometry.controlRadius)
             .onClick(() => this.dialog.open())
-          Button('导出名单').fontSize(12).layoutWeight(1)
-            .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand).borderRadius(Ui.controlRadius)
-            .onClick(() => this.exportList())
-        }.width('100%').enabled(this.ready && !this.busy)
-        Row({ space: 10 }) {
-          Text('全选结果').fontSize(12).fontColor(Ui.textBlue).onClick(() => {
-            this.selected = SiteRoutingPolicy.normalizeList(this.selected.concat(this.visible)); this.rebuild();
-          })
-          Text('取消勾选').fontSize(12).fontColor(Ui.textSecondary).onClick(() => { this.selected = []; this.rebuild(); })
-          Text(`移除 ${this.selected.length} 项`).fontSize(12).fontColor(Ui.textBlue).onClick(() => this.remove(this.selected.slice()))
-        }.width('100%').enabled(this.ready && !this.busy)
-        Text(this.dirty ? '草稿未保存' : '无未保存更改').fontSize(10).fontColor(Ui.textTertiary)
-      }.width('100%').height('100%').padding({ left: 18, right: 18, top: 8, bottom: 16 }).constraintSize({ maxWidth: Ui.pageMaxWidth })
+            Button('导出名单').height(46).padding({ left: 20, right: 20 })
+              .fontSize(14).fontWeight(FontWeight.Medium)
+              .fontColor(TunBoxColors.primary).backgroundColor(TunBoxColors.primaryLight)
+              .borderRadius(TunBoxGeometry.controlRadius)
+              .onClick(() => this.exportList())
+          }.width('100%').enabled(this.ready && !this.busy)
+        }.width('100%').padding({
+          left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 10, bottom: 24
+        }).backgroundColor(TunBoxColors.surfaceCard)
+          .border({ width: { top: 1 }, color: TunBoxColors.cardBorder })
+          .width('100%')
+      }.width('100%').height('100%')
     }.width('100%').height('100%')
   }
 }

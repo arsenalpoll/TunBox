@@ -1,6 +1,7 @@
 /**
- * SubscriptionPage —— Nexus 订阅页（对齐 HTML + Ultimate 文档 §6/§7/§8）
- * 布局：大标题+刷新全部+“+”导入 → 状态卡(当前订阅/节点/统计) → 手风琴订阅卡(展开节点单选) → 液态玻璃Dock
+ * SubscriptionPage —— 订阅与节点页（严格对齐《TunBox-UI重构笔记》§3.2）
+ * 布局：TopNav(单列/双列切换 · 刷新全部 · 添加订阅) → 全局概览卡 → 内核智能优选条目
+ *       → 折叠式订阅分组（展开后显示该订阅下的节点并单选；2026-10-17 用户要求去掉全量节点区）
  * 后端：复用 SubscriptionService / SettingsService / LatencyController / BackgroundLatencyService 全量逻辑。
  */
 import { router, promptAction } from '@kit.ArkUI';
@@ -8,8 +9,8 @@ import { picker, fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import scanBarcode from '@hms.core.scan.scanBarcode';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { Nx, NexusPing } from '../theme/NexusTokens';
-import { Ui } from '../theme/UiTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxPing } from '../theme/TunBoxTokens';
+import { TopNavBar } from '../components/TopNavBar';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { SubscriptionService, DIRECT_GROUP_ID } from '../commons/services/SubscriptionService';
 import { Subscription, SubscriptionRefreshStatus } from '../commons/models/Subscription';
@@ -17,10 +18,8 @@ import { ProxyNode } from '../commons/models/ProxyNode';
 import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
-import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { AppLogger } from '../commons/utils/AppLogger';
-import { ThemeService } from '../theme/ThemeService';
 import { LatencyController } from '../commons/services/LatencyController';
 import { NodeProtocolPolicy } from '../commons/services/NodeSortPersistence';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
@@ -51,15 +50,15 @@ struct ImportDialog {
         .width(40).height(40).textAlign(TextAlign.Center)
         .borderRadius(10).backgroundColor(bg)
       Column({ space: 1 }) {
-        Text(title).fontSize(14).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).width('100%')
-        Text(desc).fontSize(11).fontColor(Nx.muted()).width('100%')
+        Text(title).fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).width('100%')
+        Text(desc).fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
       }.layoutWeight(1).alignItems(HorizontalAlign.Start)
     }
     .width('100%')
     .padding({ left: 14, right: 14, top: 12, bottom: 12 })
     .borderRadius(12)
-    .backgroundColor(Nx.surface())
-    .borderWidth(1).borderColor(Nx.border())
+    .backgroundColor(TunBoxColors.surfaceCard)
+    .borderWidth(1).borderColor(TunBoxColors.cardBorder)
     .onClick(() => {
       this.mode = target;
     })
@@ -69,8 +68,11 @@ struct ImportDialog {
     Column({ space: 10 }) {
       Row() {
         Text(this.mode === 'main' ? '导入订阅' : (this.mode === 'scan' ? '扫码导入' : (this.mode === 'url' ? '从 URL 链接导入' : '从本地文件导入')))
-          .fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.fg()).layoutWeight(1)
-        Text('✕').fontSize(16).fontColor(Nx.muted()).padding(6)
+          .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+        Image($r('app.media.ic_close'))
+          .width(16).height(16)
+          .fillColor(TunBoxColors.textMuted)
+          .padding(6)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -80,15 +82,15 @@ struct ImportDialog {
 
       if (this.mode === 'main') {
         this.OptionBtn('☷', '扫描', '扫描屏幕或纸质二维码导入订阅',
-          Nx.successSoft(), Nx.success(), 'scan')
+          TunBoxColors.successLight, TunBoxColors.success, 'scan')
         this.OptionBtn('🔗', 'URL', '输入或粘贴订阅链接一键解析',
-          Nx.accentSoft(), Nx.accent(), 'url')
+          TunBoxColors.primaryLight, TunBoxColors.primary, 'url')
         this.OptionBtn('📄', '文件', '选择本地 .yaml / .json / .conf 配置文件',
-          'rgba(245, 158, 11, 0.12)', Nx.warning(), 'file')
+          'rgba(245, 158, 11, 0.12)', TunBoxColors.warning, 'file')
       } else if (this.mode === 'scan') {
         Column() {
           Text('[ 摄像头：请在系统扫码页对准二维码 ]')
-            .fontSize(12).fontColor(Nx.success())
+            .fontSize(12).fontColor(TunBoxColors.success)
             .width('100%').textAlign(TextAlign.Center)
             .padding(30).borderRadius(10)
             .backgroundColor('#0f172a')
@@ -96,10 +98,10 @@ struct ImportDialog {
         }.width('100%')
         Row({ space: 8 }) {
           Button('返回').layoutWeight(1).borderRadius(8)
-            .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg()).fontSize(13)
+            .backgroundColor(TunBoxColors.surfaceSubtle).fontColor(TunBoxColors.textPrimary).fontSize(13)
             .onClick(() => { this.mode = 'main'; })
           Button('开始扫码').layoutWeight(1).borderRadius(8)
-            .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(13)
+            .backgroundColor(TunBoxColors.primary).fontColor(Color.White).fontSize(13)
             .onClick(() => {
               if (this.controller !== undefined) {
                 this.controller.close();
@@ -108,19 +110,19 @@ struct ImportDialog {
             })
         }.width('100%').margin({ top: 2 })
       } else if (this.mode === 'url') {
-        Text('输入订阅链接（节点链接可一行一个批量导入）：').fontSize(12).fontColor(Nx.muted()).width('100%')
+        Text('输入订阅链接（节点链接可一行一个批量导入）：').fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
         TextArea({ placeholder: 'https://... 或 vless://...（一行一个）', text: this.urlText })
           .onChange((v: string) => { this.urlText = v; })
           .height(88).borderRadius(8).fontSize(13)
-          .backgroundColor(Nx.inputBg())
-          .borderWidth(1).borderColor(Nx.border())
-          .fontColor(Nx.fg())
+          .backgroundColor(TunBoxColors.surfaceSubtle)
+          .borderWidth(1).borderColor(TunBoxColors.cardBorder)
+          .fontColor(TunBoxColors.textPrimary)
         Row({ space: 8 }) {
           Button('返回').layoutWeight(1).borderRadius(8)
-            .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg()).fontSize(13)
+            .backgroundColor(TunBoxColors.surfaceSubtle).fontColor(TunBoxColors.textPrimary).fontSize(13)
             .onClick(() => { this.mode = 'main'; })
           Button('确认导入').layoutWeight(1).borderRadius(8)
-            .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(13)
+            .backgroundColor(TunBoxColors.primary).fontColor(Color.White).fontSize(13)
             .onClick(() => {
               if (this.controller !== undefined) {
                 this.controller.close();
@@ -131,17 +133,17 @@ struct ImportDialog {
       } else {
         Column({ space: 2 }) {
           Text('选择本地 Clash / V2Ray 配置文件').fontSize(13).fontWeight(FontWeight.Bold)
-            .fontColor(Nx.fg()).width('100%').textAlign(TextAlign.Center)
-          Text('支持 .yaml、.json、.conf 格式').fontSize(11).fontColor(Nx.muted())
+            .fontColor(TunBoxColors.textPrimary).width('100%').textAlign(TextAlign.Center)
+          Text('支持 .yaml、.json、.conf 格式').fontSize(11).fontColor(TunBoxColors.textMuted)
             .width('100%').textAlign(TextAlign.Center)
         }.width('100%').padding(16).borderRadius(8)
-        .borderWidth(1.5).borderColor(Nx.border())
+        .borderWidth(1.5).borderColor(TunBoxColors.cardBorder)
         Row({ space: 8 }) {
           Button('返回').layoutWeight(1).borderRadius(8)
-            .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg()).fontSize(13)
+            .backgroundColor(TunBoxColors.surfaceSubtle).fontColor(TunBoxColors.textPrimary).fontSize(13)
             .onClick(() => { this.mode = 'main'; })
           Button('选择文件').layoutWeight(1).borderRadius(8)
-            .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(13)
+            .backgroundColor(TunBoxColors.primary).fontColor(Color.White).fontSize(13)
             .onClick(() => {
               if (this.controller !== undefined) {
                 this.controller.close();
@@ -167,19 +169,19 @@ struct DeleteConfirmDialog {
 
   build() {
     Column({ space: 14 }) {
-      Text('确认删除').fontSize(18).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+      Text('确认删除').fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
       Text('删除后将无法恢复，确定要删除吗？')
-        .fontSize(13).fontColor(Nx.muted()).textAlign(TextAlign.Center)
+        .fontSize(13).fontColor(TunBoxColors.textMuted).textAlign(TextAlign.Center)
       Row({ space: 12 }) {
         Button('取消').layoutWeight(1).borderRadius(10)
-          .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg())
+          .backgroundColor(TunBoxColors.surfaceSubtle).fontColor(TunBoxColors.textPrimary)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
             }
           })
         Button('删除').layoutWeight(1).borderRadius(10)
-          .backgroundColor(Nx.danger()).fontColor(Color.White)
+          .backgroundColor(TunBoxColors.danger).fontColor(Color.White)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -209,19 +211,19 @@ struct NodeDeleteConfirmDialog {
 
   build() {
     Column({ space: 14 }) {
-      Text('删除节点').fontSize(18).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+      Text('删除节点').fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
       Text(`确定删除「${this.getNodeName()}」吗？该节点在订阅刷新后不会再出现。`)
-        .fontSize(13).fontColor(Nx.muted()).textAlign(TextAlign.Center)
+        .fontSize(13).fontColor(TunBoxColors.textMuted).textAlign(TextAlign.Center)
       Row({ space: 12 }) {
         Button('取消').layoutWeight(1).borderRadius(10)
-          .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg())
+          .backgroundColor(TunBoxColors.surfaceSubtle).fontColor(TunBoxColors.textPrimary)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
             }
           })
         Button('删除').layoutWeight(1).borderRadius(10)
-          .backgroundColor(Nx.danger()).fontColor(Color.White)
+          .backgroundColor(TunBoxColors.danger).fontColor(Color.White)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -257,34 +259,34 @@ struct EditSubscriptionDialog {
 
   build() {
     Column({ space: 14 }) {
-      Text('编辑订阅').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
+      Text('编辑订阅').fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
       TextInput({ placeholder: '订阅名称', text: this.editName })
         .onChange((v: string) => { this.editName = v; })
         .height(40).borderRadius(8).fontSize(13)
-        .backgroundColor(Nx.inputBg())
-        .borderWidth(1).borderColor(Nx.border())
-        .fontColor(Nx.fg())
+        .backgroundColor(TunBoxColors.surfaceSubtle)
+        .borderWidth(1).borderColor(TunBoxColors.cardBorder)
+        .fontColor(TunBoxColors.textPrimary)
       if (!this.isLocal) {
         TextInput({ placeholder: '订阅链接', text: this.editUrl })
           .onChange((v: string) => { this.editUrl = v; })
           .height(40).borderRadius(8).fontSize(13)
-          .backgroundColor(Nx.inputBg())
-          .borderWidth(1).borderColor(Nx.border())
-          .fontColor(Nx.fg())
+          .backgroundColor(TunBoxColors.surfaceSubtle)
+          .borderWidth(1).borderColor(TunBoxColors.cardBorder)
+          .fontColor(TunBoxColors.textPrimary)
       } else {
         Text('本地导入的订阅仅支持改名')
-          .fontSize(11).fontColor(Nx.muted()).width('100%')
+          .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
       }
       Row({ space: 12 }) {
         Button('取消').layoutWeight(1).borderRadius(8)
-          .backgroundColor(Nx.fgSoft()).fontColor(Nx.fg()).fontSize(13)
+          .backgroundColor(TunBoxColors.surfaceSubtle).fontColor(TunBoxColors.textPrimary).fontSize(13)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
             }
           })
         Button('保存').layoutWeight(1).borderRadius(8)
-          .backgroundColor(Nx.accent()).fontColor(Color.White).fontSize(13)
+          .backgroundColor(TunBoxColors.primary).fontColor(Color.White).fontSize(13)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -473,60 +475,54 @@ export struct SubscriptionPage {
   }
 
   /**
-   * 节点卡片（单列 100% / 双列 48.5% 共用同一套样式）。
-   * 两行信息列：名称/协议/延迟三者挤在一行时窄屏下名称被截断、协议被 layoutWeight(1)
-   * 压成残字，改为名称行 + 协议行两段后各自完整可读。
+   * 节点卡片（文档 §3.2 节点网格）：两行信息列 —— 名称行（Radio 单选 + 名称）+
+   * 协议行（协议标签 + 延迟文本）。单列/双列均由 GridRow 控宽，卡片自身 100% 填充。
    */
   @Builder
-  nodeCard(node: ProxyNode, cardWidth: string) {
-    Row({ space: 9 }) {
-      // 单选圆圈 16px
-      Stack({ alignContent: Alignment.Center }) {
-        Circle({ width: 16, height: 16 })
-          .fill(node.id === this.activeNodeId ? Nx.accent() : Color.Transparent)
-          .stroke(node.id === this.activeNodeId ? Nx.accent() : Nx.radioEdge())
-          .strokeWidth(1.6)
-        if (node.id === this.activeNodeId) {
-          Circle({ width: 5, height: 5 }).fill(Color.White)
-        }
-      }.width(16).height(16)
-      Column({ space: 3 }) {
-        // 第一行：节点名称 + 延迟
-        Row({ space: 8 }) {
-          Text(node.name)
-            .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Nx.fg())
-            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-          Row({ space: 4 }) {
-            Circle({ width: 5, height: 5 }).fill(NexusPing.color(this.pingOf(node)))
-            Text(NexusPing.text(this.pingOf(node)))
-              .fontSize(11).fontWeight(FontWeight.Bold)
-              .fontColor(NexusPing.color(this.pingOf(node))).fontFamily('monospace')
+  nodeCard(node: ProxyNode) {
+    Column({ space: 8 }) {
+      // 第一行：单选圆圈 + 节点名称
+      Row({ space: 6 }) {
+        Stack({ alignContent: Alignment.Center }) {
+          Circle({ width: 16, height: 16 })
+            .fill(node.id === this.activeNodeId ? TunBoxColors.primary : Color.Transparent)
+            .stroke(node.id === this.activeNodeId ? TunBoxColors.primary : TunBoxColors.textMuted)
+            .strokeWidth(1.6)
+          if (node.id === this.activeNodeId) {
+            Circle({ width: 5, height: 5 }).fill(TunBoxColors.textOnPrimary)
           }
-        }
-        .width('100%')
-        .alignItems(VerticalAlign.Center)
-        // 第二行：协议（独占一行，名称下方）
-        Text(this.protoOf(node))
-          .fontSize(10)
-          .fontFamily('monospace')
-          .fontColor(Nx.muted())
+        }.width(16).height(16)
+        Text(node.name)
+          .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.textPrimary)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
+          .layoutWeight(1)
       }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start)
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      // 第二行：协议标签 + 延迟
+      Row() {
+        Text(this.protoOf(node))
+          .fontSize(10).fontColor(TunBoxColors.textSecondary)
+          .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+          .backgroundColor(TunBoxColors.chipBg)
+          .borderRadius(4)
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Blank()
+        Text(this.nodePingText(node))
+          .fontSize(11).fontWeight(FontWeight.Bold)
+          .fontColor(this.nodePingColor(node))
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
     }
-    .width(cardWidth)
-    .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-    .borderRadius(10)
-    .backgroundColor(node.id === this.activeNodeId ? Nx.accentBg() : Nx.surface())
-    .borderWidth(1)
-    .borderColor(node.id === this.activeNodeId ? Nx.accent() : Nx.border())
-    .shadow(node.id === this.activeNodeId ?
-      { radius: 4, color: 'rgba(37, 99, 235, 0.15)', offsetY: 1 } :
-      { radius: 0, color: Color.Transparent, offsetY: 0 })
-    .margin({ right: this.nodeColumns === 2 ? 3 : 0, bottom: this.nodeColumns === 2 ? 5 : 0 })
+    .width('100%')
+    .padding(12)
+    .borderRadius(16)
+    .backgroundColor(TunBoxColors.surfaceCard)
+    .border({
+      width: node.id === this.activeNodeId ? 1.5 : 1,
+      color: node.id === this.activeNodeId ? TunBoxColors.primary : TunBoxColors.cardBorder
+    })
     .onClick(() => this.selectNode(node))
     // 长按弹出单节点删除确认框（与节点页长按删除同语义）
     .gesture(LongPressGesture().onAction(() => {
@@ -569,7 +565,7 @@ export struct SubscriptionPage {
   }
 
   /**
-   * 协议展示文本（第二行小字）：VLESS·REALITY / VMESS / TROJAN / HYSTERIA2 / SS / SSR / 未知。
+   * 协议展示文本（协议标签）：VLESS·REALITY / VMESS / TROJAN / HYSTERIA2 / SS / SSR / 未知。
    *
    * 复用 NodeProtocolPolicy（与 NodeSelectionPage 同一口径），不再用旧的
    * proxyType.toUpperCase().slice(0, 8)：那是把「VLESS」「HYSTERIA2」硬截成
@@ -579,8 +575,14 @@ export struct SubscriptionPage {
     return NodeProtocolPolicy.fromNode(node).display();
   }
 
-  private pingOf(node: ProxyNode): number | null {
-    return LatencyController.latencyFor(node.name);
+  /** 节点延迟文案（TunBoxPing.recordText：五态语义；第二参为页面既有延迟触发变量） */
+  private nodePingText(node: ProxyNode): string {
+    return TunBoxPing.recordText(LatencyController.recordFor(node.name), this.latencyTick);
+  }
+
+  /** 节点延迟配色（TunBoxPing.recordColor：实测走阈值，过期/未测中性，手测失败红） */
+  private nodePingColor(node: ProxyNode): ResourceColor {
+    return TunBoxPing.recordColor(LatencyController.recordFor(node.name), this.latencyTick);
   }
 
   /**
@@ -1028,364 +1030,320 @@ export struct SubscriptionPage {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
+      // 底层背景列（文档 §3.2：纯色底，不再用渐变/玻璃底）
       Column().width('100%').height('100%')
-        .backgroundColor(Nx.bg())
-        .linearGradient(ThemeService.isDark() ? undefined : { angle: 135, colors: Ui.backdropColors })
+        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
         Scroll() {
-          Column({ space: 0 }) {
-            // 顶部 Toast（刷新反馈，居中悬浮等价：顶部横条）
-            if (this.toastVisible) {
-              Text(this.toastMsg)
-                .fontSize(11.5).fontWeight(FontWeight.Bold).fontColor(Color.White)
-                .padding({ left: 14, right: 14, top: 6, bottom: 6 })
-                .borderRadius(9999)
-                .backgroundColor('rgba(15, 23, 42, 0.88)')
-                .margin({ bottom: 8 })
-            }
-            // ── 顶部大标题 + 刷新全部 + “+” ──
-            Row() {
-              Column({ space: 1 }) {
-                Text('订阅与节点').fontSize(22).fontWeight(FontWeight.Bold)
-                  .fontColor(Nx.fg()).width('100%')
-                Text('展开查看节点，点击即可直接选用')
-                  .fontSize(12).fontColor(Nx.muted()).width('100%')
-              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+          Column() {
+            // ── 顶部导航（页签页，无返回；右侧保留全部既有入口） ──
+            TopNavBar({ title: '订阅与节点' }) {
               Row({ space: 8 }) {
-                // 单列/双列节点排布切换（候选4图形，显示目标模式：单列时双列图标/双列时单列图标）
+                // 单列/双列节点排布切换
                 Stack({ alignContent: Alignment.Center }) {
-                  if (this.nodeColumns === 1) {
-                    // 单列 → 单框 + 内部多条横线（单列列表样式）
-                    Rect({ width: 11, height: 16 })
-                      .radius(3)
-                      .fill(Color.Transparent)
-                      .stroke(Nx.muted())
-                      .strokeWidth(2)
-                    Column({ space: 3 }) {
-                      Rect({ width: 6, height: 1.5 })
-                        .fill(Nx.muted())
-                      Rect({ width: 6, height: 1.5 })
-                        .fill(Nx.muted())
-                      Rect({ width: 6, height: 1.5 })
-                        .fill(Nx.muted())
-                    }
-                  } else {
-                    // 双列 → 横框 + 中缝（分栏）
-                    Rect({ width: 18, height: 14 })
-                      .radius(4)
-                      .fill(Color.Transparent)
-                      .stroke(Nx.muted())
-                      .strokeWidth(2)
-                    Rect({ width: 2, height: 10 })
-                      .fill(Nx.muted())
-                  }
+                  Image($r('app.media.ic_apps')).width(20).height(20)
+                    .fillColor(TunBoxColors.textPrimary)
                 }
-                .height(30)
-                .padding({ left: 12, right: 12 })
-                .borderRadius(9999)
-                .backgroundColor(Nx.glassFill())
-                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
-                .borderWidth(1.5).borderColor(Nx.glassEdge())
-                .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.05)', offsetY: 2 })
-                .onClick(() => this.toggleNodeColumns())
-                // 刷新全部 38px
+                .width(36).height(36)
+                .borderRadius(TunBoxGeometry.pillRadius)
+                .backgroundColor(TunBoxColors.chipBg)
+                .accessibilityText('切换单列双列排布')
+                .onClick(() => { this.toggleNodeColumns(); })
+                // 刷新全部
                 Stack({ alignContent: Alignment.Center }) {
                   if (this.isRefreshing) {
-                    LoadingProgress().width(18).height(18).color(Nx.accent())
+                    LoadingProgress().width(18).height(18).color(TunBoxColors.primary)
                   } else {
-                    Text('↻').fontSize(18).fontColor(Nx.muted())
+                    Image($r('app.media.ic_refresh')).width(20).height(20)
+                      .fillColor(TunBoxColors.textPrimary)
                       .rotate({ angle: this.spinTick * 360 })
                       .animation({ duration: 650, curve: Curve.EaseInOut })
                   }
                 }
-                .width(38).height(38).borderRadius(9999)
-                .backgroundColor(Nx.glassFill())
-                .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
-                .borderWidth(1.5).borderColor(Nx.glassEdge())
-                .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.05)', offsetY: 2 })
-                .onClick(() => this.refreshAll())
-                // “+”导入 38px
-                Text('+')
-                  .fontSize(22).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
-                  .width(38).height(38).textAlign(TextAlign.Center)
-                  .borderRadius(9999)
-                  .backgroundColor(Nx.glassFill())
-                  .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
-                  .borderWidth(1.5).borderColor(Nx.glassEdge())
-                  .shadow({ radius: 8, color: 'rgba(15, 23, 42, 0.06)', offsetY: 2 })
-                  .onClick(() => this.importDialog.open())
+                .width(36).height(36)
+                .borderRadius(TunBoxGeometry.pillRadius)
+                .backgroundColor(TunBoxColors.chipBg)
+                .accessibilityText('刷新全部订阅')
+                .onClick(() => { this.refreshAll(); })
+                // “+”添加订阅
+                Stack({ alignContent: Alignment.Center }) {
+                  Image($r('app.media.ic_plus')).width(20).height(20)
+                    .fillColor(TunBoxColors.primary)
+                }
+                .width(36).height(36)
+                .borderRadius(TunBoxGeometry.pillRadius)
+                .backgroundColor(TunBoxColors.primaryLight)
+                .accessibilityText('添加订阅')
+                .onClick(() => { this.importDialog.open(); })
               }.alignItems(VerticalAlign.Center)
-            }.width('100%').margin({ bottom: 12 })
-
-            // ── 当前状态卡 ──
-            Column({ space: 5 }) {
-              Row() {
-                Text('当前使用订阅').fontSize(12).fontColor(Nx.muted()).layoutWeight(1)
-                Text(this.activeSub() !== null ? (this.activeSub() as Subscription).name : '暂无')
-                  .fontSize(12).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
-                  .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-              }.width('100%')
-              Row() {
-                Text('当前连接节点').fontSize(12).fontColor(Nx.muted()).layoutWeight(1)
-                Text(this.activeNode() !== null ? (this.activeNode() as ProxyNode).name : '未选择')
-                  .fontSize(12).fontWeight(FontWeight.Bold).fontColor(Nx.accent())
-                  .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-              }.width('100%')
-              Row() {
-                Text('统计总览').fontSize(12).fontColor(Nx.muted()).layoutWeight(1)
-                Text(`${this.subs.length} 个订阅 · ${this.totalNodes()} 个节点`)
-                  .fontSize(12).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
-                  .fontFamily('monospace')
-              }.width('100%')
             }
-            .width('100%')
-            .padding({ left: 13, right: 13, top: 11, bottom: 11 })
-            .borderRadius(14)
-            .backgroundColor(Nx.glassFill())
-            .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
-            .backgroundEffect(Nx.glassEffect())
-            .borderWidth(1).borderColor(Nx.glassEdge())
-            .shadow({ radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
-            .margin({ bottom: 12 })
 
-            // ── 自动选择分组（mihomo-smart 内核智能选点，跨全部订阅优选） ──
-            Column({ space: 0 }) {
-              Row({ space: 10 }) {
-                Text('♻️').fontSize(15).fontColor(Nx.success())
-                  .width(32).height(32).textAlign(TextAlign.Center)
-                  .borderRadius(8).backgroundColor(Nx.successSoft())
-                Column({ space: 2 }) {
-                  Row({ space: 6 }) {
-                    Text('自动选择 · 内核智能选点')
-                      .fontSize(14).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
-                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                    if (this.autoSelectMode === AutoSelectModes.AUTO) {
-                      Text('使用中')
-                        .fontSize(10).fontWeight(FontWeight.Bold).fontColor(Nx.success())
-                        .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-                        .borderRadius(9999)
-                        .backgroundColor(Nx.successSoft())
-                    }
-                  }.width('100%')
-                  Text(`跨订阅自动优选 · 故障自动切换 · ${this.totalNodes()} 个候选节点`)
-                    .fontSize(11).fontColor(Nx.muted()).width('100%')
+            // 顶部 Toast（刷新反馈，顶部横条胶囊）
+            if (this.toastVisible) {
+              Text(this.toastMsg)
+                .fontSize(11.5).fontWeight(FontWeight.Bold).fontColor(Color.White)
+                .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+                .borderRadius(TunBoxGeometry.pillRadius)
+                .backgroundColor('rgba(15, 23, 42, 0.88)')
+                .margin({ top: 8, bottom: 8 })
+            }
+
+            Column({ space: 14 }) {
+              // ── 1. 顶部全局概览卡（文档 §3.2 第 1 节） ──
+              Row() {
+                Column({ space: 4 }) {
+                  Row() {
+                    Circle({ width: 6, height: 6 }).fill(TunBoxColors.success).margin({ right: 6 })
+                    Text('当前使用订阅组').fontSize(12).fontColor(TunBoxColors.textMuted)
+                  }
+                  Text(this.activeSub() !== null ? (this.activeSub() as Subscription).name : '暂无')
+                    .fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
                     .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                Text('›')
-                  .fontSize(18).fontColor(Nx.muted())
-                  .rotate({ angle: this.isOpen('__auto_select__') ? 90 : 0 })
-                  .animation({ duration: 250, curve: Curve.EaseInOut })
+                  Row({ space: 6 }) {
+                    Text('当前连接节点').fontSize(12).fontColor(TunBoxColors.textMuted)
+                    Text(this.activeNode() !== null ? (this.activeNode() as ProxyNode).name : '未选择')
+                      .fontSize(12).fontColor(TunBoxColors.primary).fontWeight(FontWeight.Medium)
+                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }.margin({ top: 2 })
+                }
+                .alignItems(HorizontalAlign.Start)
+                .layoutWeight(1)
+                Blank()
+                Row({ space: 4 }) {
+                  Text(`${this.subs.length} 订阅 · ${this.totalNodes()} 节点`)
+                    .fontSize(11).fontColor(TunBoxColors.primary)
+                }
+                .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+                .backgroundColor(TunBoxColors.primaryLight)
+                .borderRadius(12)
               }
               .width('100%')
-              .padding({ left: 15, right: 15, top: 13, bottom: 13 })
-              .backgroundColor(Nx.surface())
-              .onClick(() => this.toggleOpen('__auto_select__'))
+              .padding(TunBoxGeometry.cardPadding)
+              .backgroundColor(TunBoxColors.surfaceCard)
+              .borderRadius(TunBoxGeometry.cardRadiusSmall)
+              .border({ width: 1, color: TunBoxColors.cardBorder })
 
-              if (this.isOpen('__auto_select__')) {
-                Column({ space: 5 }) {
+              // ── 2. 内核智能优选条目（文档 §3.2 第 2 节，整行点击沿用既有切换逻辑） ──
+              Column({ space: 0 }) {
+                Row() {
                   Row() {
-                    Text('由 smart 内核按连接目标自动选点，无需手动切换')
-                      .fontSize(11).fontColor(Nx.muted()).layoutWeight(1)
-                  }.width('100%').padding({ left: 6, right: 6, top: 4, bottom: 2 })
-                  Row({ space: 9 }) {
-                    Stack({ alignContent: Alignment.Center }) {
-                      Circle({ width: 16, height: 16 })
-                        .fill(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accent() : Color.Transparent)
-                        .stroke(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accent() : Nx.radioEdge())
-                        .strokeWidth(1.6)
-                      if (this.autoSelectMode === AutoSelectModes.AUTO) {
-                        Circle({ width: 5, height: 5 }).fill(Color.White)
-                      }
-                    }.width(16).height(16)
-                    Text(ClashConfigGenerator.SMART_GROUP_NAME)
-                      .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Nx.fg())
-                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                      .layoutWeight(1)
-                    Text('SMART')
-                      .fontSize(10).fontColor(Nx.muted()).fontFamily('monospace')
-                      .padding({ left: 5, right: 5, top: 1, bottom: 1 })
-                      .borderRadius(4).backgroundColor(Nx.fgSoft())
-                    Text('自动优选')
-                      .fontSize(11).fontWeight(FontWeight.Bold)
-                      .fontColor(Nx.success()).fontFamily('monospace')
+                    Image($r('app.media.ic_radar')).width(24).height(24).fillColor(TunBoxColors.success)
                   }
-                  .width('100%')
-                  .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-                  .borderRadius(10)
-                  .backgroundColor(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accentBg() : Nx.surface())
-                  .borderWidth(1)
-                  .borderColor(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accent() : Nx.border())
-                  .shadow(this.autoSelectMode === AutoSelectModes.AUTO ?
-                    { radius: 4, color: 'rgba(37, 99, 235, 0.15)', offsetY: 1 } :
-                    { radius: 0, color: Color.Transparent, offsetY: 0 })
-                  .onClick(() => this.enableAutoSelect())
+                  .width(42).height(42)
+                  .borderRadius(12)
+                  .backgroundColor(TunBoxColors.successLight)
+                  .justifyContent(FlexAlign.Center)
+                  .margin({ right: 12 })
+                  Column({ space: 2 }) {
+                    Row() {
+                      Text('自动选择 · 内核智能优选')
+                        .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                      Circle({ width: 6, height: 6 })
+                        .fill(this.autoSelectMode === AutoSelectModes.AUTO
+                          ? TunBoxColors.success : TunBoxColors.textMuted)
+                        .margin({ left: 6 })
+                    }
+                    Text(`跨订阅自动优选 · 故障毫秒切换 · ${this.totalNodes()} 个候选`)
+                      .fontSize(11).fontColor(TunBoxColors.textMuted)
+                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }
+                  .alignItems(HorizontalAlign.Start)
+                  .layoutWeight(1)
+                  Blank()
+                  Stack({ alignContent: Alignment.Center }) {
+                    Circle({ width: 18, height: 18 })
+                      .fill(this.autoSelectMode === AutoSelectModes.AUTO
+                        ? TunBoxColors.success : Color.Transparent)
+                      .stroke(this.autoSelectMode === AutoSelectModes.AUTO
+                        ? TunBoxColors.success : TunBoxColors.textMuted)
+                      .strokeWidth(1.6)
+                    if (this.autoSelectMode === AutoSelectModes.AUTO) {
+                      Circle({ width: 6, height: 6 }).fill(TunBoxColors.textOnPrimary)
+                    }
+                  }.width(18).height(18)
+                  Text(this.autoSelectMode === AutoSelectModes.AUTO ? '已启用' : '未启用')
+                    .fontSize(12)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(this.autoSelectMode === AutoSelectModes.AUTO
+                      ? TunBoxColors.success : TunBoxColors.textMuted)
+                    .margin({ left: 6 })
                 }
                 .width('100%')
-                .padding({ left: 10, right: 10, bottom: 12, top: 4 })
-                .backgroundColor(Nx.bg())
-                .borderWidth({ top: 1 })
-                .borderColor(Nx.border())
+                .padding(14)
+                // 2026-10-17 用户要求：点整行即选中（不再展开子列表），语义等价原展开区里的 smart 行
+                .onClick(() => this.enableAutoSelect())
               }
-            }
-            .width('100%')
-            .borderRadius(14)
-            .backgroundColor(Nx.glassFill())
-            .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
-            .backgroundEffect(Nx.glassEffect())
-            .borderWidth(1.5)
-            .borderColor(this.autoSelectMode === AutoSelectModes.AUTO ? Nx.accent() : Nx.border())
-            .shadow(this.autoSelectMode === AutoSelectModes.AUTO ?
-              { radius: 12, color: 'rgba(37, 99, 235, 0.10)', offsetY: 3 } :
-              { radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
-            .margin({ bottom: 12 })
-            .clip(true)
+              .width('100%')
+              .borderRadius(18)
+              .backgroundColor(TunBoxColors.successTint)
+              .border({ width: 1, color: TunBoxColors.successBorder })
+              .clip(true)
 
-            // ── 手风琴订阅列表 ──
-            ForEach(this.subs, (sub: Subscription) => {
-              Column({ space: 0 }) {
-                // 头部
-                Row({ space: 10 }) {
-                  Text('📦').fontSize(15).fontColor(Nx.accent())
-                    .width(32).height(32).textAlign(TextAlign.Center)
-                    .borderRadius(8).backgroundColor(Nx.accentSoft())
-                  Column({ space: 2 }) {
-                    Row({ space: 6 }) {
-                      Text(sub.name)
-                        .fontSize(14).fontWeight(FontWeight.Bold).fontColor(Nx.fg())
-                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                      if (sub.id === this.activeSubId) {
-                        Text('使用中')
-                          .fontSize(10).fontWeight(FontWeight.Bold).fontColor(Nx.success())
-                          .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-                          .borderRadius(9999)
-                          .backgroundColor(Nx.successSoft())
-                      }
-                    }.width('100%')
-                    Text(`${this.service.nodesOf(sub.id).length} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
-                      .fontSize(11).fontColor(Nx.muted()).width('100%')
-                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                  }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                  // 分组头闪电测速（无文字，刷新按钮左边）
-                  if (sub.id !== DIRECT_GROUP_ID) {
+              // ── 3. 折叠式订阅分组（保留既有展开/收起与行头全部按钮逻辑） ──
+              ForEach(this.subs, (sub: Subscription) => {
+                Column({ space: 0 }) {
+                  // 头部
+                  Row({ space: 10 }) {
                     Stack({ alignContent: Alignment.Center }) {
-                      if (this.speedTestingIds.includes(sub.id)) {
-                        LoadingProgress().width(15).height(15).color(Nx.accent())
+                      Image($r('app.media.ic_nodes')).width(18).height(18)
+                        .fillColor(TunBoxColors.primary)
+                    }
+                    .width(32).height(32)
+                    .borderRadius(8)
+                    .backgroundColor(TunBoxColors.primaryLight)
+                    Column({ space: 2 }) {
+                      Row({ space: 6 }) {
+                        Text(sub.name)
+                          .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                        if (sub.id === this.activeSubId) {
+                          Text('使用中')
+                            .fontSize(10).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.success)
+                            .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                            .borderRadius(TunBoxGeometry.pillRadius)
+                            .backgroundColor(TunBoxColors.successLight)
+                        }
+                      }.width('100%')
+                      Text(`${this.service.nodesOf(sub.id).length} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
+                        .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                    }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                    // ── 铁律：纯图标闪电测速按钮，位于刷新按钮左边，不得移动/不得加文字 ──
+                    if (sub.id !== DIRECT_GROUP_ID) {
+                      Stack({ alignContent: Alignment.Center }) {
+                        if (this.speedTestingIds.includes(sub.id)) {
+                          LoadingProgress().width(15).height(15).color(TunBoxColors.primary)
+                        } else {
+                          Image($r('app.media.ic_bolt')).width(15).height(15)
+                            .fillColor(TunBoxColors.primary)
+                        }
+                      }
+                      .width(28).height(28)
+                      .borderRadius(TunBoxGeometry.pillRadius)
+                      .accessibilityText('闪电测速')
+                      .onClick(() => this.speedTestSub(sub.id))
+                    }
+                    // 单个刷新
+                    Stack({ alignContent: Alignment.Center }) {
+                      if (this.isRefreshingSub(sub.id)) {
+                        LoadingProgress().width(15).height(15).color(TunBoxColors.primary)
                       } else {
-                        Text('⚡').fontSize(15).fontColor(Nx.accent())
+                        Image($r('app.media.ic_refresh')).width(15).height(15)
+                          .fillColor(TunBoxColors.textMuted)
                       }
                     }
-                    .width(28).height(28).borderRadius(9999)
-                    .onClick(() => this.speedTestSub(sub.id))
-                  }
-                  // 单个刷新 28px
-                  Stack({ alignContent: Alignment.Center }) {
-                    if (this.isRefreshingSub(sub.id)) {
-                      LoadingProgress().width(15).height(15).color(Nx.accent())
-                    } else {
-                      Text('↻').fontSize(15).fontColor(Nx.muted())
+                    .width(28).height(28)
+                    .borderRadius(TunBoxGeometry.pillRadius)
+                    .accessibilityText('刷新订阅')
+                    .onClick(() => this.refreshOne(sub))
+                    // 重命名（常驻分组头，不用展开）
+                    Stack({ alignContent: Alignment.Center }) {
+                      Image($r('app.media.ic_tune')).width(15).height(15)
+                        .fillColor(TunBoxColors.textMuted)
                     }
-                  }
-                  .width(28).height(28).borderRadius(9999)
-                  .onClick(() => this.refreshOne(sub))
-                  // 重命名（常驻分组头，不用展开）
-                  Text('✎')
-                    .fontSize(15).fontColor(Nx.muted())
-                    .width(28).height(28).textAlign(TextAlign.Center)
-                    .borderRadius(9999)
+                    .width(28).height(28)
+                    .borderRadius(TunBoxGeometry.pillRadius)
+                    .accessibilityText('编辑订阅')
                     .onClick(() => this.openEdit(sub))
-                  if (sub.id !== DIRECT_GROUP_ID) {
-                    Text('🗑')
-                      .fontSize(14).fontColor(Nx.muted())
-                      .width(28).height(28).textAlign(TextAlign.Center)
-                      .borderRadius(9999)
+                    if (sub.id !== DIRECT_GROUP_ID) {
+                      Stack({ alignContent: Alignment.Center }) {
+                        Image($r('app.media.ic_delete')).width(15).height(15)
+                          .fillColor(TunBoxColors.textMuted)
+                      }
+                      .width(28).height(28)
+                      .borderRadius(TunBoxGeometry.pillRadius)
+                      .accessibilityText('删除订阅')
                       .onClick(() => {
                         this.deleteTargetId = sub.id;
                         this.deleteDialog.open();
                       })
-                  }
-                  Text('›')
-                    .fontSize(18).fontColor(Nx.muted())
-                    .rotate({ angle: this.isOpen(sub.id) ? 90 : 0 })
-                    .animation({ duration: 250, curve: Curve.EaseInOut })
-                }
-                .width('100%')
-                .padding({ left: 15, right: 15, top: 13, bottom: 13 })
-                .backgroundColor(Nx.surface())
-                .onClick(() => this.toggleOpen(sub.id))
-
-                // 展开节点区
-                if (this.isOpen(sub.id)) {
-                  Column({ space: 5 }) {
-                    Row() {
-                      Text('点击选用节点 · 长按可删除单个节点 · 点头部 ⚡ 测速')
-                        .fontSize(11).fontColor(Nx.muted()).layoutWeight(1)
-                    }.width('100%').padding({ left: 6, right: 6, top: 4, bottom: 2 })
-                    if (this.nodeColumns === 2) {
-                      Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
-                        ForEach(this.nodesSortedByLatency(sub.id), (node: ProxyNode) => {
-                          this.nodeCard(node, '48.5%')
-                        }, (node: ProxyNode) => node.id)
-                      }
-                      .width('100%')
-                    } else {
-                      Column({ space: 5 }) {
-                        ForEach(this.nodesSortedByLatency(sub.id), (node: ProxyNode) => {
-                          this.nodeCard(node, '100%')
-                        }, (node: ProxyNode) => node.id)
-                      }
-                      .width('100%')
                     }
-                    // 编辑/删除行
-                    if (sub.id !== DIRECT_GROUP_ID) {
-                      Row({ space: 12 }) {
-                        Blank()
-                        Text('✎ 编辑')
-                          .fontSize(12).fontColor(Nx.muted())
+                    // 展开指示
+                    Image($r('app.media.ic_arrow_right')).width(14).height(14)
+                      .fillColor(TunBoxColors.textMuted)
+                      .rotate({ angle: this.isOpen(sub.id) ? 90 : 0 })
+                      .animation({ duration: 250, curve: Curve.EaseInOut })
+                  }
+                  .width('100%')
+                  .padding(14)
+                  .onClick(() => this.toggleOpen(sub.id))
+
+                  // 展开节点区
+                  if (this.isOpen(sub.id)) {
+                    Column({ space: 6 }) {
+                      Row() {
+                        Text('点击选用节点 · 长按可删除单个节点 · 点行头闪电图标测速')
+                          .fontSize(11).fontColor(TunBoxColors.textMuted).layoutWeight(1)
+                      }.width('100%').padding({ left: 2, right: 2, top: 2, bottom: 2 })
+                      GridRow({ columns: this.nodeColumns, gutter: 10 }) {
+                        ForEach(this.nodesSortedByLatency(sub.id), (node: ProxyNode) => {
+                          GridCol() {
+                            this.nodeCard(node)
+                          }
+                        }, (node: ProxyNode) => `${node.id}|${node.id === this.activeNodeId ? 1 : 0}|${this.latencyTick}`)
+                      }
+                      .width('100%')
+                      // 编辑/删除行
+                      if (sub.id !== DIRECT_GROUP_ID) {
+                        Row({ space: 12 }) {
+                          Blank()
+                          Row({ space: 4 }) {
+                            Image($r('app.media.ic_tune')).width(13).height(13)
+                              .fillColor(TunBoxColors.textMuted)
+                            Text('编辑').fontSize(12).fontColor(TunBoxColors.textMuted)
+                          }
                           .onClick(() => this.openEdit(sub))
-                        Text('🗑 删除')
-                          .fontSize(12).fontColor(Nx.danger())
+                          Row({ space: 4 }) {
+                            Image($r('app.media.ic_delete')).width(13).height(13)
+                              .fillColor(TunBoxColors.danger)
+                            Text('删除').fontSize(12).fontColor(TunBoxColors.danger)
+                          }
                           .onClick(() => {
                             this.deleteTargetId = sub.id;
                             this.deleteDialog.open();
                           })
-                      }.width('100%').padding({ top: 4, right: 4 })
+                        }.width('100%').padding({ top: 4, right: 2 })
+                      }
                     }
+                    .width('100%')
+                    .padding({ left: 12, right: 12, bottom: 12, top: 4 })
+                    .backgroundColor(TunBoxColors.surfaceSubtle)
+                    .borderWidth({ top: 1 })
+                    .borderColor(TunBoxColors.cardBorder)
                   }
-                  .width('100%')
-                  .padding({ left: 10, right: 10, bottom: 12, top: 4 })
-                  .backgroundColor(Nx.bg())
-                  .borderWidth({ top: 1 })
-                  .borderColor(Nx.border())
                 }
-              }
-              .width('100%')
-              .borderRadius(14)
-              .backgroundColor(Nx.glassFill())
-              .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, Nx.glassBlur())
-              .backgroundEffect(Nx.glassEffect())
-              .borderWidth(1.5)
-              .borderColor(sub.id === this.activeSubId ? Nx.accent() : Nx.border())
-              .shadow(sub.id === this.activeSubId ?
-                { radius: 12, color: 'rgba(37, 99, 235, 0.10)', offsetY: 3 } :
-                { radius: 6, color: 'rgba(15, 23, 42, 0.04)', offsetY: 2 })
-              .margin({ bottom: 12 })
-              .clip(true)
-            }, (sub: Subscription) => `${sub.id}|${sub.name}|${this.service.nodesOf(sub.id).length}|${sub.lastFetchedAt}|${this.isOpen(sub.id) ? 1 : 0}|${sub.id === this.activeSubId ? 1 : 0}|${this.activeNodeId}|${this.latencyTick}`)
+                .width('100%')
+                .borderRadius(TunBoxGeometry.cardRadius)
+                .backgroundColor(TunBoxColors.surfaceCard)
+                .border({
+                  width: sub.id === this.activeSubId ? 1.5 : 1,
+                  color: sub.id === this.activeSubId ? TunBoxColors.primary : TunBoxColors.cardBorder
+                })
+                .clip(true)
+              }, (sub: Subscription) => `${sub.id}|${sub.name}|${this.service.nodesOf(sub.id).length}|${sub.lastFetchedAt}|${this.isOpen(sub.id) ? 1 : 0}|${sub.id === this.activeSubId ? 1 : 0}|${this.activeNodeId}|${this.latencyTick}`)
 
-            if (this.subs.length === 0) {
-              Column({ space: 10 }) {
-                Text('📡').fontSize(44)
-                Text('暂无订阅').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Nx.muted())
-                Text('点击右上角 + 添加订阅').fontSize(12).fontColor(Nx.faint())
-              }.width('100%').padding({ top: 50, bottom: 50 })
+              if (this.subs.length === 0) {
+                Column({ space: 10 }) {
+                  Image($r('app.media.ic_nodes')).width(44).height(44)
+                    .fillColor(TunBoxColors.textMuted)
+                  Text('暂无订阅').fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textMuted)
+                  Text('点击右上角 + 添加订阅').fontSize(12).fontColor(TunBoxColors.textMuted)
+                }.width('100%').padding({ top: 50, bottom: 50 })
+              }
             }
+            .width('100%')
+            // 底部为悬浮导航栏预留 TunBoxGeometry.dockClearance(96) 高度
+            .padding({
+              left: TunBoxGeometry.pagePadding,
+              right: TunBoxGeometry.pagePadding,
+              top: 4,
+              bottom: TunBoxGeometry.dockClearance
+            })
           }
           .width('100%')
-          // 底部仅留页签栏高度：barOverlap(true) 语义为「内容延伸到页签栏之下」，
-          // 留大片空白会让悬浮栏下方无内容可透，毛玻璃退化成实色圆角片。
-          .padding({ left: 18, right: 18, top: 10, bottom: 100 })
         }
         .width('100%').height('100%')
         .scrollBar(BarState.Off)

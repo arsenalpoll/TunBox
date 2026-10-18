@@ -1,5 +1,5 @@
 /**
- * 设置中心（第二阶段·第三轮 UI）
+ * 设置中心（2026-10-17 UI 重构：Nexus 设计令牌版）
  *
  * 职责：把第二阶段新增的设置项以分组形式呈现，读写均走既有服务：
  *   - 读取：SettingsService.load() → AppSettings（页面首次进入取持久化真实值）
@@ -7,13 +7,15 @@
  * 每项改动即时落盘并 showToast 反馈；返回主页后再次进入仍读回真实值（不丢状态）。
  *
  * 约束：本文件只调用既有服务的公开接口，不修改 Orchestrator/AppSettings/SettingsService。
- * 退避上限（setReconnectBackoffMax）未纳入 AppSettings 持久化字段，故用进程内静态变量
- * 在页面实例之间保持（不写盘、不新增字段）。
+ * 2026-10-17 用户要求：设置页不再暴露「重连退避上限」三档时间 —— 编排器固定用
+ * 内置最优默认 8s（RECONNECT_MAX_MS），用户只需控制「自动重连」开关。
  */
 import { router, promptAction } from '@kit.ArkUI';
+import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { common } from '@kit.AbilityKit';
 import { privacyManager } from '@kit.AppGalleryKit';
-import { Ui } from '../theme/UiTokens';
+import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TopNavBar } from '../components/TopNavBar';
 import { AppInfo } from '../commons/utils/AppInfo';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
@@ -21,12 +23,12 @@ import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrat
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { GeoAssetStatus } from '../commons/services/ConnectionOrchestrator';
 
-/** 退避上限可选值（秒） */
-const BACKOFF_OPTIONS: number[] = [8, 16, 32];
-/** 退避上限进程内记忆（未持久化；默认 8s 与 Orchestrator 的 RECONNECT_MAX_MS 一致） */
-class BackoffRuntime {
-  static sec: number = 8;
-}
+/**
+ * 2026-10-17 用户要求：重连退避上限不再暴露三档时间选项 —— 固定为 8s
+ * （与 Orchestrator 的 RECONNECT_MAX_MS 一致的最优默认值），用户只需
+ * 开/关「自动重连」。退避上限的进程内记忆与设置 UI 一并移除。
+ */
+/** 内容列最大宽度（与原 UiTokens.pageMaxWidth 取值一致，平板/折叠屏防过宽） */
 
 /** geo 资产下载源偏好选项（与 AppSettings.assetSource 白名单一致） */
 const ASSET_SOURCE_OPTIONS: string[] = ['auto', 'jsdelivr', 'ghproxy', 'github'];
@@ -47,13 +49,16 @@ function formatGeoSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-@Entry
 @Component
-struct SettingsPage {
+export struct SettingsView {
+  @StorageLink('theme_revision') themeRevision: number = 0;
+  /** 宿主（底部页签 MainPage / 路由包装页 SettingsPage）「重新展示」通知桥（替代 onPageShow 语义） */
+  shownBridge?: TabLifecycleBridge;
   @State appRoutingSummary: string = '正在读取应用分流…';
-  // ── 网络与重连 ──
+  /** 广告拦截规则状态（原首页「规则模式」卡片迁入，语义与首页 rulesStatusText 一致） */
+  @State adRulesSummary: string = '正在读取规则状态…';
+  // ── 网络重连 ──
   @State autoReconnect: boolean = true;
-  @State backoffSec: number = 8;
   // ── 故障切换 ──
   @State failoverEnabled: boolean = true;
   @State failoverThreshold: number = 3;
@@ -74,13 +79,29 @@ struct SettingsPage {
   @State quotaNotifyEnabled: boolean = true;
   // ── 关于与隐私 ──
   @State privacyUrl: string = '';
+  /** 顶栏标题（app.string.settings_title 的本地化取值；TopNavBar.title 为 string 型） */
+  private settingsTitle: string = '';
 
   private settings: AppSettings = new AppSettings();
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
   private subs: SubscriptionService = SubscriptionService.instance();
 
-  onPageShow(): void {
-    this.bootstrap();
+  aboutToAppear(): void {
+    // 顶栏标题：读取当前语言的本地化文案（与原 Text($r(...)) 呈现一致）
+    try {
+      this.settingsTitle = getContext(this).resourceManager.getStringSync($r('app.string.settings_title'));
+    } catch (e) {
+      this.settingsTitle = '设置';
+    }
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler((): void => { this.bootstrap(); });
+    }
+  }
+
+  aboutToDisappear(): void {
+    if (this.shownBridge !== undefined) {
+      this.shownBridge.setShowHandler(null);
+    }
   }
 
   private async bootstrap(): Promise<void> {
@@ -101,9 +122,6 @@ struct SettingsPage {
     this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
     this.assetSource = this.settings.assetSource;
     this.refreshGeoStatuses();
-    // 退避上限：进程内记忆，进页面即应用到编排器
-    this.backoffSec = BackoffRuntime.sec;
-    this.orchestrator.setReconnectBackoffMax(this.backoffSec * 1000);
     this.refreshNodeAndSwitchInfo();
     this.refreshPrivacyLink();
   }
@@ -145,6 +163,9 @@ struct SettingsPage {
     } else if (this.settings.appRoutingMode === 'include') {
       summary = `仅所选应用 · 已选 ${this.settings.includedApps.length} 个`;
     }
+    this.adRulesSummary = this.settings.rulesEnabled
+      ? (this.settings.hyperAdRulesEnabled ? '拦截规则生效中 · HyperADRules 智能去广告' : '规则生效中')
+      : '规则已关闭';
     this.appRoutingSummary = this.settings.appRoutingNeedsReview
       ? summary + ' · 待确认，请进入检查' : summary;
   }
@@ -199,14 +220,6 @@ struct SettingsPage {
     this.persist();
   }
 
-  private setBackoff(sec: number): void {
-    const s = BACKOFF_OPTIONS.includes(sec) ? sec : 8;
-    this.backoffSec = s;
-    BackoffRuntime.sec = s;
-    this.orchestrator.setReconnectBackoffMax(s * 1000);
-    promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
-  }
-
   private onFailoverEnabledChange(v: boolean): void {
     this.failoverEnabled = v;
     this.persist();
@@ -229,15 +242,6 @@ struct SettingsPage {
       promptAction.showToast({ message: $r('app.string.settings_clamp_toast') });
       return;
     }
-    this.persist();
-  }
-
-  private setSelectMode(mode: string): void {
-    const m = AutoSelectModes.normalize(mode);
-    if (this.autoSelectMode === m) {
-      return;
-    }
-    this.autoSelectMode = m;
     this.persist();
   }
 
@@ -316,78 +320,104 @@ struct SettingsPage {
   // ── UI ────────────────────────────────────────────────────────────
 
   build() {
-    Stack() {
-      Column()
-        .width('100%').height('100%')
-        .linearGradient({ angle: 135, colors: Ui.backdropColors })
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column().width('100%').height('100%')
+        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
-        // ── 顶栏 ──
-        Row() {
-          Text('←')
-            .fontSize(22).fontColor(Ui.textPrimary)
-            .padding({ left: 4, right: 8 })
-            .onClick(() => router.back())
-          Text($r('app.string.settings_title'))
-            .fontSize(18).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-          Blank()
-        }
-        .width('100%')
-        .height(48)
+        // ── 顶栏（底部页签页：无返回）──
+        TopNavBar({ title: this.settingsTitle })
 
         Scroll() {
           Column({ space: 14 }) {
             // ── 应用分流：进入统一页面，不在设置页维护第二份编辑状态 ──
             Column({ space: 6 }) {
-              Row({ space: 7 }) {
-                Text('📱').fontSize(16).fontColor(Ui.textSecondary)
-                Text('应用分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+              Row({ space: 8 }) {
+                Row() {
+                  Image($r('app.media.ic_apps'))
+                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                }
+                .width(28).height(28).borderRadius(8)
+                .backgroundColor(TunBoxColors.primaryLight)
+                .justifyContent(FlexAlign.Center)
+                Text('应用分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
                 Blank()
-                Text('›').fontSize(20).fontColor(Ui.textSecondary)
-              }.width('100%')
+                Image($r('app.media.ic_arrow_right'))
+                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
+              }.width('100%').alignItems(VerticalAlign.Center)
               Text(this.appRoutingSummary)
-                .fontSize(12).fontColor(Ui.textSecondary).width('100%')
+                .fontSize(12).fontColor(TunBoxColors.textSecondary).width('100%')
             }
-            .width('100%').padding(16).borderRadius(20)
-            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
             .onClick(() => router.pushUrl({ url: 'pages/AppRoutingPage' }))
 
-            // ── 网络与重连 ──
+            // ── 网站分流策略：进入统一页面配置（2026-10-17 自首页「规则模式」卡片迁入）──
+            Column({ space: 6 }) {
+              Row({ space: 8 }) {
+                Row() {
+                  Image($r('app.media.ic_swap'))
+                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                }
+                .width(28).height(28).borderRadius(8)
+                .backgroundColor(TunBoxColors.primaryLight)
+                .justifyContent(FlexAlign.Center)
+                Text('网站分流策略').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Blank()
+                Image($r('app.media.ic_arrow_right'))
+                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text(`代理 ${this.settings.forceProxySites.length} · 直连 ${this.settings.forceDirectSites.length}`)
+                .fontSize(12).fontColor(TunBoxColors.textSecondary).width('100%')
+            }
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .onClick(() => router.pushUrl({ url: 'pages/SiteRoutingPage' }))
+
+            // ── 广告拦截规则：进入统一页面配置（2026-10-17 自首页「规则模式」卡片迁入）──
+            Column({ space: 6 }) {
+              Row({ space: 8 }) {
+                Row() {
+                  Image($r('app.media.ic_shield'))
+                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                }
+                .width(28).height(28).borderRadius(8)
+                .backgroundColor(TunBoxColors.primaryLight)
+                .justifyContent(FlexAlign.Center)
+                Text('广告拦截规则').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Blank()
+                Image($r('app.media.ic_arrow_right'))
+                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text(this.adRulesSummary)
+                .fontSize(12).fontColor(TunBoxColors.textSecondary).width('100%')
+            }
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .onClick(() => router.pushUrl({ url: 'pages/RulesPage' }))
+
+            // ── 网络重连（2026-10-17：只保留「自动重连」开关，退避上限固定最优默认 8s）──
             Column({ space: 12 }) {
-              this.SectionHeader('🌐', $r('app.string.settings_network_reconnect_title'))
+              this.SectionHeader($r('app.media.ic_refresh'), $r('app.string.settings_network_reconnect_title'))
               this.ToggleRow($r('app.string.settings_auto_reconnect_label'),
                 $r('app.string.settings_auto_reconnect_desc'),
                 this.autoReconnect, (v: boolean): void => this.onAutoReconnectChange(v))
-              Column({ space: 8 }) {
-                Row() {
-                  Text($r('app.string.settings_backoff_max_label'))
-                    .fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
-                }.width('100%')
-                Row({ space: 8 }) {
-                  ForEach(BACKOFF_OPTIONS, (sec: number) => {
-                    Text($r('app.string.settings_seconds_value', sec))
-                      .fontSize(13)
-                      .fontWeight(this.backoffSec === sec ? FontWeight.Bold : FontWeight.Normal)
-                      .fontColor(this.backoffSec === sec ? Ui.textViolet : Ui.textSecondary)
-                      .padding({ left: 14, right: 14, top: 7, bottom: 7 })
-                      .borderRadius(12)
-                      .backgroundColor(this.backoffSec === sec ? Ui.selectedBackground : Ui.inputBackground)
-                      .borderWidth(1)
-                      .borderColor(this.backoffSec === sec ? Ui.primary : Ui.border)
-                      .onClick(() => this.setBackoff(sec))
-                  }, (sec: number) => `${sec}`)
-                }.width('100%')
-                Text($r('app.string.settings_backoff_max_desc'))
-                  .fontSize(11).fontColor(Ui.textTertiary).width('100%')
-              }.width('100%')
             }
-            .width('100%').padding(16).borderRadius(20)
-            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
 
             // ── 故障切换 ──
             Column({ space: 12 }) {
-              this.SectionHeader('⇄', $r('app.string.settings_failover_title'))
+              this.SectionHeader($r('app.media.ic_swap'), $r('app.string.settings_failover_title'))
               this.ToggleRow($r('app.string.settings_failover_enable_label'),
                 $r('app.string.settings_failover_enable_desc'),
                 this.failoverEnabled, (v: boolean): void => this.onFailoverEnabledChange(v))
@@ -400,58 +430,14 @@ struct SettingsPage {
                 this.failoverCooldown, true,
                 (delta: number): void => this.stepCooldown(delta))
             }
-            .width('100%').padding(16).borderRadius(20)
-            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
-
-            // ── 选点 ──
-            Column({ space: 12 }) {
-              this.SectionHeader('✦', $r('app.string.settings_select_title'))
-              Text($r('app.string.settings_select_mode_label'))
-                .fontSize(14).fontColor(Ui.textPrimary).width('100%')
-              Row() {
-                this.SelectChip(AutoSelectModes.MANUAL, $r('app.string.settings_select_mode_manual'))
-                this.SelectChip(AutoSelectModes.AUTO, $r('app.string.settings_select_mode_auto'))
-              }
-              .width('100%').padding(4).borderRadius(14).backgroundColor(Ui.inputBackground)
-              Text(this.autoSelectMode === AutoSelectModes.AUTO
-                ? $r('app.string.settings_select_mode_auto_desc')
-                : $r('app.string.settings_select_mode_manual_desc'))
-                .fontSize(11).fontColor(Ui.textTertiary).width('100%')
-
-              Divider().color(Ui.border)
-
-              Row() {
-                Text($r('app.string.settings_current_node_label'))
-                  .fontSize(13).fontColor(Ui.textSecondary).layoutWeight(1)
-                Text(this.currentNodeName.length > 0
-                  ? this.currentNodeName : $r('app.string.settings_no_node'))
-                  .fontSize(13).fontColor(Ui.textPrimary)
-                  .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .constraintSize({ maxWidth: 180 })
-              }.width('100%')
-
-              Row() {
-                Text($r('app.string.settings_last_switch_label'))
-                  .fontSize(13).fontColor(Ui.textSecondary).layoutWeight(1)
-                Text(this.switchFrom.length > 0 && this.switchTo.length > 0
-                  ? $r('app.string.settings_last_switch_pair', this.switchFrom, this.switchTo)
-                  : $r('app.string.settings_last_switch_none'))
-                  .fontSize(13).fontColor(Ui.textPrimary)
-                  .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .constraintSize({ maxWidth: 180 })
-              }.width('100%')
-
-              if (this.switchReason.length > 0) {
-                Text(this.switchReason)
-                  .fontSize(11).fontColor(Ui.textTertiary).width('100%')
-              }
-            }
-            .width('100%').padding(16).borderRadius(20)
-            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
 
             // ── 诊断 ──
             Column({ space: 12 }) {
-              this.SectionHeader('🩺', $r('app.string.settings_diagnostics_title'))
+              this.SectionHeader($r('app.media.ic_shield'), $r('app.string.settings_diagnostics_title'))
               this.ToggleRow($r('app.string.settings_health_enable_label'),
                 $r('app.string.settings_health_enable_desc'),
                 this.healthEnabled, (v: boolean): void => this.onHealthEnabledChange(v))
@@ -459,48 +445,48 @@ struct SettingsPage {
                 $r('app.string.settings_health_repair_steps_desc'),
                 this.repairMaxSteps, false,
                 (delta: number): void => this.stepRepair(delta))
-              Divider().color(Ui.border)
+              Divider().color(TunBoxColors.cardBorder)
               Column({ space: 4 }) {
                 Row() {
                   Text('订阅配额提醒')
-                    .fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
+                    .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
                   Toggle({ type: ToggleType.Switch, isOn: this.quotaNotifyEnabled })
-                    .selectedColor(Ui.primaryBlueFill)
+                    .selectedColor(TunBoxColors.primary)
                     .onChange((v: boolean): void => this.setQuotaNotify(v))
                 }.width('100%').alignItems(VerticalAlign.Center)
                 Text('订阅流量剩余不足 10% 或 3 天内到期时发送系统通知（每次刷新订阅后检查，每天最多提醒一次）')
-                  .fontSize(11).fontColor(Ui.textTertiary).width('100%')
+                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }.width('100%')
             }
-            .width('100%').padding(16).borderRadius(20)
-            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
 
             // ── 数据与规则 ──
             Column({ space: 12 }) {
-              this.SectionHeader('🗃', $r('app.string.settings_geo_title'))
+              this.SectionHeader($r('app.media.ic_doc'), $r('app.string.settings_geo_title'))
               ForEach(this.geoAssets, (asset: GeoAssetStatus) => {
                 Row({ space: 10 }) {
                   Column({ space: 3 }) {
                     Row({ space: 6 }) {
                       Text(asset.label).fontSize(14).fontWeight(FontWeight.Bold)
-                        .fontColor(Ui.textPrimary)
-                      Text(asset.ready ? '●' : '○')
-                        .fontSize(12)
-                        .fontColor(asset.ready ? Ui.success : Ui.textTertiary)
-                    }.width('100%')
+                        .fontColor(TunBoxColors.textPrimary)
+                      Circle({ width: 8, height: 8 })
+                        .fill(asset.ready ? TunBoxColors.success : TunBoxColors.textMuted)
+                    }.width('100%').alignItems(VerticalAlign.Center)
                     Text(`${asset.detail} · ${this.geoStatusText(asset)}`)
-                      .fontSize(11).fontColor(Ui.textTertiary).width('100%')
+                      .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
                       .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
                   }.alignItems(HorizontalAlign.Start).layoutWeight(1)
                   Text(this.geoUpdatingId === asset.id ? '更新中…' : '更新')
                     .fontSize(13)
                     .fontWeight(FontWeight.Bold)
-                    .fontColor(this.geoUpdatingId === asset.id ? Ui.textTertiary : Ui.primary)
+                    .fontColor(this.geoUpdatingId === asset.id ? TunBoxColors.textMuted : TunBoxColors.primary)
                     .padding({ left: 12, right: 12, top: 6, bottom: 6 })
                     .borderRadius(12)
-                    .backgroundColor(Ui.inputBackground)
-                    .borderWidth(1)
-                    .borderColor(Ui.border)
+                    .backgroundColor(TunBoxColors.surfaceCard)
+                    .border({ width: 1, color: TunBoxColors.cardBorder })
                     .onClick(() => {
                       if (this.geoUpdatingId.length === 0) {
                         this.updateAsset(asset.id);
@@ -511,62 +497,71 @@ struct SettingsPage {
                 .alignItems(VerticalAlign.Center)
                 .padding(10)
                 .borderRadius(14)
-                .backgroundColor(Ui.inputBackground)
+                .backgroundColor(TunBoxColors.surfaceSubtle)
               }, (asset: GeoAssetStatus) => `${asset.id}-${asset.ready}-${asset.sizeBytes}`)
 
               Column({ space: 8 }) {
                 Text('下载源偏好')
-                  .fontSize(14).fontColor(Ui.textPrimary).width('100%')
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).width('100%')
                 Row({ space: 8 }) {
                   ForEach(ASSET_SOURCE_OPTIONS, (src: string) => {
                     Text(ASSET_SOURCE_LABELS[src] ?? src)
                       .fontSize(13)
                       .fontWeight(this.assetSource === src ? FontWeight.Bold : FontWeight.Normal)
-                      .fontColor(this.assetSource === src ? Ui.textViolet : Ui.textSecondary)
+                      .fontColor(this.assetSource === src ? TunBoxColors.primary : TunBoxColors.textSecondary)
                       .layoutWeight(1)
                       .textAlign(TextAlign.Center)
                       .padding({ top: 7, bottom: 7 })
                       .borderRadius(12)
-                      .backgroundColor(this.assetSource === src ? Ui.selectedBackground : Ui.inputBackground)
-                      .borderWidth(1)
-                      .borderColor(this.assetSource === src ? Ui.primary : Ui.border)
+                      .backgroundColor(this.assetSource === src ? TunBoxColors.primaryLight : TunBoxColors.surfaceSubtle)
+                      .border({
+                        width: 1,
+                        color: this.assetSource === src ? TunBoxColors.primaryBorder : TunBoxColors.cardBorder
+                      })
                       .onClick(() => this.setAssetSource(src))
                   }, (src: string) => src)
                 }.width('100%')
                 Text('默认按实测可达性排序；CDN=jsdelivr 优先，加速=gh-proxy 前缀优先，官方=GitHub 直链优先。偏好源失败仍自动回退其余源。')
-                  .fontSize(11).fontColor(Ui.textTertiary).width('100%')
+                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }.width('100%')
             }
-            .width('100%').padding(16).borderRadius(20)
-            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
 
             // ── 关于与隐私 ──
             Column({ space: 12 }) {
-              this.SectionHeader('ⓘ', $r('app.string.settings_about_title'))
+              this.SectionHeader($r('app.media.ic_globe'), $r('app.string.settings_about_title'))
               Row() {
                 Text($r('app.string.settings_version_label'))
-                  .fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
                 Text(AppInfo.version())
-                  .fontSize(13).fontColor(Ui.textSecondary)
+                  .fontSize(13).fontColor(TunBoxColors.textSecondary)
               }.width('100%')
-              Divider().color(Ui.border)
+              Divider().color(TunBoxColors.cardBorder)
               Row() {
                 Text($r('app.string.settings_privacy_policy_row'))
-                  .fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
-                Text('›').fontSize(20).fontColor(Ui.textSecondary)
-              }.width('100%')
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Image($r('app.media.ic_arrow_right'))
+                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
+              }.width('100%').alignItems(VerticalAlign.Center)
               .onClick(() => this.openPrivacyPolicy())
               Text($r('app.string.settings_privacy_policy_desc'))
-                .fontSize(11).fontColor(Ui.textTertiary).width('100%')
+                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
             }
-            .width('100%').padding(16).borderRadius(20)
-            .backgroundColor(Ui.surfaceMuted).borderWidth(1).borderColor(Ui.border)
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
 
-            Blank().height(24)
+            // 页签页底部为悬浮 Dock 预留（契约：≥ TunBoxGeometry.dockClearance）
+            Blank().height(TunBoxGeometry.dockClearance)
           }
           .width('100%')
-          .constraintSize({ maxWidth: Ui.pageMaxWidth })
-          .padding({ left: 18, right: 18, top: 6, bottom: 24 })
+          .padding({
+            left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 24
+          })
         }
         .width('100%').layoutWeight(1)
         .scrollBar(BarState.Off)
@@ -578,27 +573,28 @@ struct SettingsPage {
   }
 
   @Builder
-  SectionHeader(icon: string, title: Resource) {
-    Row({ space: 7 }) {
-      Text(icon).fontSize(16).fontColor(Ui.textSecondary)
-      Text(title).fontSize(15).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+  SectionHeader(icon: Resource, title: Resource) {
+    Row({ space: 8 }) {
+      Image(icon).width(18).height(18).fillColor(TunBoxColors.primary)
+      Text(title).fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
       Blank()
     }
     .width('100%')
+    .alignItems(VerticalAlign.Center)
   }
 
   @Builder
   ToggleRow(label: Resource, desc: Resource, isOn: boolean, onChange: (v: boolean) => void) {
     Column({ space: 4 }) {
       Row() {
-        Text(label).fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
+        Text(label).fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
         Toggle({ type: ToggleType.Switch, isOn: isOn })
-          .selectedColor(Ui.primaryBlueFill)
+          .selectedColor(TunBoxColors.primary)
           .onChange(onChange)
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
-      Text(desc).fontSize(11).fontColor(Ui.textTertiary).width('100%')
+      Text(desc).fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
     }
     .width('100%')
   }
@@ -608,46 +604,59 @@ struct SettingsPage {
     onStep: (delta: number) => void) {
     Column({ space: 4 }) {
       Row() {
-        Text(label).fontSize(14).fontColor(Ui.textPrimary).layoutWeight(1)
+        Text(label).fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
         Row({ space: 0 }) {
-          Text('−')
-            .fontSize(18).fontColor(Ui.textPrimary)
-            .width(34).height(30).textAlign(TextAlign.Center)
-            .borderRadius(8).backgroundColor(Ui.inputBackground)
-            .onClick(() => onStep(-1))
+          Stack({ alignContent: Alignment.Center }) {
+            Image($r('app.media.ic_minus')).width(15).height(15).fillColor(TunBoxColors.textPrimary)
+          }
+          .width(34).height(30)
+          .borderRadius(8).backgroundColor(TunBoxColors.surfaceSubtle)
+          .border({ width: 1, color: TunBoxColors.cardBorder })
+          .onClick(() => onStep(-1))
           Text(useSeconds ? $r('app.string.settings_seconds_value', value) : `${value}`)
-            .fontSize(14).fontColor(Ui.textPrimary)
+            .fontSize(14).fontColor(TunBoxColors.textPrimary)
             .constraintSize({ minWidth: 62 })
             .textAlign(TextAlign.Center)
             .padding({ left: 6, right: 6 })
-          Text('+')
-            .fontSize(18).fontColor(Ui.textPrimary)
-            .width(34).height(30).textAlign(TextAlign.Center)
-            .borderRadius(8).backgroundColor(Ui.inputBackground)
-            .onClick(() => onStep(1))
+          Stack({ alignContent: Alignment.Center }) {
+            Image($r('app.media.ic_plus')).width(15).height(15).fillColor(TunBoxColors.textPrimary)
+          }
+          .width(34).height(30)
+          .borderRadius(8).backgroundColor(TunBoxColors.surfaceSubtle)
+          .border({ width: 1, color: TunBoxColors.cardBorder })
+          .onClick(() => onStep(1))
         }
         .alignItems(VerticalAlign.Center)
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
-      Text(desc).fontSize(11).fontColor(Ui.textTertiary).width('100%')
+      Text(desc).fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
     }
     .width('100%')
   }
 
-  @Builder
-  SelectChip(mode: string, label: Resource) {
-    Text(label)
-      .fontSize(14)
-      .fontWeight(FontWeight.Bold)
-      .fontColor(this.autoSelectMode === mode ? Ui.textViolet : Ui.textSecondary)
-      .layoutWeight(1)
-      .textAlign(TextAlign.Center)
-      .padding({ top: 9, bottom: 9 })
-      .borderRadius(11)
-      .backgroundColor(this.autoSelectMode === mode ? Ui.selectedBackground : Color.Transparent)
-      .borderWidth(this.autoSelectMode === mode ? 1 : 0)
-      .borderColor(this.autoSelectMode === mode ? Ui.primary : Color.Transparent)
-      .onClick(() => this.setSelectMode(mode))
+}
+
+/**
+ * 路由兼容入口（2026-10-17 UI 重构）：设置页内容已抽为 SettingsView，
+ * 底部页签（MainPage）直接挂 SettingsView；外部深链仍走本 @Entry 页。
+ */
+@Entry
+@Component
+struct SettingsPage {
+  @StorageLink('theme_revision') themeRevision: number = 0;
+  private bridge: TabLifecycleBridge = new TabLifecycleBridge();
+
+  onPageShow(): void {
+    this.bridge.notifyShown();
+  }
+
+  build() {
+    // @Entry 的 build 根必须是容器组件，故用 Stack 承载页签内容视图
+    Stack() {
+      SettingsView({ shownBridge: this.bridge })
+    }
+    .width('100%')
+    .height('100%')
   }
 }

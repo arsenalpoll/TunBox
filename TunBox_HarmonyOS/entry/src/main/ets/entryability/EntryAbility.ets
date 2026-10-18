@@ -7,6 +7,7 @@ import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { SettingsService } from '../commons/services/SettingsService';
+import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { UiGuardian } from '../commons/services/UiGuardian';
 import { BackgroundTaskWatch } from '../commons/services/BackgroundTaskWatch';
@@ -33,6 +34,13 @@ export default class EntryAbility extends UIAbility {
     });
     SettingsService.init(this.context).catch((e: BusinessError) => {
       AppLogger.error(TAG, `settings init failed: ${e.message}`);
+    });
+    // 启动速度（2026-10-17）：订阅 hydrate（凭据迁移 + 节点回填，真机 ~1.1-1.5s）
+    // 原本要等首页首帧后由 bootstrap 触发，现在提前到 onCreate —— 与页面 inflated
+    // 并行推进，用户冷启后立刻点连接时，connect 的就绪等待窗口显著缩短。
+    // init 进程内记忆化：bootstrap 稍后的调用直接复用同一 Promise，不会重跑。
+    SubscriptionService.instance().init(this.context).catch((e: Object): void => {
+      AppLogger.warn(TAG, `early subs init failed: ${AppLogger.errText(e)}`);
     });
     this.captureWant(want);
     this.captureDeepLink(want);
