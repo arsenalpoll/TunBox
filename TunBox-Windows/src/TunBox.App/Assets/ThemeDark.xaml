@@ -1,42 +1,43 @@
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <!-- 暗色主题：只覆盖调色 token，控件样式仍来自 Styles.xaml。
-         对齐 Mihomo Party / Clash Verge 的暗色：近黑底 + 中性灰卡 + 同一品牌蓝。
-         覆盖方式：ThemeManager 在运行时把本字典合并进窗口资源，键名与 Styles.xaml 一一对应。 -->
-    <SolidColorBrush x:Key="PageBg" Color="#0A0A0C"/>
-    <SolidColorBrush x:Key="CardBg" Color="#1A1A1E"/>
-    <SolidColorBrush x:Key="CardLine" Color="#2A2A30"/>
-    <SolidColorBrush x:Key="Brand" Color="#0A84FF"/>
-    <SolidColorBrush x:Key="BrandSoft" Color="#15304F"/>
-    <SolidColorBrush x:Key="TextMain" Color="#ECECF0"/>
-    <SolidColorBrush x:Key="TextMuted" Color="#A8A8B0"/>
-    <SolidColorBrush x:Key="Line" Color="#2E2E34"/>
-    <SolidColorBrush x:Key="SegTrack" Color="#26262C"/>
-    <SolidColorBrush x:Key="Danger" Color="#F87171"/>
-    <SolidColorBrush x:Key="Warn" Color="#F0B450"/>
-    <SolidColorBrush x:Key="WarnSoft" Color="#3A2E14"/>
-    <SolidColorBrush x:Key="Running" Color="#34D399"/>
-    <SolidColorBrush x:Key="GlowIdle" Color="#260A84FF"/>
-    <SolidColorBrush x:Key="GlowOn" Color="#4A34D399"/>
-    <SolidColorBrush x:Key="RunningSoft" Color="#2634D399"/>
-    <SolidColorBrush x:Key="RingBorder" Color="#2E2E34"/>
-    <SolidColorBrush x:Key="IconBg" Color="#242429"/>
-    <SolidColorBrush x:Key="DangerButtonBg" Color="#3B1D1D"/>
-    <SolidColorBrush x:Key="QuietBtnBg" Color="#26262C"/>
-    <SolidColorBrush x:Key="QuietBtnFg" Color="#C8C8CE"/>
-    <SolidColorBrush x:Key="InputHoverLine" Color="#3D3D45"/>
-    <SolidColorBrush x:Key="ComboHoverLine" Color="#42424B"/>
-    <SolidColorBrush x:Key="BoxBorder" Color="#3A3A42"/>
-    <SolidColorBrush x:Key="TrackBg" Color="#33333B"/>
-    <SolidColorBrush x:Key="TrackOn" Color="#34C759"/>
-    <SolidColorBrush x:Key="ScrollThumbBrush" Color="#42424B"/>
-    <SolidColorBrush x:Key="ScrollThumbHover" Color="#55555F"/>
-    <SolidColorBrush x:Key="NodeRowBg" Color="#202025"/>
-    <SolidColorBrush x:Key="NodeRowLine" Color="#2C2C33"/>
-    <SolidColorBrush x:Key="NodeRowHover" Color="#28282F"/>
-    <SolidColorBrush x:Key="NavHover" Color="#24242A"/>
-    <SolidColorBrush x:Key="ProgTrack" Color="#28282F"/>
-    <SolidColorBrush x:Key="PopupBg" Color="#202025"/>
-    <SolidColorBrush x:Key="TooltipBg" Color="#33333B"/>
-    <Color x:Key="ShadowColor">#000000</Color>
+    <!-- 暗色主题:只覆盖调色 token,控件样式仍来自 Styles.xaml。
+         对齐 TunBox 鸿蒙端 resources/dark/element/color.json:
+         深夜蓝底 #0B1220 + 蓝灰卡 #16223A + 品牌蓝 #3D7DFF + 强调绿 #2FD98F。
+         覆盖方式:ThemeManager 在运行时把本字典合并进窗口资源,键名与 Styles.xaml 一一对应。 -->
+    <SolidColorBrush x:Key="PageBg" Color="#0B1220"/>
+    <SolidColorBrush x:Key="CardBg" Color="#16223A"/>
+    <SolidColorBrush x:Key="CardLine" Color="#24344F"/>
+    <SolidColorBrush x:Key="Brand" Color="#3D7DFF"/>
+    <SolidColorBrush x:Key="BrandSoft" Color="#1B2A4A"/>
+    <SolidColorBrush x:Key="TextMain" Color="#E8EEF8"/>
+    <SolidColorBrush x:Key="TextMuted" Color="#A0AEC2"/>
+    <SolidColorBrush x:Key="Line" Color="#24344F"/>
+    <SolidColorBrush x:Key="SegTrack" Color="#24344F"/>
+    <SolidColorBrush x:Key="Danger" Color="#FF6B5E"/>
+    <SolidColorBrush x:Key="Warn" Color="#FFB020"/>
+    <SolidColorBrush x:Key="WarnSoft" Color="#33FFB020"/>
+    <SolidColorBrush x:Key="Running" Color="#2FD98F"/>
+    <SolidColorBrush x:Key="GlowIdle" Color="#330A59F7"/>
+    <SolidColorBrush x:Key="GlowOn" Color="#332FD98F"/>
+    <SolidColorBrush x:Key="RunningSoft" Color="#332FD98F"/>
+    <SolidColorBrush x:Key="RingBorder" Color="#24344F"/>
+    <SolidColorBrush x:Key="IconBg" Color="#1C2A46"/>
+    <SolidColorBrush x:Key="DangerButtonBg" Color="#3A1F22"/>
+    <SolidColorBrush x:Key="QuietBtnBg" Color="#1C2A46"/>
+    <SolidColorBrush x:Key="QuietBtnFg" Color="#A0AEC2"/>
+    <SolidColorBrush x:Key="InputHoverLine" Color="#2C4470"/>
+    <SolidColorBrush x:Key="ComboHoverLine" Color="#2C4470"/>
+    <SolidColorBrush x:Key="BoxBorder" Color="#2C4470"/>
+    <SolidColorBrush x:Key="TrackBg" Color="#24344F"/>
+    <SolidColorBrush x:Key="TrackOn" Color="#2FD98F"/>
+    <SolidColorBrush x:Key="ScrollThumbBrush" Color="#2C4470"/>
+    <SolidColorBrush x:Key="ScrollThumbHover" Color="#3A4A66"/>
+    <SolidColorBrush x:Key="NodeRowBg" Color="#101A2E"/>
+    <SolidColorBrush x:Key="NodeRowLine" Color="#24344F"/>
+    <SolidColorBrush x:Key="NodeRowHover" Color="#1B2A4A"/>
+    <SolidColorBrush x:Key="NavHover" Color="#1B2A4A"/>
+    <SolidColorBrush x:Key="ProgTrack" Color="#24344F"/>
+    <SolidColorBrush x:Key="PopupBg" Color="#16223A"/>
+    <SolidColorBrush x:Key="TooltipBg" Color="#0B1220"/>
+    <Color x:Key="ShadowColor">#050810</Color>
 </ResourceDictionary>

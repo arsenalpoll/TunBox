@@ -39,6 +39,14 @@ public partial class MainWindow : Window
             ViewModel.RefreshLocalizedOptions();   // VM 可能在字典挂上前就构造好了
         }
         catch { /* 语言字典挂不上就按默认中文 */ }
+        // 深色:InitializeComponent 解析 Window.Resources 会清掉 pre-parse 挂的暗色字典,
+        // 所以解析后重挂一次,并让当前页的模板重新实例化(模板里的 StaticResource 在
+        // 实例化时才解析,重挂 + 重实例化 = 真正变暗)。
+        if (ThemeManager.IsDark)
+        {
+            ThemeManager.ApplyDark(Resources);
+            ReloadShell();
+        }
         DataContext = ViewModel;
         // 仪表盘的速率图：采样事件 → 图表（窗口关了要摘掉，VM 比窗口活得久）
         ViewModel.SpeedSampled += OnSpeedSampled;
@@ -77,6 +85,14 @@ public partial class MainWindow : Window
         ViewModel.SpeedSampled -= OnSpeedSampled;
         ViewModel.NavigateRequested -= OnNavigateRequested;
         base.OnClosed(e);
+    }
+
+    /// <summary>让当前页的控件模板重新实例化(主题/语言字典变更后调它才彻底)。</summary>
+    public void ReloadShell()
+    {
+        var idx = Shell.SelectedIndex;
+        Shell.SelectedIndex = -1;
+        Shell.SelectedIndex = idx;
     }
 
     // ── 窗口位置/尺寸记忆 ────────────────────────────────────────────────

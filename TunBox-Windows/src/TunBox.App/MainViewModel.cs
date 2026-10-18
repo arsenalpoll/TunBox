@@ -1183,6 +1183,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
             catch { /* 单个窗口失败不挡其它窗口 */ }
         }
+        // 模板里的 StaticResource 在实例化时才解析:重挂字典后让每页重新实例化才算切换彻底
+        foreach (MainWindow mw in Application.Current.Windows.OfType<MainWindow>()) mw.ReloadShell();
     }
 
     private string _geoSummaryText = "";

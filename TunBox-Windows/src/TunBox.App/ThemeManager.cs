@@ -35,7 +35,7 @@ public static class ThemeManager
         RemoveDark(merged);
         var dark = new ResourceDictionary
         {
-            Source = new Uri("pack://application:,,,/TunBox.App;component/Assets/ThemeDark.xaml")
+            Source = new Uri("/TunBox;component/Assets/ThemeDark.xaml", UriKind.Relative)
         };
         merged.MergedDictionaries.Add(dark);
         IsDark = true;

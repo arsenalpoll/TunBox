@@ -33,7 +33,7 @@
                  ToolTip="{DynamicResource L.Dlg.Picker.Search}"/>
 
         <ListBox x:Name="List" Grid.Row="2" Margin="0,8,0,0"
-                 BorderBrush="{StaticResource Line}" BorderThickness="1"
+                 BorderBrush="{DynamicResource Line}" BorderThickness="1"
                  ScrollViewer.VerticalScrollBarVisibility="Auto"
                  CheckBox.Click="OnItemToggled">
             <ListBox.ItemTemplate>

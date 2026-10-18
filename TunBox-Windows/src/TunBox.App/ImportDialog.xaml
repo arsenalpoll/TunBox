@@ -53,10 +53,10 @@
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
-            <Separator Grid.Column="0" VerticalAlignment="Center" Background="{StaticResource Line}"/>
+            <Separator Grid.Column="0" VerticalAlignment="Center" Background="{DynamicResource Line}"/>
             <TextBlock Grid.Column="1" Text="{DynamicResource L.Dlg.Import.Or}" Margin="10,0" VerticalAlignment="Center"
                        Foreground="{DynamicResource TextMuted}" FontSize="11.5"/>
-            <Separator Grid.Column="2" VerticalAlignment="Center" Background="{StaticResource Line}"/>
+            <Separator Grid.Column="2" VerticalAlignment="Center" Background="{DynamicResource Line}"/>
         </Grid>
 
         <TextBlock Text="{DynamicResource L.Dlg.Import.FileLabel}" Style="{StaticResource FieldLabel}"/>

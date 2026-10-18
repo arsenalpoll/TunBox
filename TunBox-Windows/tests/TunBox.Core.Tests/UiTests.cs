@@ -108,7 +108,7 @@ public class UiTests
         var styles = File.ReadAllText(FindSourceFile(Path.Combine("Assets", "Styles.xaml")));
         Assert.Contains("<SolidColorBrush x:Key=\"Running\"", styles);
         Assert.Contains(@"<DataTrigger Binding=""{Binding IsConnected}"" Value=""True"">", xaml);
-        Assert.Contains(@"Value=""{StaticResource Running}""", xaml);
+        Assert.Contains(@"Value=""{DynamicResource Running}""", xaml);   // 画刷走 Dynamic,主题切换实时生效
     }
 
     private static string FindSourceFile(string name)

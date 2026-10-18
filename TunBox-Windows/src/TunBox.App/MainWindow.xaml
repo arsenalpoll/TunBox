@@ -34,7 +34,7 @@
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="ToggleButton">
-                            <Border x:Name="track" CornerRadius="13" Background="{StaticResource TrackBg}">
+                            <Border x:Name="track" CornerRadius="13" Background="{DynamicResource TrackBg}">
                                 <Ellipse x:Name="knob" Width="20" Height="20" Fill="White"
                                          HorizontalAlignment="Left" Margin="3,0,0,0">
                                     <Ellipse.Effect>
@@ -44,7 +44,7 @@
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsChecked" Value="True">
-                                    <Setter TargetName="track" Property="Background" Value="{StaticResource TrackOn}"/>
+                                    <Setter TargetName="track" Property="Background" Value="{DynamicResource TrackOn}"/>
                                     <Setter TargetName="knob" Property="HorizontalAlignment" Value="Right"/>
                                     <Setter TargetName="knob" Property="Margin" Value="0,0,3,0"/>
                                 </Trigger>
@@ -63,20 +63,20 @@
                                 <StackPanel Orientation="Horizontal">
                                     <TextBlock x:Name="g" Text="{TemplateBinding Tag}" FontFamily="Segoe MDL2 Assets"
                                                FontSize="17" FontWeight="Bold" VerticalAlignment="Center"
-                                               Foreground="{StaticResource TextMuted}"/>
+                                               Foreground="{DynamicResource TextMuted}"/>
                                     <TextBlock x:Name="l" Text="{TemplateBinding Header}" FontSize="14.5"
                                                FontWeight="Bold" Margin="11,0,0,0" VerticalAlignment="Center"
-                                               Foreground="{StaticResource TextMuted}"/>
+                                               Foreground="{DynamicResource TextMuted}"/>
                                 </StackPanel>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="t" Property="Background" Value="{StaticResource NavHover}"/>
+                                    <Setter TargetName="t" Property="Background" Value="{DynamicResource NavHover}"/>
                                 </Trigger>
                                 <Trigger Property="IsSelected" Value="True">
-                                    <Setter TargetName="t" Property="Background" Value="{StaticResource BrandSoft}"/>
-                                    <Setter TargetName="g" Property="Foreground" Value="{StaticResource Brand}"/>
-                                    <Setter TargetName="l" Property="Foreground" Value="{StaticResource Brand}"/>
+                                    <Setter TargetName="t" Property="Background" Value="{DynamicResource BrandSoft}"/>
+                                    <Setter TargetName="g" Property="Foreground" Value="{DynamicResource Brand}"/>
+                                    <Setter TargetName="l" Property="Foreground" Value="{DynamicResource Brand}"/>
                                     <Setter TargetName="l" Property="FontWeight" Value="Bold"/>
                                 </Trigger>
                             </ControlTemplate.Triggers>
@@ -87,8 +87,8 @@
 
             <!-- 节点卡：代理页的网格单元（名字 + 类型徽章 + 延迟），悬停微亮反馈 -->
             <Style x:Key="NodeCard" TargetType="Border">
-                <Setter Property="Background" Value="{StaticResource NodeRowBg}"/>
-                <Setter Property="BorderBrush" Value="{StaticResource NodeRowLine}"/>
+                <Setter Property="Background" Value="{DynamicResource NodeRowBg}"/>
+                <Setter Property="BorderBrush" Value="{DynamicResource NodeRowLine}"/>
                 <Setter Property="BorderThickness" Value="1"/>
                 <Setter Property="CornerRadius" Value="10"/>
                 <Setter Property="Padding" Value="12,10"/>
@@ -97,7 +97,7 @@
                 <Setter Property="Cursor" Value="Hand"/>
                 <Style.Triggers>
                     <Trigger Property="IsMouseOver" Value="True">
-                        <Setter Property="Background" Value="{StaticResource NodeRowHover}"/>
+                        <Setter Property="Background" Value="{DynamicResource NodeRowHover}"/>
                     </Trigger>
                 </Style.Triggers>
             </Style>
@@ -138,20 +138,20 @@
                     </Grid.ColumnDefinitions>
 
                     <!-- 左侧栏：logo + 六页导航 + 底部退出 -->
-                    <Border Grid.Column="0" Background="{StaticResource CardBg}"
-                            BorderBrush="{StaticResource Line}" BorderThickness="0,0,1,0">
+                    <Border Grid.Column="0" Background="{DynamicResource CardBg}"
+                            BorderBrush="{DynamicResource Line}" BorderThickness="0,0,1,0">
                         <DockPanel>
                             <StackPanel DockPanel.Dock="Top" Margin="14,16,14,4">
                                 <StackPanel Orientation="Horizontal">
                                     <Image Source="/TunBox;component/Assets/logo.png" Width="28" Height="28"/>
                                     <TextBlock Text="TunBox" FontSize="18" FontWeight="SemiBold"
-                                               Foreground="{StaticResource Brand}" VerticalAlignment="Center"
+                                               Foreground="{DynamicResource Brand}" VerticalAlignment="Center"
                                                Margin="9,0,0,0"/>
                                 </StackPanel>
-                                <Border Background="{StaticResource IconBg}" CornerRadius="6" Padding="6,2"
+                                <Border Background="{DynamicResource IconBg}" CornerRadius="6" Padding="6,2"
                                         HorizontalAlignment="Left" Margin="0,7,0,0">
                                     <TextBlock Text="{Binding VersionText, StringFormat=v{0}}" FontSize="11"
-                                               Foreground="{StaticResource TextMuted}"/>
+                                               Foreground="{DynamicResource TextMuted}"/>
                                 </Border>
                             </StackPanel>
                             <StackPanel DockPanel.Dock="Bottom" Margin="12,4,12,14">
@@ -171,15 +171,15 @@
                         </Grid.RowDefinitions>
 
                         <!-- 页头：左边页名，右边实时速率 -->
-                        <Border Grid.Row="0" Background="{StaticResource CardBg}"
-                                BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1" Padding="18,10">
+                        <Border Grid.Row="0" Background="{DynamicResource CardBg}"
+                                BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1" Padding="18,10">
                             <Grid>
                                 <TextBlock Text="{Binding ActivePage}" FontSize="20" FontWeight="SemiBold"
-                                           Foreground="{StaticResource TextMain}" VerticalAlignment="Center"/>
+                                           Foreground="{DynamicResource TextMain}" VerticalAlignment="Center"/>
                                 <TextBlock Text="{Binding TrafficText}" FontSize="12"
                                            HorizontalAlignment="Right" VerticalAlignment="Center"
                                            MaxWidth="520" TextTrimming="CharacterEllipsis"
-                                           Foreground="{StaticResource TextMuted}"/>
+                                           Foreground="{DynamicResource TextMuted}"/>
                             </Grid>
                         </Border>
 
@@ -201,11 +201,11 @@
                         </Grid>
 
                         <!-- 全站唯一的反馈位：报完 3 秒自己消失 -->
-                        <Border Grid.Row="2" Background="{StaticResource IconBg}"
-                                BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="14,7"
+                        <Border Grid.Row="2" Background="{DynamicResource IconBg}"
+                                BorderBrush="{DynamicResource Line}" BorderThickness="0,1,0,0" Padding="14,7"
                                 Visibility="{Binding DetailText, Converter={StaticResource HasText}}">
                             <TextBlock Text="{Binding DetailText}" FontSize="12" TextWrapping="Wrap"
-                                       Foreground="{StaticResource TextMain}"/>
+                                       Foreground="{DynamicResource TextMain}"/>
                         </Border>
                     </Grid>
                 </Grid>
@@ -223,7 +223,7 @@
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
@@ -235,22 +235,22 @@
                             <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                                 <!-- 状态圆点：灰 = 未连接，琥珀 = 连接中，绿 = 已连接 -->
                                 <Ellipse Width="11" Height="11" VerticalAlignment="Center" Margin="0,1,10,0"
-                                         Fill="{StaticResource BoxBorder}">
+                                         Fill="{DynamicResource BoxBorder}">
                                     <Ellipse.Style>
                                         <Style TargetType="Ellipse">
                                             <Style.Triggers>
                                                 <DataTrigger Binding="{Binding IsConnected}" Value="True">
-                                                    <Setter Property="Fill" Value="{StaticResource Running}"/>
+                                                    <Setter Property="Fill" Value="{DynamicResource Running}"/>
                                                 </DataTrigger>
                                                 <DataTrigger Binding="{Binding IsConnecting}" Value="True">
-                                                    <Setter Property="Fill" Value="{StaticResource Warn}"/>
+                                                    <Setter Property="Fill" Value="{DynamicResource Warn}"/>
                                                 </DataTrigger>
                                             </Style.Triggers>
                                         </Style>
                                     </Ellipse.Style>
                                 </Ellipse>
                                 <TextBlock Text="{DynamicResource L.Dash.ConnectTitle}" FontSize="16" FontWeight="SemiBold"
-                                           Foreground="{StaticResource TextMain}" VerticalAlignment="Center"/>
+                                           Foreground="{DynamicResource TextMain}" VerticalAlignment="Center"/>
                             </StackPanel>
                             <!-- 桌面端的主开关：拨上去接管，拨回来放手 -->
                             <ToggleButton Style="{StaticResource SwitchLarge}" HorizontalAlignment="Right"
@@ -259,23 +259,23 @@
                                           ToolTip="{DynamicResource L.Dash.ConnectSwitchTip}"/>
                         </Grid>
                         <TextBlock Text="{Binding RingStateText}" FontSize="13" FontWeight="SemiBold" Margin="0,10,0,0"
-                                   Foreground="{StaticResource TextMain}">
+                                   Foreground="{DynamicResource TextMain}">
                             <TextBlock.Style>
                                 <Style TargetType="TextBlock">
                                     <Style.Triggers>
                                         <DataTrigger Binding="{Binding IsConnected}" Value="True">
-                                            <Setter Property="Foreground" Value="{StaticResource Running}"/>
+                                            <Setter Property="Foreground" Value="{DynamicResource Running}"/>
                                         </DataTrigger>
                                     </Style.Triggers>
                                 </Style>
                             </TextBlock.Style>
                         </TextBlock>
-                        <TextBlock Margin="0,6,0,2" FontSize="12.5" Foreground="{StaticResource TextMuted}">
+                        <TextBlock Margin="0,6,0,2" FontSize="12.5" Foreground="{DynamicResource TextMuted}">
                             <Run Text="{DynamicResource L.Dash.CurrentEgress}"/>
                             <Run Text="{Binding SelectedEgressText, Mode=OneWay}" FontWeight="SemiBold"
-                                 Foreground="{StaticResource TextMain}"/>
+                                 Foreground="{DynamicResource TextMain}"/>
                         </TextBlock>
-                        <Border Background="{StaticResource SegTrack}" CornerRadius="10" Padding="3" Margin="0,12,0,0">
+                        <Border Background="{DynamicResource SegTrack}" CornerRadius="10" Padding="3" Margin="0,12,0,0">
                             <UniformGrid Columns="3">
                                 <Button Content="{DynamicResource L.Dash.ModeRule}" Style="{StaticResource ModeSegment}" Padding="0,7"
                                         Command="{Binding SetModeCommand}" CommandParameter="rule"
@@ -305,12 +305,12 @@
                         <Grid Grid.Row="0">
                             <TextBlock Text="{DynamicResource L.Dash.RateTitle}" Style="{StaticResource SectionTitle}"/>
                             <TextBlock HorizontalAlignment="Right" VerticalAlignment="Top" FontSize="12.5">
-                                <Run Text="↑ " Foreground="{StaticResource Running}"/>
+                                <Run Text="↑ " Foreground="{DynamicResource Running}"/>
                                 <Run Text="{Binding UpSpeedText, Mode=OneWay}" FontWeight="SemiBold"
-                                     Foreground="{StaticResource TextMain}"/>
+                                     Foreground="{DynamicResource TextMain}"/>
                                 <Run Text="   ↓ "/>
                                 <Run Text="{Binding DownSpeedText, Mode=OneWay}" FontWeight="SemiBold"
-                                     Foreground="{StaticResource TextMain}"/>
+                                     Foreground="{DynamicResource TextMain}"/>
                             </TextBlock>
                         </Grid>
                         <local:TrafficChart x:Name="RateChart" Grid.Row="1" Margin="0,10,0,2" MinHeight="88"/>
@@ -322,12 +322,12 @@
                     <StackPanel>
                         <Grid>
                             <TextBlock Text="{DynamicResource L.Dash.TunTitle}" Style="{StaticResource SectionTitle}"
-                                       Foreground="{StaticResource TextMain}"/>
+                                       Foreground="{DynamicResource TextMain}"/>
                             <ToggleButton HorizontalAlignment="Right" IsChecked="{Binding TunOn}"
                                           Style="{StaticResource Switch}" Click="OnToggleApply"/>
                         </Grid>
                         <TextBlock Text="{Binding TunStatusText}" FontSize="12" Margin="0,8,0,0"
-                                   TextWrapping="Wrap" Foreground="{StaticResource Brand}"/>
+                                   TextWrapping="Wrap" Foreground="{DynamicResource Brand}"/>
                         <Button Content="{DynamicResource L.Dash.TunRestartAdmin}" Style="{StaticResource GhostButton}" Padding="10,6"
                                 Margin="0,8,0,0" HorizontalAlignment="Left"
                                 Command="{Binding RestartAsAdminCommand}"
@@ -345,7 +345,7 @@
                             <Button Style="{StaticResource GhostButton}" Padding="8,4" HorizontalAlignment="Right"
                                     VerticalAlignment="Center" Command="{Binding TestAllCommand}"
                                     ToolTip="{DynamicResource L.Proxy.TestAllTip}">
-                                <TextBlock Text="&#x26A1;" FontSize="13" Foreground="#D97706"/>
+                                <TextBlock Text="&#x26A1;" FontSize="13" Foreground="#FF9500"/>
                             </Button>
                         </Grid>
                         <ComboBox ItemsSource="{Binding QuickEgressOptions}"
@@ -361,7 +361,7 @@
                                             <ColumnDefinition Width="Auto"/>
                                         </Grid.ColumnDefinitions>
                                         <TextBlock Grid.Column="0" Text="{Binding Name}" FontSize="13.5"
-                                                   Foreground="{StaticResource TextMain}"
+                                                   Foreground="{DynamicResource TextMain}"
                                                    TextTrimming="CharacterEllipsis" Margin="0,0,10,0"/>
                                         <TextBlock Grid.Column="1" Text="{Binding Node.LatencyText}"
                                                    FontSize="12" FontWeight="SemiBold"
@@ -379,13 +379,13 @@
                     <StackPanel>
                         <Grid>
                             <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                                <Border Width="30" Height="30" CornerRadius="8" Background="#FFF3E0"
+                                <Border Width="30" Height="30" CornerRadius="8" Background="#FFF4E0"
                                         VerticalAlignment="Center">
                                     <TextBlock Text="&#xE945;" FontFamily="Segoe MDL2 Assets" FontSize="15"
-                                               Foreground="#D97706" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                               Foreground="#FF9500" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                                 </Border>
                                 <TextBlock Text="{DynamicResource L.Dash.CoreInfoTitle}" FontSize="16" FontWeight="SemiBold"
-                                           Foreground="{StaticResource TextMain}" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                                           Foreground="{DynamicResource TextMain}" VerticalAlignment="Center" Margin="10,0,0,0"/>
                             </StackPanel>
                         </Grid>
                         <Grid Margin="0,10,0,0">
@@ -401,9 +401,9 @@
                                 <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <TextBlock Grid.Row="0" Grid.Column="0" Text="{DynamicResource L.Dash.CoreVersion}" FontSize="12"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,6"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,0,12,6"/>
                             <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding CoreVersionText}" FontSize="12.5"
-                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}" Margin="0,0,0,6"
+                                       FontWeight="SemiBold" Foreground="{DynamicResource TextMain}" Margin="0,0,0,6"
                                        HorizontalAlignment="Right">
                                 <TextBlock.Style>
                                     <Style TargetType="TextBlock">
@@ -411,31 +411,31 @@
                                             <DataTrigger Binding="{Binding CoreVersionText}" Value="">
                                                 <Setter Property="Text" Value="—"/>
                                                 <Setter Property="FontWeight" Value="Normal"/>
-                                                <Setter Property="Foreground" Value="{StaticResource TextMuted}"/>
+                                                <Setter Property="Foreground" Value="{DynamicResource TextMuted}"/>
                                             </DataTrigger>
                                         </Style.Triggers>
                                     </Style>
                                 </TextBlock.Style>
                             </TextBlock>
                             <TextBlock Grid.Row="1" Grid.Column="0" Text="{DynamicResource L.Dash.SysProxyAddr}" FontSize="12"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,6"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,0,12,6"/>
                             <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding ProxyAddrText}" FontSize="12.5"
-                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}" Margin="0,0,0,6"
+                                       FontWeight="SemiBold" Foreground="{DynamicResource TextMain}" Margin="0,0,0,6"
                                        HorizontalAlignment="Right"/>
                             <TextBlock Grid.Row="2" Grid.Column="0" Text="{DynamicResource L.Dash.MixedPortLabel}" FontSize="12"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,6"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,0,12,6"/>
                             <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding MixedPortText}" FontSize="12.5"
-                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}" Margin="0,0,0,6"
+                                       FontWeight="SemiBold" Foreground="{DynamicResource TextMain}" Margin="0,0,0,6"
                                        HorizontalAlignment="Right"/>
                             <TextBlock Grid.Row="3" Grid.Column="0" Text="{DynamicResource L.Dash.Uptime}" FontSize="12"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,6"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,0,12,6"/>
                             <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding CoreUptimeText}" FontSize="12.5"
-                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}" Margin="0,0,0,6"
+                                       FontWeight="SemiBold" Foreground="{DynamicResource TextMain}" Margin="0,0,0,6"
                                        HorizontalAlignment="Right"/>
                             <TextBlock Grid.Row="4" Grid.Column="0" Text="{DynamicResource L.Dash.RulesCount}" FontSize="12"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,0"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,0,12,0"/>
                             <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding RulesCountText}" FontSize="12.5"
-                                       FontWeight="SemiBold" Foreground="{StaticResource TextMain}"
+                                       FontWeight="SemiBold" Foreground="{DynamicResource TextMain}"
                                        HorizontalAlignment="Right"/>
                         </Grid>
                     </StackPanel>
@@ -445,7 +445,7 @@
                     <StackPanel>
                         <Grid>
                             <TextBlock Text="{DynamicResource L.Dash.EgressTitle}" Style="{StaticResource SectionTitle}"
-                                       Foreground="{StaticResource TextMain}"/>
+                                       Foreground="{DynamicResource TextMain}"/>
                             <Button Content="{DynamicResource L.Common.Refresh}" Style="{StaticResource GhostButton}" Padding="10,5"
                                     HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="12"
                                     Command="{Binding RefreshEgressCommand}"
@@ -463,31 +463,31 @@
                                 <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <TextBlock Grid.Row="0" Grid.Column="0" Text="{DynamicResource L.Dash.EgressIp}" FontSize="12"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,4"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,0,12,4"/>
                             <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding EgressIpText, Mode=OneWay}"
                                        FontSize="12.5" FontWeight="SemiBold" TextWrapping="Wrap"
-                                       Foreground="{StaticResource TextMain}" Cursor="Hand"
+                                       Foreground="{DynamicResource TextMain}" Cursor="Hand"
                                        ToolTip="{DynamicResource L.Dash.CopyIpTip}"
                                        MouseLeftButtonUp="OnCopyEgressIp"/>
                             <TextBlock Grid.Row="1" Grid.Column="0" Text="{DynamicResource L.Dash.Location}" FontSize="12"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,4"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,0,12,4"/>
                             <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding EgressLocationText, Mode=OneWay}"
                                        FontSize="12.5" TextWrapping="Wrap"
-                                       Foreground="{StaticResource TextMain}"/>
+                                       Foreground="{DynamicResource TextMain}"/>
                             <TextBlock Grid.Row="2" Grid.Column="0" Text="{DynamicResource L.Dash.Carrier}" FontSize="12"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,4"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,0,12,4"/>
                             <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding EgressCarrierText, Mode=OneWay}"
                                        FontSize="12.5" TextWrapping="Wrap"
-                                       Foreground="{StaticResource TextMain}"/>
+                                       Foreground="{DynamicResource TextMain}"/>
                             <TextBlock Grid.Row="3" Grid.Column="0" Text="{DynamicResource L.Dash.LocalIp}" FontSize="12"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,0"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,0,12,0"/>
                             <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding LocalIpText, Mode=OneWay}"
-                                       FontSize="12.5" Foreground="{StaticResource TextMuted}"/>
+                                       FontSize="12.5" Foreground="{DynamicResource TextMuted}"/>
                         </Grid>
-                        <Border Background="{StaticResource WarnSoft}" CornerRadius="7" Padding="8,6" Margin="0,8,0,0"
+                        <Border Background="{DynamicResource WarnSoft}" CornerRadius="7" Padding="8,6" Margin="0,8,0,0"
                                 Visibility="{Binding ShowEgressWarn, Converter={StaticResource BoolVis}}">
                             <TextBlock Text="{Binding EgressNote, Mode=OneWay}" FontSize="11.5" TextWrapping="Wrap"
-                                       Foreground="{StaticResource Warn}"/>
+                                       Foreground="{DynamicResource Warn}"/>
                         </Border>
                     </StackPanel>
                 </Border>
@@ -535,7 +535,7 @@
                                 </Border>
                                 <ControlTemplate.Triggers>
                                     <Trigger Property="IsMouseOver" Value="True">
-                                        <Setter TargetName="b" Property="Background" Value="{StaticResource NodeRowHover}"/>
+                                        <Setter TargetName="b" Property="Background" Value="{DynamicResource NodeRowHover}"/>
                                     </Trigger>
                                 </ControlTemplate.Triggers>
                             </ControlTemplate>
@@ -545,11 +545,11 @@
                                 <TextBlock Text="&#x267B;&#xFE0F;" FontSize="20" VerticalAlignment="Center"/>
                                 <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
                                     <TextBlock Text="{DynamicResource L.Proxy.Smart}" FontSize="15" FontWeight="SemiBold"
-                                               Foreground="{StaticResource TextMain}"/>
+                                               Foreground="{DynamicResource TextMain}"/>
                                     <TextBlock Text="{Binding SmartSubtitle}" Style="{StaticResource Hint}"/>
                                 </StackPanel>
                             </StackPanel>
-                            <Border Background="{StaticResource Running}" CornerRadius="8" Padding="10,4"
+                            <Border Background="{DynamicResource Running}" CornerRadius="8" Padding="10,4"
                                     HorizontalAlignment="Right" VerticalAlignment="Center"
                                     Visibility="{Binding SmartActive, Converter={StaticResource BoolVis}}">
                                 <TextBlock Text="&#xE73E;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="White"/>
@@ -574,7 +574,7 @@
                                                     </Grid.ColumnDefinitions>
                                                     <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="6,0,10,0">
                                                         <TextBlock Text="{Binding Name}" FontWeight="SemiBold" FontSize="15"
-                                                                   Foreground="{StaticResource TextMain}"
+                                                                   Foreground="{DynamicResource TextMain}"
                                                                    TextTrimming="CharacterEllipsis"/>
                                                         <StackPanel Orientation="Horizontal" Margin="0,3,0,0">
                                                             <TextBlock Text="{Binding NodeCountText}" Style="{StaticResource Hint}"/>
@@ -602,9 +602,9 @@
                                                             <Button.Template>
                                                                 <ControlTemplate TargetType="Button">
                                                                     <Border x:Name="b" CornerRadius="8" Padding="9,6"
-                                                                            Background="#FFF3E0">
+                                                                            Background="#FFF4E0">
                                                                         <TextBlock Text="&#x26A1;" FontSize="13"
-                                                                                   Foreground="#D97706"/>
+                                                                                   Foreground="#FF9500"/>
                                                                     </Border>
                                                                     <ControlTemplate.Triggers>
                                                                         <Trigger Property="IsMouseOver" Value="True">
@@ -620,17 +620,17 @@
                                                             <Button.Template>
                                                                 <ControlTemplate TargetType="Button">
                                                                     <Border x:Name="b" CornerRadius="8" Padding="9,6"
-                                                                            Background="{StaticResource BrandSoft}">
+                                                                            Background="{DynamicResource BrandSoft}">
                                                                         <Grid Width="14" Height="14">
                                                                             <TextBlock x:Name="glyph" Text="&#xE72C;" FontFamily="Segoe MDL2 Assets"
-                                                                                       FontSize="13" Foreground="{StaticResource Brand}"
+                                                                                       FontSize="13" Foreground="{DynamicResource Brand}"
                                                                                        RenderTransformOrigin="0.5,0.5">
                                                                                 <TextBlock.RenderTransform>
                                                                                     <RotateTransform Angle="0"/>
                                                                                 </TextBlock.RenderTransform>
                                                                             </TextBlock>
                                                                             <TextBlock x:Name="check" Text="&#xE73E;" FontFamily="Segoe MDL2 Assets"
-                                                                                       FontSize="13" Foreground="{StaticResource Running}"
+                                                                                       FontSize="13" Foreground="{DynamicResource Running}"
                                                                                        RenderTransformOrigin="0.5,0.5" Visibility="Collapsed">
                                                                                 <TextBlock.RenderTransform>
                                                                                     <ScaleTransform ScaleX="1" ScaleY="1"/>
@@ -685,9 +685,9 @@
                                                             <Button.Template>
                                                                 <ControlTemplate TargetType="Button">
                                                                     <Border x:Name="b" CornerRadius="8" Padding="9,6"
-                                                                            Background="#E6F4EA">
+                                                                            Background="#E6F7EE">
                                                                         <TextBlock Text="&#xE70F;" FontFamily="Segoe MDL2 Assets"
-                                                                                   FontSize="13" Foreground="#0F9D58"/>
+                                                                                   FontSize="13" Foreground="#00BA66"/>
                                                                     </Border>
                                                                     <ControlTemplate.Triggers>
                                                                         <Trigger Property="IsMouseOver" Value="True">
@@ -702,9 +702,9 @@
                                                             <Button.Template>
                                                                 <ControlTemplate TargetType="Button">
                                                                     <Border x:Name="b" CornerRadius="8" Padding="9,6"
-                                                                            Background="{StaticResource DangerButtonBg}">
+                                                                            Background="{DynamicResource DangerButtonBg}">
                                                                         <TextBlock Text="&#xE74D;" FontFamily="Segoe MDL2 Assets"
-                                                                                   FontSize="13" Foreground="{StaticResource Danger}"/>
+                                                                                   FontSize="13" Foreground="{DynamicResource Danger}"/>
                                                                     </Border>
                                                                     <ControlTemplate.Triggers>
                                                                         <Trigger Property="IsMouseOver" Value="True">
@@ -721,7 +721,7 @@
                                                 <ProgressBar Height="4" Minimum="0" Maximum="1"
                                                              Value="{Binding TrafficRatio, Mode=OneWay}"
                                                              Foreground="{Binding TrafficRatioBrush, Mode=OneWay}"
-                                                             Background="{StaticResource ProgTrack}"
+                                                             Background="{DynamicResource ProgTrack}"
                                                              Visibility="{Binding HasTraffic, Converter={StaticResource BoolVis}}"/>
                                                 <ItemsControl ItemsSource="{Binding VisibleNodes}" Margin="0,12,0,0">
                                                     <ItemsControl.ItemsPanel>
@@ -737,13 +737,13 @@
                                                                         <RowDefinition Height="Auto"/>
                                                                     </Grid.RowDefinitions>
                                                                     <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="SemiBold"
-                                                                               Foreground="{StaticResource TextMain}"
+                                                                               Foreground="{DynamicResource TextMain}"
                                                                                TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}"/>
                                                                     <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,8,0,0">
-                                                                        <Border Background="{StaticResource IconBg}" CornerRadius="5"
+                                                                        <Border Background="{DynamicResource IconBg}" CornerRadius="5"
                                                                                 Padding="5,1.5" VerticalAlignment="Center">
                                                                             <TextBlock Text="{Binding Kind}" FontSize="10.5"
-                                                                                       Foreground="{StaticResource TextMuted}"/>
+                                                                                       Foreground="{DynamicResource TextMuted}"/>
                                                                         </Border>
                                                                         <TextBlock Text="{Binding LatencyText}" FontSize="12.5"
                                                                                    FontWeight="SemiBold" Margin="8,0,0,0"
@@ -756,8 +756,8 @@
                                                             </Border>
                                                             <DataTemplate.Triggers>
                                                                 <DataTrigger Binding="{Binding RowState}" Value="selected">
-                                                                    <Setter TargetName="row" Property="BorderBrush" Value="{StaticResource Brand}"/>
-                                                                    <Setter TargetName="row" Property="Background" Value="{StaticResource BrandSoft}"/>
+                                                                    <Setter TargetName="row" Property="BorderBrush" Value="{DynamicResource Brand}"/>
+                                                                    <Setter TargetName="row" Property="Background" Value="{DynamicResource BrandSoft}"/>
                                                                 </DataTrigger>
                                                             </DataTemplate.Triggers>
                                                         </DataTemplate>
@@ -802,7 +802,7 @@
                              VerticalAlignment="Center" Margin="0,0,10,0"/>
                     <StackPanel Grid.Column="1" Orientation="Horizontal">
                         <TextBlock Text="{Binding RequestsCountText}" FontSize="12" VerticalAlignment="Center"
-                                   Margin="0,0,10,0" Foreground="{StaticResource TextMuted}"/>
+                                   Margin="0,0,10,0" Foreground="{DynamicResource TextMuted}"/>
                         <Button Content="{Binding PauseLabel}" Style="{StaticResource QuietButton}" Padding="11,7"
                                 Command="{Binding PauseToggleCommand}" ToolTip="{DynamicResource L.Req.PauseTip}"/>
                         <Button Content="{DynamicResource L.Req.CloseAll}" Style="{StaticResource DangerButton}"
@@ -812,7 +812,7 @@
                     </StackPanel>
                 </Grid>
                 <ListView ItemsSource="{Binding ConnectionsView}" BorderThickness="0"
-                          Background="Transparent" Foreground="{StaticResource TextMain}">
+                          Background="Transparent" Foreground="{DynamicResource TextMain}">
                     <ListView.View>
                         <GridView AllowsColumnReorder="True">
                             <GridViewColumn Header="{DynamicResource L.Req.Col.Target}" Width="270" DisplayMemberBinding="{Binding Target}"/>
@@ -845,7 +845,7 @@
                                     <ColumnDefinition Width="*"/>
                                 </Grid.ColumnDefinitions>
                                 <StackPanel Grid.Column="0" Margin="0,0,16,0">
-                                    <TextBlock Text="{DynamicResource L.Set.Appearance}" Foreground="{StaticResource TextMain}" Margin="0,0,0,4"/>
+                                    <TextBlock Text="{DynamicResource L.Set.Appearance}" Foreground="{DynamicResource TextMain}" Margin="0,0,0,4"/>
                                     <ComboBox SelectedValue="{Binding ThemeChoice}" SelectedValuePath="Tag" MinWidth="160"
                                               HorizontalAlignment="Left"
                                               ToolTip="{DynamicResource L.Set.AppearanceTip}">
@@ -855,7 +855,7 @@
                                     </ComboBox>
                                 </StackPanel>
                                 <StackPanel Grid.Column="1">
-                                    <TextBlock Text="{DynamicResource L.Set.Language}" Foreground="{StaticResource TextMain}" Margin="0,0,0,4"/>
+                                    <TextBlock Text="{DynamicResource L.Set.Language}" Foreground="{DynamicResource TextMain}" Margin="0,0,0,4"/>
                                     <ComboBox SelectedValue="{Binding LanguageChoice}" SelectedValuePath="Tag" MinWidth="160"
                                               HorizontalAlignment="Left"
                                               ToolTip="{DynamicResource L.Set.LanguageTip}">
@@ -865,7 +865,7 @@
                                     </ComboBox>
                                 </StackPanel>
                             </Grid>
-                            <TextBlock Text="{DynamicResource L.Set.CloseBehavior}" Foreground="{StaticResource TextMain}" Margin="0,12,0,4"/>
+                            <TextBlock Text="{DynamicResource L.Set.CloseBehavior}" Foreground="{DynamicResource TextMain}" Margin="0,12,0,4"/>
                             <ComboBox SelectedValue="{Binding CloseChoice}" SelectedValuePath="Tag" MinWidth="160"
                                       HorizontalAlignment="Left"
                                       ToolTip="{DynamicResource L.Set.CloseBehaviorTip}">
@@ -880,13 +880,13 @@
                                 </Grid.ColumnDefinitions>
                                 <Grid Grid.Column="0" Margin="0,0,16,0">
                                     <TextBlock Text="{DynamicResource L.Set.AutoStart}" VerticalAlignment="Center"
-                                               Foreground="{StaticResource TextMain}"/>
+                                               Foreground="{DynamicResource TextMain}"/>
                                     <ToggleButton HorizontalAlignment="Right" IsChecked="{Binding AutoStartOn}"
                                                   Style="{StaticResource Switch}"/>
                                 </Grid>
                                 <Grid Grid.Column="1">
                                     <TextBlock Text="{DynamicResource L.Set.SilentStart}" VerticalAlignment="Center"
-                                               Foreground="{StaticResource TextMain}"
+                                               Foreground="{DynamicResource TextMain}"
                                                ToolTip="{DynamicResource L.Set.SilentStartTip}"/>
                                     <ToggleButton HorizontalAlignment="Right" IsChecked="{Binding StartMinimizedOn}"
                                                   Style="{StaticResource Switch}"
@@ -898,7 +898,7 @@
                                 <Button Content="{DynamicResource L.Set.CheckUpdate}" Style="{StaticResource GhostButton}"
                                         Command="{Binding CheckUpdateCommand}"/>
                                 <TextBlock Text="{Binding UpdateStatusText}" FontSize="12"
-                                           Foreground="{StaticResource TextMuted}"
+                                           Foreground="{DynamicResource TextMuted}"
                                            VerticalAlignment="Center" Margin="10,0,0,0"
                                            TextTrimming="CharacterEllipsis"/>
                             </StackPanel>
@@ -909,7 +909,7 @@
                 <Border Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding PortsExpanded, Mode=TwoWay}"
                               Header="{DynamicResource L.Set.Section.Network}" FontSize="16" FontWeight="SemiBold"
-                              Foreground="{StaticResource TextMain}">
+                              Foreground="{DynamicResource TextMain}">
                         <StackPanel Margin="0,8,0,0">
                             <Grid>
                                 <Grid.ColumnDefinitions>
@@ -922,23 +922,23 @@
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
                                 <TextBlock Grid.Row="0" Text="{DynamicResource L.Set.MixedPort}" VerticalAlignment="Center"
-                                           Foreground="{StaticResource TextMain}"/>
+                                           Foreground="{DynamicResource TextMain}"/>
                                 <TextBox Grid.Row="0" Grid.Column="1" Margin="0,0,0,6" VerticalAlignment="Center"
                                          Text="{Binding MixedPortText, UpdateSourceTrigger=PropertyChanged}"/>
                                 <TextBlock Grid.Row="1" Text="{DynamicResource L.Set.HttpPort}" VerticalAlignment="Center"
-                                           Foreground="{StaticResource TextMain}"/>
+                                           Foreground="{DynamicResource TextMain}"/>
                                 <TextBox Grid.Row="1" Grid.Column="1" Margin="0,0,0,6" VerticalAlignment="Center"
                                          Text="{Binding HttpPortText, UpdateSourceTrigger=PropertyChanged}"/>
                                 <TextBlock Grid.Row="2" Text="{DynamicResource L.Set.SocksPort}" VerticalAlignment="Center"
-                                           Foreground="{StaticResource TextMain}"/>
+                                           Foreground="{DynamicResource TextMain}"/>
                                 <TextBox Grid.Row="2" Grid.Column="1" Margin="0,0,0,6" VerticalAlignment="Center"
                                          Text="{Binding SocksPortText, UpdateSourceTrigger=PropertyChanged}"/>
                                 <TextBlock Grid.Row="3" Text="{DynamicResource L.Set.ApiPort}" VerticalAlignment="Center"
-                                           Foreground="{StaticResource TextMain}"/>
+                                           Foreground="{DynamicResource TextMain}"/>
                                 <TextBox Grid.Row="3" Grid.Column="1" Margin="0,0,0,6" VerticalAlignment="Center"
                                          Text="{Binding ApiPortText, UpdateSourceTrigger=PropertyChanged}"/>
                                 <TextBlock Grid.Row="4" Text="{DynamicResource L.Set.ApiSecret}" VerticalAlignment="Center"
-                                           Foreground="{StaticResource TextMain}"/>
+                                           Foreground="{DynamicResource TextMain}"/>
                                 <TextBox Grid.Row="4" Grid.Column="1" VerticalAlignment="Center"
                                          Text="{Binding ApiSecretText, UpdateSourceTrigger=PropertyChanged}"
                                          ToolTip="{DynamicResource L.Set.ApiSecretTip}"/>
@@ -949,7 +949,7 @@
                                     <ColumnDefinition Width="110"/>
                                 </Grid.ColumnDefinitions>
                                 <TextBlock Text="{DynamicResource L.Set.TunStack}" VerticalAlignment="Center"
-                                           Foreground="{StaticResource TextMain}"/>
+                                           Foreground="{DynamicResource TextMain}"/>
                                 <ComboBox Grid.Column="1" SelectedValue="{Binding TunStackChoice}"
                                           SelectedValuePath="Tag" MinWidth="150" HorizontalAlignment="Left"
                                           ToolTip="{DynamicResource L.Set.TunStackTip}">
@@ -964,7 +964,7 @@
                                     <ColumnDefinition Width="110"/>
                                 </Grid.ColumnDefinitions>
                                 <TextBlock Text="{DynamicResource L.Set.TunMtu}" VerticalAlignment="Center"
-                                           Foreground="{StaticResource TextMain}"
+                                           Foreground="{DynamicResource TextMain}"
                                            ToolTip="{DynamicResource L.Set.TunMtuTip}"/>
                                 <TextBox Grid.Column="1" VerticalAlignment="Center"
                                          Text="{Binding TunMtuText, UpdateSourceTrigger=PropertyChanged}"
@@ -985,7 +985,7 @@
                                      VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
                                      ToolTip="{DynamicResource L.Set.DnsServersTip}"/>
                             <TextBlock Text="{Binding DnsFeedback}" Style="{StaticResource Hint}" Margin="0,6,0,0"
-                                       Foreground="{StaticResource Warn}"/>
+                                       Foreground="{DynamicResource Warn}"/>
                         </StackPanel>
                     </Expander>
                 </Border>
@@ -993,39 +993,39 @@
                 <Border Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding RulesExpanded, Mode=TwoWay}"
                               Header="{DynamicResource L.Set.Section.Rules}" FontSize="16" FontWeight="SemiBold"
-                              Foreground="{StaticResource TextMain}">
+                              Foreground="{DynamicResource TextMain}">
                         <StackPanel Margin="0,8,0,0">
                             <CheckBox Content="{DynamicResource L.Set.RulesEnable}" IsChecked="{Binding RulesOn}"/>
                             <CheckBox Content="{DynamicResource L.Set.AdRules}" Margin="0,8,0,0" IsChecked="{Binding AdRulesOn}"/>
                             <Grid Margin="0,12,0,0">
                                 <TextBlock Text="{DynamicResource L.Set.GeoLib}" FontSize="12.5" FontWeight="Bold" VerticalAlignment="Center"
-                                           Foreground="{StaticResource TextMain}"/>
+                                           Foreground="{DynamicResource TextMain}"/>
                                 <Button Content="{DynamicResource L.Common.Update}" Style="{StaticResource GhostButton}" Padding="10,5" FontSize="12"
                                         HorizontalAlignment="Right" Command="{Binding RefreshGeoCommand}"/>
                             </Grid>
                             <TextBlock Text="{Binding GeoSummaryText}" TextWrapping="Wrap" FontSize="11.5"
-                                       Foreground="{StaticResource TextMuted}" Margin="0,4,0,0"/>
+                                       Foreground="{DynamicResource TextMuted}" Margin="0,4,0,0"/>
                             <Expander Header="{DynamicResource L.Set.CustomRules}" Margin="0,10,0,0" FontSize="12">
                                 <StackPanel Margin="0,8,0,0">
                                     <TextBlock Text="{DynamicResource L.Set.ForceDirect}" FontSize="12.5" FontWeight="Bold"
-                                               Foreground="{StaticResource TextMain}"/>
+                                               Foreground="{DynamicResource TextMain}"/>
                                     <TextBox Text="{Binding ForceDirectText, UpdateSourceTrigger=PropertyChanged}"
                                              AcceptsReturn="True" MinHeight="36" FontSize="12" Margin="0,4,0,0"/>
                                     <TextBlock Text="{DynamicResource L.Set.ForceProxy}" FontSize="12.5" FontWeight="Bold" Margin="0,8,0,0"
-                                               Foreground="{StaticResource TextMain}"/>
+                                               Foreground="{DynamicResource TextMain}"/>
                                     <TextBox Text="{Binding ForceProxyText, UpdateSourceTrigger=PropertyChanged}"
                                              AcceptsReturn="True" MinHeight="36" FontSize="12" Margin="0,4,0,0"/>
                                     <TextBlock Text="{DynamicResource L.Set.CustomRules}" FontSize="12.5" FontWeight="Bold" Margin="0,8,0,0"
-                                               Foreground="{StaticResource TextMain}"/>
+                                               Foreground="{DynamicResource TextMain}"/>
                                     <TextBox Text="{Binding CustomRulesText, UpdateSourceTrigger=PropertyChanged}"
                                              AcceptsReturn="True" MinHeight="72" MaxHeight="150" FontSize="12"
                                              FontFamily="Consolas, Microsoft YaHei UI" Margin="0,4,0,0"
                                              VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
                                              ToolTip="{DynamicResource L.Set.CustomRulesTip}"/>
                                     <TextBlock Text="{Binding RuleFeedback}" Style="{StaticResource Hint}" Margin="0,6,0,0"
-                                               Foreground="{StaticResource Warn}"/>
+                                               Foreground="{DynamicResource Warn}"/>
                                     <TextBlock Text="{DynamicResource L.Set.AppRouting}" FontSize="12.5" FontWeight="Bold" Margin="0,8,0,0"
-                                               Foreground="{StaticResource TextMain}"/>
+                                               Foreground="{DynamicResource TextMain}"/>
                                     <ComboBox SelectedValue="{Binding AppRoutingChoice}" SelectedValuePath="Tag" Margin="0,4,0,0"
                                               MinWidth="200" HorizontalAlignment="Left">
                                         <ComboBoxItem Content="{DynamicResource L.Set.AppRouting.All}" Tag="all"/>
@@ -1054,12 +1054,12 @@
                 <Border Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding KernelExpanded, Mode=TwoWay}"
                               Header="{DynamicResource L.Set.Section.Kernel}" FontSize="16" FontWeight="SemiBold"
-                              Foreground="{StaticResource TextMain}">
+                              Foreground="{DynamicResource TextMain}">
                         <StackPanel Margin="0,8,0,0">
-                            <TextBlock Text="{DynamicResource L.Set.TestUrl}" Foreground="{StaticResource TextMain}" Margin="0,0,0,4"/>
+                            <TextBlock Text="{DynamicResource L.Set.TestUrl}" Foreground="{DynamicResource TextMain}" Margin="0,0,0,4"/>
                             <TextBox Text="{Binding TestUrlText, UpdateSourceTrigger=PropertyChanged}"
                                      ToolTip="{DynamicResource L.Set.TestUrlTip}"/>
-                            <TextBlock Text="{DynamicResource L.Set.LogLevel}" Foreground="{StaticResource TextMain}" Margin="0,12,0,4"/>
+                            <TextBlock Text="{DynamicResource L.Set.LogLevel}" Foreground="{DynamicResource TextMain}" Margin="0,12,0,4"/>
                             <ComboBox SelectedValue="{Binding LogLevelChoice}" SelectedValuePath="Tag" MinWidth="160"
                                       HorizontalAlignment="Left">
                                 <ComboBoxItem Content="{DynamicResource L.Set.LogLevel.Info}" Tag="info"/>
@@ -1088,7 +1088,7 @@
                                     ToolTip="{DynamicResource L.Tools.NetCheckTip}"/>
                         </Grid>
                         <ListView ItemsSource="{Binding NetCheckRows}" BorderThickness="0" Background="Transparent"
-                                  Foreground="{StaticResource TextMain}">
+                                  Foreground="{DynamicResource TextMain}">
                             <ListView.View>
                                 <GridView AllowsColumnReorder="False">
                                     <GridViewColumn Header="{DynamicResource L.Tools.NetCheck.Col.Url}" Width="330"
@@ -1108,7 +1108,7 @@
                 <Border Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding OverrideHostsExpanded, Mode=TwoWay}"
                               Header="{DynamicResource L.Set.Section.OverrideHosts}" FontSize="16" FontWeight="SemiBold"
-                              Foreground="{StaticResource TextMain}">
+                              Foreground="{DynamicResource TextMain}">
                         <StackPanel Margin="0,8,0,0">
                         <TextBlock Text="{DynamicResource L.Tools.Hosts}" Style="{StaticResource SectionTitle}"/>
                         <TextBox Text="{Binding HostsText, UpdateSourceTrigger=PropertyChanged}"
@@ -1117,7 +1117,7 @@
                                  VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
                                  ToolTip="{DynamicResource L.Tools.Hosts.Tip}"/>
                         <TextBlock Text="{Binding HostsFeedback}" Style="{StaticResource Hint}" Margin="0,6,0,0"
-                                   Foreground="{StaticResource Warn}"/>
+                                   Foreground="{DynamicResource Warn}"/>
                     
                         <Grid>
                             <TextBlock Text="{DynamicResource L.Tools.Override}" Style="{StaticResource SectionTitle}"/>
@@ -1125,10 +1125,10 @@
                                       VerticalAlignment="Center" IsChecked="{Binding OverrideEnabledOn}"/>
                         </Grid>
                         <TextBlock Text="{DynamicResource L.Tools.Override.Disabled}" Style="{StaticResource Hint}"
-                                   Foreground="{StaticResource Warn}" Margin="0,6,0,0"
+                                   Foreground="{DynamicResource Warn}" Margin="0,6,0,0"
                                    Visibility="{Binding OverrideDisabledHint, Converter={StaticResource BoolVis}}"/>
                         <TextBlock Text="{DynamicResource L.Tools.Override.Merge}" FontWeight="Bold" FontSize="12.5"
-                                   Foreground="{StaticResource TextMain}" Margin="0,10,0,0"/>
+                                   Foreground="{DynamicResource TextMain}" Margin="0,10,0,0"/>
                         <TextBox Text="{Binding OverrideMergeText, UpdateSourceTrigger=PropertyChanged}"
                                  AcceptsReturn="True" MinHeight="72" MaxHeight="180"
                                  FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"
@@ -1136,7 +1136,7 @@
                                  ToolTip="{DynamicResource L.Tools.Override.MergeTip}"/>
                         <TextBlock Text="{DynamicResource L.Tools.Override.MergeTip}" Style="{StaticResource Hint}" Margin="0,4,0,0"/>
                         <TextBlock Text="{DynamicResource L.Tools.Override.Script}" FontWeight="Bold" FontSize="12.5"
-                                   Foreground="{StaticResource TextMain}" Margin="0,10,0,0"/>
+                                   Foreground="{DynamicResource TextMain}" Margin="0,10,0,0"/>
                         <TextBox Text="{Binding OverrideScriptText, UpdateSourceTrigger=PropertyChanged}"
                                  AcceptsReturn="True" MinHeight="72" MaxHeight="180"
                                  FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"
@@ -1174,12 +1174,12 @@
                     <Grid>
                         <StackPanel>
                             <TextBlock Text="{DynamicResource L.Set.About}" Style="{StaticResource SectionTitle}"
-                                       Foreground="{StaticResource TextMain}"/>
+                                       Foreground="{DynamicResource TextMain}"/>
                             <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
                                 <TextBlock Text="{DynamicResource L.Set.About.Core}" FontSize="12" Margin="0,0,10,0"
-                                           Foreground="{StaticResource TextMuted}"/>
+                                           Foreground="{DynamicResource TextMuted}"/>
                                 <TextBlock Text="{Binding CoreVersionText}" FontSize="12" FontWeight="SemiBold"
-                                           Foreground="{StaticResource TextMain}">
+                                           Foreground="{DynamicResource TextMain}">
                                     <TextBlock.Style>
                                         <Style TargetType="TextBlock">
                                             <Style.Triggers>
@@ -1187,7 +1187,7 @@
                                                 <DataTrigger Binding="{Binding CoreVersionText}" Value="">
                                                     <Setter Property="Text" Value="{DynamicResource L.Set.About.CoreUnknown}"/>
                                                     <Setter Property="FontWeight" Value="Normal"/>
-                                                    <Setter Property="Foreground" Value="{StaticResource TextMuted}"/>
+                                                    <Setter Property="Foreground" Value="{DynamicResource TextMuted}"/>
                                                 </DataTrigger>
                                             </Style.Triggers>
                                         </Style>
@@ -1196,15 +1196,15 @@
                             </StackPanel>
                             <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
                                 <TextBlock Text="{DynamicResource L.Set.About.Repo}" FontSize="12" Margin="0,0,10,0"
-                                           Foreground="{StaticResource TextMuted}"/>
+                                           Foreground="{DynamicResource TextMuted}"/>
                                 <TextBlock Text="github.com/xiaoli8571/TunBox" FontSize="12" Cursor="Hand"
-                                           Foreground="{StaticResource Brand}"
+                                           Foreground="{DynamicResource Brand}"
                                            MouseLeftButtonUp="OnOpenRepoClick"/>
                             </StackPanel>
                         </StackPanel>
                         <TextBlock Text="{Binding VersionText, StringFormat=v{0}}" FontSize="12.5" FontWeight="Bold"
                                    HorizontalAlignment="Right" VerticalAlignment="Top"
-                                   Foreground="{StaticResource TextMuted}"/>
+                                   Foreground="{DynamicResource TextMuted}"/>
                     </Grid>
                 </Border>
             </StackPanel>
