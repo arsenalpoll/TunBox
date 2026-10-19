@@ -15,6 +15,13 @@
  *    蓝→青渐变轨环、两条动态电平弧线（#0A59F7→#2DD4BF 与 #00BA66）、
  *    两颗自转卫星节点（径向渐变光晕）。
  *    由 60ms(≈16fps) 定时器重绘 —— 旋转是慢速漂移，16fps 足够平滑且 CPU 减半。
+ *    **2026-10-18 用户报障修复**：球与弧线原先各用不同角速度（spin / spin*0.55 /
+ *    -spin*0.8），相对角度线性漂移 → 必然周期性叠在一起。现在四条元素共用同一
+ *    轨道相位（角速度全等），并按**十字对称**排布：两球在竖直轴（同外轨 r=140，
+ *    相隔 180°）、两条等长 42° 长条在水平轴（同轨环 r=130，相隔 180°），
+ *    匀速转动时角间距恒为 90°/48° → 永不重叠，且任意相位都保持十字形态；
+ *    几何集中在 `CelestialOrbLayout.ets`，由 `scripts/verify-orb-separation.mjs`
+ *    真跑校验（当前最小间距 96.9vp，远大于视觉外延 13vp）。
  *  - 内容层：40vp 电源徽标胶囊（#EFF5FF）、标题（开启连接/已连接）、当前节点名
  *    （2026-10-17 用户要求：删掉副标题与 TUN 待命状态胶囊，节点名放回按钮内部，同旧 StatusRing）。
  *  - 生命周期：onVisibleAreaChange 在切页签/切后台时停掉定时器、回前台立即重绘再启表 ——
@@ -29,17 +36,25 @@ import { curves } from '@kit.ArkUI';
 import { vibrator } from '@kit.SensorServiceKit';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
 import { ThemeService } from '../theme/ThemeService';
+import { OrbLayout } from './CelestialOrbLayout';
 
 /** 动态层重绘周期（≈16fps）：慢速自转足够平滑，逐帧成本必须压低（见头注释） */
 const TICK_MS = 60;
 /** 自转速率（度/帧）：待命缓慢自转，连接后加快（等价旧 25fps 下的 4.5°/s 与 12.5°/s） */
 const SPIN_IDLE = 0.27;
 const SPIN_ACTIVE = 0.75;
-/** 弧线基准相位（设计稿：-60° / 130°）与弧长（按 260 轨环换算自 dash 140/70） */
-const ARC1_BASE = -60;
-const ARC1_SWEEP = 42;
-const ARC2_BASE = 130;
-const ARC2_SWEEP = 21;
+/**
+ * 弧线与卫星的角度槽位来自 `CelestialOrbLayout`（2026-10-18 修「转动时互相重叠」）。
+ *
+ * 旧实现三条元素各用不同角速度（`spin` / `spin*0.55` / `-spin*0.8`），相对角度线性
+ * 漂移 → 必然周期性重合，调参救不了。现在**全部同速**、只保留固定偏移，
+ * 角间距恒定 → 永不重叠；布局与最小间距由 `OrbLayout.minGapVp()` 保证，
+ * 回归脚本 `scripts/verify-orb-separation.mjs` 真跑校验。
+ */
+const ARC1 = OrbLayout.ARC1;
+const ARC2 = OrbLayout.ARC2;
+const BALL1 = OrbLayout.BALL1;
+const BALL2 = OrbLayout.BALL2;
 /** 呼吸周期（秒），对齐旧 StatusRing 的 1.4s 交替呼吸 */
 const BREATH_SEC = 1.4;
 
@@ -187,19 +202,19 @@ export struct CelestialPowerOrb {
     ringGrad.addColorStop(1.0, `rgba(${this.greenRgb()}, 0.30)`);
     this.strokeArc(ctx, c, rArc, 2, ringGrad, 0, 360);
 
-    // 4. 两条动态电平弧线（随连接状态缓慢自转）
-    this.gradientArc(ctx, c, rArc, 4.5, ARC1_BASE + this.spinDeg, ARC1_SWEEP,
+    // 4. 两条动态电平弧线（与卫星共用同一轨道相位 → 角间距恒定，永不相交）
+    this.gradientArc(ctx, c, ARC1.radius, 4.5, ARC1.startAt(this.spinDeg), ARC1.sweepDeg,
       this.blueHex(), this.tealHex());
     const greenArc = `rgba(${this.greenRgb()}, 0.9)`;
-    this.gradientArc(ctx, c, rArc, 4.5, ARC2_BASE + this.spinDeg * 0.55, ARC2_SWEEP,
+    this.gradientArc(ctx, c, ARC2.radius, 4.5, ARC2.startAt(this.spinDeg), ARC2.sweepDeg,
       greenArc, greenArc);
 
-    // 5. 卫星节点：主卫星（白心蓝晕）沿外轨，次卫星（绿）沿内轨反向缓行
-    const sat1Rad: number = (-90 + this.spinDeg) * Math.PI / 180;
-    this.drawSatellite(ctx, c + this.trackSize / 2 * Math.cos(sat1Rad),
-      c + this.trackSize / 2 * Math.sin(sat1Rad), this.blueRgb(), this.blueHex());
-    const sat2Rad: number = (30 - this.spinDeg * 0.8) * Math.PI / 180;
-    this.drawSatellite(ctx, c + rArc * Math.cos(sat2Rad), c + rArc * Math.sin(sat2Rad),
+    // 5. 卫星节点：主卫星（白心蓝晕）沿外轨，次卫星（绿）沿轨环 —— 同速、固定错位
+    const sat1Rad: number = BALL1.startAt(this.spinDeg) * Math.PI / 180;
+    this.drawSatellite(ctx, c + BALL1.radius * Math.cos(sat1Rad),
+      c + BALL1.radius * Math.sin(sat1Rad), this.blueRgb(), this.blueHex());
+    const sat2Rad: number = BALL2.startAt(this.spinDeg) * Math.PI / 180;
+    this.drawSatellite(ctx, c + BALL2.radius * Math.cos(sat2Rad), c + BALL2.radius * Math.sin(sat2Rad),
       this.greenRgb(), `rgba(${this.greenRgb()}, 0.9)`);
   }
 

@@ -64,6 +64,12 @@ export class AppSettingsJson {
   appRoutingMode: string | undefined = undefined;
   appRoutingNeedsReview: boolean = false;
   appRoutingCustomApps: AppRoutingCustomApp[] = [];
+  /**
+   * 已被用户从「应用分流」目录里删除的**预置**包名（2026-10-18 用户要求：
+   * 自带包名也要能删）。预置列表是代码里的常量、rebuild() 每次都会重新加入，
+   * 所以必须单独记一份"用户已删除"的名单，否则删掉后立刻又冒出来。
+   */
+  appRoutingRemovedPresets: string[] = [];
   forceProxySites: string[] = [];
   forceDirectSites: string[] = [];
   /**
@@ -168,6 +174,8 @@ export class AppSettings {
   /** 旧版双名单冲突/非法数据必须由 UI 保存确认，普通设置保存不得清除。 */
   appRoutingNeedsReview: boolean = false;
   appRoutingCustomApps: AppRoutingCustomApp[] = [];
+  /** 用户已删除的预置包名（见 AppSettings.appRoutingRemovedPresets 注释） */
+  appRoutingRemovedPresets: string[] = [];
   forceProxySites: string[] = [];
   /** 强制直连网站（始终 DIRECT, 不走代理） */
   forceDirectSites: string[] = [];
@@ -257,6 +265,7 @@ export class AppSettings {
     j.appRoutingMode = this.appRoutingMode;
     j.appRoutingNeedsReview = this.appRoutingNeedsReview;
     j.appRoutingCustomApps = this.appRoutingCustomApps;
+    j.appRoutingRemovedPresets = this.appRoutingRemovedPresets;
     j.forceProxySites = this.forceProxySites;
     j.forceDirectSites = this.forceDirectSites;
     j.forceBlockSites = this.forceBlockSites;
@@ -322,6 +331,11 @@ export class AppSettings {
         s.appRoutingCustomApps.push(custom);
       }
     }
+    // 用户已删除的预置包名（只接受合法字符串，长度与包名上限一致）
+    s.appRoutingRemovedPresets = Array.isArray(j.appRoutingRemovedPresets)
+      ? AppRoutingPolicy.normalizePackages(j.appRoutingRemovedPresets
+        .filter((v: string) => typeof v === 'string'))
+      : [];
     s.forceProxySites = Array.isArray(j.forceProxySites)
       ? j.forceProxySites.filter((v: string) => typeof v === 'string') : [];
     s.forceDirectSites = Array.isArray(j.forceDirectSites)
@@ -337,8 +351,18 @@ export class AppSettings {
       ? (j.testLatencyUrl === 'https://www.gstatic.com/generate_204'
         ? 'http://www.gstatic.com/generate_204' : j.testLatencyUrl)
       : 'http://www.gstatic.com/generate_204';
+    // ── 代理模式恢复：`direct` **不跨重启持久化**（2026-10-19 稳定性裁定）──
+    //
+    // `direct` 是 0.4.0 新增的第三态（首页「直连」按钮）。它的语义是「所有流量
+    // 绕过代理直连」，一旦被持久化，用户误触一次之后每次启动、每次连接都仍然直连，
+    // 表现就是「VPN 连上了但代理完全不生效、公网 IP 是本地出口」——这正是 0.4.0
+    // 被反馈的一类故障形态，而且用户很难自己发现是模式问题。
+    //
+    // 因此：`direct` 只在**本次运行期**有效（运行期切模式走 ClashApiService.setMode，
+    // 热更新不改磁盘语义），重启后一律回落 `rule`。需要直连的场景重新点一下按钮即可，
+    // 代价是点一次，收益是**不可能被粘在直连态**。
     const parsedMode: string = j.proxyMode;
-    s.proxyMode = (parsedMode === 'global' || parsedMode === 'direct') ? parsedMode : 'rule';
+    s.proxyMode = parsedMode === 'global' ? 'global' : 'rule';
     s.nodeSortMode = NodeSortModes.normalize(j.nodeSortMode);
     s.nodeSortSnapshot = typeof j.nodeSortSnapshot === 'string' ? j.nodeSortSnapshot : '';
     s.proxyGroupSelections = typeof j.proxyGroupSelections === 'string' ? j.proxyGroupSelections : '';

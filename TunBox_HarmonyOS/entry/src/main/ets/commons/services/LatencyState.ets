@@ -131,8 +131,20 @@ export class LatencyRecord {
  *  - CANCELLED / UNTESTED 不带结论，权重排在失败之后。
  */
 export class LatencyPolicy {
-  /** 单节点探测超时：用户要求 3000ms 无返回即判超时（此前 5000ms 等待太长）。 */
-  static readonly DEFAULT_TIMEOUT_MS: number = 3000;
+  /**
+   * 单节点探测超时：**2500ms**（统一口径，不按协议分档）。
+   *
+   * 沿革：5000ms → 3000ms（用户嫌等太久）→ 1000ms（2026-10-18 要求"判超时快一点"）
+   * → **2500ms（同日回退）**。1000ms 被真机证伪：飞鸟云 35 个节点是 **hysteria2
+   * （QUIC/UDP，sni: localhost）**，首次 QUIC 握手 + TLS 需要 1~2 个 RTT，16 路并发
+   * 建连时更久 —— 同一批节点 3s 超时能测出 143/558/560ms，1s 时 measured=0、
+   * timeout=31（全部判死）。对照 FlClash 默认 5s，两边尺子不同。
+   * 用户裁定：全部统一 2.5s —— 兼顾"别等太久"与"别把好节点误杀"。
+   *
+   * 这个值同时是发给内核 `/delay` 的 `timeout` 参数；外层 http 超时按它推导
+   * （`timeout + 1200`），所以整批耗时也随之变化。
+   */
+  static readonly DEFAULT_TIMEOUT_MS: number = 2500;
   /** mihomo 的 timeout 用 16 位整数解析，> 32767 直接 400。 */
   static readonly MAX_TIMEOUT_MS: number = 30000;
   /** 结果视为"旧"的阈值：超过即灰显，提示用户可能不准 */

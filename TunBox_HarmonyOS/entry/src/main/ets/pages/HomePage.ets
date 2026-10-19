@@ -24,7 +24,6 @@ import { PublicIpService } from '../commons/services/PublicIpService';
 import { PublicIpInfo, AppDiagnostics } from '../commons/models/PublicIpInfo';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
-import { DoHResolver } from '../commons/services/DoHResolver';
 import { LatencyController } from '../commons/services/LatencyController';
 import { FormStateSync } from '../commons/services/FormStateSync';
 import { UiGuardian } from '../commons/services/UiGuardian';
@@ -198,6 +197,12 @@ export struct HomePage {
   @State publicIp: string = '';
   @State publicIpRefreshing: boolean = false;
   @State publicIpError: string = '';
+  /**
+   * 公网 IP 查询代次（2026-10-19 稳定性）。
+   * 每次 refreshPublicIp 自增；回调只在「自己仍是最新一次」时写 UI。
+   * 详见 refreshPublicIp 的注释 —— 这是 0.4.0「取不到公网 IP」的直接修复。
+   */
+  private ipQuerySeq: number = 0;
   @State currentNodeName: string = '';
   @State showDiagnostics: boolean = false;
   @State diagData: AppDiagnostics | null = null;
@@ -423,7 +428,15 @@ export struct HomePage {
   }
 
   private applyOrchestratorState(): void {
+    const wasConnected: boolean = this.isConnected;
     this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
+    // 连接状态翻转时作废在飞的 IP 查询（2026-10-19 稳定性）：
+    // 出口从「本机宽带」变成「代理」或反过来，旧查询的结论对新状态无意义；
+    // 若让它晚到并写 UI，就会出现「刚连上显示的还是直连 IP / 刚断开显示代理 IP」。
+    // 代次递增后，旧回调的结果会被 refreshPublicIp 直接丢弃。
+    if (wasConnected !== this.isConnected) {
+      this.invalidatePublicIpQueries();
+    }
     // App 内手动连接路径的会话守护：连接成功注册 dataTransfer 连续任务（防杀），
     // 断开/失败释放。幂等，状态重复同步不会重复注册/释放。
     if (this.isConnected && !UiGuardian.isRegistered()) {
@@ -536,39 +549,26 @@ export struct HomePage {
     }
     if (this.publicIp.length === 0) {
       setTimeout((): void => {
-        this.refreshPublicIp().catch((): void => {});
+        // 启动期这次查询发生在**隧道未建立**时：出口是本机宽带，弱网下容易超时。
+        // 代次机制保证它晚到的失败结果不会覆盖连接后的正确结果。
+        this.refreshPublicIp('home-bootstrap').catch((): void => {});
       }, 0);
     }
-    // 启动速度预热（2026-10-17）：应用打开、尚未连接时（此刻网络干净、TUN 未建），
-    // 后台把当前首选节点及其余订阅节点入口域名的 DoH pin 全部解析好。用户点「启动」
-    // 时连接路径上的 DoH 预解析直接全量命中缓存（budget 1.5s 通常瞬间归零），
-    // 首连冷缓存最坏 6s 的 DoH 等待被挪到「开应用的空闲时间」。失败静默 ——
-    // 预热失败只是回到旧行为（连接时现场解析）。
-    if (!this.isConnected && !this.isConnecting) {
-      const domains: string[] = [];
-      const seenD = new Set<string>();
-      for (const n of this.subs.nodes) {
-        const s = n.server;
-        if (s.length === 0 || s.includes(':') || /^\d+\.\d+\.\d+\.\d+$/.test(s)) {
-          continue;
-        }
-        const d = s.toLowerCase();
-        if (!seenD.has(d)) {
-          seenD.add(d);
-          domains.push(d);
-        }
-      }
-      if (domains.length > 0) {
-        const preferred: ProxyNode | null = this.selectedNode();
-        const priority: string[] = (preferred !== null && preferred.server.length > 0
-          && !preferred.server.includes(':')
-          && !/^\d+\.\d+\.\d+\.\d+$/.test(preferred.server)) ? [preferred.server] : [];
-        DoHResolver.resolveMany(domains, 6000, priority)
-          .catch((e: Object): void => {
-            AppLogger.warn('HomePage', `doh warmup failed: ${AppLogger.errText(e)}`);
-          });
-      }
-    }
+    // ── 冷启 DoH 预热：2026-10-19 **已移除**（稳定性回退）────────────────────
+    //
+    // 0.4.0 在这里加过一段 fire-and-forget 的 `DoHResolver.resolveMany(全部节点域名,
+    // 6000, priority)`：16 个 worker 并发发 HTTPS 到 doh.pub / alidns，预算 6s。
+    // 目的是把首连的 DoH 等待挪到「开应用的空闲时间」。实测/复盘后确认它有害：
+    //   ① 它与上面那次**公网 IP 查询**必然重叠（预热预算 6s > ip-api 连接超时 5s），
+    //      在移动数据/弱网/多订阅（实测 111 节点 → 58 个唯一域名）下把 ip-api 的
+    //      连接握手挤到超时；ip-api 失败无重试，随后就被下一次成功结果之外的
+    //      失败结果覆盖成「获取失败」。
+    //   ② 预热产物大部分被「短 TTL 不 pin」策略丢弃（见 DoHResolver 文件头），
+    //      实际收益远小于设计预期。
+    //   ③ 每次回到首页（未连接时）都会重跑，弱网下形成持续后台流量。
+    // 稳定性优先：预热整体删除，首连的 DoH 等待回到连接路径内（预算已恢复 6000ms，
+    // 与 0.3.3 一致）。若将来要恢复预热，必须满足：延后到首屏之后 ≥3s、worker ≤4、
+    // 只预热当前订阅、且与公网 IP 查询串行。
     this.applyOrchestratorState();
     this.pageReady = true;
     this.syncConnectionTimer();
@@ -580,7 +580,7 @@ export struct HomePage {
       return;
     }
     this.publicIp = '';
-    this.refreshPublicIp().catch((): void => {});
+    this.refreshPublicIp('node-switched', true).catch((): void => {});
   }
 
   onVpnRequest(): void {
@@ -635,7 +635,9 @@ export struct HomePage {
       }
       const ok = await this.orchestrator.connect(node, this.subs);
       if (ok) {
-        this.refreshPublicIp();
+        // 与 toggleConnection 同款：先作废启动期直连查询，再查隧道出口（并清掉旧值）。
+        this.invalidatePublicIpQueries();
+        this.refreshPublicIp('after-connect-shortcut', true);
       }
     } finally {
       this.pendingStart = false;
@@ -722,16 +724,87 @@ export struct HomePage {
     });
   }
 
-  private async refreshPublicIp(): Promise<void> {
+  /**
+   * 查询并刷新首页公网 IP。
+   *
+   * ## 2026-10-19 稳定性加固（0.4.0「取不到公网 IP」的直接修复）
+   *
+   * 旧实现的三个缺陷，任何一个都会让 UI 停在「获取失败」且不自愈：
+   *   ① **没有请求代次**：两个并发调用各自 `await` 后无条件写 `publicIp`/
+   *      `publicIpError`。启动期那次「直连」查询（此时还没隧道，弱网下最长 5s+8s）
+   *      晚于连接后那次「走隧道」的成功查询返回时，会把已经显示的正确 IP
+   *      **清空成红字**。0.3.3 因为连接慢、两次查询不重叠所以没暴露；0.4.0 把连接
+   *      提速 0.3–1.5s 后必然重叠 → 这就是"部分用户、0.4 才有"的根因。
+   *   ② **失败就清空**：`this.publicIp = ''` 让一次瞬时失败抹掉上一次的可用结果。
+   *   ③ **`publicIpRefreshing` 可能永久为 true**：`PublicIpService.query()` 若在
+   *      建连阶段同步抛异常（旧实现 `http.createHttp()` 在 try 之外），标志位再也
+   *      复位不了，IP 区一直转圈。
+   *
+   * 现在的语义：
+   *   · 每次调用取一个**递增代次**；只有「自己仍是最新一次调用」时才允许写 UI，
+   *     过期结果直接丢弃（不覆盖新结果、不重置刷新标志）；
+   *   · 失败时**保留上一次成功的 IP**（只在从未成功过时才显示错误文案），
+   *     并在错误文案里区分「还没连上/查询失败」，避免误导；
+   *   · `try/finally` 保证刷新标志一定复位；
+   *   · 所有触发点都带 trigger 名字，日志可定位是谁发起的。
+   *
+   * @param trigger 触发来源，仅用于日志
+   * @param clearBefore true 时先清空旧值（用户主动换节点/断开后重查的场景）
+   */
+  private async refreshPublicIp(trigger: string = 'manual', clearBefore: boolean = false): Promise<void> {
+    const seq = ++this.ipQuerySeq;
+    if (clearBefore) {
+      this.publicIp = '';
+    }
     this.publicIpRefreshing = true;
     this.publicIpError = '';
-    const info: PublicIpInfo = await PublicIpService.query();
-    if (info.ip.length > 0) {
-      this.publicIp = info.ip;
-    } else {
-      this.publicIp = '';
-      this.publicIpError = '获取公网 IPv4 失败，点击重试';
+    try {
+      const info: PublicIpInfo = await PublicIpService.query(trigger);
+      if (seq !== this.ipQuerySeq) {
+        // 已有更新的一次查询在跑：本结果作废，绝不覆盖（这就是旧版的核心 bug）
+        return;
+      }
+      if (info.ip.length > 0) {
+        this.publicIp = info.ip;
+        this.publicIpError = '';
+      } else {
+        // 保留上一次成功的值；只有从来没有成功过才显示失败文案。
+        if (this.publicIp.length === 0) {
+          // 已连接却连「主端点 + 备用端点」都拿不到 IP —— 这不是显示问题，
+          // 而是**隧道可能没有可用出口**（节点失效 / 选点没生效 / DNS 被污染）。
+          // 文案要指向可行动的操作（换节点/重试），而不是让用户以为只是"没显示出来"。
+          // 注意：ip-api 被限流时也可能走到这里，所以措辞用「可能」而非断言。
+          this.publicIpError = this.isConnected
+            ? '未取到出口 IP，点击重试或更换节点'
+            : '未连接，点击重试';
+        }
+      }
+    } catch (e) {
+      if (seq === this.ipQuerySeq) {
+        AppLogger.warn('HomePage', `refreshPublicIp(${trigger}) threw: ${AppLogger.errText(e)}`);
+        if (this.publicIp.length === 0) {
+          this.publicIpError = this.isConnected
+            ? '未取到出口 IP，点击重试或更换节点'
+            : '未连接，点击重试';
+        }
+      }
+    } finally {
+      if (seq === this.ipQuerySeq) {
+        this.publicIpRefreshing = false;
+      }
     }
+  }
+
+  /**
+   * 作废所有在飞的 IP 查询（连接状态切换时调用）。
+   *
+   * 为什么需要：连接成功后，启动期那次「直连出口」的查询结果已经**没有意义**
+   * （它测的是本机宽带出口，不是代理出口）。只靠代次丢弃也能避免覆盖，但让它在
+   * 隧道建好后继续占用连接/带宽、还可能撞上 ip-api 的按出口限流，得不偿失。
+   * 递增代次后，那次调用的结果会被 `refreshPublicIp` 直接丢弃。
+   */
+  private invalidatePublicIpQueries(): void {
+    this.ipQuerySeq = this.ipQuerySeq + 1;
     this.publicIpRefreshing = false;
   }
 
@@ -754,7 +827,7 @@ export struct HomePage {
         await this.orchestrator.disconnect();
         await FormStateSync.publish(context,
           node === null ? FormStateSync.noNode() : FormStateSync.disconnected(nodeName));
-        this.refreshPublicIp();
+        this.refreshPublicIp('after-disconnect', true);
         return;
       }
       if (node === null) {
@@ -767,7 +840,12 @@ export struct HomePage {
       await FormStateSync.publish(context,
         ok ? FormStateSync.connected(node.name) : FormStateSync.failed(node.name));
       if (ok) {
-        this.refreshPublicIp();
+        // 连接成功：先作废启动期那次「直连出口」的查询（结果已无意义，且可能仍在飞），
+        // 再发一次走隧道的查询。代次保证：即使旧查询晚到，也绝不会覆盖这次的结果。
+        // clearBefore=true：出口已经变了，旧值（本机宽带 IP）必须立刻丢弃 ——
+        // 万一这次也失败，宁可显示「未取到出口 IP」也不能显示一个错的出口。
+        this.invalidatePublicIpQueries();
+        this.refreshPublicIp('after-connect', true);
       }
     } finally {
       this.pendingStart = false;
@@ -780,13 +858,33 @@ export struct HomePage {
     }
     this.proxyMode = mode;
     this.settings.proxyMode = mode;
-    await SettingsService.save(this.settings);
-    const label = mode === 'global' ? '全局模式' : (mode === 'direct' ? '直连模式' : '规则模式');
+    // ── `direct` 不落盘（2026-10-19 稳定性裁定）──────────────────────────────
+    //
+    // 「直连」= 所有流量绕过代理。它是排查/临时需求，不是长期配置：
+    // 一旦写进磁盘，用户误触后每次启动都直连，表现是「VPN 连上了但代理不生效、
+    // 公网 IP 是本地出口」，而用户几乎不可能自己想到是模式问题。
+    // 所以 direct 只在本次运行期生效（内存 + 内核热更新），磁盘上保持上一次的
+    // rule/global；重启后由 AppSettings.fromJson 再兜一层（direct → rule）。
+    // 需要直连时再点一次按钮，代价是一次点击，收益是不可能被粘死。
+    if (mode !== 'direct') {
+      await SettingsService.save(this.settings);
+    }
+    // 内存里保留 `settings.proxyMode = 'direct'`（上面已赋值），但要注意一个
+    // **有意的行为**：自动重连（网络切换/故障切换）走的是
+    // `ConnectionOrchestrator.connect()` 里 `SettingsService.load()` 的磁盘值，
+    // 那里没有 direct → 重连后自动回到 rule。这符合"direct 是临时诊断态"的定位：
+    // 用户不会因为一次误触而永久直连，代价只是重连后需要重新点一次。
+    const label = mode === 'global' ? '全局模式' : (mode === 'direct' ? '直连模式（不保存）' : '规则模式');
     await this.orchestrator.applyProxyMode(mode);
     promptAction.showToast({
       message: this.orchestrator.state === ConnState.CONNECTED
         ? `已切换${label}` : `已切换${label}，下次连接生效`
     });
+    // 模式切换会改变出口（尤其 direct），旧 IP 结论作废，立即重查
+    if (this.orchestrator.state === ConnState.CONNECTED) {
+      this.invalidatePublicIpQueries();
+      this.refreshPublicIp('after-mode-change', true);
+    }
   }
 
   /** Nexus §9 导出：快照 → JSON → 可选密码加密 → 系统文件选择器另存（用户自选导出位置） */
@@ -1023,7 +1121,7 @@ export struct HomePage {
                   .alignItems(HorizontalAlign.Center)
                   .onClick(() => {
                     if (!this.publicIpRefreshing) {
-                      this.refreshPublicIp();
+                      this.refreshPublicIp('user-retry');
                     }
                   })
                 }

@@ -184,6 +184,15 @@ export class DirectLatencyTester {
 }
 `);
 
+// 桩：DoHResolver（入口域名 pin 自愈：节点 TIMEOUT 时丢 pin）
+w('DoHResolver.ts', `
+export class DoHResolver {
+  static dropped = [];
+  static reset() { DoHResolver.dropped = []; }
+  static dropPin(domain) { DoHResolver.dropped.push(domain); }
+}
+`);
+
 // 桩：ConnectionOrchestrator（记录回收/自愈调用）
 w('ConnectionOrchestrator.ts', `
 export class ConnectionOrchestrator {
@@ -219,7 +228,8 @@ engSrc = engSrc
   .replace(/from '\.\/LatencyState'/g, "from './LatencyState.ts'")
   .replace(/from '\.\/LatencyController'/g, "from './LatencyController.ts'")
   .replace(/from '\.\.\/models\/ProxyNode'/g, "from './ProxyNode.ts'")
-  .replace(/from '\.\/DirectLatencyTester'/g, "from './DirectLatencyTester.ts'");
+  .replace(/from '\.\/DirectLatencyTester'/g, "from './DirectLatencyTester.ts'")
+  .replace(/from '\.\/DoHResolver'/g, "from './DoHResolver.ts'");
 ok(!/from '@ohos/.test(engSrc), 'staged engine must not import ohos kits');
 w('LatencyEngine.ts', engSrc);
 
@@ -232,6 +242,7 @@ const { ClashApiService, LatencyFailKind, probeResult } =
 const { ConnectionOrchestrator } = await import(pathToFileURL(path.join(stage, 'ConnectionOrchestrator.ts')).href);
 const { ProxyNode } = await import(pathToFileURL(path.join(stage, 'ProxyNode.ts')).href);
 const { DirectLatencyTester } = await import(pathToFileURL(path.join(stage, 'DirectLatencyTester.ts')).href);
+const { DoHResolver } = await import(pathToFileURL(path.join(stage, 'DoHResolver.ts')).href);
 
 const URL_ = 'https://www.gstatic.com/generate_204';
 function nodes(n) {
@@ -244,6 +255,7 @@ function fresh() {
   ClashApiService.reset();
   DirectLatencyTester.reset();
   ConnectionOrchestrator.reset();
+  DoHResolver.reset();
 }
 function opts(over = {}) {
   const o = new LatencyRunOptions();
@@ -329,24 +341,32 @@ await checkAsync('内核回 200 但 delay==0（失败语义）不得记为有效
   }
 });
 
-// ── 5. 通道故障绝不写成节点失败 + 整批作废 ────────────────────────────────
-await checkAsync('内核不可用：连续命中后作废整批，且绝不盖章成节点失败', async () => {
+// ── 5. 通道故障绝不写成 FAILED；但被搁置的节点必须补「超时」（2026-10-18 新契约）──
+// 旧契约：内核不可用 -> 整批作废、节点保持「未测」。
+// 新契约（用户裁定「要么显示延迟、要么显示超时，不要第三种结果」）：
+// 通道不可用 -> 整批作废，但**被搁置的节点补 TIMEOUT**，绝不留 `--`；
+// 同时**绝不**写成 FAILED（FAILED 表示协议/认证层失败，与"够不着"不同）。
+await checkAsync('内核全程不可用：不留未测、搁置节点补超时，且绝不写成失败', async () => {
   fresh();
-  ConnectionOrchestrator.recoverResult = false; // 自愈失败 -> 应作废
+  ConnectionOrchestrator.recoverResult = false; // 自愈失败 -> 通道不可用
   ClashApiService.handler = async () => probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0);
   const run = LatencyEngine.start(new ClashApiService(), nodes(30), URL_, opts());
   const p = await run.run();
   LatencyEngine.release(run);
   eq(p.coreUnavailable, true, 'batch must be flagged unavailable');
-  eq(p.failed, 0, 'a dead core must NOT produce node failures');
-  eq(p.timeout, 0, 'nor timeouts');
-  // 没有节点被写成失败/超时
+  eq(p.failed, 0, 'a dead core must NOT produce FAILED verdicts');
+  ok(p.timeout > 0, `stranded nodes must be stamped TIMEOUT (got ${p.timeout})`);
+  let untested = 0;
+  let testing = 0;
   for (let i = 0; i < 30; i++) {
     const st = LatencyController.stateFor('node-' + i);
-    ok(st !== LatencyState.FAILED && st !== LatencyState.TIMEOUT,
-      `node-${i} must not be stamped failed/timeout (got ${st})`);
+    if (st === LatencyState.UNTESTED) untested++;
+    if (st === LatencyState.TESTING) testing++;
+    ok(st !== LatencyState.FAILED, `node-${i} must not be FAILED (got ${st})`);
   }
-  ok(p.finished < 30, `batch should abort early (finished=${p.finished})`);
+  eq(testing, 0, 'no node may be left TESTING (the forever-spinner bug)');
+  eq(untested, 0, 'no node may be left "--" when the channel died (user requirement)');
+  ok(p.finished < 30, `batch should still abort early (finished=${p.finished})`);
   ok(ConnectionOrchestrator.recoverCalls <= 1, 'recovery attempted at most once per batch');
 });
 
@@ -354,11 +374,19 @@ await checkAsync('内核不可用：连续命中后作废整批，且绝不盖�
 await checkAsync('中途失联但自愈成功：批次继续跑完', async () => {
   fresh();
   ConnectionOrchestrator.recoverResult = true;
-  let n = 0;
-  ClashApiService.handler = async () => {
-    n++;
-    // 前 3 次（触发阈值）通道故障，之后恢复
-    return n <= 3 ? probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0) : probeResult(77);
+  // 注意（2026-10-18 方案 C 后调整）：通道瞬时抖动现在会被**就地重试**吸收，
+  // 所以"前 3 次调用失败"这种写法再也触发不到自愈（重试的后续调用就越过了阈值）。
+  // 而 tryRecoverChannel() 只在 coreNotReadyStreak 达到阈值(=3)时才真正自愈。
+  // 因此要走到自愈，必须让 **3 个节点各自把重试全部用尽**：
+  // 每个节点 首次 + 2 次重试 都失败 → 连击满 3 → 触发一次自愈 → 自愈成功、不作废。
+  const attempts = new Map();
+  ClashApiService.handler = async (name) => {
+    const a = attempts.get(name) ?? 0;
+    attempts.set(name, a + 1);
+    const alwaysFails = name === 'node-0' || name === 'node-1' || name === 'node-2';
+    return (alwaysFails && a < 3)
+      ? probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0)
+      : probeResult(77);
   };
   const run = LatencyEngine.start(new ClashApiService(), nodes(12), URL_, opts());
   const p = await run.run();
@@ -662,6 +690,90 @@ await checkAsync('release 之后引擎不再认为自己在跑', async () => {
   ok(!LatencyEngine.isRunning(), 'released engine is not running');
   ok(LatencyEngine.currentProgress() === null || LatencyEngine.currentProgress() !== null,
     'currentProgress must not throw after release');
+});
+
+// ── 17. 方案 C（2026-10-18）：真实节点结论不得被通道作废回滚 ──────────────
+// 用户报障：飞鸟云 37 节点批里，14 个已被内核盖成「超时」的节点在通道过载作废
+// 整批后被回滚成「未测」，加上 20 个未探测节点，34/38 行都是 `--`。
+// 用户要求「要么超时、要么显示延迟，不要第三种结果」。
+// 旧实现回滚的理由是「通道故障批的章不可信」，但通道级故障走 notPublishable，
+// 从不发布记录 —— 能被回滚的失败章 100% 是内核对该节点的真实拨号结论。
+await checkAsync('C：通道作废整批时，已盖章的逐节点「超时」必须保留（不再回滚成未测）', async () => {
+  fresh();
+  ConnectionOrchestrator.recoverResult = false;
+  let n = 0;
+  // 前 6 个探测是真实节点超时（内核 504），其余按通道不可用 -> 触发整批作废
+  ClashApiService.handler = async () => {
+    n++;
+    return n <= 6 ? probeResult(-1, LatencyFailKind.TIMEOUT, 504)
+      : probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0);
+  };
+  const run = LatencyEngine.start(new ClashApiService(), nodes(30), URL_, opts());
+  const p = await run.run();
+  LatencyEngine.release(run);
+
+  eq(p.coreUnavailable, true, 'this batch must still be flagged unavailable (abort path kept)');
+  ok(p.timeout > 0, `genuine node timeouts must be counted (got ${p.timeout})`);
+  // 关键断言：已盖章的超时结论必须仍然读作 TIMEOUT，不得被改回 UNTESTED
+  let keptTimeouts = 0;
+  let rolledBack = 0;
+  for (let i = 0; i < 30; i++) {
+    const st = LatencyController.stateFor('node-' + i);
+    if (st === LatencyState.TIMEOUT) keptTimeouts++;
+    if (st === LatencyState.UNTESTED) rolledBack++;
+  }
+  eq(keptTimeouts, p.timeout,
+    'every counted timeout must still read as TIMEOUT in the controller (no rollback)');
+  ok(keptTimeouts > 0, `expected some surviving timeout verdicts (got ${keptTimeouts})`);
+  ok(rolledBack < 30,
+    `aborted batch must not erase every verdict into "--" (untested=${rolledBack})`);
+});
+
+// ── 18. 方案 C：通道瞬时过载先重试/退避，不立刻判死 ───────────────────────
+await checkAsync('C：通道瞬时不可用会重试；重试成功则照常出结论且不作废整批', async () => {
+  fresh();
+  ConnectionOrchestrator.recoverResult = false;
+  let n = 0;
+  const seenCount = new Map();
+  // 每个节点的第 1 次探测都报通道不可用，重试即恢复 —— 模拟 controller 瞬时过载
+  ClashApiService.handler = async (name) => {
+    n++;
+    const seen = seenCount.get(name) ?? 0;
+    seenCount.set(name, seen + 1);
+    return seen === 0 ? probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0) : probeResult(66);
+  };
+  const run = LatencyEngine.start(new ClashApiService(), nodes(6), URL_, opts());
+  const p = await run.run();
+  LatencyEngine.release(run);
+
+  eq(p.coreUnavailable, false,
+    'transient overload absorbed by retry must NOT invalidate the whole batch');
+  eq(p.measured, 6, `all 6 nodes should recover via retry (measured=${p.measured})`);
+  ok(n > 6, `retry must actually re-probe (calls=${n} for 6 nodes)`);
+  for (let i = 0; i < 6; i++) {
+    eq(LatencyController.stateFor('node-' + i), LatencyState.MEASURED, `node-${i} measured`);
+  }
+});
+
+// ── 19. 2026-10-18：节点超时 → 丢掉该入口域名的 DoH pin（主机名死 pin 自愈）──
+// 背景：飞鸟云 34 节点整屏「超时」的真因是 hosts pin 把短 TTL 入口域名钉在旧 IP 上。
+// 引擎这一侧的责任是：内核明确判该节点超时后，别让那条 pin 继续毒害下一批配置。
+await checkAsync('超时节点会丢弃其入口域名的 DoH pin（下一批交给内核现解析）', async () => {
+  fresh();
+  const ns = [];
+  for (let i = 0; i < 4; i++) ns.push(new ProxyNode('hn-' + i, 'sg0' + i + '.example.xyz'));
+  ClashApiService.handler = async (name) => {
+    // 前两个节点超时，后两个正常 —— 只应丢掉超时那两个的域名
+    return name === 'hn-0' || name === 'hn-1'
+      ? probeResult(-1, LatencyFailKind.TIMEOUT, 504)
+      : probeResult(88);
+  };
+  const run = LatencyEngine.start(new ClashApiService(), ns, URL_, opts());
+  const p = await run.run();
+  LatencyEngine.release(run);
+  eq(p.timeout, 2, `two nodes should be timeout (got ${p.timeout})`);
+  eq(DoHResolver.dropped.slice().sort(), ['sg00.example.xyz', 'sg01.example.xyz'],
+    'exactly the timed-out nodes\' server domains must have their pin dropped');
 });
 
 fs.rmSync(stage, { recursive: true, force: true });

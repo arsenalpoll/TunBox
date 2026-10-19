@@ -20,7 +20,9 @@
  *   8. shouldStop：中止后不再启动新条目，在途条目仍完整落盘（不留半截数据）
  *   9. 接入点静态断言：两个页面确实改用它、旧的串行 for 循环已移除、服务端确实消费预取
  *
- * 用法: node scripts/verify-concurrent-refresh.mjs
+ * 用法: node scripts/verify-concurrent-refresh.mjs [--ets <dir>]
+ *   --ets 指向另一棵 entry/src/main/ets 树，用于负对照（对旧代码/被改坏的代码
+ *   运行本脚本时**必须失败**）。省略时用本仓库的 ets 树。
  * 退出码: 0 = 全部断言通过；1 = 有断言失败或加载失败
  */
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -30,8 +32,14 @@ import { tmpdir } from 'node:os';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appRoot = resolve(here, '..');
-const svcDir = join(appRoot, 'entry', 'src', 'main', 'ets', 'commons', 'services');
-const pageDir = join(appRoot, 'entry', 'src', 'main', 'ets', 'pages');
+const etsArg = process.argv.indexOf('--ets');
+const etsRoot = etsArg >= 0 && process.argv[etsArg + 1]
+  ? resolve(process.argv[etsArg + 1])
+  : join(appRoot, 'entry', 'src', 'main', 'ets');
+const svcDir = join(etsRoot, 'commons', 'services');
+const pageDir = join(etsRoot, 'pages');
+// 仓库是 CRLF 检出：接入点静态断言统一按 LF 语义书写。
+const readSource = file => readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
 
 // ── 极简断言器 ────────────────────────────────────────────────────────
 let passed = 0;
@@ -485,9 +493,9 @@ async function runBatch(svc, lanes, stopAfter) {
 // 9. 接入点静态断言（纯调度器绿 ≠ 页面真的用上了）
 // ══════════════════════════════════════════════════════════════════════
 {
-  const service = readFileSync(join(svcDir, 'SubscriptionService.ets'), 'utf8');
-  const subPage = readFileSync(join(pageDir, 'SubscriptionPage.ets'), 'utf8');
-  const nodePage = readFileSync(join(pageDir, 'NodeSelectionPage.ets'), 'utf8');
+  const service = readSource(join(svcDir, 'SubscriptionService.ets'));
+  const subPage = readSource(join(pageDir, 'SubscriptionPage.ets'));
+  const nodePage = readSource(join(pageDir, 'NodeSelectionPage.ets'));
 
   ok('wire.service.concurrentEntry', /async refreshSubscriptionsConcurrently\(ids: string\[\], lanes: number,/.test(service));
   ok('wire.service.usesScheduler', /await ConcurrentRefresh\.run\(ids, lanes,/.test(service));
@@ -501,11 +509,15 @@ async function runBatch(svc, lanes, stopAfter) {
 
   ok('wire.subPage.usesConcurrent', /this\.service\.refreshSubscriptionsConcurrently\(ids,/.test(subPage));
   ok('wire.subPage.lanes', /ConcurrentRefresh\.DEFAULT_LANES/.test(subPage));
+  // 0.4.0 SubscriptionPage 重构：批量刷新在途集合更名为 refreshingIds（每订阅一格的
+  // 行内进度也复用同一集合），重入守卫仍是「新增/全量刷新/逐条刷新任一在途即拒绝」。
   ok('wire.subPage.reentryGuard',
-    /if \(this\.isAdding \|\| this\.isRefreshing \|\| this\.refreshingSubscriptionIds\.length > 0\)/.test(subPage));
-  // 断言「每完成一条就更新进度」的真实写法（页面用 head 模板拼接），不依赖注释文字
+    /if \(this\.isAdding \|\| this\.isRefreshing \|\| this\.refreshingIds\.length > 0\)/.test(subPage));
+  // 断言「每完成一条就更新进度」的真实写法（0.4.0 去掉了旧 `head` 模板字符串，
+  // 改为进度回调移除该订阅 + UI 按 refreshingIds 渲染行内 LoadingProgress）。
   ok('wire.subPage.progressUi',
-    /const head = `正在刷新 \$\{progress\.done\}\/\$\{progress\.total\}/.test(subPage));
+    /this\.refreshingIds = this\.refreshingIds\.filter\(\(x\) => x !== item\.id\);/.test(subPage)
+    && /if \(this\.isRefreshingSub\(sub\.id\)\) \{\n\s*LoadingProgress\(\)/.test(subPage));
   ok('wire.subPage.summaryWithFailReasons', /部分刷新成功（\$\{summary\.okCount\} 成功 \/ \$\{summary\.failCount\} 失败）/.test(subPage));
   ok('wire.subPage.noSerialLoop',
     !/for \(const s of this\.subs\.filter\(\(item: Subscription\) => item\.id !== DIRECT_GROUP_ID\)\)/.test(subPage));
@@ -513,17 +525,18 @@ async function runBatch(svc, lanes, stopAfter) {
 
   ok('wire.nodePage.usesConcurrent', /this\.subs\.refreshSubscriptionsConcurrently\(ids,/.test(nodePage));
   ok('wire.nodePage.lanes', /ConcurrentRefresh\.DEFAULT_LANES/.test(nodePage));
-  // 源码是 CRLF：换行必须写成 \r?\n，否则正则永不命中（此前的假失败根因）
   ok('wire.nodePage.reentryGuard',
-    /private async refreshNodes\(\): Promise<void> \{\r?\n    if \(this\.refreshing\) \{/.test(nodePage));
+    /private async refreshNodes\(\): Promise<void> \{\n    if \(this\.refreshing\) \{/.test(nodePage));
   ok('wire.nodePage.progressUi', /this\.refreshDone = progress\.done;/.test(nodePage));
-  ok('wire.nodePage.iconProgress', /this\.refreshing \? `◌ \$\{this\.refreshDone\}\/\$\{this\.refreshTotal\}` : '⟳'/.test(nodePage));
+  // 0.4.0 重排：刷新按钮旁改为「进度文本」（done/total），旧的三态图标字符串已移除。
+  ok('wire.nodePage.iconProgress',
+    /if \(this\.refreshing\) \{\n\s*Text\(`\$\{this\.refreshDone\}\/\$\{this\.refreshTotal\}`\)/.test(nodePage));
   ok('wire.nodePage.noSerialLoop', !/const r = await this\.subs\.refreshSubscription\(s\.id\);/.test(nodePage));
   ok('wire.nodePage.toastSummary', /刷新完成，共 \$\{summary\.nodeCount\} 个节点/.test(nodePage));
 }
 
 // ── 汇总 ────────────────────────────────────────────────────────────
-console.log(`\n并发刷新离线回归：断言 ${passed} 条通过，${failures.length} 条失败`);
+console.log(`\n并发刷新离线回归${etsArg >= 0 ? `（--ets ${etsRoot}）` : ''}：断言 ${passed} 条通过，${failures.length} 条失败`);
 if (failures.length > 0) {
   console.error('失败明细：');
   for (const f of failures) {

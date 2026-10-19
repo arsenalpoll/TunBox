@@ -418,9 +418,12 @@ const apiSrc = readFileSync(join(svcDir, 'ClashApiService.ets'), 'utf8');
 const homeSrc = readFileSync(join(etsRoot, 'pages', 'HomePage.ets'), 'utf8');
 const rulesSrc = readFileSync(join(etsRoot, 'pages', 'RulesPage.ets'), 'utf8');
 has('home.hotmode', homeSrc, 'applyProxyMode');
-// 2026-09-17 规则入口集中到主页「网络规则」4 选项弹窗（规则/强制代理/强制直连/应用分流），
-// RulesPage 仍由弹窗跳转进入并保留 applyRulesChanged。
-has('home.rules-entry', homeSrc, 'pages/RulesPage');
+// 2026-09-17 规则入口集中到主页「网络规则」4 选项弹窗；0.4.0 设置页精简后，
+// 规则页入口**迁到设置页**（SettingsPage → router.pushUrl('pages/RulesPage')），
+// 主页不再直接跳转。断言随之改为「入口仍然存在且可达」，而不是死守旧位置——
+// 否则这条护栏会变成永远红的噪音（0.4.0 起就是如此，2026-10-19 修正）。
+const rulesEntrySrc = readFileSync(join(etsRoot, 'pages', 'SettingsPage.ets'), 'utf8');
+has('home.rules-entry', rulesEntrySrc, 'pages/RulesPage');
 has('rules.hotmode', rulesSrc, 'applyRulesChanged');
 const nselSrc = readFileSync(join(etsRoot, 'pages', 'NodeSelectionPage.ets'), 'utf8');
 has('nsel.forceReconnectWithNode', nselSrc, 'reconnectWithNode(node, this.subs');

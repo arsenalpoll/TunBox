@@ -46,6 +46,7 @@ import { LatencyChannel, LatencyPolicy, LatencyRecord, LatencyState } from './La
 import { LatencyController } from './LatencyController';
 import { ProxyNode } from '../models/ProxyNode';
 import { DirectLatencyTester } from './DirectLatencyTester';
+import { DoHResolver } from './DoHResolver';
 
 const TAG = 'LatencyEngine';
 
@@ -69,6 +70,18 @@ const STAGGER_MAX_MS = 200;
 export const BATCH_DEADLINE_MS = 90000;
 /** 连续「通道不可用」达到该次数即中止本批（内核不在/凭证错配，整批结论无效）。 */
 const CORE_NOT_READY_ABORT_STREAK = 3;
+/**
+ * 通道报「不可用」时的**就地重试**次数与线性退避基数。
+ *
+ * 为什么必须重试（真机取证 2026-10-18，飞鸟云 37 节点批）：
+ * 死亡节点成批拨号会把 controller(127.0.0.1:9090) 拖到 `code=2300028 Operation timeout`，
+ * 但这是**瞬时过载**而非内核死亡 —— 实测同一台机器上 44/46、24/24 的批次都正常。
+ * 旧实现每命中一次就 `coreNotReadyStreak++`，连续 3 次即作废整批：37 节点中
+ * 14 个已经被内核盖成「超时」的真实结论被回滚，其余 20 个永远停在「未测」——
+ * 用户看到的就是「一半超时、一半 --」。先重试再判死，可让批次真正跑完。
+ */
+const CORE_NOT_READY_RETRY_MAX = 2;
+const CORE_NOT_READY_RETRY_BACKOFF_MS = 350;
 /** `force=false` 时，多久以内的实测结果视为新鲜、可跳过重测。 */
 export const FRESH_RESULT_MS = 5 * 60 * 1000;
 /**
@@ -191,6 +204,7 @@ export class LatencyRun {
     if (this.cancelled || this.finished) {
       return;
     }
+    this.userCancelled = true;
     this.cancelled = true;
     this.generation = this.generation + 1;
     if (this.api !== null) {
@@ -199,6 +213,13 @@ export class LatencyRun {
     AppLogger.info(TAG, `latency run cancelled finished=${this.progress.finished}/${this.progress.total} `
       + `channel=${this.progress.channel}`);
   }
+
+  /**
+   * 「用户主动取消 / 新批次抢占」与「引擎因通道不可用自行作废」必须区分：
+   * 前者绝不能写任何节点结论（用户点了取消，不是节点的问题）；后者要给
+   * 被搁置的节点补一个明确结论（见 clearOwnTestingMarks 的兜底盖章）。
+   */
+  private userCancelled: boolean = false;
 
   /** 内部：新批次抢占/通道不可用时作废本批剩余工作（不再发布结果） */
   private invalidate(): void {
@@ -219,30 +240,52 @@ export class LatencyRun {
    */
   private clearOwnTestingMarks(): void {
     let cleared = 0;
-    let failuresReclaimed = 0;
     for (const node of this.nodes) {
       // 只收回**本批**打上的 TESTING：runId 是批次身份，抢占后的新批在
       // 同一节点上重新 markTesting(runId'≠runId)，旧批收尾不得清掉它。
       if (LatencyController.isTestingOwnedBy(node.name, this.runId)) {
         LatencyController.setRecord(LatencyRecord.untested(node.name));
         cleared = cleared + 1;
-        continue;
-      }
-      // 通道故障批（coreUnavailable）：中止前已盖章的失败同样无效 —— 此时
-      // **不能**把结果当节点结论（真机取证 2026-10-17：44 节点批测因 headless
-      // 内核 API 过载中止，11 个 TIMEOUT 章仍然生效，29 个 TESTING 被收回）。
-      // 用 runId 归属判断，只收本批打的章；取消批（coreUnavailable=false）
-      // 的已落库结果保持可见，不回滚。
-      if (this.progress.coreUnavailable
-        && LatencyController.isFailureOwnedBy(node.name, this.runId)) {
-        LatencyController.setRecord(LatencyRecord.untested(node.name));
-        failuresReclaimed = failuresReclaimed + 1;
       }
     }
-    if (cleared > 0 || failuresReclaimed > 0) {
-      AppLogger.info(TAG, `latency cleanup: ${cleared} node(s) left TESTING -> untested, `
-        + `${failuresReclaimed} stamped failure(s) -> untested `
-        + `(cancelled=${this.cancelled} unavailable=${this.progress.coreUnavailable})`);
+    // ⚠ 这里**不再**回滚已盖章的失败结论（2026-10-18 用户裁定后移除）。
+    //
+    // 旧实现（coreUnavailable 时把本批 failure 章一并改回 untested）的理由是
+    // 「通道故障批的章不可信」，但代码路径上根本不成立：通道级故障
+    // （failKind=CORE_NOT_READY）在 probeThroughCore 里走的是
+    // `ProbeOutcome.notPublishable()` —— **从不发布任何记录**。因此能被回滚的
+    // 失败章，100% 都是内核针对该节点给出的真实拨号结论（504 → TIMEOUT）。
+    //
+    // 真机取证 2026-10-18（飞鸟云 37 节点批）：内核已把 14 个节点盖成「超时」，
+    // 随后 controller 瞬时过载触发整批作废，这 14 个真实结论被改回「未测」，
+    // 连同 20 个未探测节点，用户看到 34/38 行都是 `--`。用户明确要求
+    // 「要么超时、要么显示延迟，不要第三种结果」——故此处只收回 TESTING
+    // （"我们不知道"才是诚实的中性态），已确定的节点结论一律保留。
+    // ── 兜底盖章（2026-10-18 用户裁定）：因**通道不可用**被搁置的节点补「超时」 ──
+    //
+    // 用户诉求：「要么显示延迟多少、要么显示超时，不要第三种结果」。
+    // 通道作废整批时，没来得及拨号的节点此前会永远留 `--`（未测），用户会误以为
+    // 根本没测速。这里给它们一个明确结论：内核不可用 → 该节点本轮无法使用 → 超时。
+    //
+    // 边界（很重要，别扩大）：
+    //  · 只在 coreUnavailable（引擎判定通道不可用）时补章；
+    //  · **用户主动取消 / 新批次抢占**（userCancelled）绝不补章 —— 那不是节点的错；
+    //  · 已有结论的节点一律不动（上面已保证真实结论不被回滚）。
+    let strandedStamped = 0;
+    if (this.progress.coreUnavailable && !this.userCancelled) {
+      for (const node of this.nodes) {
+        if (LatencyController.stateFor(node.name) === LatencyState.UNTESTED) {
+          this.publish(node.name, LatencyRecord.failed(node.name, LatencyState.TIMEOUT, Date.now()));
+          strandedStamped = strandedStamped + 1;
+        }
+      }
+      this.progress.timeout = this.progress.timeout + strandedStamped;
+    }
+    if (cleared > 0 || strandedStamped > 0) {
+      AppLogger.info(TAG, `latency cleanup: ${cleared} node(s) left TESTING -> untested`
+        + `${strandedStamped > 0 ? `, ${strandedStamped} stranded node(s) stamped TIMEOUT` : ''} `
+        + `(cancelled=${this.cancelled} userCancelled=${this.userCancelled} `
+        + `unavailable=${this.progress.coreUnavailable}); stamped node verdicts kept`);
       LatencyController.notify();
     }
   }
@@ -417,7 +460,31 @@ export class LatencyRun {
     if (api === null) {
       return ProbeOutcome.notPublishable();
     }
-    const probe = await api.testLatencyDetailed(node.name, this.url, this.timeoutMs, 16);
+    const firstProbe = await api.testLatencyDetailed(node.name, this.url, this.timeoutMs, 16);
+    // ── 通道瞬时过载：先就地重试/退避，不要立刻把它算进「通道不可用」连击 ──
+    // 死亡节点成批拨号会把 controller 打到 Operation timeout（2300028），这是过载
+    // 而不是内核死亡；实测同一内核稍后仍能正常出结果。旧实现每命中一次就累加连击，
+    // 3 次即作废整批 → 已盖章的真实结论被回滚、其余节点永远停在「未测」。
+    // 这里最多再试 CORE_NOT_READY_RETRY_MAX 次（线性退避），任一成功即按正常流程
+    // 发布结论；全部失败才交回下面的连击/中止逻辑。
+    let probe = firstProbe;
+    if (firstProbe.failKind === LatencyFailKind.CORE_NOT_READY) {
+      for (let attempt = 1; attempt <= CORE_NOT_READY_RETRY_MAX; attempt += 1) {
+        if (this.isAborted(generation)) {
+          break;
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(() => resolve(), CORE_NOT_READY_RETRY_BACKOFF_MS * attempt);
+        });
+        if (this.isAborted(generation)) {
+          break;
+        }
+        probe = await api.testLatencyDetailed(node.name, this.url, this.timeoutMs, 16);
+        if (probe.failKind !== LatencyFailKind.CORE_NOT_READY) {
+          break;
+        }
+      }
+    }
     if (this.isAborted(generation)) {
       // 用户取消 / 新批次抢占 / 通道作废：本批剩余工作全部作废。
       //
@@ -467,6 +534,10 @@ export class LatencyRun {
     const state = LatencyEngine.mapFailure(probe.failKind, probe.httpCode);
     if (state === LatencyState.TIMEOUT) {
       this.progress.timeout = this.progress.timeout + 1;
+      // 该节点入口域名若还挂着 DoH pin，却连握手都等不到应答，最可能是记录已轮换
+      // （机场短 TTL 换绑）而 hosts pin 把内核钉在旧 IP 上。丢掉这条 pin：下一个
+      // 批次重新生成配置时不再写 hosts，交由内核按 TTL 现解析。
+      DoHResolver.dropPin(node.server);
     } else {
       this.progress.failed = this.progress.failed + 1;
     }

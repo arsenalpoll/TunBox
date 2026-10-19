@@ -53,22 +53,6 @@ export class LatencyController {
   }
 
   /**
-   * 该节点的失败记录（TIMEOUT/FAILED）是否属于指定批次。
-   *
-   * 通道故障批收尾时把本批已盖章的失败一并收回 untested（与 TESTING 收回同路径）：
-   * 引擎注释自己写着「整批因通道不可用而中止：此时不能把结果当节点结论」，
-   * 中止前已盖章的失败章同样无效。runId 不匹配（包括 runId===0 的旧记录）一律
-   * 不收回 —— 只收自己打的章，不碰别的批次或历史结果。
-   */
-  static isFailureOwnedBy(nodeName: string, runId: number): boolean {
-    const v = LatencyController.map.get(nodeName);
-    if (v === undefined || !v.isFailure()) {
-      return false;
-    }
-    return runId !== 0 && v.runId === runId;
-  }
-
-  /**
    * 兼容视图：数值延迟。
    * MEASURED/OFFLINE → 延迟；TIMEOUT/FAILED → -1；其余（未测/测试中/取消）→ null。
    */

@@ -656,8 +656,19 @@ export struct SubscriptionPage {
     this.showToast(didRestart ? '已启用内核智能选点，正在自动重连…' : '已启用内核智能选点，下次连接生效');
   }
 
+  /**
+   * 分组头闪电测速（单个订阅 / **单节点分组**）。
+   *
+   * 单节点分组（`DIRECT_GROUP_ID`）必须与普通订阅同权：手工导入的节点其
+   * `subscriptionId` 就是 DIRECT_GROUP_ID，而 `BackgroundLatencyService.testSubscription`
+   * 正是按 `node.subscriptionId` 过滤节点集合 —— 因此它走的是**完全相同**的
+   * LatencyEngine 路径，没有任何特殊之处。此前这里把 direct 一并拦掉，
+   * 配合按钮上同款 `sub.id !== DIRECT_GROUP_ID` 判定，使「单节点」分组头既没有
+   * 闪电图标、展开区的提示文字却又写着「点行头闪电图标测速」——用户报障：
+   * 单节点无法测速。
+   */
   private async speedTestSub(subId: string): Promise<void> {
-    if (subId === DIRECT_GROUP_ID || this.speedTestingIds.includes(subId)) {
+    if (this.speedTestingIds.includes(subId)) {
       return;
     }
     this.speedTestingIds = this.speedTestingIds.concat([subId]);
@@ -1080,15 +1091,9 @@ export struct SubscriptionPage {
               }.alignItems(VerticalAlign.Center)
             }
 
-            // 顶部 Toast（刷新反馈，顶部横条胶囊）
-            if (this.toastVisible) {
-              Text(this.toastMsg)
-                .fontSize(11.5).fontWeight(FontWeight.Bold).fontColor(Color.White)
-                .padding({ left: 14, right: 14, top: 6, bottom: 6 })
-                .borderRadius(TunBoxGeometry.pillRadius)
-                .backgroundColor('rgba(15, 23, 42, 0.88)')
-                .margin({ top: 8, bottom: 8 })
-            }
+            // 顶部提示不再放在这里（2026-10-18）：它曾是 Scroll 内容里的条件 Text，
+            // 每次「正在测速…/✓ 测速完成/刷新完成」出现时都把下面的订阅卡整体下推一行。
+            // 现在改为根 Stack 上的浮动胶囊（见 build() 末尾），绝不参与布局。
 
             Column({ space: 14 }) {
               // ── 1. 顶部全局概览卡（文档 §3.2 第 1 节） ──
@@ -1196,15 +1201,23 @@ export struct SubscriptionPage {
                     .backgroundColor(TunBoxColors.primaryLight)
                     Column({ space: 2 }) {
                       Row({ space: 6 }) {
+                        // ⚠ 名称必须 layoutWeight(1)：否则超长订阅名会按「理想宽度」撑开
+                        // 这个 width('100%') 的 Row，把后面的「使用中」徽标挤出 Column 的
+                        // 右边界，而 ArkUI 不裁剪溢出内容 —— 徽标会画到行头按钮区、与
+                        // 闪电测速图标重叠（真机报障截图）。加权后名称吃掉剩余宽度并省略号，
+                        // 徽标始终留在 Row 内。
                         Text(sub.name)
                           .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
                           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                          .layoutWeight(1)
                         if (sub.id === this.activeSubId) {
                           Text('使用中')
                             .fontSize(10).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.success)
                             .padding({ left: 6, right: 6, top: 1, bottom: 1 })
                             .borderRadius(TunBoxGeometry.pillRadius)
                             .backgroundColor(TunBoxColors.successLight)
+                            // 徽标永不压缩/永不被挤出去：它是状态标识，宽度必须完整
+                            .flexShrink(0)
                         }
                       }.width('100%')
                       Text(`${this.service.nodesOf(sub.id).length} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
@@ -1212,20 +1225,20 @@ export struct SubscriptionPage {
                         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                     }.layoutWeight(1).alignItems(HorizontalAlign.Start)
                     // ── 铁律：纯图标闪电测速按钮，位于刷新按钮左边，不得移动/不得加文字 ──
-                    if (sub.id !== DIRECT_GROUP_ID) {
-                      Stack({ alignContent: Alignment.Center }) {
-                        if (this.speedTestingIds.includes(sub.id)) {
-                          LoadingProgress().width(15).height(15).color(TunBoxColors.primary)
-                        } else {
-                          Image($r('app.media.ic_bolt')).width(15).height(15)
-                            .fillColor(TunBoxColors.primary)
-                        }
+                    // 单节点分组（DIRECT_GROUP_ID）同样必须有：手工导入的节点就在该组，
+                    // 测速路径与普通订阅完全一致（见 speedTestSub）。
+                    Stack({ alignContent: Alignment.Center }) {
+                      if (this.speedTestingIds.includes(sub.id)) {
+                        LoadingProgress().width(15).height(15).color(TunBoxColors.primary)
+                      } else {
+                        Image($r('app.media.ic_bolt')).width(15).height(15)
+                          .fillColor(TunBoxColors.primary)
                       }
-                      .width(28).height(28)
-                      .borderRadius(TunBoxGeometry.pillRadius)
-                      .accessibilityText('闪电测速')
-                      .onClick(() => this.speedTestSub(sub.id))
                     }
+                    .width(28).height(28)
+                    .borderRadius(TunBoxGeometry.pillRadius)
+                    .accessibilityText('闪电测速')
+                    .onClick(() => this.speedTestSub(sub.id))
                     // 单个刷新
                     Stack({ alignContent: Alignment.Center }) {
                       if (this.isRefreshingSub(sub.id)) {
@@ -1351,6 +1364,46 @@ export struct SubscriptionPage {
       }
       .width('100%').height('100%')
 
+      // ── 顶部浮动提示（2026-10-18 用户要求：不挤占内容）──
+      //
+      // 为什么必须做成**叠层**而不是内容里的一行：
+      // 测速/刷新的「正在测速…/✓ 测速完成/刷新完成…」是瞬态反馈，用户要的是
+      // 「看得见、但不打断」；旧实现把它当 Scroll 内容里的条件 Text，出现一次就把
+      // 下面所有订阅卡下推一行，反复测速时列表会持续跳动。
+      //
+      // 实现要点：
+      //  · 根 Stack 的最后一个子节点 → 绘制在所有内容之上，且不参与 Column 布局；
+      //  · 全屏透明容器 + 顶部内边距（让开 56vp 导航栏）→ 胶囊真正居中在顶部；
+      //  · hitTestBehavior(None) → 提示层完全不拦截触摸（不会挡住底下的订阅卡/按钮）；
+      //  · 只在 toastVisible 期间存在，配合 OPACITY 过渡淡入淡出。
+      if (this.toastVisible) {
+        Column() {
+          Text(this.toastMsg)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            // 配色跟随主题（2026-10-18 用户要求）：白/深卡底 + 正文色字 + 品牌蓝描边，
+            // 不再用写死的黑色底 + 白字（浅色主题里与整体白卡蓝调完全不搭）。
+            .fontColor(TunBoxColors.toastText)
+            .textAlign(TextAlign.Center)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+            .borderRadius(TunBoxGeometry.pillRadius)
+            .backgroundColor(TunBoxColors.toastBg)
+            .borderWidth(1)
+            .borderColor(TunBoxColors.toastBorder)
+            .shadow({ radius: 16, color: TunBoxColors.toastShadow, offsetX: 0, offsetY: 6 })
+            .constraintSize({ maxWidth: '88%' })
+            .transition(TransitionEffect.OPACITY.animation({ duration: 160, curve: Curve.EaseOut }))
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ top: TunBoxGeometry.navHeight + 8, left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding })
+        .justifyContent(FlexAlign.Start)
+        .alignItems(HorizontalAlign.Center)
+        .hitTestBehavior(HitTestMode.None)
+        .zIndex(20)
+      }
     }
     .width('100%').height('100%')
   }

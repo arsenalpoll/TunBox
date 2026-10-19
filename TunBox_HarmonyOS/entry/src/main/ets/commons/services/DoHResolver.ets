@@ -1,14 +1,52 @@
-/** 代理入口 DoH 预解析。每条 pin 独立计时，允许有界 stale 使用，不在命中或落盘时续期。 */
+/**
+ * 代理入口 DoH 预解析：解析出的 IP 写进 YAML `hosts:`，让内核拨代理服务器时
+ * 不再走运行期明文 DNS（防投毒）。
+ *
+ * ## 2026-10-18 修正：pin 必须有 DNS TTL 支撑，短 TTL 记录一律**不 pin**
+ *
+ * 旧实现按固定 3h/6h 计时，与 DNS 记录自身的 TTL 无关。而机场入口域名普遍是
+ * 60~120s 短 TTL + IP 轮换（AWS EIP 换绑），旧 IP 几分钟后就 ping 不通；`hosts:`
+ * 又是**永久覆盖**（内核整条连接生命周期都不会再问 DNS），于是节点被钉死在失效
+ * 地址上：拨号 5s 无应答 → 内核 504 → 界面整屏「超时」。
+ *
+ * 真机取证（2026-10-18 20:0x，飞鸟云 34 个 hysteria2 节点）：
+ *   · 34 节点批 `measured=0~3 / timeout=29~32`，同一网络 FlClash 实测 <200ms；
+ *   · 当时落的 hosts pin：sg02=13.228.124.169 / sg03=3.1.16.214 / us03=35.163.34.69
+ *     ……**全部已失效**（DNS 现解析 sg02=18.141.49.209，旧 IP 100% 丢包；该域名
+ *     TTL 只有 60~120s）；
+ *   · 同一份 YAML 在 PC 上用同一内核复现：带 pin → 503/5.0s；把 pin 换成现解析值
+ *     → 164~330ms；**整段删掉 pin → 155~250ms**。
+ * 结论：pin 只对「记录本身稳定」的域名有意义；短 TTL 记录交给内核运行期解析
+ * （内核 DNS 缓存按 TTL 过期，这正是 FlClash 等客户端的口径）。
+ *
+ * ## ⚠ 与 ClashConfigGenerator 的 proxy-server-nameserver **强耦合**（2026-10-19）
+ *
+ * 上面这个结论有一个隐含前提：**内核自己解析代理域名时必须是安全的**。
+ * 2026-10-19 之前该配置是明文 UDP `223.5.5.5 / 119.29.29.29`，理由写在
+ * ClashConfigGenerator 里：「这些域名已被 UI 进程 DoH pin 进 hosts:，运行期几乎
+ * 不会被真的问到」。而「短 TTL 不 pin」把这条前提推翻了 —— 机场入口域名 TTL
+ * 实测 60~120s，**永远拿不到 pin**，于是内核每次都要用明文 UDP 解析它们，
+ * 而明文 UDP/53 在国内会被投毒（实测 www.google.com → 185.45.5.35，
+ * 真值 142.251.155.119）。后果是拨代理服务器打到假 IP → 全节点超时 →
+ * 「连上了但没有出口 / 公网 IP 查不到」。
+ *
+ * 因此 2026-10-19 已把 `proxy-server-nameserver` 同步改为加密 DoT
+ * （`tls://223.5.5.5:853` + `tls://1.12.12.12:853`）。**两者必须一起改**：
+ *   · 恢复「短 TTL 也 pin」→ 可以保留加密 DoT（没有坏处，只是多几毫秒）；
+ *   · 想退回明文 UDP → 必须先恢复长 TTL pin，否则投毒面立刻回来。
+ */
 import { http } from '@kit.NetworkKit';
 import { AppLogger } from '../utils/AppLogger';
 import { SettingsService } from './SettingsService';
 
 const TAG = 'DoHResolver';
 const ENDPOINTS: string[] = ['https://doh.pub/dns-query', 'https://dns.alidns.com/resolve'];
-// pin TTL 收紧（加固③）：陈旧 pin 可能把节点钉死在失效 IP 上很久。
-// 3h 起进 stale 队列由 refreshStale 重解析，6h 硬过期（加载时过期即弃）。
-const FRESH_TTL_MS = 3 * 60 * 60 * 1000;
-const USABLE_TTL_MS = 6 * 60 * 60 * 1000;
+/** 只有 TTL ≥ 该值的记录才允许写进 hosts（实测机场入口域名 TTL 多为 60~300s）。 */
+const MIN_PIN_TTL_MS = 10 * 60 * 1000;
+/** 即便 TTL 更长，pin 也不无限期覆盖：超过该年龄一律丢弃重解析。 */
+const PIN_MAX_AGE_MS = 60 * 60 * 1000;
+/** 被判为「短 TTL 不可 pin」的域名，多久内不再重复查询（内核自己会解析）。 */
+const UNPINNABLE_HOLD_MS = 30 * 60 * 1000;
 const PERSIST_DEBOUNCE_MS = 2000;
 
 /**
@@ -33,6 +71,8 @@ interface DoHAnswer {
   name: string;
   type: number;
   data: string;
+  /** 记录 TTL（秒）。DoH JSON 规范字段，doh.pub / alidns 都会返回。 */
+  TTL?: number;
 }
 interface DoHResponse {
   Status: number;
@@ -41,9 +81,12 @@ interface DoHResponse {
 class DoHPin {
   ip: string;
   resolvedAt: number;
-  constructor(ip: string, resolvedAt: number) {
+  /** 有效寿命（毫秒）= min(DoH 应答 TTL, PIN_MAX_AGE_MS)。 */
+  lifetimeMs: number;
+  constructor(ip: string, resolvedAt: number, lifetimeMs: number) {
     this.ip = ip;
     this.resolvedAt = resolvedAt;
+    this.lifetimeMs = lifetimeMs;
   }
 }
 
@@ -56,6 +99,12 @@ export class DoHResolver {
   private static refreshing: Promise<number> | null = null;
   private static persistTimer: number = -1;
   private static staleQueue: Set<string> = new Set<string>();
+  /**
+   * 「短 TTL 不 pin」留痕：域名 → 该结论的有效截止时间。
+   * 目的有两个：① 别再对它反复发 DoH 查询（内核会按 TTL 自己解析）；
+   * ② 让连接路径的 DoH 预算真正落地（否则每次连接都要等它查完）。
+   */
+  private static unpinnable: Map<string, number> = new Map<string, number>();
 
   /** 并发调用共享同一载入任务；失败允许下一次重试。 */
   static async ensureLoaded(): Promise<void> {
@@ -78,43 +127,78 @@ export class DoHResolver {
     try {
       const persisted = await SettingsService.loadDohPins();
       const now = Date.now();
+      let dropped = 0;
       for (const domain of Object.keys(persisted)) {
         const packed = persisted[domain];
         if (typeof packed !== 'string') {
+          dropped++;
           continue;
         }
         // 易变域名不加载历史 pin（加固③a）
         if (isVolatileDomain(domain)) {
+          dropped++;
           continue;
         }
-        const bar = packed.indexOf('|');
-        const ip = bar > 0 ? packed.substring(0, bar) : '';
-        const ts = bar > 0 ? Number(packed.substring(bar + 1)) : 0;
-        if (!DoHResolver.looksLikeIPv4(ip) || !Number.isFinite(ts) || ts <= 0
-          || ts > now || now - ts > USABLE_TTL_MS) {
+        // 只有 `ip|resolvedAt|lifetimeMs` 三段的记录才带得动 TTL 契约。
+        // 旧版两段式（ip|ts）没有 TTL 依据，而机场短 TTL 域名的旧 IP 往往已经
+        // 轮换 —— 留着就是把节点钉在失效地址上（本次真机「整屏超时」的直接原因）。
+        const parts = packed.split('|');
+        if (parts.length < 3) {
+          dropped++;
           continue;
         }
-        DoHResolver.cachePut(domain.toLowerCase(), ip, false, ts);
+        const ip = parts[0];
+        const ts = Number(parts[1]);
+        const lifetime = Math.min(Number(parts[2]), PIN_MAX_AGE_MS);
+        if (!DoHResolver.looksLikeIPv4(ip) || !Number.isFinite(ts) || ts <= 0 || ts > now
+          || !Number.isFinite(lifetime) || lifetime < MIN_PIN_TTL_MS
+          || now - ts >= lifetime) {
+          dropped++;
+          continue;
+        }
+        DoHResolver.cachePut(domain.toLowerCase(), ip, lifetime, false, ts);
       }
       DoHResolver.loaded = true;
+      if (dropped > 0) {
+        AppLogger.info(TAG, `doh pin cache: dropped ${dropped} legacy/short-ttl entr(ies)`);
+        // 立即重写一次：旧条目留在磁盘上会被下一个进程反复加载、反复丢弃。
+        DoHResolver.schedulePersist();
+      }
     } catch (e) {
       AppLogger.warn(TAG, `doh pin cache load failed: ${AppLogger.errText(e)}`);
     }
   }
 
-  /** 命中时同样检查年龄；长驻进程不能无限使用已经失效的 IP。 */
+  /** 该域名是否已被判为「短 TTL，不 pin」，且结论仍在有效期内。 */
+  private static isHeldUnpinnable(domain: string): boolean {
+    const until = DoHResolver.unpinnable.get(domain);
+    if (until === undefined) {
+      return false;
+    }
+    if (Date.now() >= until) {
+      DoHResolver.unpinnable.delete(domain);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * 命中时同样检查年龄；长驻进程不能无限使用已经失效的 IP。
+   * 年龄按 pin 自身的 lifetime（= min(DNS TTL, PIN_MAX_AGE_MS)）判定：
+   * 过寿命一半即进 stale 队列，到期直接丢弃。
+   */
   private static cachedIp(domain: string): string {
     const pin = DoHResolver.cache.get(domain);
     if (pin === undefined) {
       return '';
     }
     const age = Date.now() - pin.resolvedAt;
-    if (age < 0 || age > USABLE_TTL_MS) {
+    if (age < 0 || age >= pin.lifetimeMs) {
       DoHResolver.cache.delete(domain);
       DoHResolver.staleQueue.delete(domain);
       return '';
     }
-    if (age > FRESH_TTL_MS) {
+    if (age * 2 >= pin.lifetimeMs) {
       DoHResolver.staleQueue.add(domain);
     }
     DoHResolver.cache.delete(domain);
@@ -123,9 +207,29 @@ export class DoHResolver {
   }
 
   /**
-   * 连接路径判据（2026-10-17 启动速度）：该域名是否已有可用 pin。
-   * 命中时 ConnectionOrchestrator 可把连接期 DoH 预算从 6s 收紧到 1.5s ——
-   * 关键节点已 pin，其余备用域名晚点解析无碍。
+   * 丢弃某个域名的 pin（下次生成配置时该域名不再进 hosts，改由内核按 TTL 现解析）。
+   * 场景：pin 存在却仍然拨号超时 —— 说明记录已轮换，pin 是负资产。
+   */
+  static dropPin(domain: string): void {
+    const d = domain.trim().toLowerCase();
+    if (d.length === 0) {
+      return;
+    }
+    if (DoHResolver.cache.delete(d)) {
+      DoHResolver.staleQueue.delete(d);
+      AppLogger.info(TAG, `doh pin dropped (dial timed out): ${d}`);
+      DoHResolver.schedulePersist();
+    }
+  }
+
+  /**
+   * 连接路径判据：该域名是否已有可用 pin。
+   *
+   * ⚠ 2026-10-19 稳定性回退后**已无调用方**：0.4.0 曾用它把连接期 DoH 预算从
+   * 6s 收紧到 1.5s（命中 pin 就认为"关键域名已就绪"），但那样会让备用节点域名
+   * 几乎必然解析不到（见 ConnectionOrchestrator 里 resolveMany 的注释）。
+   * 预算恢复固定 6000ms 后不再需要这个判据。保留此方法仅供诊断/后续优化复用，
+   * 不要再接回连接主路径 —— 除非同时保证备用域名仍能拿到完整预算。
    */
   static async hasUsablePin(domain: string): Promise<boolean> {
     if (domain.length === 0) {
@@ -154,9 +258,11 @@ export class DoHResolver {
       const cached = DoHResolver.cachedIp(d);
       if (cached.length > 0) {
         result[d] = cached;
-      } else {
+      } else if (!DoHResolver.isHeldUnpinnable(d)) {
         pending.push(d);
       }
+      // 命中「短 TTL 不 pin」结论的域名既不进结果也不查询：
+      // 它会被写进 hosts 就会钉住会轮换的 IP，而内核自己按 TTL 解析是对的。
     }
     pending = DoHResolver.sortByPriority(pending, priority);
     const deadline = Date.now() + Math.max(0, budgetMs);
@@ -171,7 +277,12 @@ export class DoHResolver {
             const d = current[idx++];
             const ip = await DoHResolver.resolveANoCache(d, deadline);
             if (ip.length > 0) {
-              result[d] = ip;
+              // 只有**真的被 pin 住**的域名才允许进 hosts（短 TTL 的 cachePut 会
+              // 直接拒收，此时 cachedIp 为空 → 该域名不进结果，交给内核现解析）。
+              const pinned = DoHResolver.cachedIp(d);
+              if (pinned.length > 0) {
+                result[d] = pinned;
+              }
             } else {
               remaining.push(d);
             }
@@ -259,7 +370,10 @@ export class DoHResolver {
       workers.push((async (): Promise<void> => {
         while (Date.now() < deadline && idx < todo.length) {
           const d = todo[idx++];
-          if ((await DoHResolver.resolveANoCache(d, deadline)).length > 0) {
+          if ((await DoHResolver.resolveANoCache(d, deadline)).length > 0
+            && DoHResolver.cachedIp(d).length > 0) {
+            // 只算真正被 pin 住的：短 TTL 记录刷新后不 pin，等于交给内核解析，
+            // 不要把它算成「已刷新」，否则调用方会误以为 pin 还在。
             updated++;
           }
         }
@@ -316,7 +430,11 @@ export class DoHResolver {
         }
         for (const a of parsed.Answer) {
           if (a.type === 1 && typeof a.data === 'string' && DoHResolver.looksLikeIPv4(a.data)) {
-            DoHResolver.cachePut(domain, a.data, true, Date.now());
+            // TTL 是 pin 的**唯一**寿命依据（见文件头 2026-10-18 修正）。
+            // 缺 TTL（非标 DoH 端点）按 0 处理 → 不 pin，交给内核现解析。
+            const ttlSec = typeof a.TTL === 'number' ? a.TTL : Number(a.TTL);
+            const ttlMs = Number.isFinite(ttlSec) && ttlSec > 0 ? ttlSec * 1000 : 0;
+            DoHResolver.cachePut(domain, a.data, ttlMs, true, Date.now());
             return a.data;
           }
         }
@@ -344,14 +462,29 @@ export class DoHResolver {
     return true;
   }
 
-  private static cachePut(domain: string, ip: string, schedule: boolean, resolvedAt: number): void {
+  /**
+   * 落一条 pin（**只有 TTL 足够长的记录才会真的落**）。
+   * @param ttlMs DoH 应答 TTL（毫秒）；0/过短 = 记录会轮换 → 不 pin。
+   */
+  private static cachePut(domain: string, ip: string, ttlMs: number, schedule: boolean,
+    resolvedAt: number): void {
     // 易变域名不 pin（加固③a）：不进内存缓存也不持久化，域名留给内核运行时解析
     if (isVolatileDomain(domain)) {
       return;
     }
+    // 短 TTL 记录不 pin（2026-10-18 修正）：hosts 是永久覆盖，钉住会轮换的 IP 会让
+    // 整条订阅在 IP 换绑后全部拨号超时。留一条「别再问」的记号，之后交给内核解析。
+    if (!(ttlMs >= MIN_PIN_TTL_MS)) {
+      DoHResolver.cache.delete(domain);
+      DoHResolver.staleQueue.delete(domain);
+      DoHResolver.unpinnable.set(domain, Date.now() + UNPINNABLE_HOLD_MS);
+      return;
+    }
+    DoHResolver.unpinnable.delete(domain);
+    const lifetimeMs = Math.min(ttlMs, PIN_MAX_AGE_MS);
     DoHResolver.cache.delete(domain);
-    DoHResolver.cache.set(domain, new DoHPin(ip, resolvedAt));
-    if (Date.now() - resolvedAt > FRESH_TTL_MS) {
+    DoHResolver.cache.set(domain, new DoHPin(ip, resolvedAt, lifetimeMs));
+    if (Date.now() - resolvedAt >= lifetimeMs / 2) {
       DoHResolver.staleQueue.add(domain);
     } else {
       DoHResolver.staleQueue.delete(domain);
@@ -379,8 +512,10 @@ export class DoHResolver {
       const now = Date.now();
       for (const domain of DoHResolver.cache.keys()) {
         const pin = DoHResolver.cache.get(domain);
-        if (pin !== undefined && now >= pin.resolvedAt && now - pin.resolvedAt <= USABLE_TTL_MS) {
-          out[domain] = `${pin.ip}|${pin.resolvedAt}`;
+        if (pin !== undefined && pin.lifetimeMs >= MIN_PIN_TTL_MS
+          && now >= pin.resolvedAt && now - pin.resolvedAt < pin.lifetimeMs) {
+          // 三段式：ip|resolvedAt|lifetimeMs —— 寿命是 pin 自己的契约，读回来必须能重建
+          out[domain] = `${pin.ip}|${pin.resolvedAt}|${pin.lifetimeMs}`;
         }
       }
       SettingsService.saveDohPins(out).catch((e: Error): void => {

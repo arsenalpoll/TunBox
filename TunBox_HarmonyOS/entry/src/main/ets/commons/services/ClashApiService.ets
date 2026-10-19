@@ -225,11 +225,60 @@ export class ClashApiService {
   /** 切换选中节点。必须同时下发到 PROXY 组和 GLOBAL 组:
    *  mihomo 在 global(全局)模式下忽略具名 PROXY 组, 走隐式 GLOBAL 组; 若不设置
    *  GLOBAL, 它默认选 DIRECT → 全局模式下所有流量直连、被国内 DNS 污染打不开。
-   *  (真机实证: 全局模式 GLOBAL now=DIRECT, youtube dial 假 IP 超时。) */
+   *  (真机实证: 全局模式 GLOBAL now=DIRECT, youtube dial 假 IP 超时。)
+   *
+   *  2026-10-19 稳定性：返回值改为「PROXY 组钉选成功」——旧实现是
+   *  `okProxy || okGlobal`，只要 GLOBAL 成功就算成功，于是规则模式下 PROXY 组
+   *  没钉上也会返回 true，调用方以为选点已生效（真机表现为「连上了但走的是旧节点」）。
+   *  GLOBAL 是**尽力而为**（部分配置不声明 GLOBAL 组，PUT 会 404，属正常）。
+   *  失败时重试一次：内核刚起时首个 PUT 偶发 400/超时，重试即可收敛。
+   */
   async selectNode(nodeName: string): Promise<boolean> {
-    const okProxy = await this.selectInGroup('PROXY', nodeName);
-    const okGlobal = await this.selectInGroup('GLOBAL', nodeName);
-    return okProxy || okGlobal;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (await this.selectInGroup('PROXY', nodeName)) {
+        // GLOBAL 尽力而为，不参与返回值；失败只记 info，避免误判为整体失败
+        if (!(await this.selectInGroup('GLOBAL', nodeName))) {
+          AppLogger.info(TAG, `selectInGroup(GLOBAL) not applied for ${nodeName} (group may be absent)`);
+        }
+        return true;
+      }
+      if (attempt === 0) {
+        await ClashApiService.sleep(120);
+      }
+    }
+    AppLogger.error(TAG, `selectNode(${nodeName}) failed after retry`);
+    return false;
+  }
+
+  /**
+   * 读回某代理组当前选中的成员（GET /proxies/{group} 的 `now` 字段）。
+   * 返回 null 表示内核不可达/组不存在；空串表示组存在但没有选中项。
+   * 用途：连接后确认「选点真的生效了」，而不是只信 PUT 的 204。
+   *
+   * 超时刻意收紧到 1500/2000（回环请求正常 <10ms）：这是连接主路径上的
+   * **观测**调用，绝不允许在 controller 过载时把连接额外拖慢 3s。
+   */
+  async groupSelection(group: string): Promise<string | null> {
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/proxies/${encodeURIComponent(group)}`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: 1500,
+        readTimeout: 2000,
+        usingCache: false
+      });
+      if (resp.responseCode !== 200 || typeof resp.result !== 'string') {
+        return null;
+      }
+      const parsed = JSON.parse(resp.result as string) as Record<string, Object>;
+      const now = parsed['now'];
+      return typeof now === 'string' ? now as string : '';
+    } catch (e) {
+      return null;
+    } finally {
+      req.destroy();
+    }
   }
 
   /**

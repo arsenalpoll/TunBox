@@ -7,6 +7,13 @@
  * SOURCE: explicitly static integration guards. No build, disk writes or commit.
  * --defer-home-node skips only parallel-agent-owned Home/Node SOURCE checks.
  * AUDIT reports existing out-of-contract malformed JSON limitations separately.
+ *
+ * 用法: node scripts/verify-site-routing.mjs [--ets <dir>] [--defer-home-node]
+ *   --ets 指向另一棵 entry/src/main/ets 树，用于负对照（对旧代码/被改坏的代码
+ *   运行本脚本时**必须失败**）。省略时用本仓库的 ets 树。
+ *
+ * ⚠ 行尾陷阱：仓库是 core.autocrlf=true 的 CRLF 检出；读取时统一归一化 CRLF→LF，
+ *   让 `^  }` 之类的方法边界断言按真实语义工作。
  */
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
@@ -14,8 +21,11 @@ import { stripTypeScriptTypes } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const ets = resolve(root, 'entry/src/main/ets');
-const read = path => readFileSync(resolve(ets, path), 'utf8');
+const etsArg = process.argv.indexOf('--ets');
+const ets = etsArg >= 0 && process.argv[etsArg + 1]
+  ? resolve(process.argv[etsArg + 1])
+  : resolve(root, 'entry/src/main/ets');
+const read = path => readFileSync(resolve(ets, path), 'utf8').replace(/\r\n/g, '\n');
 const policy = read('commons/services/SiteRoutingPolicy.ets');
 const page = read('pages/SiteRoutingPage.ets');
 const network = read('pages/HomePage.ets');
@@ -40,9 +50,14 @@ assert.ok(start >= 0 && end > start, 'real page class prefix must exist');
 let pageClass = page.slice(start, end);
 const dialog = extract(pageClass,
   /^  private dialog: CustomDialogController = new CustomDialogController\(\{\r?\n[\s\S]*?^  \}\);/m, 'only dialog initializer');
+// 0.4.0 起类前缀里不再只有 @State：主题即时切换引入了 @StorageLink（以及后续可能
+// 出现的 @Prop/@Link/@Watch/@LocalStorageLink…）。这些**字段装饰器**都只影响 ArkUI
+// 运行时，去掉后字段本身仍是合法 TS 类字段。因此按「整行装饰器」统一剥离，而不是
+// 逐条枚举 —— 逐条枚举会在下一次加装饰器时又变成假失败。
+// 只剥离 `^  @Name` 或 `^  @Name(...)` 形式的行首装饰器：字符串/回调里的 "@" 不受影响。
 pageClass = pageClass.replace(dialog, '  private dialog = { open() {}, close() {} };')
   .replace(/^struct SiteRoutingPage \{/m, 'export class SiteRoutingPage {')
-  .replace(/^  @State /gm, '  ') + '\n}\n';
+  .replace(/^  @[A-Za-z_$][\w$]*(?:\([^()]*\))?[ \t]*/gm, '  ') + '\n}\n';
 assert.ok(!/^\s*@/m.test(pageClass), 'no unhandled decorators may enter execution');
 const harness = `
 export const boundary = { dialogs: [], toasts: [], backs: 0, applies: [], outcome: 'hot', params: {}, loadError: false, saveError: false, applyError: false };
@@ -68,6 +83,7 @@ const js = stripTypeScriptTypes(code, { mode: 'strip' });
 const mod = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'));
 const P = mod.SiteRoutingPolicy, A = mod.AppSettings, S = mod.SettingsService;
 const B = mod.boundary, store = mod.store;
+console.log(`\nSite routing verification${etsArg >= 0 ? ` (--ets ${ets})` : ''}`);
 let passed = 0, failed = 0, audits = 0;
 const check = async (label, fn) => {
   try { await fn(); passed++; console.log('PASS ' + label); }
@@ -222,13 +238,17 @@ await check('EXEC load failure prevents editing save from clobbering settings', 
   assert.equal(p.ready, false); assert.equal(p.busy, false); await p.save(); assert.equal(store.puts, 0); B.loadError = false;
 });
 const save = method(page, 'save'), back = method(page, 'back');
-await check('SOURCE saving validates then reloads settings and writes only two site fields before apply', () => {
+await check('SOURCE saving validates then reloads settings and writes the three site lists before apply', () => {
   assert.ok(save.indexOf('SiteRoutingPolicy.validationError(') < save.indexOf('SettingsService.load()'));
   assert.ok(save.indexOf('SettingsService.load()') < save.indexOf('settings.forceProxySites ='));
-  assert.deepEqual([...save.matchAll(/settings\.(\w+)\s*=(?!=)/g)].map(m => m[1]).sort(), ['forceDirectSites', 'forceProxySites']);
+  // 0.4.0 起网站规则是三态（代理 / 直连 / 拦截）：保存必须同时写三份名单，
+  // 漏写任何一份都会让该态规则在下次启动后静默丢失。
+  assert.deepEqual([...save.matchAll(/settings\.(\w+)\s*=(?!=)/g)].map(m => m[1]).sort(),
+    ['forceBlockSites', 'forceDirectSites', 'forceProxySites']);
   assert.ok(save.indexOf('await SettingsService.save(settings)') < save.indexOf('applyRulesChanged('));
   assert.match(save, /result\.index === 2/); assert.ok(!save.includes('restartIfConnected('));
-  assert.ok(save.includes('this.originalProxy') && save.includes('this.originalDirect'));
+  assert.ok(save.includes('this.originalProxy') && save.includes('this.originalDirect')
+    && save.includes('this.originalBlock'), 'three-way concurrent-edit guard must cover the block list too');
 });
 await check('SOURCE discard and hardware back are guarded and never persist', () => {
   assert.match(back, /if \(!this\.dirty\)/); assert.match(back, /result\.index === 1/);
@@ -240,48 +260,68 @@ await check('SOURCE hot reload attempted before reconnect fallback', () => {
   assert.ok(apply.indexOf('reloadRulesHot(reason)') < apply.indexOf('restartIfConnected(reason)'));
   assert.match(apply, /if \(hot\) \{\s*return 'hot';/); assert.ok(apply.includes("'reconnect' : 'none'"));
 });
-await check('SOURCE generator emits both lists, direct before proxy, and suffix semantics', () => {
+await check('SOURCE generator emits all three lists, direct before proxy, and suffix semantics', () => {
   assert.ok(generator.includes('normalizeDomains(settings.forceDirectSites)'));
   assert.ok(generator.includes('normalizeDomains(settings.forceProxySites)'));
+  // 第三态（拦截）在 DNS 层单独出 REJECT 预匹配规则，漏掉就等于该态配置无效。
+  assert.ok(generator.includes('normalizeDomains(settings.forceBlockSites)'));
   assert.ok(generator.indexOf('DOMAIN-SUFFIX,${site},DIRECT') < generator.indexOf('DOMAIN-SUFFIX,${site},PROXY'));
   assert.ok(generator.includes('if (!directSites.includes(site))'));
   assert.ok(page.includes('勾选仅用于批量操作，不是启用开关'));
 });
-await check('SOURCE network entries target registered existing site/app pages with correct kinds', () => {
+await check('SOURCE network entries live in SettingsPage and target registered existing pages', () => {
   const routes = JSON.parse(readFileSync(resolve(root, 'entry/src/main/resources/base/profile/main_pages.json'), 'utf8')).src;
   for (const route of ['pages/SiteRoutingPage', 'pages/AppRoutingPage', 'pages/RulesPage', 'pages/NodeSelectionPage']) {
     assert.ok(routes.includes(route), route + ' registered'); assert.ok(existsSync(resolve(ets, route + '.ets')), route + ' exists');
   }
   assert.ok(!routes.includes('pages/NetworkRulesPage'), 'obsolete transparent router page removed from main_pages.json');
-  // 2026-09-17 网络规则入口合并为主页「网络规则」4 选项弹窗（规则/强制代理/强制直连/应用分流），
-  // 旧的 NetworkRulesPage 已删除；弹窗在主页内直接路由到三个配置页面。
-  assert.match(network, /struct NetworkRulesDialog/);
-  assert.match(network, /'pages\/SiteRoutingPage', params: \{ kind: kind === 'direct' \? 'direct' : 'proxy' \}/);
-  assert.match(network, /'pages\/AppRoutingPage'/);
-  assert.match(network, /'pages\/RulesPage'/);
-  assert.match(network, /this\.networkRulesDialog\.open\(\)/);
-  assert.match(network, /rulesSummary = this\.settings\.rulesEnabled/);
+  // 0.4.0 重排：网络规则入口从主页「网络规则」弹窗统一收进设置页（单一事实来源），
+  // 主页不再维护第二份入口/编辑状态；SiteRoutingPage 同时改为页面内三态切换
+  // （代理/直连/拦截），不再靠 pushUrl 的 kind 参数分流。
+  const settingsPage = read('pages/SettingsPage.ets');
+  assert.match(settingsPage, /router\.pushUrl\(\{ url: 'pages\/AppRoutingPage' \}\)/);
+  assert.match(settingsPage, /router\.pushUrl\(\{ url: 'pages\/SiteRoutingPage' \}\)/);
+  assert.match(settingsPage, /router\.pushUrl\(\{ url: 'pages\/RulesPage' \}\)/);
+  assert.match(settingsPage, /Text\('应用分流'\)/);
+  // 三态切换与三份名单都在 SiteRoutingPage 内闭环
+  assert.match(page, /private switchKind\(kind: string\): void \{/);
+  assert.match(page, /forceBlockSites/);
+  // 主页不得再出现第二份网络规则入口
+  assert.ok(!network.includes('NetworkRulesDialog'), 'HomePage must not duplicate the network rules surface');
+  assert.ok(!network.includes("url: 'pages/NetworkRulesPage'"));
 });
-const noCustomMotion = source => {
-  assert.doesNotMatch(source, /\bpageTransition\s*\(|\bPageTransition(?:Enter|Exit)\s*\(|\banimateTo\s*\(|\.animation\s*\(|\.transition\s*\(/);
+// 0.4.0 统一转场（见 theme/TunBoxTokens.ets 的 TunBoxMotion）：被推入的子页必须用
+// **同一套**转场令牌，禁止各页自带时长/曲线，也禁止命令式 animateTo —— 否则同一
+// 手势在不同页面会有不同手感，深浅色/动效开关也没法统一治理。
+const unifiedMotion = (source, label) => {
+  assert.match(source, /pageTransition\(\) \{/, label + ' must declare the unified page transition');
+  assert.match(source, /PageTransitionEnter\(\{ duration: TunBoxMotion\.ms, curve: TunBoxMotion\.curve \}\)/,
+    label + ' enter transition must use TunBoxMotion tokens');
+  assert.match(source, /PageTransitionExit\(\{ duration: TunBoxMotion\.ms, curve: TunBoxMotion\.curve \}\)/,
+    label + ' exit transition must use TunBoxMotion tokens');
+  assert.match(source, /TunBoxMotion\.slidePercent/, label + ' must slide by the shared percentage token');
+  assert.doesNotMatch(source, /\banimateTo\s*\(/, label + ' must not use imperative animateTo');
 };
-await check('SOURCE Site/Network/App pages use system-default transitions', () => {
-  for (const source of [page, read('pages/AppRoutingPage.ets')]) noCustomMotion(source);
+await check('SOURCE Site/App pages share the unified TunBoxMotion transition', () => {
+  unifiedMotion(page, 'SiteRoutingPage');
+  unifiedMotion(read('pages/AppRoutingPage.ets'), 'AppRoutingPage');
 });
 if (process.argv.includes('--defer-home-node')) {
   console.log('DEFER SOURCE Home/Node agent-owned entries and transitions: parent must run without --defer-home-node after agent completion.');
 } else {
-  await check('SOURCE Home network rules dialog merges rule entries, default motion', () => {
-    const home = read('pages/HomePage.ets'); noCustomMotion(home);
-    assert.ok(!home.includes('struct RulesCard'), 'standalone rules card merged into network rules dialog');
-    for (const value of ["Text('网络规则')", 'NetworkRulesDialog', 'pages/RulesPage', 'pages/AppRoutingPage', 'pages/SiteRoutingPage']) {
-      assert.ok(home.includes(value), value);
-    }
+  await check('SOURCE HomePage keeps no duplicate rules surface and no push transition', () => {
+    const home = read('pages/HomePage.ets');
+    // 主页是根页签页，不做推入转场；网络规则入口已收进设置页，这里不得回流副本。
+    assert.doesNotMatch(home, /\bpageTransition\s*\(/, 'root tab page must not declare a push transition');
+    assert.doesNotMatch(home, /\banimateTo\s*\(/);
+    assert.ok(!home.includes('struct NetworkRulesDialog'), 'network rules dialog must stay in SettingsPage only');
+    assert.ok(!home.includes('struct RulesCard'), 'standalone rules card merged into the rules page');
     assert.ok(!home.includes("url: 'pages/NetworkRulesPage'"));
-    assert.ok(!home.includes("url: 'pages/SettingsPage'"), 'old expanded settings entry removed');
+    assert.ok(!home.includes("url: 'pages/SettingsPage'"), 'settings entry lives in the tab bar, not a route');
     assert.doesNotMatch(home, /promptAction\.showActionMenu\(/, 'proxy mode uses themed CustomDialog, not black system menu');
   });
-  await check('SOURCE NodeSelection shares system-default transitions with AppRouting', () => noCustomMotion(read('pages/NodeSelectionPage.ets')));
+  await check('SOURCE NodeSelection shares the unified TunBoxMotion transition with AppRouting',
+    () => unifiedMotion(read('pages/NodeSelectionPage.ets'), 'NodeSelectionPage'));
 }
 // These are existing data-model boundary limitations, not a substituted
 // expected implementation. Report observed defects separately from scoped gates.

@@ -48,6 +48,32 @@ struct RoutingInputDialog {
   }
 }
 
+/** 预置鸿蒙常用应用（用户 2026-10-14 提供）。2026-10-18 起用户可删除：
+ *  删除记录在 AppSettings.appRoutingRemovedPresets，rebuild() 据此跳过。 */
+class PresetApp {
+  bundleName: string = '';
+  label: string = '';
+  constructor(bundleName: string, label: string) {
+    this.bundleName = bundleName;
+    this.label = label;
+  }
+}
+
+const PRESET_APPS: PresetApp[] = [
+  new PresetApp('com.tencent.wechat', '微信'),
+  new PresetApp('com.ss.hm.ugc.aweme', '抖音'),
+  new PresetApp('com.alipay.mobile.client', '支付宝'),
+  new PresetApp('com.amap.hmapp', '高德地图'),
+  new PresetApp('com.cmbchina.harmony', '招商银行'),
+  new PresetApp('com.taobao.taobao4hmos', '淘宝'),
+  new PresetApp('com.taobao.idlefish4ohos', '闲鱼'),
+  new PresetApp('com.sina.weibo.stage', '微博'),
+  new PresetApp('app.huawei.hmos.motor', '鸿蒙智行'),
+  new PresetApp('com.sankuai.hmeituan', '美团'),
+  new PresetApp('com.jd.hm.mall', '京东'),
+  new PresetApp('com.sdu.didi.hmos.psnger', '滴滴出行'),
+];
+
 /** 应用接管范围：先编辑草稿，统一保存；不将目录伪装为已安装列表。 */
 @Entry
 @Component
@@ -57,6 +83,8 @@ struct AppRoutingPage {
   @State included: string[] = [];
   @State excluded: string[] = [];
   @State customApps: AppRoutingCustomApp[] = [];
+  /** 用户已删除的预置包名（持久化；rebuild 据此隐藏预置行） */
+  @State removedPresets: string[] = [];
   @State needsReview: boolean = false;
   @State query: string = '';
   @State selectedOnly: boolean = false;
@@ -86,6 +114,7 @@ struct AppRoutingPage {
       this.included = settings.includedApps.slice();
       this.excluded = settings.excludedApps.slice();
       this.customApps = settings.appRoutingCustomApps.slice();
+      this.removedPresets = settings.appRoutingRemovedPresets.slice();
       this.needsReview = settings.appRoutingNeedsReview;
       this.original = this.fingerprint();
       this.ready = true;
@@ -96,7 +125,8 @@ struct AppRoutingPage {
   }
 
   private fingerprint(): string {
-    return JSON.stringify([this.mode, this.included, this.excluded, this.customApps, this.needsReview]);
+    return JSON.stringify([this.mode, this.included, this.excluded,
+      this.customApps, this.removedPresets, this.needsReview]);
   }
 
   private current(): string[] { return this.mode === 'include' ? this.included : this.excluded; }
@@ -120,18 +150,12 @@ struct AppRoutingPage {
     const rows: RoutingRow[] = [];
     // 预置鸿蒙常用应用包名（用户 2026-10-14 提供）：默认全部不勾选，
     // 用户按需勾选（selected 仅在已存名单中才置位，见 addRow）。
-    this.addRow(rows, 'com.tencent.wechat', '微信', '预置 · 常用应用');
-    this.addRow(rows, 'com.ss.hm.ugc.aweme', '抖音', '预置 · 常用应用');
-    this.addRow(rows, 'com.alipay.mobile.client', '支付宝', '预置 · 常用应用');
-    this.addRow(rows, 'com.amap.hmapp', '高德地图', '预置 · 常用应用');
-    this.addRow(rows, 'com.cmbchina.harmony', '招商银行', '预置 · 常用应用');
-    this.addRow(rows, 'com.taobao.taobao4hmos', '淘宝', '预置 · 常用应用');
-    this.addRow(rows, 'com.taobao.idlefish4ohos', '闲鱼', '预置 · 常用应用');
-    this.addRow(rows, 'com.sina.weibo.stage', '微博', '预置 · 常用应用');
-    this.addRow(rows, 'app.huawei.hmos.motor', '鸿蒙智行', '预置 · 常用应用');
-    this.addRow(rows, 'com.sankuai.hmeituan', '美团', '预置 · 常用应用');
-    this.addRow(rows, 'com.jd.hm.mall', '京东', '预置 · 常用应用');
-    this.addRow(rows, 'com.sdu.didi.hmos.psnger', '滴滴出行', '预置 · 常用应用');
+    // 2026-10-18 用户要求：**自带包名也必须能删** —— 这里跳过用户已删除的那些
+    // （removedPresets 已持久化），否则删掉后 rebuild() 又把它们加回来。
+    for (const preset of PRESET_APPS) {
+      if (this.removedPresets.includes(preset.bundleName)) { continue; }
+      this.addRow(rows, preset.bundleName, preset.label, '预置 · 常用应用');
+    }
     for (const app of this.customApps) { this.addRow(rows, app.bundleName, app.label, '手动添加 · 安装状态未确认'); }
     for (const name of this.included.concat(this.excluded)) { this.addRow(rows, name, '', '已有名单 · 安装状态未确认'); }
     const keyword = this.query.trim().toLowerCase();
@@ -194,15 +218,22 @@ struct AppRoutingPage {
 
   private async removeEntry(name: string): Promise<void> {
     if (this.busy || !this.ready) { return; }
+    const isPreset = PRESET_APPS.some((p: PresetApp) => p.bundleName === name);
     try {
       const response = await promptAction.showDialog({ title: '移除应用条目',
-        message: `${name}\n从两份名单及手动目录移除（常用目录仍会保留）。保存前不会改变当前 VPN。`,
+        message: `${name}\n从两份名单及手动目录移除`
+          + `${isPreset ? '，并从预置常用应用里删除（保存后不会再出现）' : ''}。保存前不会改变当前 VPN。`,
         buttons: [{ text: '取消', color: $r('app.color.ui_text_secondary') }, { text: '移除', color: $r('app.color.ui_text_blue') }] });
       if (response.index !== 1) { return; }
       this.included = this.included.filter((p: string) => p !== name);
       this.excluded = this.excluded.filter((p: string) => p !== name);
       this.customApps = this.customApps.filter((app: AppRoutingCustomApp) => app.bundleName !== name);
+      // 预置项：记入"已删除"名单，否则 rebuild() 会立刻把它加回来（删不掉的真因）
+      if (isPreset && !this.removedPresets.includes(name)) {
+        this.removedPresets = this.removedPresets.concat([name]);
+      }
       this.rebuild();
+      if (isPreset) { this.toast('已移除预置条目，点「保存」后永久生效'); }
     } catch (e) { /* 取消不改变草稿。 */ }
   }
 
@@ -232,6 +263,7 @@ struct AppRoutingPage {
       settings.includedApps = this.included.slice();
       settings.excludedApps = this.excluded.slice();
       settings.appRoutingCustomApps = this.customApps.slice();
+      settings.appRoutingRemovedPresets = this.removedPresets.slice();
       await SettingsService.save(settings);
       this.original = this.fingerprint();
       this.rebuild();

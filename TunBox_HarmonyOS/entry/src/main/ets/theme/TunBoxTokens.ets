@@ -204,6 +204,31 @@ export class TunBoxColors {
   static get scrim(): ResourceColor {
     return ThemeService.isDark() ? 'rgba(0, 0, 0, 0.55)' : 'rgba(15, 23, 42, 0.35)';
   }
+
+  // ── 顶部浮动提示胶囊（2026-10-18 用户要求：不要黑色底，跟软件整体配色一致）──
+  /**
+   * 底色：浅色=卡片白（与订阅卡/概览卡同一种表面），深色=半透明深卡底。
+   * 旧实现是写死的 rgba(15,23,42,0.92) 黑底 —— 在浅色主题里像一块外来的黑膏药，
+   * 用户明确要求换成与整体配色一致的底与字色。
+   */
+  static get toastBg(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(20, 28, 46, 0.94)' : '#FFFFFF';
+  }
+
+  /** 文字：跟随正文色（浅色墨黑 / 深色近白），不再一律白字 */
+  static get toastText(): ResourceColor {
+    return ThemeService.isDark() ? '#F8FAFC' : '#111827';
+  }
+
+  /** 描边：品牌蓝细线 —— 白色胶囊叠在白色卡片上时靠它勾出轮廓 */
+  static get toastBorder(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(59, 130, 246, 0.42)' : '#D0E1FD';
+  }
+
+  /** 投影：浅色用极淡的品牌蓝投影（与底栏投影同源），深色用纯黑 */
+  static get toastShadow(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(0, 0, 0, 0.60)' : 'rgba(10, 89, 247, 0.16)';
+  }
 }
 
 /** 文档 §1.2 圆角与间距规范 */
@@ -279,7 +304,14 @@ export class TunBoxPing {
     return `${latencyMs}ms`;
   }
 
-  /** 状态化文案（五态可区分；auto 失败=未测，manual 失败=超时/失败） */
+  /** 状态化文案（五态可区分）。
+   *
+   * ⚠ 2026-10-18 用户裁定：**失败一律显示「超时/失败」，不再按来源分成「未测」**。
+   * 旧实现把 `source === 'auto'`（冷启动 / 导入订阅后的静默批）的失败显示成中性
+   * 「未测」，本意是避免冷内核假超时误导；但真机上表现为「导入订阅后一大片未测」，
+   * 用户明确要求「要么显示延迟多少、要么显示超时，不要第三种结果」——已经测出结论
+   * 却显示成"没测过"，比显示超时更让人误会（用户会以为根本没测速）。
+   */
   static recordText(rec: LatencyRecord | null, nowMs: number): string {
     if (rec === null) {
       return '--';
@@ -291,13 +323,10 @@ export class TunBoxPing {
       }
       return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
     }
-    if (rec.isFailure() && rec.source === 'auto') {
-      return '未测';
-    }
     return LatencyPolicy.stateText(rec.state);
   }
 
-  /** 状态化配色（文档色角色：实测走阈值；过期/未测中性；用户手测失败红） */
+  /** 状态化配色：实测走阈值；过期结果中性；失败一律红（与 recordText 同口径） */
   static recordColor(rec: LatencyRecord | null, nowMs: number): ResourceColor {
     if (rec === null) {
       return TunBoxColors.textMuted;
@@ -307,9 +336,6 @@ export class TunBoxPing {
         return TunBoxColors.textSecondary;
       }
       return TunBoxPing.color(rec.delayMs);
-    }
-    if (rec.isFailure() && rec.source === 'auto') {
-      return TunBoxColors.textMuted;
     }
     if (rec.state === LatencyState.TIMEOUT || rec.state === LatencyState.FAILED) {
       return TunBoxColors.danger;

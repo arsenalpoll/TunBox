@@ -4,6 +4,14 @@
  * EXEC: 真 AppRoutingPolicy + AppSettings + 提取真 NodeSortModes 类，原生去类型执行。
  * SOURCE: SDK 集成点静态护栏，不声称等同真机 VPN 验证；不构建、不改写工程。
  * SettingsService 真 load/save 方法另注入纯内存 store，验证损坏 JSON 的 fail-closed 边界。
+ *
+ * 用法: node scripts/verify-app-routing.mjs [--ets <dir>]
+ *   --ets 指向另一棵 entry/src/main/ets 树，用于负对照（对旧代码/被改坏的代码
+ *   运行本脚本时**必须失败**）。省略时用本仓库的 ets 树。
+ *
+ * ⚠ 行尾陷阱（本脚本已处理，勿改回去）：仓库在 Windows 上是 core.autocrlf=true 的
+ *   CRLF 检出，而源码断言里写的是 LF 字面量（`...;\n      return;`）。读取时统一
+ *   归一化 CRLF→LF，否则断言恒假 —— 这就是本脚本 0.4.0 之后常年红的原因。
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -11,8 +19,12 @@ import { stripTypeScriptTypes } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const ets = resolve(root, 'entry/src/main/ets');
-const read = path => readFileSync(resolve(ets, path), 'utf8');
+const etsArg = process.argv.indexOf('--ets');
+const ets = etsArg >= 0 && process.argv[etsArg + 1]
+  ? resolve(process.argv[etsArg + 1])
+  : resolve(root, 'entry/src/main/ets');
+// 统一换行：仓库是 CRLF 检出，源码断言写的是 LF；归一化后断言才反映真实语义。
+const read = path => readFileSync(resolve(ets, path), 'utf8').replace(/\r\n/g, '\n');
 const policySource = read('commons/services/AppRoutingPolicy.ets');
 const settingsSource = read('commons/models/AppSettings.ets');
 const sortSource = read('commons/services/NodeSortPersistence.ets');
@@ -47,6 +59,7 @@ const P = mod.AppRoutingPolicy;
 const M = mod.AppRoutingModes;
 const A = mod.AppSettings;
 const J = mod.AppSettingsJson;
+console.log(`\nApp routing verification${etsArg >= 0 ? ` (--ets ${ets})` : ''}`);
 let passed = 0;
 const check = (label, fn) => { fn(); passed++; console.log('PASS ' + label); };
 const validate = (mode, inc = [], exc = [], review = false) => P.validationError(mode, inc, exc, review);
@@ -237,7 +250,13 @@ check('SOURCE mutually exclusive API fields from selected mode', () => {
   assert.ok(onCreate.includes('this.applyAppRouting(config);'));
 });
 check('SOURCE rebuild revalidates and reapplies before destroying old connection', () => {
-  assert.ok(rebuild.indexOf('AppRoutingPolicy.runtimeError(this.appRouting)') < rebuild.indexOf('await old.destroy()'));
+  // 0.4.0 重排：旧连接变量 old 更名为 retired（重建期间保留 gap protection 语义）。
+  // 断言的语义不变：必须先校验路由、再销毁旧连接；只接受当前实现的变量名。
+  const routingCheck = rebuild.indexOf('AppRoutingPolicy.runtimeError(this.appRouting)');
+  const destroyOld = /await (?:retired|old)\.destroy\(\)/.exec(rebuild);
+  assert.ok(routingCheck >= 0 && destroyOld !== null,
+    'rebuild must both revalidate routing and destroy the previous connection');
+  assert.ok(routingCheck < destroyOld.index);
   assert.ok(rebuild.indexOf('this.applyAppRouting(config)') < rebuild.indexOf('candidate.create(config)'));
   assert.ok(recover.indexOf('AppRoutingPolicy.runtimeError(this.appRouting)') < recover.indexOf('await coreBridge.stopCore()'));
 });

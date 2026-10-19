@@ -152,12 +152,16 @@ const HEARTBEAT_STALE_MS = 15000;
 const STATE_PROBE_CACHE_MS = 120;
 /**
  * API readiness 快速起步并有上限退避，总超时仍由调用方 deadline 决定。
- * 2026-10-17 启动速度：探针上限 300ms → 150ms —— 内核已就绪但还没被探测到的
- * 「检测滞后」上限从 300ms 砍半（探针成本是 fs.stat + 回环 HTTP，未就绪时连接
- * 被拒立即返回，加倍探测频率的代价可忽略）。
+ *
+ * 2026-10-19 稳定性回退：上限 150ms → 300ms（回到 0.3.3 取值）。
+ * 0.4.0 曾为提速砍到 150ms，收益是「内核已就绪但未被探测到」的滞后上限减半
+ * （真机 100–500ms 级），但代价是连接成功判定整体提前，把「已连接」上屏与
+ * 「节点钉选/首个请求可用」之间的窗口拉大 —— 见 connect() 里 selectNode 的
+ * 恢复注释。稳定性优先，故退回 300ms；后续若再提速，必须与 selectNode 的
+ * await 语义一起评估，不能单独改。
  */
 const READINESS_INITIAL_DELAY_MS = 40;
-const READINESS_MAX_DELAY_MS = 150;
+const READINESS_MAX_DELAY_MS = 300;
 /** Two-second traffic sampling reduces /connections allocations and UI redraws. */
 const TRAFFIC_POLL_INTERVAL_MS = 2000;
 /** 测速内核停扩展的重试次数与间隔：停失败必须重试，或至少让下次启动能正确重建 */
@@ -2550,14 +2554,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.info(TAG, `doh stale refresh skipped: ${AppLogger.errText(e)}`);
       });
       let proxyHosts: Record<string, string> = {};
-      // 性能（2026-10-17 启动速度）：本次目标节点的入口域名已 pin（缓存命中）时，
-      // 其余备用域名的解析只是锦上添花 —— 预算从 6s 收紧到 1.5s；目标域名未 pin
-      // 时仍保留 6s（必须先 pin 住要连的节点，防投毒优先）。
-      const priorityDomain: string = priorityDomains.length > 0 ? priorityDomains[0] : '';
-      const priorityPinned: boolean = await DoHResolver.hasUsablePin(priorityDomain);
-      const dohBudgetMs: number = (priorityDomain.length > 0 && !priorityPinned) ? 6000 : 1500;
+      // 2026-10-19 稳定性回退：预算恢复为固定 6000ms（0.3.3 口径）。
+      //
+      // 0.4.0 曾在「目标域名已 pin」时把预算收紧到 1500ms，收益是首连少等最多 4.5s；
+      // 但代价是**备用节点域名几乎必然解析不到** → 不进 YAML `hosts:` → 内核运行期
+      // 退回 proxy-server-nameserver 现解析 → 切节点/故障切换时可能拿到被污染的 IP。
+      // 稳定性优先：所有节点域名一律给足 6s，宁可首连慢一点，也不留"某些节点不通"的坑。
+      // （注意：DoHResolver 内部对短 TTL 域名不再 pin，那部分见该文件头注释。）
       try {
-        proxyHosts = await DoHResolver.resolveMany(serverDomains, dohBudgetMs, priorityDomains);
+        proxyHosts = await DoHResolver.resolveMany(serverDomains, 6000, priorityDomains);
       } catch (e) {
         proxyHosts = {};
         AppLogger.warn(TAG, `proxy-server DoH pre-resolution failed: ${AppLogger.errText(e)}`);
@@ -2774,12 +2779,61 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       tReady = Date.now() - connectT0;
 
-      // ── 性能（2026-10-17 启动速度）：先上屏「已连接」，再做节点钉选 ──
-      // 生成的配置已把本次目标节点排在 PROXY 组首位（groupSelected unshift），
-      // 内核冷启动默认选中的就是它；selectNode 只是纠正内核 store-selections
-      // 记忆的兜底。旧实现把 PUT /proxies 的内核往返 await 在 state=CONNECTED
-      // 之前，「已连接」要等这次调用才上屏（真机 100–500ms）。改为上屏后补钉选，
-      // 失败只记日志 —— 语义不变（钉选失败回落 PROXY 组首位节点）。
+      // ── 节点钉选：**必须**在 state=CONNECTED 之前完成（2026-10-19 稳定性回退）──
+      //
+      // 0.4.0 曾把这段改成「先上屏已连接、再 fire-and-forget 补钉选」，理由是省掉
+      // PUT /proxies 的 100–500ms 内核往返。但 YAML 里开着 `store-selections: true`
+      // （ClashConfigGenerator 的 experimental 段），内核冷启动会**恢复上次持久化的
+      // 组选点**，而不是用配置里 unshift 到首位的目标节点。于是「已连接」上屏到钉选
+      // 真正生效之间存在一个 100–500ms 的窗口，窗口内新建的连接走的是**上一次选过的
+      // 节点**（可能已失效/已被用户换掉）—— 真机表现就是「连上了但代理不生效、公网
+      // IP 查不到、个别用户整条链路不通」，且只在选点与上次不同时才复现。
+      //
+      // 现在的语义（与 0.3.3 一致，另加读回校验）：
+      //   ① await 钉选 → ② 读回 PROXY 组 `now` 确认真的生效 → ③ 才置 CONNECTED。
+      //
+      // ⚠ 钉选失败**只 warn、不抛错**（严格对齐 0.3.3）：
+      //   曾经考虑「钉选失败就抛错，别让连接假装成功」，但那会引入**新的失败面**：
+      //   `generate()` 会把被丢弃的非法节点过滤掉（validNodes），此时 target 可能
+      //   根本不在 PROXY 组里 → PUT 必然 400 → 用户从"能连但慢"变成"完全连不上"。
+      //   用户的要求是「任何场景都不能出现启动代理不可用」，所以宁可保留 0.3.3 的
+      //   宽松语义：钉选失败 = 内核按配置里 PROXY 组首个成员（=本次目标节点）走，
+      //   这正是我们生成 YAML 时 unshift 保证的顺序。读回日志用于事后定位。
+      const pinSmartGroup = useSmart && settings.autoSelectMode === AutoSelectModes.AUTO;
+      const pinTargetName: string = pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name;
+      const pinned = await this.api.selectNode(pinTargetName);
+      if (!pinned) {
+        AppLogger.warn(TAG, `selectNode(${pinTargetName}) failed; keep default PROXY first node`);
+      }
+      // 读回校验：只用于**观测**，不改变控制流。能区分三类现场：
+      //   · now === 目标（或 smart 组）→ 钉选确实生效；
+      //   · now === 别的节点 → 内核用了 store-selections 记忆/配置首项（有日志可查）；
+      //   · now 为空或 DIRECT/REJECT → 真正的异常，日志里能一眼看出来。
+      const pinnedNow = await this.api.groupSelection('PROXY');
+      if (pinnedNow === null) {
+        AppLogger.info(TAG, 'PROXY selection read-back unavailable (controller busy); skipping check');
+      } else if (pinnedNow !== pinTargetName) {
+        AppLogger.warn(TAG, `PROXY now=${pinnedNow.length > 0 ? pinnedNow : '<empty>'}`
+          + ` (expected ${pinTargetName}); dialing continues with kernel selection`);
+        // 定向自愈（2026-10-19）：只有一种读回值意味着「隧道完全没有出口」——
+        // PROXY 落到了内建策略 DIRECT / REJECT 上（或为空）。这正是"连上了但
+        // 代理不生效、公网 IP 拿不到"的最终形态，值得再钉一次。
+        // 只在这一种情况下重试，且失败也只记 error 不抛错 —— 不引入新的失败面。
+        if (pinnedNow === 'DIRECT' || pinnedNow === 'REJECT' || pinnedNow === 'REJECT-DROP'
+          || pinnedNow.length === 0) {
+          const retried = await this.api.selectNode(pinTargetName);
+          const after = retried ? await this.api.groupSelection('PROXY') : null;
+          if (after !== null && after === pinTargetName) {
+            AppLogger.info(TAG, `PROXY re-pinned to ${pinTargetName} after fallback to ${pinnedNow}`);
+          } else {
+            AppLogger.error(TAG, `PROXY still not pinned (now=${after === null ? '?' : after})`
+              + ` after retry; traffic may go DIRECT`);
+          }
+        }
+      } else {
+        AppLogger.info(TAG, `PROXY pinned to ${pinTargetName}`);
+      }
+
       if (seq !== this.connectSeq) {
         await this.disconnectInternal(intentGeneration);
         return false; // 已被更新的连接请求取代
@@ -2793,23 +2847,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 重连成功 → 取消挂起的退避定时器并复位尝试计数（禁止重连风暴）
       this.reconnectAttempts = 0;
       this.cancelReconnect('connected');
-      // auto 模式且 smart 组已声明时**不要**把 PROXY 钉到具体节点 —— 那会让内核
-      // 的按连接智能选点彻底失效（PROXY 指向谁就整条隧道走谁）。此时把 PROXY
-      // 指向 smart 组本身，由内核按目标特征在组内动态选点。不阻塞上屏。
-      const pinSmartGroup = useSmart && settings.autoSelectMode === AutoSelectModes.AUTO;
-      this.api.selectNode(pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name)
-        .then((selected: boolean): void => {
-          if (!selected) {
-            AppLogger.warn(TAG, `selectNode(${pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name})`
-              + ' failed; keep default PROXY first node');
-          }
-        })
-        .catch((e: Object): void => {
-          AppLogger.warn(TAG, `selectNode rejected: ${AppLogger.errText(e)}`);
-        });
       this.notify();
       AppLogger.info(TAG, `connect timing: prep=${tPrep}ms prelaunch=${tPrelaunch}ms`
-        + ` launch=${tLaunch}ms ready=${tReady}ms total=${Date.now() - connectT0}ms`);
+        + ` launch=${tLaunch}ms ready=${tReady}ms pinned=${Date.now() - connectT0}ms`
+        + ` total=${Date.now() - connectT0}ms`);
       // 连接快照升格为 connected：同代写入。期间若用户已推进新代次（又点了
       // 断开或连接）则放弃写入 —— 绝不用旧结果覆盖更新的用户意图。
       const committed = await this.updateSessionSnapshot(intentGeneration, true, 'connected',

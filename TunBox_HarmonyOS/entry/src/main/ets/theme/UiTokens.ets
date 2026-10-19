@@ -118,6 +118,11 @@ export class LatencyStyle {
    * 状态化文案：五态必须可区分（旧实现把「没测过 / 失败 / 超时」一律画成
    * 「超时」，是"很难用"的主要来源之一）。
    * 离线粗略探测带 ≈ 前缀，绝不与真实代理延迟混淆。
+   *
+   * ⚠ 2026-10-18 用户裁定：**失败一律显示「超时/失败」，不再有「未测」这一档**。
+   * 旧实现把 `source === 'auto'`（冷启动 / 进页面 / 导入订阅后的静默批）的失败
+   * 显示成中性「未测」，真机表现为「导入订阅后一大片未测」，用户明确要求
+   * 「要么显示延迟多少、要么显示超时」——已测出结论却显示成没测过，反而误导。
    */
   static recordText(rec: LatencyRecord | null, nowMs: number): string {
     if (rec === null) {
@@ -130,16 +135,10 @@ export class LatencyStyle {
       }
       return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
     }
-    if (rec.isFailure() && rec.source === 'auto') {
-      // auto 来源（后台/进页面静默批）的失败不显「超时/失败」：冷内核并发把慢握手
-      // 节点盖假超时章，用户诉求「只是显示超时，用这个节点还能正常代理」→ 显示
-      // 中性「未测」，用户手测（manual）仍是红色「超时」。
-      return '未测';
-    }
     return LatencyPolicy.stateText(rec.state);
   }
 
-  /** 状态化配色：实测走既有阈值；过期结果与未测/测试中为中性色；失败为红 */
+  /** 状态化配色：实测走既有阈值；过期结果与测试中为中性色；失败一律红 */
   static recordColor(rec: LatencyRecord | null, nowMs: number): ResourceColor {
     if (rec === null) {
       return Ui.textSecondary;
@@ -149,10 +148,6 @@ export class LatencyStyle {
         return Ui.textSecondary;
       }
       return LatencyStyle.color(rec.delayMs);
-    }
-    if (rec.isFailure() && rec.source === 'auto') {
-      // auto 来源失败：中性色，不显红（同 recordText 的「未测」语义）
-      return Ui.textSecondary;
     }
     if (rec.state === LatencyState.TIMEOUT || rec.state === LatencyState.FAILED) {
       return Ui.error;
