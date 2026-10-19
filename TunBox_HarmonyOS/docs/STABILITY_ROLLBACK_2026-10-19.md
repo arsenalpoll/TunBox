@@ -127,13 +127,42 @@ hvigor --mode module -p product=default -p module=entry@default -p buildMode=deb
 
 ### 4.2 脚本
 
-见 `scripts/verify-*.mjs`。新增：
-- `verify-public-ip-stability.mjs`（公网 IP 链路：代次/保留旧值/备用端点/日志不含 IP）
-- `verify-connect-stability.mjs`（连接链路：readiness 300、selectNode await 顺序、预算 6000、无预热）
-- `verify-build-profile.mjs`（签名配置为空、无凭据字样）
+**一条命令跑完全部门禁**：
+
+```bash
+cd TunBox_HarmonyOS
+node scripts/verify-all.mjs          # 25 PASS / 2 白名单 / 0 真失败 → exit 0
+node scripts/verify-all.mjs --strict # 发布前最终闸门（白名单也要求通过）
+```
+
+新增：
+- `verify-all.mjs`（**一键门禁**：跑完全部 verify 脚本，白名单项显式打印"为什么允许失败"，
+  白名单外的任何失败 → exit 1）
+- `verify-public-ip-stability.mjs`（公网 IP 链路：代次/保留旧值/备用端点/日志不含 IP，36 条）
+- `verify-connect-stability.mjs`（连接链路：readiness 300、selectNode await 顺序、
+  PROXY 读回校验、DIRECT/REJECT 自愈、预算 6000、无预热，38 条）
+- `verify-build-profile.mjs`（签名配置为空、无凭据字样，13 条）
+
+以上三个新脚本均对**修复前代码**（`git worktree` 出的 HEAD 副本）做过负对照：
+A 组 31/36 失败、B+C+D 组 30/38 失败、E 组 10/13 失败 —— 证明断言不是空转。
 
 修复（0.4.0 起常年红）：`verify-app-routing`、`verify-site-routing`、
 `verify-sub-node-two-row`、`verify-concurrent-refresh`。
+（根因：CRLF 假阴性 + 页面重构后断言过期；已用 18 条负对照逐条验证修复后的断言仍会红。）
+
+### 4.3 可复现性
+
+```
+# 在干净检出的 worktree（git worktree add <dir> HEAD）里构建：
+hvigor --mode module -p product=default -p module=entry@default -p buildMode=release assembleHap
+→ BUILD SUCCESSFUL，且 ets/modules.abc sha256 与工作区构建**逐字节相同**
+  （da3dcdb6aeb605f0211cfb4e9361ea73f8a0589ed1aa66870da3090b8a7242a5）
+```
+
+> 注意：HAP 的 zip 层 hash 每次不同（内嵌时间戳），但**编译产物 abc 完全一致**，
+> 说明"同一 commit → 同一份代码"成立。资源 ID 在增量缓存下会漂移（同一个源码
+> 两次增量构建 abc 有 175 字节差异），**清掉 `entry/build` 与 `.hvigor/cache` 后即一致**——
+> 这也是为什么发布包必须在干净构建目录里产出。
 
 ---
 
