@@ -28,6 +28,14 @@ import {
 } from '../commons/services/ConcurrentRefresh';
 
 const TAG = 'SubscriptionPage';
+/**
+ * 订阅展开区操作行（测速 / 编辑 / 删除）之间的固定间距。
+ *
+ * 2026-10-19 用户要求：三个入口整体靠右，且**两两间距严格相等**。
+ * 用 Row({ space }) 时条目间距会被条件块与子结构带偏（真机截图里
+ * 「测速↔编辑」明显比「编辑↔删除」宽），故改为显式左外边距，值即此常量。
+ */
+const ACTION_GAP = 28;
 
 /** “+”导入三选一弹窗（扫描 / URL / 文件），对齐 HTML import-overlay */
 @CustomDialog
@@ -1190,8 +1198,8 @@ export struct SubscriptionPage {
               // ── 3. 折叠式订阅分组（保留既有展开/收起与行头全部按钮逻辑） ──
               ForEach(this.subs, (sub: Subscription) => {
                 Column({ space: 0 }) {
-                  // 头部
-                  Row({ space: 10 }) {
+                  // 头部（2026-10-19：间距 10→8，配合右侧图标紧凑组，给订阅名多留宽度）
+                  Row({ space: 8 }) {
                     Stack({ alignContent: Alignment.Center }) {
                       Image($r('app.media.ic_nodes')).width(18).height(18)
                         .fillColor(TunBoxColors.primary)
@@ -1224,22 +1232,13 @@ export struct SubscriptionPage {
                         .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
                         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                     }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                    // ── 铁律：纯图标闪电测速按钮，位于刷新按钮左边，不得移动/不得加文字 ──
-                    // 单节点分组（DIRECT_GROUP_ID）同样必须有：手工导入的节点就在该组，
-                    // 测速路径与普通订阅完全一致（见 speedTestSub）。
-                    Stack({ alignContent: Alignment.Center }) {
-                      if (this.speedTestingIds.includes(sub.id)) {
-                        LoadingProgress().width(15).height(15).color(TunBoxColors.primary)
-                      } else {
-                        Image($r('app.media.ic_bolt')).width(15).height(15)
-                          .fillColor(TunBoxColors.primary)
-                      }
-                    }
-                    .width(28).height(28)
-                    .borderRadius(TunBoxGeometry.pillRadius)
-                    .accessibilityText('闪电测速')
-                    .onClick(() => this.speedTestSub(sub.id))
-                    // 单个刷新
+                    // 2026-10-19 用户要求（订阅卡片改版）：行头**只保留刷新**，
+                    // 闪电测速 / 编辑 / 删除 全部下移到展开区操作行。
+                    // 行头固定占用从约 218dp 降到约 114dp，订阅名获得充足宽度，
+                    // 不再被图标挤到只剩几个字（真机报障截图：名字被遮住）。
+                    //
+                    // 注：原「闪电测速必须常驻行头、位于刷新左边、不得移动」的旧约定
+                    // 已被本次用户明确要求取代（闪电改到展开区、位于编辑左边）。
                     Stack({ alignContent: Alignment.Center }) {
                       if (this.isRefreshingSub(sub.id)) {
                         LoadingProgress().width(15).height(15).color(TunBoxColors.primary)
@@ -1250,30 +1249,9 @@ export struct SubscriptionPage {
                     }
                     .width(28).height(28)
                     .borderRadius(TunBoxGeometry.pillRadius)
+                    .flexShrink(0)
                     .accessibilityText('刷新订阅')
                     .onClick(() => this.refreshOne(sub))
-                    // 重命名（常驻分组头，不用展开）
-                    Stack({ alignContent: Alignment.Center }) {
-                      Image($r('app.media.ic_tune')).width(15).height(15)
-                        .fillColor(TunBoxColors.textMuted)
-                    }
-                    .width(28).height(28)
-                    .borderRadius(TunBoxGeometry.pillRadius)
-                    .accessibilityText('编辑订阅')
-                    .onClick(() => this.openEdit(sub))
-                    if (sub.id !== DIRECT_GROUP_ID) {
-                      Stack({ alignContent: Alignment.Center }) {
-                        Image($r('app.media.ic_delete')).width(15).height(15)
-                          .fillColor(TunBoxColors.textMuted)
-                      }
-                      .width(28).height(28)
-                      .borderRadius(TunBoxGeometry.pillRadius)
-                      .accessibilityText('删除订阅')
-                      .onClick(() => {
-                        this.deleteTargetId = sub.id;
-                        this.deleteDialog.open();
-                      })
-                    }
                     // 展开指示
                     Image($r('app.media.ic_arrow_right')).width(14).height(14)
                       .fillColor(TunBoxColors.textMuted)
@@ -1287,10 +1265,55 @@ export struct SubscriptionPage {
                   // 展开节点区
                   if (this.isOpen(sub.id)) {
                     Column({ space: 6 }) {
+                      // 2026-10-19 用户要求：原「点击选用节点 · 长按可删除单个节点 ·
+                      // 点行头闪电图标测速」提示行**去掉**，这一行改放操作按钮：
+                      // 闪电测速 / 编辑 / 删除（闪电在编辑左边）。
+                      // 原来在节点下方的「编辑 / 删除」行同步删除，避免重复入口。
+                      // 2026-10-19 用户要求：操作行**整体靠右**，且三个入口间距严格相等。
+                      // 不用 Row({ space })：实测条目间距会被条件块/不同子结构带偏
+                      // （用户截图里「测速↔编辑」比「编辑↔删除」宽）。改用显式左外边距，
+                      // 每个后续入口固定 ACTION_GAP，间距必然一致。
                       Row() {
-                        Text('点击选用节点 · 长按可删除单个节点 · 点行头闪电图标测速')
-                          .fontSize(11).fontColor(TunBoxColors.textMuted).layoutWeight(1)
-                      }.width('100%').padding({ left: 2, right: 2, top: 2, bottom: 2 })
+                        // Blank 放在最前 → 整组被推到右侧（用户要求「全部放到右边」）
+                        Blank()
+                        // 闪电测速
+                        Row({ space: 4 }) {
+                          if (this.speedTestingIds.includes(sub.id)) {
+                            LoadingProgress().width(13).height(13).color(TunBoxColors.primary)
+                          } else {
+                            Image($r('app.media.ic_bolt')).width(13).height(13)
+                              .fillColor(TunBoxColors.primary)
+                          }
+                          Text('测速').fontSize(12).fontColor(TunBoxColors.primary)
+                        }
+                        .accessibilityText('闪电测速')
+                        .onClick(() => this.speedTestSub(sub.id))
+                        // 手工导入分组（DIRECT_GROUP_ID）没有可编辑/可删除的订阅实体
+                        if (sub.id !== DIRECT_GROUP_ID) {
+                          Row({ space: 4 }) {
+                            Image($r('app.media.ic_tune')).width(13).height(13)
+                              .fillColor(TunBoxColors.textMuted)
+                            Text('编辑').fontSize(12).fontColor(TunBoxColors.textMuted)
+                          }
+                          .margin({ left: ACTION_GAP })
+                          .accessibilityText('编辑订阅')
+                          .onClick(() => this.openEdit(sub))
+                          Row({ space: 4 }) {
+                            Image($r('app.media.ic_delete')).width(13).height(13)
+                              .fillColor(TunBoxColors.danger)
+                            Text('删除').fontSize(12).fontColor(TunBoxColors.danger)
+                          }
+                          .margin({ left: ACTION_GAP })
+                          .accessibilityText('删除订阅')
+                          .onClick(() => {
+                            this.deleteTargetId = sub.id;
+                            this.deleteDialog.open();
+                          })
+                        }
+                      }
+                      .width('100%')
+                      .alignItems(VerticalAlign.Center)
+                      .padding({ left: 2, right: 2, top: 2, bottom: 2 })
                       GridRow({ columns: this.nodeColumns, gutter: 10 }) {
                         ForEach(this.nodesSortedByLatency(sub.id), (node: ProxyNode) => {
                           GridCol() {
@@ -1299,27 +1322,6 @@ export struct SubscriptionPage {
                         }, (node: ProxyNode) => `${node.id}|${node.id === this.activeNodeId ? 1 : 0}|${this.latencyTick}`)
                       }
                       .width('100%')
-                      // 编辑/删除行
-                      if (sub.id !== DIRECT_GROUP_ID) {
-                        Row({ space: 12 }) {
-                          Blank()
-                          Row({ space: 4 }) {
-                            Image($r('app.media.ic_tune')).width(13).height(13)
-                              .fillColor(TunBoxColors.textMuted)
-                            Text('编辑').fontSize(12).fontColor(TunBoxColors.textMuted)
-                          }
-                          .onClick(() => this.openEdit(sub))
-                          Row({ space: 4 }) {
-                            Image($r('app.media.ic_delete')).width(13).height(13)
-                              .fillColor(TunBoxColors.danger)
-                            Text('删除').fontSize(12).fontColor(TunBoxColors.danger)
-                          }
-                          .onClick(() => {
-                            this.deleteTargetId = sub.id;
-                            this.deleteDialog.open();
-                          })
-                        }.width('100%').padding({ top: 4, right: 2 })
-                      }
                     }
                     .width('100%')
                     .padding({ left: 12, right: 12, bottom: 12, top: 4 })

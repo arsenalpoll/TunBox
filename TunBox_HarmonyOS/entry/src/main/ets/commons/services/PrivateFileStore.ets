@@ -79,6 +79,42 @@ export class FileIoPrivateFs implements PrivateFs {
     }
   }
 
+  /**
+   * 异步读取上限内的文本（promise 版 stat/open/read/close）。
+   *
+   * 2026-10-19 保活整改：同步版 readCapped 会被 3 秒存活监控定时器每轮调用，
+   * 主线程阻塞 IO 累积导致 THREAD_BLOCK_3S（真机取证 pid 4616 卡 3 秒），
+   * 自愈逻辑因此失效。本方法把同样的有界读取搬到 promise API 上。
+   */
+  async readCappedAsync(path: string, maxBytes: number): Promise<SyncReadResult> {
+    const limit = maxBytes > 0 ? maxBytes : MAX_STATE_FILE_BYTES;
+    let file: fs.File | null = null;
+    try {
+      const stat = await fs.stat(path);
+      if (stat.size <= 0) {
+        return { ok: true, text: '', truncated: false };
+      }
+      const readLen = stat.size > limit ? limit : stat.size;
+      const truncated = stat.size > limit;
+      file = await fs.open(path, fs.OpenMode.READ_ONLY);
+      const buf = new ArrayBuffer(readLen);
+      const got = await fs.read(file.fd, buf);
+      const text = util.TextDecoder.create('utf-8')
+        .decodeToString(new Uint8Array(buf, 0, got > 0 ? got : 0));
+      return { ok: true, text: text, truncated: truncated };
+    } catch (e) {
+      return { ok: false, text: '', truncated: false };
+    } finally {
+      if (file !== null) {
+        try {
+          await fs.close(file);
+        } catch (e) {
+          // 关闭失败不覆盖已有结果
+        }
+      }
+    }
+  }
+
   remove(path: string): boolean {
     try {
       fs.unlinkSync(path);

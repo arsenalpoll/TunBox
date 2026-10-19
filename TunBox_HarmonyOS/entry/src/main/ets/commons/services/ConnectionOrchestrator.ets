@@ -1222,11 +1222,28 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           AppLogger.info(TAG, '[health] core restored');
           return;
         }
-        this.state = ConnState.DISCONNECTED;
-        if (this.lastError.length === 0) {
-          this.lastError = '内核已死，链路自检与有限修复未能恢复，已停止自动重试';
+        // 2026-10-19 保活整改：进程被系统 LowMemoryKill 回收是**外部事件**，
+        // 不是用户意图。原实现自愈失败后直接落 DISCONNECTED 并放弃，导致
+        // 被杀一次就永久断线、必须用户手动重进 App（真机取证：11 分钟内被杀
+        // 3 次，每次都要手动恢复）。这里改为交给既有退避重连：用户意图仍为
+        // "连接"时按指数退避重试，只有 intent=disconnected 或重试耗尽才放弃。
+        if (this.disconnectRequested) {
+          this.state = ConnState.DISCONNECTED;
+          if (this.lastError.length === 0) {
+            this.lastError = '内核已死，链路自检与有限修复未能恢复，已停止自动重试';
+          }
+          this.notify();
+          return;
         }
+        AppLogger.warn(TAG, '[health] repair failed after core-death; '
+          + 'escalating to bounded backoff reconnect (external kill is not user intent)');
+        // 保留 lastError 供 UI 提示，但状态保持 RECOVERING，避免 UI 闪成"已断开"
+        if (this.lastError.length === 0) {
+          this.lastError = '内核已被系统回收，正在自动重连…';
+        }
+        this.state = ConnState.RECOVERING;
         this.notify();
+        this.requestReconnect('core-killed-by-system');
         return;
       }
       // 自检被关闭：退回既有有界恢复策略（最多 2 次）
@@ -1626,6 +1643,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.stateProbeHeartbeatAge = -1;
   }
 
+  /**
+   * 同步刷新探针缓存（**仅限同步上下文**，如 readStartOk 的既有调用点）。
+   *
+   * 2026-10-19 保活整改（真机取证 THREAD_BLOCK_3S，pid 4616 主线程卡 3 秒）：
+   * 本函数内含 fs.statSync + 同步读文件，每次都是主线程阻塞 IO。原实现被
+   * 3 秒存活监控定时器每轮直接调用（缓存仅 120ms，等于每轮必刷），
+   * 主线程因此被反复阻塞 —— 自愈/重连逻辑跑在主线程上，一卡就整个失效。
+   * 监控循环已改走 refreshStateProbeCacheAsync()，本函数只保留给同步调用点。
+   */
   private refreshStateProbeCache(nowMs: number): void {
     if (this.context === null) {
       this.invalidateStateProbeCache();
@@ -1644,6 +1670,52 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       `${this.context.cacheDir}/${HEARTBEAT_FILE}`, MAX_STATE_FILE_BYTES);
     this.stateProbeHeartbeatAge = res.ok ? heartbeatAgeFromText(res.text, nowMs) : -1;
     this.stateProbeCachedAt = nowMs;
+  }
+
+  /**
+   * 异步刷新探针缓存（监控定时器等异步上下文专用）。
+   * 用 promise 版 stat/read 把阻塞 IO 让出主线程，避免 THREAD_BLOCK_3S。
+   */
+  private async refreshStateProbeCacheAsync(nowMs: number): Promise<void> {
+    if (this.context === null) {
+      this.invalidateStateProbeCache();
+      return;
+    }
+    if (this.stateProbeCachedAt > 0 && nowMs - this.stateProbeCachedAt < STATE_PROBE_CACHE_MS) {
+      return;
+    }
+    // 先占位时间戳，避免同一事件循环内并发重入重复读盘
+    this.stateProbeCachedAt = nowMs;
+    const startOkPath = `${this.context.cacheDir}/${START_OK_FILE}`;
+    const heartbeatPath = `${this.context.cacheDir}/${HEARTBEAT_FILE}`;
+    try {
+      await fs.stat(startOkPath);
+      this.stateProbeStartOk = true;
+    } catch (e) {
+      this.stateProbeStartOk = false;
+    }
+    try {
+      const text = await privateFs.readCappedAsync(heartbeatPath, MAX_STATE_FILE_BYTES);
+      this.stateProbeHeartbeatAge = text.ok ? heartbeatAgeFromText(text.text, nowMs) : -1;
+    } catch (e) {
+      this.stateProbeHeartbeatAge = -1;
+    }
+  }
+
+  /** 异步版心跳年龄（供监控循环使用，不阻塞主线程） */
+  private async readHeartbeatAgeAsync(): Promise<number> {
+    const nowMs = Date.now();
+    await this.refreshStateProbeCacheAsync(nowMs);
+    if (this.stateProbeHeartbeatAge < 0) {
+      return -1;
+    }
+    return this.stateProbeHeartbeatAge + Math.max(0, nowMs - this.stateProbeCachedAt);
+  }
+
+  /** 异步版内核存活判定（监控循环用） */
+  private async isCoreAliveByHeartbeatAsync(): Promise<boolean> {
+    const age = await this.readHeartbeatAgeAsync();
+    return age >= 0 && age < HEARTBEAT_STALE_MS;
   }
 
   /** 扩展进程是否已回写启动成功标记；同一同步周期复用短时探针缓存。 */
@@ -3478,16 +3550,23 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.monitorTimer = setInterval(() => {
       // 内核跑在 VPN 扩展进程里，UI 进程的 coreBridge.isCoreAlive() 永远为 false，
       // 只能依据扩展进程心跳文件判断存活（心跳新鲜 = 内核活着）。
-      const alive = this.isCoreAliveByHeartbeat();
-      if (!alive && this.state === ConnState.CONNECTED) {
-          // 内核死亡：权威判据为「心跳过期/无心跳」→ 升级到链路自检 + 有限修复
-          // （对应 core_recovery_policy；healthCheckEnabled=false 时退回既有有界恢复）
-          this.state = ConnState.RECOVERING;
-          this.notify();
-          AppLogger.warn(TAG, `core died (authority: heartbeat stale/absent); escalating to health self-check`);
-          this.handleCoreLoss();
+      //
+      // 2026-10-19 保活整改（真机取证 THREAD_BLOCK_3S）：原实现在本定时器里调用
+      // 同步版 isCoreAliveByHeartbeat()，内含 statSync + 同步读文件，每 3 秒阻塞
+      // 主线程一次；主线程一旦卡住，跑在它上面的自愈/重连就跟着失效。改为异步。
+      this.isCoreAliveByHeartbeatAsync().then((alive: boolean): void => {
+        if (alive || this.state !== ConnState.CONNECTED) {
           return;
         }
+        // 内核死亡：权威判据为「心跳过期/无心跳」→ 升级到链路自检 + 有限修复
+        // （对应 core_recovery_policy；healthCheckEnabled=false 时退回既有有界恢复）
+        this.state = ConnState.RECOVERING;
+        this.notify();
+        AppLogger.warn(TAG, `core died (authority: heartbeat stale/absent); escalating to health self-check`);
+        this.handleCoreLoss();
+      }).catch((e: Error): void => {
+        AppLogger.warn(TAG, `liveness probe failed: ${AppLogger.errText(e)}`);
+      });
     }, 3000);
     this.trafficPollRunning = false;
     this.trafficTimer = setInterval(() => {
@@ -3500,7 +3579,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         if (this.state === ConnState.CONNECTED) {
           TaskProgressUpdater.updateLive(
             this.notifyNodeText(this.lastNodeName.length > 0 ? this.lastNodeName : '已连接'),
-            `↓ ${this.formatSpeed(t.downloadSpeed)}  ↑ ${this.formatSpeed(t.uploadSpeed)}`,
+            // 2026-10-19：实况通知单行宽度有限，速率串用紧凑写法（去掉多余空格），
+            // 配合 TaskProgressUpdater 里「只放速率、不放时长」的改动，避免被截断。
+            `↓${this.formatSpeed(t.downloadSpeed)} ↑${this.formatSpeed(t.uploadSpeed)}`,
             this.connDurationText());
         }
         this.notify();

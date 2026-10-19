@@ -439,6 +439,10 @@ export struct HomePage {
     }
     // App 内手动连接路径的会话守护：连接成功注册 dataTransfer 连续任务（防杀），
     // 断开/失败释放。幂等，状态重复同步不会重复注册/释放。
+    // 2026-10-19 保活整改：RECOVERING（内核被系统回收后的自愈/重连窗口）**不释放**。
+    // 真机取证：原实现一旦进入非 CONNECTED 就 release，导致 VPN 进程被
+    // LowMemoryKill 回收后守护立即撤销，后台彻底失去驻留凭证、再也拉不回来
+    // （必须用户手动重进 App）。用户意图仍为连接时必须保持守护。
     if (this.isConnected && !UiGuardian.isRegistered()) {
       UiGuardian.engage(getContext(this) as Context).catch((): void => {});
     } else if (!this.isConnected && UiGuardian.isRegistered()
@@ -1049,6 +1053,11 @@ export struct HomePage {
           Column({ space: 16 }) {
             // ── 2. 天体轨域启动按钮（2026-10-17 用户按 stitch 设计稿「方案一」重构；
             //       节点名放回按钮内部，副标题/状态胶囊按用户要求删除）──
+            // 2026-10-19 用户要求「启动按钮缩小一点，下面整体往上挪一行」：
+            // 按钮本体已在 TunBoxTokens 等比缩到 87.5%（省 40vp），
+            // 这里再把上下内边距 8/4 收成 0 —— 合计上移约 52vp（≈ 一行内容）。
+            // 首页下方（模式按钮 / 速率卡 / 连接卡）因此整体上提，连接卡不再被
+            // 底部 Dock 遮挡。
             Column() {
               CelestialPowerOrb({
                 isConnected: $isConnected,
@@ -1061,7 +1070,7 @@ export struct HomePage {
             }
             .width('100%')
             .alignItems(HorizontalAlign.Center)
-            .padding({ top: 8, bottom: 4 })
+            .padding({ top: 0, bottom: 0 })
 
             // ── 代理模式三段按钮：规则/全局/直连（2026-10-17 自分流模式卡片迁出，置于启动按钮下方）──
             Row({ space: 10 }) {
@@ -1073,85 +1082,73 @@ export struct HomePage {
 
             // ── 3. 实时速率与流量卡片（文档 §3.1 第 4 节）──
             Column({ space: 12 }) {
+              // 2026-10-19：公网 IP 已移到下方「连接」卡片的中线位置（用户要求），
+              // 本卡恢复两列：左「实时速率」+ 右「流量消耗 / 连接时长」。
+              // 防溢出：两列等权 layoutWeight(1)，任何列都不能靠内容撑大自己；
+              // 每个 Text 再叠 maxLines(1)+省略号，窄屏下只会截断、绝不越界。
               Row() {
+                // ── 左 1/2：实时速率 ──
                 Column({ space: 4 }) {
                   Text('实时速率')
                     .fontSize(12)
                     .fontColor(TunBoxColors.textMuted)
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
                     .width('100%')
                   Row() {
                     Text(this.realtimeRateParts()[0])
                       .fontSize(26)
                       .fontWeight(FontWeight.Bold)
                       .fontColor(TunBoxColors.textPrimary)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
                     Text(` ${this.realtimeRateParts()[1]}`)
                       .fontSize(13)
                       .fontColor(TunBoxColors.textSecondary)
-                  }.alignItems(VerticalAlign.Bottom)
-                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                // 2026-10-17 用户要求：公网 IP 与启动按钮保持同一中线 —— 左右两侧
-                // 各配一个等宽 flex(1) 列（此处是右侧容器，包住「流量消耗」与
-                // 「连接时长」），IP 块在中间自适应宽度，Row 主轴自然居中，
-                // IP 的几何中心与卡片（=启动按钮）中线对齐。
-                if (this.isConnected) {
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }
+                  .width('100%')
+                  .alignItems(VerticalAlign.Bottom)
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+
+                // ── 右 1/2：流量消耗 + 连接时长（子项等权，可压缩）──
+                Row({ space: 8 }) {
                   Column({ space: 4 }) {
-                    Text('公网 IP')
+                    Text('流量消耗')
                       .fontSize(12)
                       .fontColor(TunBoxColors.textMuted)
-                    Row({ space: 4 }) {
-                      if (this.publicIpRefreshing) {
-                        LoadingProgress().width(12).height(12).color(TunBoxColors.primary)
-                      }
-                      Text(this.publicIpRefreshing ? '获取中…'
-                        : (this.publicIp.length > 0 ? this.publicIp : this.publicIpError))
-                        .fontSize(14)
-                        .fontWeight(FontWeight.Medium)
-                        .fontColor(this.publicIpRefreshing ? TunBoxColors.textMuted
-                          : (this.publicIp.length > 0 ? TunBoxColors.textPrimary : TunBoxColors.danger))
-                        .fontFamily('monospace')
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                        .constraintSize({ maxWidth: 180 })
-                    }.alignItems(VerticalAlign.Center)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Text(this.formatTotalMB())
+                      .fontSize(14)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor(TunBoxColors.textPrimary)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
                   }
-                  // 2026-10-17 用户要求：公网 IP 与启动按钮保持同一中线 —— 左侧
-                  // 「实时速率」与右侧「流量消耗+连接时长」两个 flex(1) 等分剩余
-                  // 宽度，中间的 IP 块（自适应宽）天然落在卡片（=页面）中线上；
-                  // 不再给 IP 列配重，左右列宽变化也不会让中线偏移。
-                  .alignItems(HorizontalAlign.Center)
-                  .onClick(() => {
-                    if (!this.publicIpRefreshing) {
-                      this.refreshPublicIp('user-retry');
-                    }
-                  })
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.End)
+                  Column({ space: 4 }) {
+                    Text('连接时长')
+                      .fontSize(12)
+                      .fontColor(TunBoxColors.textMuted)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Text(this.formatDuration())
+                      .fontSize(14)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor(TunBoxColors.textPrimary)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }
+                  .layoutWeight(1)
+                  .alignItems(HorizontalAlign.End)
                 }
-
-                Column() {
-                  Row({ space: 20 }) {
-                    Column({ space: 4 }) {
-                      Text('流量消耗')
-                        .fontSize(12)
-                        .fontColor(TunBoxColors.textMuted)
-                      Text(this.formatTotalMB())
-                        .fontSize(14)
-                        .fontWeight(FontWeight.Medium)
-                        .fontColor(TunBoxColors.textPrimary)
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    }.alignItems(HorizontalAlign.End)
-                    Column({ space: 4 }) {
-                      Text('连接时长')
-                        .fontSize(12)
-                        .fontColor(TunBoxColors.textMuted)
-                      Text(this.formatDuration())
-                        .fontSize(14)
-                        .fontWeight(FontWeight.Medium)
-                        .fontColor(TunBoxColors.textPrimary)
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    }.alignItems(HorizontalAlign.End)
-                  }
-                }.layoutWeight(1).alignItems(HorizontalAlign.End)
+                .layoutWeight(1)
+                .alignItems(VerticalAlign.Top)
               }.width('100%').alignItems(VerticalAlign.Top)
 
               // 速率曲线容器（48 高，2026-10-17 用户要求去掉凹槽框，曲线直接坐在卡片上）
@@ -1161,6 +1158,9 @@ export struct HomePage {
                   .fontSize(11)
                   .fontColor(TunBoxColors.textSecondary)
                   .margin({ left: 10, bottom: 6 })
+                  // 防溢出：曲线区已 clip，这里再加单行+省略号约束
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
               }
               .width('100%')
               .height(48)
@@ -1172,19 +1172,56 @@ export struct HomePage {
             .backgroundColor(TunBoxColors.surfaceCard)
             .borderRadius(TunBoxGeometry.cardRadius)
             .border({ width: 1, color: TunBoxColors.cardBorder })
+            // 2026-10-19 用户硬性要求：卡片信息任何情况下都不得超出卡片边界。
+            // 上面已用「等权列 + 省略号 + 自适应字号」保证不产生溢出；这里再加
+            // clip 作为最后一道视觉保险，即使极端字号/系统字体放大也只会被卡片
+            // 圆角裁掉，绝不会画到卡片外面。
+            .clip(true)
 
 
             // ── 连接卡（2026-10-17 自速率卡下移为独立卡：可收起/展开显示连接信息）──
             Column({ space: 10 }) {
+              // 2026-10-19 用户要求：公网 IP 放在连接卡**左侧**，紧跟「连接」之后
+              // （既不是独立成行——那会撑高卡片把下面内容下移；也不是绝对居中）。
+              //
+              // 布局：连接 ●  |  公网 IP：x.x.x.x  |  ← 剩余空间  |  ›
+              //   · IP 用 layoutWeight(1) 占据「连接」与箭头之间的全部剩余空间，
+              //     左对齐紧随其后，不新增行 ⇒ 卡片高度不变。
+              //   · maxLines(1)+省略号：IP 再长也只在自己的剩余宽度内截断，
+              //     绝不会把右侧箭头挤出卡片。
               Row({ space: 8 }) {
                 Text('连接')
                   .fontSize(15)
                   .fontWeight(FontWeight.Bold)
                   .fontColor(TunBoxColors.textPrimary)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
                 Circle({ width: 6, height: 6 })
                   .fill(this.isConnecting ? TunBoxColors.primary
                     : (this.isConnected ? TunBoxColors.success : TunBoxColors.textMuted))
-                Blank()
+                if (this.isConnected) {
+                  Text(this.publicIpRefreshing ? '公网 IP：获取中…'
+                    : (this.publicIp.length > 0
+                      ? `公网 IP：${this.publicIp}`
+                      : (this.publicIpError.length > 0 ? this.publicIpError : '公网 IP：--')))
+                    .fontSize(12)
+                    .fontColor(this.publicIpRefreshing ? TunBoxColors.textMuted
+                      : (this.publicIp.length > 0 ? TunBoxColors.textSecondary : TunBoxColors.danger))
+                    .fontFamily('monospace')
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .textAlign(TextAlign.Start)
+                    .layoutWeight(1)
+                    // 左侧留一点间距，与「●」分开
+                    .margin({ left: 2 })
+                    .onClick(() => {
+                      if (!this.publicIpRefreshing) {
+                        this.refreshPublicIp('user-retry');
+                      }
+                    })
+                } else {
+                  Blank()
+                }
                 Image($r('app.media.ic_arrow_right'))
                   .width(14).height(14)
                   .fillColor(TunBoxColors.textMuted)
@@ -1205,6 +1242,8 @@ export struct HomePage {
                       .fontSize(12)
                       .fontColor(TunBoxColors.textMuted)
                       .width('100%')
+                      .maxLines(2)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
                   } else {
                     ForEach(this.connPreview, (item: ConnectionEntry) => {
                       Row({ space: 8 }) {
@@ -1220,11 +1259,16 @@ export struct HomePage {
                           .fontColor(TunBoxColors.textMuted)
                           .maxLines(1)
                           .textOverflow({ overflow: TextOverflow.Ellipsis })
-                          .constraintSize({ maxWidth: 130 })
+                          // 2026-10-19 防溢出：原为固定 constraintSize(maxWidth:130)，
+                          // 不参与权重分配；改为 layoutWeight 让三列按可用宽度等分，
+                          // 任何窄屏下都不会撑破卡片（内容超长由省略号截断）。
+                          .layoutWeight(1)
                         Text(this.formatConnBytes(item.download + item.upload))
                           .fontSize(11)
                           .fontColor(TunBoxColors.textSecondary)
                           .fontFamily('monospace')
+                          .maxLines(1)
+                          .textOverflow({ overflow: TextOverflow.Ellipsis })
                       }
                       .width('100%')
                       .alignItems(VerticalAlign.Center)
@@ -1237,6 +1281,8 @@ export struct HomePage {
                         .fontSize(12)
                         .fontWeight(FontWeight.Bold)
                         .fontColor(TunBoxColors.primary)
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
                       Image($r('app.media.ic_arrow_right'))
                         .width(12).height(12)
                         .fillColor(TunBoxColors.primary)
@@ -1257,6 +1303,8 @@ export struct HomePage {
             .borderRadius(TunBoxGeometry.cardRadius)
             .backgroundColor(TunBoxColors.surfaceCard)
             .border({ width: 1, color: TunBoxColors.cardBorder })
+            // 同上：连接卡（含展开后的活跃连接列表）也做视觉裁剪兜底
+            .clip(true)
 
             // ── 错误条（既有功能，令牌化）：点击打开诊断面板 ──
             if (this.errorMessage.length > 0) {

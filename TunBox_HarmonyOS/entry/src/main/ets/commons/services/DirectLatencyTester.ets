@@ -34,9 +34,13 @@ import { ProxyNode } from '../models/ProxyNode';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'DirectLatencyTester';
-const TCP_TIMEOUT_MS = 4000;
-const QUIC_TIMEOUT_MS = 2500;
-const TLS_TIMEOUT_MS = 3000;
+// 各阶段上限。2026-10-19 随单节点超时统一为 5s（LatencyPolicy.DEFAULT_TIMEOUT_MS）：
+// 这些是**阶段**硬上限，最终还受 testNode 的 timeoutMs 约束（取二者较小）。
+// 原值 4000/2500/3000 在 2.5s 总预算下根本用不满，改 5s 后才有意义 ——
+// 否则 QUIC 阶段会被 2.5s 截断，hysteria2 节点在离线通道里被误判超时。
+const TCP_TIMEOUT_MS = 5000;
+const QUIC_TIMEOUT_MS = 5000;
+const TLS_TIMEOUT_MS = 5000;
 
 export class DirectLatencyTester {
   /** 直连测试单个节点: 毫秒数; 失败 -1; 无法离线探测 -2。
@@ -47,7 +51,7 @@ export class DirectLatencyTester {
    *     "端口开着但 TLS 层已死"的假活节点误判为正常
    *   - 其余(ss/ssr/明文) → TCP 握手(无更高层可探, 结果仅代表服务器可达)
    */
-  static async testNode(node: ProxyNode, timeoutMs: number = 3000): Promise<number> {
+  static async testNode(node: ProxyNode, timeoutMs: number = 5000): Promise<number> {
     if (node.server.length === 0 || node.port <= 0 || node.port >= 65536) {
       return -1;
     }

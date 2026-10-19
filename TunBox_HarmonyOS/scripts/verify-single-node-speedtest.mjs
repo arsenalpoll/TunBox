@@ -1,15 +1,26 @@
 /**
  * 单节点分组（DIRECT_GROUP_ID）可测速 —— 修复自检（结构断言 + 负对照）。
  *
- * 用户报障：通过 vless:// 等直链导入的节点落在默认「单节点」分组里，
- * 而该分组头**没有闪电测速按钮**，展开区提示文字却写着「点行头闪电图标测速」
- * —— 于是单节点永远无法测速。
+ * ## 被守护的不变量（始终有效）
  *
- * 根因（两处同样口径的拦截，必须同时拆掉，缺一仍是死按钮）:
+ * 通过 vless:// 等直链导入的节点落在默认「单节点」分组里，该分组**必须也能测速**。
+ * 历史上它测不了，根因是两处同样口径的拦截，必须同时拆掉，缺一仍是死按钮：
  *   1) speedTestSub() 开头 `if (subId === DIRECT_GROUP_ID || ...) return;`
  *      → 即使按钮画出来，点下去也是静默 no-op。
- *   2) 分组头闪电 Stack 外面包着 `if (sub.id !== DIRECT_GROUP_ID) { ... }`
+ *   2) 闪电按钮外面包着 `if (sub.id !== DIRECT_GROUP_ID) { ... }`
  *      → 单节点分组根本不渲染这个按钮。
+ *
+ * ## 2026-10-19 设计变更（用户要求，本脚本随之调整断言）
+ *
+ * 用户把订阅卡改版：
+ *   · 行头**只保留刷新**（原来行头有 闪电/刷新/编辑/删除 四个按钮，把订阅名挤没了）；
+ *   · 闪电测速 / 编辑 / 删除 三个操作下移到展开区，放在原「点击选用节点…」提示行；
+ *   · 顺序要求：闪电在编辑左边；原提示文字去掉；节点下方的编辑/删除行去掉。
+ *
+ * 于是闪电按钮的**位置**从行头变到展开区，但**不变量不变**：
+ * 它必须仍然渲染于 DIRECT_GROUP_ID 分组（即不被 `sub.id !== DIRECT_GROUP_ID` 包裹），
+ * 且 speedTestSub 仍不得拦截 direct。本脚本断言的正是这个不变量，
+ * 以及「行头确实瘦身了」这个新增的负对照。
  *
  * 本脚本不做完整 ArkTS 解析（无 DevEco SDK），只对源码做结构断言，
  * 与仓库既有 verify-*.mjs 的「文本断言 + 负对照」风格一致。
@@ -147,12 +158,33 @@ function balancedReport() {
   return { ok: true, msg: '括号全部配平' };
 }
 
+// ── 区间锚点（2026-10-19 改版后的结构）──────────────────────────────────
+// 展开区操作行：用改版注释定位，再取其后第一个 Row() ——
+// 不用 `Row({ space: 16 })` 之类布局细节做锚点（间距实现换过一次就失效）。
+const ACTION_COMMENT = '// 2026-10-19 用户要求：操作行**整体靠右**';
+const actionCommentIdx = src.indexOf(ACTION_COMMENT);
+const actionRowIdx = actionCommentIdx >= 0 ? src.indexOf('Row() {', actionCommentIdx) : -1;
+// 该行之后第一个 GridRow 即节点网格 —— 操作行区间右界
+const gridIdx = src.indexOf('GridRow({ columns: this.nodeColumns', actionRowIdx);
+// 展开区内唯一的 DIRECT 判定：编辑/删除闸门（闪电在其之前，故不被包裹）
+const gateIdx = src.indexOf('if (sub.id !== DIRECT_GROUP_ID)', actionRowIdx);
+
+// 闪电按钮区间 = 操作行起点 → 编辑/删除闸门起点（不含闸门）
+const boltRegion = (actionRowIdx >= 0 && gateIdx > actionRowIdx) ? src.slice(actionRowIdx, gateIdx) : '';
+const boltCode = stripComments(boltRegion);
+
+// 行头区间 = 改版注释 → 展开箭头
+const headerAnchor = src.indexOf('// 2026-10-19 用户要求（订阅卡片改版）');
+const headerArrow = src.indexOf("Image($r('app.media.ic_arrow_right')).width(14).height(14)", headerAnchor);
+const headerRegion = (headerAnchor >= 0 && headerArrow > headerAnchor)
+  ? src.slice(headerAnchor, headerArrow) : '';
+
 console.log(`\n单节点分组可测速修复自检${argIdx >= 0 ? `（--file ${file}）` : ''}`);
 
 // ── 0. 文件与行尾格式前提 ──────────────────────────────────────────────
 ok('源码存在且非空', src.length > 1000, `len=${src.length}`);
 
-// ── 1. speedTestSub：早退守卫不再拦截 direct（修复第 1 部分）────────────
+// ── 1. speedTestSub：早退守卫不再拦截 direct（不变量第 1 部分）──────────
 const FN_SIG = 'private async speedTestSub(subId: string): Promise<void> {';
 const fnIdx = src.indexOf(FN_SIG);
 ok('speedTestSub 存在', fnIdx > 0, `idx=${fnIdx}`);
@@ -180,56 +212,64 @@ ok('speedTestSub 仍调用 BackgroundLatencyService.testSubscription',
 ok('speedTestSub 仍在 finally 里清理 speedTestingIds',
   /finally\s*\{[\s\S]{0,200}?this\.speedTestingIds = this\.speedTestingIds\.filter\(\(x: string\) => x !== subId\)/.test(fnCode));
 
-// ── 2. 分组头闪电按钮：不再被 direct 判定包裹（修复第 2 部分）───────────
-const ironIdx = src.indexOf('// ── 铁律：纯图标闪电测速按钮');
-const refreshIdx = src.indexOf('// 单个刷新', ironIdx);
-ok('「铁律」注释存在', ironIdx > 0);
-ok('「单个刷新」注释存在', refreshIdx > ironIdx);
-// 行头按钮窗口 = 铁律注释 → 单个刷新注释
-const boltRegion = (ironIdx > 0 && refreshIdx > ironIdx) ? src.slice(ironIdx, refreshIdx) : '';
-// 注释里提到 DIRECT_GROUP_ID 不算「闸门」：判定必须看去注释后的代码视图
-const boltCode = stripComments(boltRegion);
-ok('闪电按钮窗口可截取', boltRegion.length > 0 && boltRegion.length < 1200, `len=${boltRegion.length}`);
-
-ok('闪电按钮窗口内不再有 sub.id !== DIRECT_GROUP_ID（负对照）',
-  boltRegion.length > 0 && !/sub\.id\s*!==\s*DIRECT_GROUP_ID/.test(boltRegion));
+// ── 2. 闪电按钮（2026-10-19 起位于展开区操作行）：仍不被 direct 判定包裹 ──
+//    不变量第 2 部分 —— 位置变了，但「单节点分组必须有闪电」没变。
+ok('展开区操作行可截取（Row({ space: 16 }) → 编辑/删除闸门）',
+  boltRegion.length > 0 && boltRegion.length < 1200, `len=${boltRegion.length}`);
+ok('操作行之后确实紧跟节点网格（区间右界有效）', gridIdx > actionRowIdx, `grid=${gridIdx}`);
+ok('闪电按钮位于编辑/删除闸门**之前**（即不被 sub.id !== DIRECT_GROUP_ID 包裹）',
+  actionRowIdx >= 0 && gateIdx > actionRowIdx, `actionRow=${actionRowIdx} gate=${gateIdx}`);
 ok('闪电按钮窗口内代码区无任何 DIRECT_GROUP_ID 判定（注释提及不算）',
   boltRegion.length > 0 && !/DIRECT_GROUP_ID/.test(boltCode));
 
-// 结构完整性：Stack 属性链仍然挂在同一对象上
-ok('闪电按钮为 Stack({ alignContent: Alignment.Center })',
-  /Stack\(\{ alignContent: Alignment\.Center \}\)/.test(boltRegion));
-ok('闪电按钮仍绑定 speedTestSub(sub.id)',
+// 结构完整性：属性链仍然挂在同一对象上
+ok('闪电按钮绑定 speedTestSub(sub.id)',
   /\.onClick\(\(\) => this\.speedTestSub\(sub\.id\)\)/.test(boltRegion));
 ok('闪电按钮仍带 accessibilityText(闪电测速)',
   /\.accessibilityText\('闪电测速'\)/.test(boltRegion));
-ok('闪电按钮尺寸/圆角链完整',
-  /\.width\(28\)\.height\(28\)[\s\S]{0,120}?\.borderRadius\(TunBoxGeometry\.pillRadius\)/.test(boltRegion));
-
-// 重入保护在 UI 上保留：测速中显示 LoadingProgress
 ok('闪电按钮测速中显示 LoadingProgress',
-  /this\.speedTestingIds\.includes\(sub\.id\)[\s\S]{0,200}?LoadingProgress\(\)\.width\(15\)\.height\(15\)/.test(boltRegion));
+  /this\.speedTestingIds\.includes\(sub\.id\)[\s\S]{0,220}?LoadingProgress\(\)/.test(boltRegion));
+ok('闪电按钮无「测速中」以外的其它图标（仍是 ic_bolt）',
+  /Image\(\$r\('app\.media\.ic_bolt'\)\)/.test(boltRegion));
 
-// 「铁律」：纯图标、无文字标签
-ok('闪电按钮无文字标签（仅 Image/LoadingProgress）',
-  !/\bText\(/.test(boltCode), 'bolt region must stay icon-only');
+// ── 3. 顺序：闪电 → 编辑 → 删除（用户 2026-10-19 明确要求「闪电在编辑左边」）──
+const boltA11y = src.indexOf(".accessibilityText('闪电测速')");
+const editA11y = src.indexOf(".accessibilityText('编辑订阅')");
+const delA11y = src.indexOf(".accessibilityText('删除订阅')");
+ok('闪电 / 编辑 / 删除 三个入口都存在', boltA11y > 0 && editA11y > 0 && delA11y > 0,
+  `bolt=${boltA11y} edit=${editA11y} del=${delA11y}`);
+ok('闪电在编辑左边（用户明确要求）', boltA11y > 0 && boltA11y < editA11y,
+  `bolt=${boltA11y} edit=${editA11y}`);
+ok('编辑在删除左边', editA11y > 0 && editA11y < delA11y, `edit=${editA11y} del=${delA11y}`);
 
-// ── 3. 位置：闪电必须在刷新之前 ────────────────────────────────────────
-const boltStackIdx = src.indexOf('Stack({ alignContent: Alignment.Center })', ironIdx);
-ok('闪电 Stack 位于铁律注释之后', boltStackIdx > ironIdx);
-ok('闪电 Stack 在「单个刷新」之前（顺序未变）',
-  boltStackIdx > 0 && boltStackIdx < refreshIdx, `bolt=${boltStackIdx} refresh=${refreshIdx}`);
-ok('闪电 Stack 在刷新 Stack 之前（按代码位置复核）',
-  src.indexOf('.onClick(() => this.speedTestSub(sub.id))') <
-  src.indexOf('.onClick(() => this.refreshOne(sub))'));
-ok('闪电按钮仍位于行头 Row 内（其后紧跟刷新按钮）',
-  /\.onClick\(\(\) => this\.speedTestSub\(sub\.id\)\)[\s\S]{0,40}?\/\/ 单个刷新/.test(src));
+// 右对齐 + 严格等间距（2026-10-19 用户第二轮要求：
+// 「间隔不一样大…你把编辑和删除之间的间隔也调整的一样大的，现在都在左边，
+//   你改成全部放到右边」）
+const actionRegion = (actionRowIdx >= 0 && gridIdx > actionRowIdx)
+  ? src.slice(actionRowIdx, gridIdx) : '';
+const blankPos = actionRegion.indexOf('Blank()');
+const boltInRow = actionRegion.indexOf(".accessibilityText('闪电测速')");
+ok('操作行整体靠右（Blank() 位于闪电之前，而非末尾）',
+  blankPos > 0 && boltInRow > 0 && blankPos < boltInRow, `blank=${blankPos} bolt=${boltInRow}`);
+ok('ACTION_GAP 常量已定义', /const ACTION_GAP = \d+;/.test(src));
+ok('编辑/删除共用同一 ACTION_GAP 左外边距（间距严格相等，与 Row space 无关）',
+  (actionRegion.match(/\.margin\(\{ left: ACTION_GAP \}\)/g) || []).length === 2,
+  `margins=${(actionRegion.match(/\.margin\(\{ left: ACTION_GAP \}\)/g) || []).length}`);
 
-// ── 4. 括号/大括号配平（本文件结构未被改坏）────────────────────────────
+// ── 4. 行头瘦身（2026-10-19 新增负对照）──────────────────────────────
+//    用户报障「订阅名字会被遮住」：行头必须只剩刷新 + 展开箭头，
+//    闪电 / 编辑 / 删除 都不得再出现在行头。
+ok('行头区间可截取', headerRegion.length > 0 && headerRegion.length < 1600, `len=${headerRegion.length}`);
+ok('行头保留刷新按钮', /Image\(\$r\('app\.media\.ic_refresh'\)\)/.test(headerRegion));
+ok('行头已无闪电按钮（负对照）', !/ic_bolt/.test(headerRegion), 'header must not contain ic_bolt');
+ok('行头已无编辑按钮（负对照）', !/ic_tune/.test(headerRegion), 'header must not contain ic_tune');
+ok('行头已无删除按钮（负对照）', !/ic_delete/.test(headerRegion), 'header must not contain ic_delete');
+
+// ── 5. 括号/大括号配平（本文件结构未被改坏）────────────────────────────
 const bal = balancedReport();
 ok('全文件括号配平', bal.ok, bal.msg);
 
-// ── 5. DIRECT_GROUP_ID 仍被使用（无死 import）+ 存活合法闸门盘点 ────────
+// ── 6. DIRECT_GROUP_ID 仍被使用（无死 import）+ 存活合法闸门盘点 ────────
 ok('DIRECT_GROUP_ID 仍从 SubscriptionService 导入',
   src.includes("import { SubscriptionService, DIRECT_GROUP_ID }"));
 const occ = [];
@@ -247,8 +287,8 @@ ok('DIRECT_GROUP_ID 在文件内仍有实际使用（非死 import）', occ.leng
 ok('speedTestSub 函数体内未出现 DIRECT_GROUP_ID（真实起止下标 + 仅代码区）',
   !occ.some((o) => o.index >= fnOpen && o.index <= fnClose && MASK[o.index] === 1),
   'unexpected DIRECT_GROUP_ID inside speedTestSub');
-ok('行头闪电按钮窗口内未出现 DIRECT_GROUP_ID（真实区间 + 仅代码区）',
-  !occ.some((o) => o.index >= ironIdx && o.index < refreshIdx && MASK[o.index] === 1),
+ok('闪电按钮区间内未出现 DIRECT_GROUP_ID（真实区间 + 仅代码区）',
+  !occ.some((o) => o.index >= actionRowIdx && o.index < gateIdx && MASK[o.index] === 1),
   'unexpected DIRECT_GROUP_ID inside bolt button region');
 
 // 存活的合法闸门（人工分类，脚本只负责如实报出，防止「拆错闸门」）
@@ -260,18 +300,25 @@ for (const o of occ) {
   console.log(`      L${o.line}: ${lineText.slice(0, 96)}`);
 }
 
-// 明确断言：本次修复**不得**误伤其它合法闸门
-ok('删除按钮闸门保留（常驻分组不可删）',
-  /if \(sub\.id !== DIRECT_GROUP_ID\) \{\r?\n\s*Stack\(\{ alignContent: Alignment\.Center \}\) \{\r?\n\s*Image\(\$r\('app\.media\.ic_delete'\)\)/.test(src));
-ok('refreshOne 的 direct 早退保留（本次修复范围外，刷新语义不变）',
+// 明确断言：本次改版**不得**误伤其它合法闸门
+ok('编辑/删除闸门保留（常驻分组不可编辑/不可删）',
+  /if \(sub\.id !== DIRECT_GROUP_ID\) \{\r?\n\s*Row\(\{ space: 4 \}\) \{\r?\n\s*Image\(\$r\('app\.media\.ic_tune'\)\)/.test(src));
+ok('删除入口仍受同一闸门保护（ic_delete 在闸门之后、网格之前）',
+  gateIdx > 0 && src.indexOf('ic_delete', gateIdx) > gateIdx
+  && src.indexOf('ic_delete', gateIdx) < gridIdx,
+  `gate=${gateIdx} del=${src.indexOf('ic_delete', gateIdx)} grid=${gridIdx}`);
+ok('refreshOne 的 direct 早退保留（本次改版范围外，刷新语义不变）',
   /if \(sub\.id === DIRECT_GROUP_ID \|\| this\.isRefreshing \|\| this\.isRefreshingSub\(sub\.id\)\) \{\r?\n\s*return;/.test(src));
 ok('reload 的 direct 空组过滤保留',
   /s\.id !== DIRECT_GROUP_ID \|\| s\.nodeCount > 0\);/.test(src));
 ok('doDelete 常驻分组守卫保留', src.includes('单节点分组为常驻分组，不能删除'));
 
-// ── 6. 提示文案与按钮能力一致（回归防线）──────────────────────────────
-ok('展开区提示文字仍指引「点行头闪电图标测速」',
-  src.includes('点行头闪电图标测速'));
+// ── 7. 旧「点击选用节点…」提示文字必须从代码里消失（只在注释里说明历史）──
+const srcCode = stripComments(src);
+ok('旧提示文字「点行头闪电图标测速」已从代码中移除',
+  !srcCode.includes('点行头闪电图标测速'), 'hint text still present in code');
+ok('旧提示文字「点击选用节点」已从代码中移除',
+  !srcCode.includes('点击选用节点'), 'hint text still present in code');
 
 // ── 汇总 ──────────────────────────────────────────────────────────────
 console.log(`\n单节点测速自检：${pass} 条通过，${fails.length} 条失败`);
@@ -279,6 +326,6 @@ if (fails.length > 0) {
   console.error('失败：' + fails.join(' | '));
   process.exit(1);
 }
-console.log('全部通过（单节点分组已有闪电按钮，speedTestSub 不再拦截 direct，'
-  + '重入保护 / 位置 / 纯图标 / 删除闸门均未受影响）');
+console.log('全部通过（单节点分组仍有闪电按钮、speedTestSub 不拦截 direct、'
+  + '闪电在编辑左边、行头已瘦身、旧提示文字已移除、合法闸门未被误伤）');
 process.exit(0);

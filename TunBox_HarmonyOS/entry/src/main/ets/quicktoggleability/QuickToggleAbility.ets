@@ -79,6 +79,8 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
   private healing: boolean = false;
   /** 已消耗的自愈次数（退避后重试，耗尽才释放守护） */
   private healAttempts: number = 0;
+  /** 长时任务取消后的重挂防抖定时器(2026-10-19 后台保活整改) */
+  private rearmTimer: number = -1;
   /** 主窗口句柄：守护接管后用于最小化回桌面（设备不支持时降级为透明悬窗）。 */
   private mainWindow: window.Window | null = null;
 
@@ -131,6 +133,10 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
     this.windowStageReady = false;
     this.clearLifetimeGuard();
     this.clearGuardianTimer();
+    if (this.rearmTimer >= 0) {
+      clearTimeout(this.rearmTimer);
+      this.rearmTimer = -1;
+    }
     BackgroundTaskWatch.removeListener(this);
     if (this.bgTaskRegistered) {
       // 兜底：进程被系统直接回收时尽力注销连续任务，避免残留登记。
@@ -145,7 +151,10 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
 
   /**
    * 长时任务被外部取消（用户在通知栏删除任务通知 / 系统取消）：
-   * 只清记账 + 记日志，绝不自动重申请（《Background Tasks Kit 接入规范》红线）。
+   * 后台保活整改(2026-10-19,对标 FlClash-ohos):原语义是"只清记账、绝不自动重申请"
+   * —— 与 FlClash 的"取消后 1 秒无条件重挂"正相反,是保活效果差距的最大单一来源。
+   * 现改为:会话仍存活(desiredConnected)时 1 秒后自动重挂 dataTransfer 连续任务;
+   * 会话已断则保持原语义不重挂。
    */
   onContinuousTaskCancel(id: number, reason: string): void {
     if (!this.bgTaskRegistered) {
@@ -153,7 +162,23 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
     }
     this.bgTaskRegistered = false;
     AppLogger.warn(TAG,
-      `guardian continuous task canceled externally (id=${id} reason=${reason}); no auto re-register`);
+      `guardian continuous task canceled externally (id=${id} reason=${reason}); re-arm in 1s`);
+    // 1 秒防抖后重挂(FlClash 语义);会话是否仍存活由 UiGuardian.rearm 内部
+    // 结合权威租约判断——这里只做延迟触发,避免取消风暴下重复挂。
+    if (this.rearmTimer >= 0) {
+      clearTimeout(this.rearmTimer);
+    }
+    this.rearmTimer = setTimeout((): void => {
+      this.rearmTimer = -1;
+      if (this.destroyed) {
+        return;
+      }
+      UiGuardian.rearm(this.context).then((armed: boolean): void => {
+        if (armed) {
+          this.bgTaskRegistered = true;
+        }
+      });
+    }, 1000);
   }
 
   /**

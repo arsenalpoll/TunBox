@@ -54,7 +54,12 @@ export struct TopNavBar {
         .fontWeight(FontWeight.Bold)
         .fontColor(TunBoxColors.textPrimary)
         .margin({ left: this.hasBack ? 8 : 0 })
-      Blank()
+        // 2026-10-19 防溢出：标题与右侧操作区共存时，标题过长不得撑破导航条。
+        // 用 layoutWeight(1) 让标题占用剩余空间并可被压缩（原 Blank() 与权重
+        // 会争抢空间，故移除 Blank，标题自身即充当弹性占位）。
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
       // 右侧操作区（文档：Row({ space: 12 })；扩展槽优先，供既有功能入口使用）
       Row({ space: 12 }) {
         this.rightSlot()

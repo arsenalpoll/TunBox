@@ -79,6 +79,18 @@ export class LatencyRecord {
    * 持久化兼容：旧记录缺字段默认 'manual'（显示不回退，保持红）。
    */
   source: string = 'manual';
+  /**
+   * 失败分类（LatencyFailKind.*；空串 = 无失败/未分类）。
+   *
+   * ⚠ 这一层**曾经把分类整个丢掉**：探测侧（ClashApiService）已经把 404（内核代理表里
+   * 没有这个节点）/ 504（真超时）/ 拨号失败分好类，但记录里只留了 state（数字），
+   * UI 只能按 state 渲染成「超时/失败」。结果是**「节点没进内核配置」与「节点连不上」
+   * 在用户侧完全一样** —— 2026-10-19 真机：36 个 anytls 因解析丢凭据被丢弃，
+   * 内核 404，UI 全红，用户以为节点坏了（节点实际可用，代理正常）。
+   *
+   * 现在分类一路带到 UI（stateText/recordColor）与持久化快照。
+   */
+  failKind: string = '';
 
   static measured(name: string, delayMs: number, channel: string, atMs: number): LatencyRecord {
     const r = new LatencyRecord();
@@ -90,13 +102,15 @@ export class LatencyRecord {
     return r;
   }
 
-  static failed(name: string, state: number, atMs: number, channel: string = LatencyChannel.CORE): LatencyRecord {
+  static failed(name: string, state: number, atMs: number, channel: string = LatencyChannel.CORE,
+    failKind: string = ''): LatencyRecord {
     const r = new LatencyRecord();
     r.name = name;
     r.state = state;
     r.delayMs = -1;
     r.channel = channel;
     r.atMs = atMs;
+    r.failKind = failKind;
     return r;
   }
 
@@ -141,10 +155,15 @@ export class LatencyPolicy {
    * timeout=31（全部判死）。对照 FlClash 默认 5s，两边尺子不同。
    * 用户裁定：全部统一 2.5s —— 兼顾"别等太久"与"别把好节点误杀"。
    *
+   * 2026-10-19 用户要求改为 **5s**。理由与上面的取证一致：2.5s 仍会把慢 RTT
+   * 的好节点误杀（真机出现过 measured=0/timeout=31 的整批假死），而 5s 与
+   * FlClash 默认一致 —— 两边尺子不同会让"同一节点在两个客户端表现不同"，
+   * 用户无法判断是节点问题还是客户端问题。
+   *
    * 这个值同时是发给内核 `/delay` 的 `timeout` 参数；外层 http 超时按它推导
    * （`timeout + 1200`），所以整批耗时也随之变化。
    */
-  static readonly DEFAULT_TIMEOUT_MS: number = 2500;
+  static readonly DEFAULT_TIMEOUT_MS: number = 5000;
   /** mihomo 的 timeout 用 16 位整数解析，> 32767 直接 400。 */
   static readonly MAX_TIMEOUT_MS: number = 30000;
   /** 结果视为"旧"的阈值：超过即灰显，提示用户可能不准 */
@@ -282,8 +301,23 @@ export class LatencyPolicy {
     return nowMs - rec.atMs > LatencyPolicy.STALE_MS;
   }
 
-  /** 状态文案（UI 唯一来源，禁止各处自己拼字符串） */
-  static stateText(state: number): string {
+  /**
+   * 状态文案（UI 唯一来源，禁止各处自己拼字符串）。
+   *
+   * @param failKind 失败分类（LatencyFailKind.*）。**只影响「内核代理表里没有这个
+   *   节点」这一种**：它意味着节点根本没进内核配置（订阅解析/配置生成阶段把它丢了），
+   *   与「节点连不上」是两回事，必须让用户能分辨 —— 否则配置类 bug 在用户侧只能
+   *   表现为「一片红」，用户会以为节点坏了（真机 2026-10-19：36 个 anytls 因解析
+   *   丢凭据被丢弃，内核 404，UI 全红，而节点实际可用、代理正常）。
+   *
+   *   这里用字面量而不是 LatencyFailKind.SWITCH_FAILED：本文件与 ClashApiService
+   *   互相引用，引入会造成循环依赖。两者必须保持同一个字符串。
+   */
+  static stateText(state: number, failKind: string = ''): string {
+    if (LatencyPolicy.isNotEffective(failKind)) {
+      // 明确的结论（不是「没测过」）：节点没进内核配置 → 节点对当前配置无效
+      return '未生效';
+    }
     if (state === LatencyState.MEASURED || state === LatencyState.OFFLINE) {
       return '';
     }
@@ -300,5 +334,16 @@ export class LatencyPolicy {
       return '已取消';
     }
     return '--';
+  }
+
+  /**
+   * 是否是「节点未生效」类失败（内核代理表里没有它）。
+   *
+   * 与 LatencyFailKind.SWITCH_FAILED 同值（字面量，避免循环依赖）。
+   * 判定依据是 failKind 而不是 state：switch_failed 与 timeout 在 state 上
+   * 都是「失败」这一档，必须靠分类才能区分。
+   */
+  static isNotEffective(failKind: string): boolean {
+    return failKind === 'switch_failed';
   }
 }

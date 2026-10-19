@@ -15,6 +15,7 @@ import {
   NodeSortSnapshot, NodeSortModes, NodeLatencyRecord, NodeProtocolPolicy
 } from '../../../main/ets/commons/services/NodeSortPersistence';
 import { ProxyNode, ProxyNodeType } from '../../../main/ets/commons/models/ProxyNode';
+import { ProxyGroup } from '../../../main/ets/commons/models/ProxyGroup';
 import { AppSettings, AppSettingsJson } from '../../../main/ets/commons/models/AppSettings';
 import {
   MAX_STATE_FILE_BYTES, PRIVATE_CONFIG_FILE, PRIVATE_TEST_CONFIG_FILE, PrivateFs,
@@ -85,6 +86,11 @@ class FakePrivateFs implements PrivateFs {
       return { ok: false, text: '', truncated: false };
     }
     return { ok: true, text: raw, truncated: raw.length > maxBytes };
+  }
+
+  /** 异步版与同步版同语义（测试用内存 Map，无真实 IO） */
+  async readCappedAsync(path: string, maxBytes: number): Promise<SyncReadResult> {
+    return this.readCapped(path, maxBytes);
   }
 
   remove(path: string): boolean {
@@ -176,6 +182,46 @@ export default function logicTest() {
       node.password = 'p';
       const yaml = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec');
       expect(yaml.includes('DOMAIN-SUFFIX,openai.com,PROXY')).assertTrue();
+    });
+
+    it('config_generator_rule_target_must_be_emitted', 0, () => {
+      // 回归（2026-10-19 用户报障）：订阅组被 planProxyGroups 丢弃（空成员无法落地）后，
+      // 引用它的规则必须一并跳过。否则内核 config.Parse 报
+      //   parse config:rules[0] [DOMAIN-SUFFIX,local, 本地直连] error: proxy not found
+      // 整份配置拒载 → 启动代理失败。
+      const s = new AppSettings();
+      const node = new ProxyNode();
+      node.name = 'HK-01';
+      node.server = 'h.example.com';
+      node.port = 443;
+      node.method = 'aes-128-gcm';
+      node.password = 'pw';
+
+      const dead = new ProxyGroup();
+      dead.name = '本地直连';
+      dead.groupType = 'select';
+      dead.members = [];
+      const yamlDead = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec',
+        true, false, {}, true, [dead], true, false,
+        ['DOMAIN-SUFFIX,local,本地直连']);
+      expect(yamlDead.includes('DOMAIN-SUFFIX,local,本地直连')).assertFalse();
+
+      // 对照组：组能落地（成员是真实节点）时规则必须保留，别误杀。
+      const live = new ProxyGroup();
+      live.name = '本地直连';
+      live.groupType = 'select';
+      live.members = ['HK-01'];
+      const yamlLive = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec',
+        true, false, {}, true, [live], true, false,
+        ['DOMAIN-SUFFIX,local,本地直连']);
+      expect(yamlLive.includes('DOMAIN-SUFFIX,local,本地直连')).assertTrue();
+    });
+
+    it('config_generator_normalizes_rule_whitespace', 0, () => {
+      // 逗号后带空格的规则（用户报障原文 `DOMAIN-SUFFIX,local, 本地直连`）写盘时
+      // 必须归一，避免校验（trim 过）与写盘（原始行）语义不一致。
+      expect(ClashConfigGenerator.normalizeRuleLine('DOMAIN-SUFFIX,local, 本地直连'))
+        .assertEqual('DOMAIN-SUFFIX,local,本地直连');
     });
 
     it('country_detect', 0, () => {

@@ -96,15 +96,63 @@ export class UiGuardian {
   }
 
   /**
-   * 外部取消（用户删除长时任务通知 / 系统取消）的记账入口，由 BackgroundTaskWatch 调用：
-   * 刷新登记状态 + 进入抑制态 + 进度心跳止损。绝不在这里重新申请任务（规范红线）。
+   * 长时任务被取消后的自动重挂入口(2026-10-19 后台保活整改,FlClash 语义):
+   * 会话仍存活(用户意图仍是"连接")时,1 秒后重新注册 dataTransfer 连续任务。
+   * 由 BackgroundTaskWatch 统一触发(带防抖);调用方需自行判断会话是否仍应存活。
+   * 返回 true 表示重挂成功,false 表示未挂(会话已断/已被抑制/申请失败)。
+   */
+  static async rearm(context: Context): Promise<boolean> {
+    if (UiGuardian.registered || UiGuardian.engaging) {
+      return UiGuardian.registered;
+    }
+    if (UiGuardian.autoEngageSuppressed) {
+      AppLogger.info(TAG, 'guardian rearm skipped: suppressed');
+      return false;
+    }
+    UiGuardian.engaging = true;
+    try {
+      const agentRequest: wantAgent.WantAgentInfo = {
+        wants: [{
+          bundleName: 'com.tunbox.client',
+          moduleName: 'entry',
+          abilityName: 'EntryAbility'
+        }],
+        operationType: wantAgent.OperationType.START_ABILITY,
+        requestCode: 0,
+        wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+      };
+      const agent = await wantAgent.getWantAgent(agentRequest);
+      const modes: string[] = ['dataTransfer'];
+      const res = await backgroundTaskManager.startBackgroundRunning(context, modes, agent);
+      UiGuardian.registered = true;
+      TaskProgressUpdater.attach(res !== undefined && res !== null ? res.notificationId : -1);
+      AppLogger.info(TAG, 'guardian re-armed after external cancel (dataTransfer)');
+      return true;
+    } catch (e) {
+      const err = e as BusinessError;
+      AppLogger.warn(TAG, `guardian rearm failed (code=${err.code} ${err.message})`);
+      return false;
+    } finally {
+      UiGuardian.engaging = false;
+    }
+  }
+
+  /**
+   * 外部取消（用户删除长时任务通知 / 系统取消）的记账入口，由 BackgroundTaskWatch 调用。
+   *
+   * 后台保活整改(2026-10-19,对标 FlClash-ohos):原语义是"进入抑制态、窗口内自动补挂
+   * 一律跳过、仅显式用户操作可清除" —— 与 FlClash 的"取消后 1 秒无条件重挂"正相反,
+   * 是保活效果差距的最大单一来源(逆向结论见 C:\Worker\_re_flclash\最终报告.md §3)。
+   * 现改为:清账 + 记录取消时间,自动重挂由 BackgroundTaskWatch 统一触发
+   * (1 秒防抖,VPN 会话仍存活时立即补挂)。
    */
   static noteExternalCancel(): void {
     if (UiGuardian.registered) {
       AppLogger.warn(TAG, 'guardian registration cleared by external cancel');
     }
     UiGuardian.registered = false;
-    UiGuardian.autoEngageSuppressed = true;
+    // 不再进入抑制态:自动重挂走 BackgroundTaskWatch 的统一 1 秒防抖入口。
+    // 抑制态字段保留(不再置 true),供诊断与回退开关使用。
     TaskProgressUpdater.detach();
   }
 

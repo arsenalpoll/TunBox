@@ -135,10 +135,16 @@ export class LatencyStyle {
       }
       return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
     }
-    return LatencyPolicy.stateText(rec.state);
+    return LatencyPolicy.stateText(rec.state, rec.failKind);
   }
 
-  /** 状态化配色：实测走既有阈值；过期结果与测试中为中性色；失败一律红 */
+  /**
+   * 状态化配色：实测走既有阈值；过期结果与测试中为中性色；失败一律红。
+   *
+   * 例外：「节点未生效」（内核代理表里没有它 = 节点没进配置）用警告色 —— 红=「节点坏了」，
+   * 但这种情况节点可能是好的、只是配置生成把它丢了（真机 2026-10-19：36 个 anytls
+   * 被丢弃 → 内核 404 → UI 全红，节点实际可用）。
+   */
   static recordColor(rec: LatencyRecord | null, nowMs: number): ResourceColor {
     if (rec === null) {
       return Ui.textSecondary;
@@ -148,6 +154,9 @@ export class LatencyStyle {
         return Ui.textSecondary;
       }
       return LatencyStyle.color(rec.delayMs);
+    }
+    if (LatencyPolicy.isNotEffective(rec.failKind)) {
+      return Ui.warning;
     }
     if (rec.state === LatencyState.TIMEOUT || rec.state === LatencyState.FAILED) {
       return Ui.error;

@@ -78,7 +78,7 @@ ok(!/from '@ohos/.test(src), 'staged module must not import ohos kits');
 fs.writeFileSync(path.join(stage, 'NodeSortPersistence.ts'), src);
 
 const mod = await import(pathToFileURL(path.join(stage, 'NodeSortPersistence.ts')).href);
-const { NodeSortSnapshot, NodeLatencyRecord, NodeSortModes } = mod;
+const { NodeSortSnapshot, NodeLatencyRecord, NodeSortModes, NodeProtocolPolicy } = mod;
 
 /** 造一条记录：latency>=0 实测 / -1 失败 / -2 未测 */
 function rec(name, latency, opts = {}) {
@@ -267,6 +267,47 @@ check('端到端：整批通道故障后，排序与上次实测完全一致', (
   ], second, ['fast', 'mid', 'slow']);
   eq(third.orderedNames(['fast', 'mid', 'slow']).length, 3, 'all present');
   eq(third.recordFor('fast').latency, -1, 'real failures now recorded');
+});
+
+// ── 协议展示：白名单漏一个协议就整批节点显示「未知」（2026-10-19 修复）────
+// 真实报障：ikuuu 订阅的 34 个 ss 节点协议显示「未知」（ss 不在原白名单里，
+// proxyType 非空但未命中 → 返回 '' → 展示层只能显示「未知」）。
+// 同订阅的 vmess 正常（vmess 在白名单里）—— 白名单式实现的典型漏法。
+// 下面是**真跑**（加载真实模块并调用真实方法），不是读源码断言。
+check('协议展示：ss 不再显示「未知」', () => {
+  const info = NodeProtocolPolicy.resolve('ss', 'ss', '', '');
+  eq(info.key, 'ss', 'ss protocol key');
+  eq(info.label, 'SS', 'ss display label');
+  ok(!info.display().includes('未知'), 'ss must not display as 未知');
+});
+check('协议展示：白名单外的协议回退为原样（不丢信息）', () => {
+  for (const p of ['hysteria', 'snell', 'mieru', 'ssh', 'http', 'socks5', 'ss2022', 'juicity']) {
+    const info = NodeProtocolPolicy.resolve(p, '', '', '');
+    eq(info.key, p, `${p} protocol key`);
+    ok(!info.display().includes('未知'), `${p} must not display as 未知`);
+  }
+});
+check('协议展示：别名规范化仍生效', () => {
+  eq(NodeProtocolPolicy.resolve('hy2', '', '', '').key, 'hysteria2', 'hy2 → hysteria2');
+  eq(NodeProtocolPolicy.resolve('hysteria2', '', '', '').label, 'HYSTERIA2', 'hysteria2 label');
+  eq(NodeProtocolPolicy.resolve('shadow-tls', '', '', '').key, 'shadowtls', 'shadow-tls → shadowtls');
+  eq(NodeProtocolPolicy.resolve('shadow-tls', '', '', '').label, 'ShadowTLS', 'shadow-tls label');
+});
+check('协议展示：VMESS/VLESS/TROJAN/AnyTLS 保持原样', () => {
+  eq(NodeProtocolPolicy.resolve('vmess', '', '', '').label, 'VMESS', 'vmess');
+  eq(NodeProtocolPolicy.resolve('vless', '', '', '').label, 'VLESS', 'vless');
+  eq(NodeProtocolPolicy.resolve('trojan', '', '', '').label, 'TROJAN', 'trojan');
+  eq(NodeProtocolPolicy.resolve('anytls', '', '', '').label, 'AnyTLS', 'anytls');
+});
+check('协议展示：REALITY 仍识别（vless + 公钥）', () => {
+  const info = NodeProtocolPolicy.resolve('vless', '', 'pubkey', 'shortid');
+  eq(info.display(), 'VLESS·REALITY', 'reality display');
+  // 非 vless 的协议不得被误判为 REALITY
+  ok(!NodeProtocolPolicy.resolve('trojan', '', 'pubkey', 'shortid').display().includes('REALITY'),
+    'trojan must not be reality');
+});
+check('协议展示：真无协议信息才显示「未知」', () => {
+  eq(NodeProtocolPolicy.resolve('', '', '', '').display(), '未知', 'no protocol at all');
 });
 
 fs.rmSync(stage, { recursive: true, force: true });

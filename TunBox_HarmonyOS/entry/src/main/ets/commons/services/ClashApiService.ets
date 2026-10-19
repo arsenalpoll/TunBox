@@ -343,6 +343,50 @@ export class ClashApiService {
   }
 
   /**
+   * GET /proxies → 内核代理表里的**全部**名字（含组名）。
+   *
+   * 与 testableProxyNames 的区别：那个过滤掉了内置节点与不可测类型，只适合
+   * 「哪些节点能测」；这里要回答的是另一个问题 ——
+   * **「这个节点到底在不在内核里」**。
+   *
+   * 组测（GET /group/PROXY/delay）只返回成功的节点，失败的节点**没有状态码**，
+   * 内核不告诉你是 404（节点没进配置）还是 504（真超时）。但代理表能回答：
+   * 名字不在表里 = 节点压根没被写进内核配置（订阅解析/配置生成阶段丢了它）。
+   * 真机 2026-10-19：36 个 anytls 因解析丢凭据被丢弃 → 内核 404 → 「测全部」
+   * 全红，用户以为节点坏了（节点实际可用）。
+   *
+   * @returns null = 内核不可用（调用方必须当作「通道不可用」，不是「没有节点」）
+   */
+  async proxyTableNames(): Promise<string[] | null> {
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/proxies`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: 2500,
+        readTimeout: 6000,
+        usingCache: false
+      });
+      if (resp.responseCode !== 200) {
+        AppLogger.warn(TAG, `proxyTableNames non-200: code=${resp.responseCode}`);
+        return null;
+      }
+      const body = typeof resp.result === 'string' ? resp.result : JSON.stringify(resp.result);
+      const root = JSON.parse(body) as Record<string, Object>;
+      const proxies = root['proxies'];
+      if (proxies === undefined || proxies === null) {
+        return null;
+      }
+      return Object.keys(proxies as Record<string, Object>);
+    } catch (e) {
+      AppLogger.warn(TAG, `proxyTableNames failed: ${this.errText(e)}`);
+      return null;
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /**
    * GET /connections → 经过 `groupName` 的连接**实际使用**的节点名（去重）。
    *
    * 为什么必须看 /connections 而不是 /proxies：内核 `Smart.Now()` 返回的是
@@ -576,7 +620,7 @@ export class ClashApiService {
    * 失败分类随结果返回（LatencyFailKind），调用方不得再统一折叠成「超时」。
    */
   async testLatencyDetailed(nodeName: string, testUrl: string,
-    timeoutMs: number = 3000, lanes: number = 1): Promise<LatencyProbeResult> {
+    timeoutMs: number = 5000, lanes: number = 1): Promise<LatencyProbeResult> {
     const out = new LatencyProbeResult();
     const req = http.createHttp();
     this.inflight.add(req);

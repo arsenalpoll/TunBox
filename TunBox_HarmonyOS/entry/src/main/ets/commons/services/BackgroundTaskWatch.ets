@@ -49,7 +49,14 @@ export class BackgroundTaskWatch {
     }
   }
 
-  /** 事件分发：先做核心清账（进度心跳止损 + 守护抑制态），再广播给监听者。 */
+  /** 事件分发：先做核心清账（进度心跳止损 + 守护记账），再广播给监听者。
+   *
+   * 后台保活整改(2026-10-19,对标 FlClash-ohos):原语义是"抑制自动补挂、仅显式用户
+   * 操作可清除" —— 与 FlClash 的"取消后 1 秒无条件重挂"正相反。现改为:
+   * 广播给监听者(QuickToggleAbility/EntryAbility 的 onContinuousTaskCancel 实现),
+   * 由监听者自行决定是否重挂;1 秒防抖统一在 dispatch 前置。
+   * 监听者实现里用 UiGuardian.rearm(context) 补挂(会话仍存活时)。
+   */
   private static dispatch(info: backgroundTaskManager.ContinuousTaskCancelInfo): void {
     const id: number = (info !== undefined && info !== null) ? info.id : -1;
     const reason: string = (info !== undefined && info !== null && typeof info.reason === 'string')
@@ -60,7 +67,7 @@ export class BackgroundTaskWatch {
     AppLogger.warn(TAG, `continuous task canceled externally: id=${id} reason=${reason}`);
     // 任务已不存在：进度心跳立刻止损（继续 publish 会持续报错）
     TaskProgressUpdater.detach();
-    // 刷新守护记账并进入抑制态（窗口内自动补挂一律跳过；仅显式用户操作可清除）
+    // 刷新守护记账(不再进入抑制态,自动重挂由监听者决定)
     UiGuardian.noteExternalCancel();
     for (const l of BackgroundTaskWatch.listeners.slice()) {
       try {

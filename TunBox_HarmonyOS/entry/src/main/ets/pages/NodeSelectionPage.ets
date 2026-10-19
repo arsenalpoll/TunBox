@@ -1085,6 +1085,18 @@ struct NodeSelectionPage {
   private toPersistRecord(rec: LatencyRecord): NodeLatencyRecord {
     const out = new NodeLatencyRecord();
     out.name = rec.name;
+    // 优先用探测侧给出的分类：state 只有「失败」一档，分不出「内核里没这个节点」
+    // (switch_failed) 与「真超时」(timeout) —— 落盘后再分就晚了，只能重新盖章。
+    if (rec.failKind.length > 0) {
+      out.latency = rec.state === LatencyState.MEASURED ? rec.delayMs
+        : (rec.state === LatencyState.OFFLINE ? -2 : -1);
+      out.failKind = rec.failKind;
+      if (NodeLatencyRecord.isNonVerdict(rec.failKind)) {
+        // 非节点判定（通道未就绪/仅端口可达/整批未测）：不是失败结论
+        out.latency = -2;
+      }
+      return out;
+    }
     if (rec.state === LatencyState.MEASURED) {
       out.latency = rec.delayMs;
       out.failKind = LatencyFailKind.NONE;
@@ -1187,11 +1199,17 @@ struct NodeSelectionPage {
     this.commitLatencySnapshot(list);
     await this.persistSortState();
     AppLogger.info(TAG, `group latency batch done: total=${progress.total} measured=${progress.measured} `
-      + `timeout=${progress.timeout} channel=${progress.channel}`);
+      + `timeout=${progress.timeout} failed=${progress.failed} channel=${progress.channel}`);
     if (this.pageActive) {
-      promptAction.showToast({
-        message: `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout}`
-      });
+      // 「未生效」必须单独报出来：它不是节点连不上，而是**节点根本没进内核配置**
+      // （订阅解析/配置生成阶段丢了它）—— 指向配置/解析问题，不是节点质量。
+      // 混在「超时」里，用户只会以为节点坏了（真机 2026-10-19：36 个 anytls
+      // 被丢弃 → 内核 404 → 「超时 41」，节点实际可用）。
+      let msg = `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout}`;
+      if (progress.failed > 0) {
+        msg += ` / 未生效 ${progress.failed}`;
+      }
+      promptAction.showToast({ message: msg });
     }
   }
 
@@ -1267,10 +1285,27 @@ struct NodeSelectionPage {
       }
       return progress;
     }
-    // 逐节点落库：map 有 → 实测；map 无 → 内核侧超时（TIMEOUT）。
+    // 逐节点落库：map 有 → 实测；map 无 → 内核侧未成功。
     // 每条落库立即 flushNow：组测是一次请求拿到全部结果，落库循环毫秒级完成，
     // 若只靠 200ms 合并通知会全部落完才排一次（表现为"边测边排序没生效"）。
     // 逐条 flush 让 UI 逐节点看到排序冒泡（每次 O(N log N)，百节点可忽略）。
+    //
+    // 组测接口（/group/PROXY/delay）**不返回失败状态码** —— 内核只给"成功的节点"。
+    // 但内核代理表能回答「这个节点在不在内核里」：不在 = 节点根本没进配置
+    // （订阅解析/配置生成把它丢了），与「节点连不上」是两回事，必须分开落库，
+    // 否则用户看到的是"全红"，会以为节点坏了（真机 2026-10-19：36 个 anytls
+    // 被丢弃 → 内核 404 → 测速全红，节点实际可用、代理正常）。
+    const failedNames: string[] = [];
+    for (const n of list) {
+      if (resultMap.get(n.name) === undefined) {
+        failedNames.push(n.name);
+      }
+    }
+    let coreTable: Set<string> | null = null;
+    if (failedNames.length > 0) {
+      const names = await api.proxyTableNames();
+      coreTable = names === null ? null : new Set<string>(names);
+    }
     for (const n of list) {
       const delay = resultMap.get(n.name);
       if (delay !== undefined && delay > 0) {
@@ -1278,12 +1313,23 @@ struct NodeSelectionPage {
           LatencyRecord.measured(n.name, delay, LatencyChannel.CORE, Date.now()));
         progress.measured = progress.measured + 1;
       } else {
-        const failedRec = LatencyRecord.failed(n.name, LatencyState.TIMEOUT, Date.now(),
-          LatencyChannel.CORE);
+        // 不在内核代理表里 → 节点没进配置（未生效）；在内核里却测不通 → 真超时/失败
+        let notInCore = false;
+        if (coreTable !== null) {
+          notInCore = !coreTable.has(n.name);
+        }
+        const failedRec = LatencyRecord.failed(n.name,
+          notInCore ? LatencyState.FAILED : LatencyState.TIMEOUT, Date.now(),
+          LatencyChannel.CORE,
+          notInCore ? LatencyFailKind.SWITCH_FAILED : LatencyFailKind.TIMEOUT);
         failedRec.source = source;
         failedRec.runId = 0;
         LatencyController.setRecord(failedRec);
-        progress.timeout = progress.timeout + 1;
+        if (notInCore) {
+          progress.failed = progress.failed + 1;
+        } else {
+          progress.timeout = progress.timeout + 1;
+        }
       }
       progress.finished = progress.finished + 1;
       this.latencyDone = progress.finished;

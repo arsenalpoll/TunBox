@@ -60,9 +60,11 @@ for (const t of targets) {
   ok(`${t.ns}.recordColor 不再按 source==='auto' 走中性色`,
     !/source\s*===\s*'auto'/.test(color));
 
-  // 必须仍然把失败落到 stateText（超时/失败）
+  // 必须仍然把失败落到 stateText（超时/失败），并且**必须带上 failKind**：
+  // 2026-10-19 起 state 只有「失败」一档，分不出「内核里没这个节点」(switch_failed)
+  // 与「真超时」(timeout)。不带 failKind 就会退回"404 和 504 在 UI 上完全一样"。
   ok(`${t.ns}.recordText 失败走 LatencyPolicy.stateText`,
-    /LatencyPolicy\.stateText\(rec\.state\)/.test(text));
+    /LatencyPolicy\.stateText\(rec\.state,\s*rec\.failKind\)/.test(text));
   // 必须仍然保留离线 ≈ 前缀与"没数据 = --"语义
   ok(`${t.ns}.recordText 保留离线 ≈ 前缀`,
     /`≈\$\{body\}`/.test(text) || /≈/.test(text));
@@ -70,6 +72,9 @@ for (const t of targets) {
   // 失败配色必须是红色系（不再是中性）
   ok(`${t.ns}.recordColor 失败走红色`,
     /LatencyState\.TIMEOUT\s*\|\|\s*rec\.state\s*===\s*LatencyState\.FAILED/.test(color));
+  // 「节点未生效」（内核里没它）必须走警告色，不能和"节点坏了"一样红
+  ok(`${t.ns}.recordColor 对未生效用警告色`,
+    /isNotEffective\(rec\.failKind\)[\s\S]{0,120}?warning/.test(color));
 }
 
 // 反例守护：确保 stateText 真的把 TIMEOUT 映射成「超时」
@@ -77,6 +82,58 @@ const stateSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/services/LatencyState.ets'), 'utf8');
 ok('LatencyPolicy.stateText 中 TIMEOUT 映射为「超时」',
   /TIMEOUT[\s\S]{0,120}?超时/.test(stateSrc));
+
+// ── 失败分类必须一路带到 UI（2026-10-19 新增契约）────────────────────
+// 反例守护：分类若在运行时被丢掉，switch_failed（节点没进内核配置）与 timeout
+// （真超时）会再次在用户侧完全一样 —— 真机教训：36 个 anytls 被丢弃 → 内核 404
+// → UI 全红，用户以为节点坏了（实际节点可用、代理正常）。
+ok('LatencyRecord 带 failKind 字段',
+  /class LatencyRecord[\s\S]{0,2000}?failKind\s*:\s*string\s*=\s*''/.test(stateSrc));
+ok('LatencyPolicy.stateText 接受 failKind 参数',
+  /static stateText\(state:\s*number,\s*failKind:\s*string\s*=\s*''\)/.test(stateSrc));
+ok('LatencyPolicy.stateText 对 switch_failed 显示「未生效」',
+  /isNotEffective\(failKind\)[\s\S]{0,200}?'未生效'/.test(stateSrc));
+ok('LatencyPolicy.isNotEffective 判定 switch_failed',
+  /isNotEffective[\s\S]{0,200}?'switch_failed'/.test(stateSrc));
+
+const engineSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/services/LatencyEngine.ets'), 'utf8');
+ok('LatencyEngine 把 probe.failKind 写进记录',
+  /LatencyRecord\.failed\([^;]*probe\.failKind/.test(engineSrc));
+
+const persistSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/pages/NodeSelectionPage.ets'), 'utf8');
+ok('持久化转换优先使用 rec.failKind（不再从 state 重新盖章）',
+  /toPersistRecord[\s\S]{0,600}?rec\.failKind\.length\s*>\s*0/.test(persistSrc));
+
+// ── 「测全部」走组测路径，组接口不返回状态码 → 必须靠内核代理表区分 ────
+// 契约：组测后用 proxyTableNames() 判断"节点在不在内核里"，
+// 不在 → switch_failed（未生效）；在 → 真超时。否则「测全部」看到的仍是全红。
+ok('组测路径用内核代理表区分「未生效」',
+  /proxyTableNames\(\)/.test(persistSrc));
+ok('组测路径把不在代理表的失败节点标为 switch_failed',
+  /notInCore[\s\S]{0,400}?LatencyFailKind\.SWITCH_FAILED/.test(persistSrc));
+ok('测速完成提示单独报「未生效」计数',
+  /未生效 \$\{progress\.failed\}/.test(persistSrc));
+
+const apiSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/services/ClashApiService.ets'), 'utf8');
+ok('ClashApiService 提供 proxyTableNames（内核代理表全名）',
+  /async proxyTableNames\(\): Promise<string\[\] \| null>/.test(apiSrc));
+
+// ── 测速超时与并发度（2026-10-19 用户要求：超时 5s、并发 88）──────────────
+// 契约：单节点超时、组测预算、并发度三者必须一致 —— 同一节点在「测全部」
+// 和「单节点测速」里用不同尺子，结论会相反。
+ok('单节点测速超时为 5000ms', /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*5000/.test(stateSrc));
+ok('并发测速数为 88', /LATENCY_CONCURRENCY\s*=\s*88/.test(engineSrc));
+ok('组测每节点预算与单节点一致（5000ms）', /GROUP_TEST_TIMEOUT_MS\s*=\s*5000/.test(engineSrc));
+ok('内核延迟探测默认超时同步为 5000ms',
+  /testLatencyDetailed\(nodeName: string, testUrl: string,\s*\n?\s*timeoutMs: number = 5000/.test(apiSrc));
+ok('离线探测的阶段预算同步为 5s（不被 2.5s 截断）',
+  /QUIC_TIMEOUT_MS\s*=\s*5000/.test(fs.readFileSync(
+    path.join(root, 'entry/src/main/ets/commons/services/DirectLatencyTester.ets'), 'utf8')));
+ok('批次硬截止可注入（回归测试不再依赖并发算术巧合）',
+  /batchDeadlineMs:\s*number\s*=\s*BATCH_DEADLINE_MS/.test(engineSrc));
 
 console.log(`\n延迟显示契约自检：${pass} 条通过，${fails.length} 条失败`);
 if (fails.length > 0) {

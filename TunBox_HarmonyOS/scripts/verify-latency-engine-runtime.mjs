@@ -263,6 +263,10 @@ function opts(over = {}) {
   o.timeoutMs = over.timeoutMs ?? 5000;
   o.onResult = null;
   o.onProgress = over.onProgress ?? null;
+  // 可注入的整批硬截止（默认 90s；测试用小值确定性触发 deadline）
+  if (over.batchDeadlineMs !== undefined) {
+    o.batchDeadlineMs = over.batchDeadlineMs;
+  }
   return o;
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -651,18 +655,26 @@ await checkAsync('进度确定性：finished 单调不减且最终等于 total',
 });
 
 // ── 15. 硬截止：剩余保持未测而不是失败 ────────────────────────────────────
-// 确定性做法：单次探测耗时 × 节点数 / 并发 必然超过整批截止，从而必然触达 deadline。
-// 用 (BATCH_DEADLINE_MS * 并发 / 节点数) 量级的单次耗时，保证剩余节点跑不完。
+// 确定性做法：给引擎注入一个小 deadline（LatencyRunOptions.batchDeadlineMs），
+// 让它必然在批内触发。原做法是按「deadline × 并发 / 节点数」算一个巨大的单次
+// 探测耗时去撞真实 90s 上限 —— 那让测试同时依赖并发度与节点数的算术关系，
+// 改一次并发度就失效（2026-10-19 改 50→88 时确实挂了一次）。而且它要真等
+// 两分多钟。现在：每批探测 60ms、deadline 200ms → 第三批取节点时必然已过截止。
 await checkAsync('硬截止后剩余节点保持未测（绝不写成失败）', async () => {
   fresh();
-  const total = 60;
-  // 每个探测 ~ (deadline / (total/concurrency) ) * 2 → 必然用时超过 deadline
-  const perProbeMs = Math.ceil((BATCH_DEADLINE_MS * LATENCY_CONCURRENCY / total) * 2);
+  // 节点数必须**大于**并发数，否则只有一批、取不到「下一批」可拦。
+  // 用 LATENCY_CONCURRENCY + 40 自适应，改并发度也不会让本测试失效。
+  const total = LATENCY_CONCURRENCY + 40;
+  const perProbeMs = 300;
+  // deadline 必须大于首批 worker 的错峰抖动上限（200ms，保证首批 88 个都能
+  // 取到节点），又要小于首批完成时刻（300ms+jitter）→ 第二批必然被拦。
+  const deadlineMs = 250;
   ClashApiService.handler = async () => {
     await sleep(perProbeMs);
     return probeResult(10);
   };
-  const run = LatencyEngine.start(new ClashApiService(), nodes(total), URL_, opts());
+  const run = LatencyEngine.start(new ClashApiService(), nodes(total), URL_,
+    opts({ batchDeadlineMs: deadlineMs }));
   const p = await run.run();
   LatencyEngine.release(run);
   eq(p.failed, 0, 'deadline must not produce failures');
@@ -672,7 +684,7 @@ await checkAsync('硬截止后剩余节点保持未测（绝不写成失败）',
     if (LatencyController.stateFor('node-' + i) === LatencyState.TESTING) testing++;
   }
   eq(testing, 0, 'deadline must not leave TESTING');
-  ok(p.measured < total,
+  ok(p.measured > 0 && p.measured < total,
     `deadline should leave nodes untested (measured=${p.measured}/${total}, perProbe=${perProbeMs}ms)`);
   // 剩余节点既不是失败也不是超时 —— 就是"没测"
   eq(p.finished, p.measured, 'finished counts only the ones that actually settled');

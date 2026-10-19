@@ -50,16 +50,31 @@ import { DoHResolver } from './DoHResolver';
 
 const TAG = 'LatencyEngine';
 
-/** 并发探测数。OHOS http 单 host ~8 并发上限，32 路本来就在排队；冷内核 44 节点
- * 全并发把 controller API 拖到 Operation timeout（真机取证 2026-10-17）。16 路。 */
-export const LATENCY_CONCURRENCY = 16;
+/**
+ * 并发探测数（2026-10-19 用户要求：50 → 88）。
+ *
+ * ⚠ 历史真机取证（2026-10-17）：冷内核 44 节点**全并发**把 controller API
+ * 拖到 Operation timeout；OHOS http 单 host 约 8 并发上限，超过即排队。
+ * 原值 16 是当时验证过的安全值。50 → 88 的变化：
+ *   · 88 = 客户端 8 并发上限的 11 批。`testLatencyDetailed` 的外层超时按
+ *     `ceil(lanes/8) * timeoutMs + 1200` 自适应（见 ClashApiService 注释），
+ *     所以排队中的请求等得起内核的 504，**不会**被误报成"内核不可用"。
+ *   · 单批硬上限 BATCH_DEADLINE_MS（90s）与错峰抖动仍生效：88 并发 × 5s 的
+ *     最坏排队约 11×5s=55s，仍在 90s 内；真超时则剩余节点保持「未测」
+ *     （不会被盖章为失败），不会整批挂死。
+ *   · 单节点超时同步改为 5s（LatencyPolicy.DEFAULT_TIMEOUT_MS），两边尺子一致。
+ * 若真机复现「测速卡住/大量假超时」，优先回退到 24 或 32。
+ */
+export const LATENCY_CONCURRENCY = 88;
 /** 单节点探测超时（mihomo 内部默认 5000ms）。 */
 export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
 /** 组测速（GET /group/{name}/delay）的整组预算。真机实测（2026-09-23）：内核的
  * 单节点拨号/HTTP 请求都用整组 context——死节点和连得上但响应慢的节点会等满
  * 预算才放弃，把整组拖长。3000ms：健康节点真机最高实测 ~522ms，5.7 倍余量，
- * 整组约 3 秒完成（用户要求）。 */
-export const GROUP_TEST_TIMEOUT_MS = 3000;
+ * 整组约 3 秒完成（用户要求）。
+ * 2026-10-19 随单节点超时统一为 5s：组测里这个值是**每个节点**的拨号预算，
+ * 与逐节点探测必须同尺，否则同一节点在「测全部」和「单节点测速」里结论相反。 */
+export const GROUP_TEST_TIMEOUT_MS = 5000;
 /** 首批请求错峰抖动上限，避免整批同时撞内核（Clash Verge Rev 同款做法）。 */
 const STAGGER_MAX_MS = 200;
 /**
@@ -131,6 +146,14 @@ export class LatencyRunOptions {
   force: boolean = true;
   /** 结果来源：'auto'（静默批）| 'manual'（用户手点）；随记录落库供 UI 区分显示 */
   source: string = 'manual';
+  /**
+   * 整批硬截止（毫秒）。默认 BATCH_DEADLINE_MS；**仅供回归测试注入小值** ——
+   * 引擎本身在「取下一个节点前」检查截止时间，测试要触发它就得真等 90s。
+   * 做成可注入后，回归套件能用毫秒级确定性地验证「超时的节点保持未测、
+   * 绝不写成失败」这条契约，不必把「并发数 × 节点数」的算术巧合当前提
+   * （改一次并发度就让门禁失效，是很脆的测试）。
+   */
+  batchDeadlineMs: number = BATCH_DEADLINE_MS;
   onResult: LatencyResultSink | null = null;
   onProgress: LatencyProgressSink | null = null;
 }
@@ -147,6 +170,7 @@ export class LatencyRun {
   private readonly source: string;
   private readonly onResult: LatencyResultSink | null;
   private readonly onProgress: LatencyProgressSink | null;
+  private readonly batchDeadlineMs: number;
   private readonly progress: LatencyProgress = new LatencyProgress();
   /** 代次：被 cancel / 新批次抢占时递增，旧回调据此丢弃结果 */
   private generation: number = 0;
@@ -170,7 +194,7 @@ export class LatencyRun {
 
   constructor(api: ClashApiService | null, nodes: ProxyNode[], url: string, timeoutMs: number,
     force: boolean, onResult: LatencyResultSink | null, onProgress: LatencyProgressSink | null,
-    source: string = 'manual') {
+    source: string = 'manual', batchDeadlineMs: number = BATCH_DEADLINE_MS) {
     this.api = api;
     this.nodes = nodes;
     this.url = url;
@@ -179,6 +203,7 @@ export class LatencyRun {
     this.source = source;
     this.onResult = onResult;
     this.onProgress = onProgress;
+    this.batchDeadlineMs = batchDeadlineMs;
     this.progress.total = nodes.length;
     this.progress.channel = api === null ? LatencyChannel.OFFLINE : LatencyChannel.CORE;
   }
@@ -275,7 +300,10 @@ export class LatencyRun {
     if (this.progress.coreUnavailable && !this.userCancelled) {
       for (const node of this.nodes) {
         if (LatencyController.stateFor(node.name) === LatencyState.UNTESTED) {
-          this.publish(node.name, LatencyRecord.failed(node.name, LatencyState.TIMEOUT, Date.now()));
+          // 通道不可用 ≠ 节点失败：分类标 core_not_ready（NodeSortPersistence 把它
+          // 列为「非节点判定」，持久化时沿用上次结论，不再把整批写成「全失败」）。
+          this.publish(node.name, LatencyRecord.failed(node.name, LatencyState.TIMEOUT, Date.now(),
+            LatencyChannel.CORE, LatencyFailKind.CORE_NOT_READY));
           strandedStamped = strandedStamped + 1;
         }
       }
@@ -294,7 +322,7 @@ export class LatencyRun {
   async run(): Promise<LatencyProgress> {
     const generation = this.generation;
     const startedAt = Date.now();
-    const deadlineAt = startedAt + BATCH_DEADLINE_MS;
+    const deadlineAt = startedAt + this.batchDeadlineMs;
     AppLogger.info(TAG, `latency batch start nodes=${this.nodes.length} `
       + `concurrency=${LATENCY_CONCURRENCY} timeout=${this.timeoutMs}ms force=${this.force} `
       + `channel=${this.progress.channel} url=${this.url}`);
@@ -541,7 +569,10 @@ export class LatencyRun {
     } else {
       this.progress.failed = this.progress.failed + 1;
     }
-    return ProbeOutcome.publishable(LatencyRecord.failed(node.name, state, Date.now()));
+    // 失败分类必须带进记录：switch_failed（内核里没这个节点）与 timeout（真超时）
+    // 在 state 上都是「失败」这一档，只有靠 failKind 才能在 UI 上区分开。
+    return ProbeOutcome.publishable(
+      LatencyRecord.failed(node.name, state, Date.now(), LatencyChannel.CORE, probe.failKind));
   }
 
   /**
@@ -576,8 +607,12 @@ export class LatencyRun {
         LatencyRecord.measured(node.name, delay, LatencyChannel.OFFLINE, Date.now()));
     }
     this.progress.failed = this.progress.failed + 1;
+    // 离线通道只能得出**端口级**结论（TCP 能不能连上），不是协议级失败。
+    // 标 PORT_ONLY（NodeSortPersistence 的「非节点判定」类）→ 持久化时沿用上次结论，
+    // 不会把"离线探测没通"当成"节点坏了"覆盖掉已有延迟。
     return ProbeOutcome.publishable(
-      LatencyRecord.failed(node.name, LatencyState.FAILED, Date.now(), LatencyChannel.OFFLINE));
+      LatencyRecord.failed(node.name, LatencyState.FAILED, Date.now(), LatencyChannel.OFFLINE,
+        LatencyFailKind.PORT_ONLY));
   }
 
   private publish(nodeName: string, rec: LatencyRecord): void {
@@ -655,7 +690,7 @@ export class LatencyEngine {
       LatencyEngine.current.cancel();
     }
     const run = new LatencyRun(api, nodes, url, opts.timeoutMs, opts.force,
-      opts.onResult, opts.onProgress, opts.source);
+      opts.onResult, opts.onProgress, opts.source, opts.batchDeadlineMs);
     LatencyEngine.current = run;
     return run;
   }

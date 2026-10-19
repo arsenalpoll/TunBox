@@ -699,12 +699,26 @@ export class ClashConfigGenerator {
         lines.push(`  - ${customRule}`);
       }
       // ── 订阅自带 rules（导入订阅时落账）──────────────────────────────
-      // 策略目标必须是已声明的代理组或内置策略、RULE-SET 必须引用已声明的 provider；
-      // 不合法的行跳过并计数（静态账本 lastSkippedUserRules），绝不整份拒载。
+      // 策略目标必须是**实际写进 proxy-groups 段的组**或内置策略；RULE-SET 必须引用
+      // 已声明的 provider。不合法的行跳过并计数（静态账本 lastSkippedUserRules），
+      // 绝不整份拒载。
+      //
+      // ⚠ 2026-10-19 真机报障修复：这里原先遍历的是 mergedGroups（**过滤前**），
+      // 而 proxy-groups 段实际由 emittedGroups（planProxyGroups 过滤后）写出。
+      // 二者不等价 —— planProxyGroups 会丢弃「类型不支持 / 与节点同名 / 空成员 /
+      // 循环引用无法落地」的组。于是订阅里被丢弃的组仍被当作合法目标，引用它的规则
+      // 照常写入，内核 config.Parse 直接报
+      //   parse config:rules[0] [DOMAIN-SUFFIX,local, 本地直连] error: proxy not found
+      // 整份配置拒载 → 启动代理失败（用户报障原文）。必须用 emittedGroups。
       const groupTargets = new Set<string>(['DIRECT', 'PROXY', 'REJECT', 'REJECT-DROP',
-        'PASS', 'GLOBAL', 'COMPATIBLE', 'REJECT-DROP', ClashConfigGenerator.SMART_GROUP_NAME]);
-      for (const g of mergedGroups) {
+        'PASS', 'GLOBAL', 'COMPATIBLE']);
+      for (const g of emittedGroups) {
         groupTargets.add(g.name);
+      }
+      // ♻️ 自动选择组只在 emitSmart 为真时才真正声明（见上方 proxy-groups 段），
+      // 未声明就不能算合法目标，否则同理会写出指向不存在组的规则。
+      if (emitSmart) {
+        groupTargets.add(ClashConfigGenerator.SMART_GROUP_NAME);
       }
       let skippedUserRules = 0;
       // GEOIP 规则依赖 geoip.metadb（坑 40 同源）：metadb 缺失/损坏时内核会在
@@ -717,7 +731,7 @@ export class ClashConfigGenerator {
           continue;
         }
         if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, emittedProviderNames, groupTargets)) {
-          lines.push(`  - ${ruleLine}`);
+          lines.push(`  - ${ClashConfigGenerator.normalizeRuleLine(ruleLine)}`);
         } else {
           skippedUserRules = skippedUserRules + 1;
         }
@@ -729,7 +743,7 @@ export class ClashConfigGenerator {
           continue;
         }
         if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, emittedProviderNames, groupTargets)) {
-          lines.push(`  - ${ruleLine}`);
+          lines.push(`  - ${ClashConfigGenerator.normalizeRuleLine(ruleLine)}`);
         } else {
           skippedUserRules = skippedUserRules + 1;
         }
@@ -809,8 +823,21 @@ export class ClashConfigGenerator {
   }
 
   /**
+   * 规范化用户规则行的逗号空白：`DOMAIN-SUFFIX,local, 本地直连` → `DOMAIN-SUFFIX,local,本地直连`。
+   *
+   * 2026-10-19：isValidUserRuleLine 校验时对每个逗号段做了 trim，但写盘用的是原始行。
+   * 校验通过、写盘却带空白，会让内核侧「策略目标精确匹配」的语义与校验不一致
+   * （用户报障原文里规则正是 `DOMAIN-SUFFIX,local, 本地直连`，逗号后带空格）。
+   * 这里把两侧统一到同一个规范形态，消除歧义。
+   */
+  static normalizeRuleLine(rule: string): string {
+    return rule.split(',').map((v: string) => v.trim()).join(',');
+  }
+
+  /**
    * 单条用户规则行（订阅自带 rules / 覆盖层 rules）是否可安全写入 rules 段：
-   * - 策略目标（最后一个逗号字段，容忍 no-resolve 参数）必须是已声明的代理组或内置策略；
+   * - 策略目标（最后一个逗号字段，容忍 no-resolve 参数）必须是**实际写进 proxy-groups
+   *   段的组**或内置策略（见 generate() 里 groupTargets 的构建，务必传 emittedGroups）；
    * - RULE-SET 引用的 provider 必须已声明（声明段与引用同受校验）。
    * 不合法的行由调用方跳过并计数 —— 内核 config.Parse 对「引用未声明的 provider /
    * 不存在的组」会直接拒载整份配置，所以这里必须在生成侧兜底。
@@ -1371,12 +1398,22 @@ export class ClashConfigGenerator {
     // 对下面这些协议有必填凭据/参数:一个空 password/uuid 的节点会让**整份配置**
     // 解析失败(真机报错 `proxy "N": has unset fields:password`,内核完全起不来)。
     // 因此必须在生成前按内核必填字段丢弃,统一进「无效节点」账本提示。
-    if (proxyType === 'tuic' && (n.password.length === 0 || n.uuid.length === 0)) {
-      return ProxyDropReason.MISSING_CREDENTIAL;
+    //
+    // 判定口径必须与**实际写进内核的键**一致,否则会误丢可用节点:
+    //  · tuic v4 = uuid + password;tuic v5 = token(只认 token,不认 uuid/password)。
+    //    token 走 extraOpts 原样透传(不能回填到 password 槽 —— 那会让内核 v5 收到
+    //    一个它不认的 password 键),所以这里要查 extraOpts。
+    //  · hysteria v1 的凭据是 auth-str/auth_str(已由 YamlMerger 回填进 password 槽);
+    //    它的 `protocol` 是**传输协议**(udp/wechat-video/faketcp,默认 udp)、
+    //    `up`/`down` 是带宽(mihomo 自带默认值)——都不是必填凭据,不能拿来判死节点。
+    if (proxyType === 'tuic') {
+      const hasToken = ClashConfigGenerator.hasExtraKey(n.extraOpts, 'token');
+      const hasV4 = n.password.length > 0 && n.uuid.length > 0;
+      if (!hasToken && !hasV4) {
+        return ProxyDropReason.MISSING_CREDENTIAL;
+      }
     }
-    if (proxyType === 'hysteria'
-      && (n.password.length === 0 || n.protocol.length === 0
-        || n.hyUp.length === 0 || n.hyDown.length === 0)) {
+    if (proxyType === 'hysteria' && n.password.length === 0) {
       return ProxyDropReason.MISSING_CREDENTIAL;
     }
     if (proxyType === 'anytls' && n.password.length === 0) {
@@ -1470,6 +1507,24 @@ export class ClashConfigGenerator {
       AppLogger.warn(TAG, `raw provider plan: ${plan.stats.detail()}`);
     }
     return plan;
+  }
+
+  /**
+   * extraOpts 里是否存在某个键（用于按「实际写进内核的键」判定凭据齐不齐）。
+   *
+   * 例：tuic v5 的凭据键是 `token`，它走中继透传留在 extraOpts 里，
+   * 结构化槽位 password/uuid 都是空的 —— 判定必须查这里，否则 v5 节点被误丢。
+   */
+  private static hasExtraKey(extraOpts: string, key: string): boolean {
+    if (extraOpts.length === 0) {
+      return false;
+    }
+    for (const pair of YamlMerger.parseExtraOpts(extraOpts)) {
+      if (pair[0] === key) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -1597,6 +1652,12 @@ export class ClashConfigGenerator {
         && n.password.length > 0)) {
       // 口令类协议: vless/vmess 用 uuid, 其余(含 tuic/hysteria/socks5/http)用 password
       fields.push(`password: ${q(n.password)}`);
+      // hysteria v1 的凭据键在 mihomo 里是 auth-str/auth_str（password 是较新内核的
+      // 别名）。与 URI 导入路径（ProxyNode.parseHysteria）保持同一口径：password 与
+      // auth-str 一起写，缺一个就可能让内核认不出凭据 → 节点连不上。
+      if (proxyType === 'hysteria') {
+        fields.push(`auth-str: ${q(n.password)}`);
+      }
     }
     if (proxyType === 'ssr') {
       fields.push(`protocol: ${q(n.protocol)}`);

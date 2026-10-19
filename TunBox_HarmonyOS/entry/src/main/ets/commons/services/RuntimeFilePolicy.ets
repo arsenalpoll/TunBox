@@ -52,6 +52,8 @@ export interface PrivateFs {
   writePrivate(path: string, content: string): void;
   /** 读取上限内的文本；失败返回 { ok: false }，绝不抛异常 */
   readCapped(path: string, maxBytes: number): SyncReadResult;
+  /** 异步读取上限内的文本（不阻塞主线程）；失败返回 { ok: false }，绝不抛异常 */
+  readCappedAsync(path: string, maxBytes: number): Promise<SyncReadResult>;
   /** 删除单个文件；不存在/失败均返回 false，绝不抛异常 */
   remove(path: string): boolean;
   /** 仅探测存在性 */

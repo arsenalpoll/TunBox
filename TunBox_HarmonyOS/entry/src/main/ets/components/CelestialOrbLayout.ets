@@ -85,10 +85,13 @@ export class OrbLayout {
   static readonly BALL_EXTENT: number = 11;
   /** 弧线半宽（vp，lineWidth 4.5 / 2） */
   static readonly ARC_HALF_WIDTH: number = 2.25;
-  /** 外圈点阵轨道半径（trackSize 280 / 2） */
-  static readonly OUTER_R: number = 140;
-  /** 渐变轨环半径（arcRingSize 260 / 2） */
-  static readonly RING_R: number = 130;
+  /** 外圈点阵轨道半径（trackSize / 2）
+   *  2026-10-19：随启动按钮等比缩小，280 → 245（orbTrack/2 = 122.5） */
+  static readonly OUTER_R: number = 122.5;
+  /** 渐变轨环半径（arcRingSize / 2）
+   *  2026-10-19：随启动按钮等比缩小，260 → 228（orbArcRing/2 = 114）。
+   *  这条是四个转动元素实际使用的半径（见下方 BALL/ARC 定义）。 */
+  static readonly RING_R: number = 114;
   /**
    * 两条长条的统一扫角（度）—— 取旧实现里较长那根的 42°，
    * 两根等长才构成对称十字（2026-10-18 用户要求）。

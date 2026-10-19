@@ -256,12 +256,19 @@ export class TunBoxGeometry {
   static readonly dockBottomMargin: number = 20;
   /** 页面底部为悬浮栏留白（栏高 + 下边距 + 余量） */
   static readonly dockClearance: number = 96;
-  /** 首页「天体轨域」启动按钮（CelestialPowerOrb，2026-10-17 设计稿规格）：
-   *  最外呼吸光晕 320 / 点阵轨道 280 / 渐变轨环(弧线) 260 / 核心亚克力盘 200 */
-  static readonly orbGlow: number = 320;
-  static readonly orbTrack: number = 280;
-  static readonly orbArcRing: number = 260;
-  static readonly orbDisc: number = 200;
+  /** 首页「天体轨域」启动按钮（CelestialPowerOrb）：
+   *  最外呼吸光晕 / 点阵轨道 / 渐变轨环(弧线) / 核心亚克力盘。
+   *
+   *  2026-10-19 用户要求「启动按钮缩小一点，下面整体往上挪一行」：
+   *  原 320/280/260/200 等比缩到约 87.5%（280/245/228/175），
+   *  按钮整体高度减少 40vp —— 首页下方内容因此上移一行。
+   *  ⚠ 改这四个值必须同步改 CelestialOrbLayout 的 OUTER_R / RING_R
+   *  （它们分别定义为 orbTrack/2、orbArcRing/2），否则十字轨道半径与
+   *  画布尺寸不一致，回归脚本 scripts/verify-orb-separation.mjs 会失败。 */
+  static readonly orbGlow: number = 280;
+  static readonly orbTrack: number = 245;
+  static readonly orbArcRing: number = 228;
+  static readonly orbDisc: number = 175;
 }
 
 /**
@@ -323,10 +330,17 @@ export class TunBoxPing {
       }
       return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
     }
-    return LatencyPolicy.stateText(rec.state);
+    return LatencyPolicy.stateText(rec.state, rec.failKind);
   }
 
-  /** 状态化配色：实测走阈值；过期结果中性；失败一律红（与 recordText 同口径） */
+  /**
+   * 状态化配色：实测走阈值；过期结果中性；失败一律红（与 recordText 同口径）。
+   *
+   * 例外：「节点未生效」（内核代理表里没有它 = 节点根本没进配置）用**警告色**而不是红 ——
+   * 红=「节点坏了」，但这种情况节点可能是好的、只是配置生成把它丢了（真机 2026-10-19：
+   * 36 个 anytls 被丢弃导致全红，用户以为节点坏了，实际可用）。用警告色把
+   * 「配置问题」与「节点问题」在视觉上分开。
+   */
   static recordColor(rec: LatencyRecord | null, nowMs: number): ResourceColor {
     if (rec === null) {
       return TunBoxColors.textMuted;
@@ -336,6 +350,9 @@ export class TunBoxPing {
         return TunBoxColors.textSecondary;
       }
       return TunBoxPing.color(rec.delayMs);
+    }
+    if (LatencyPolicy.isNotEffective(rec.failKind)) {
+      return TunBoxColors.warning;
     }
     if (rec.state === LatencyState.TIMEOUT || rec.state === LatencyState.FAILED) {
       return TunBoxColors.danger;
