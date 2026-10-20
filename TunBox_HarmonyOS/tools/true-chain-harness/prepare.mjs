@@ -37,9 +37,13 @@ const FILES = [
     },
   },
   {
+    src: 'commons/services/LatencyState.ets', out: 'LatencyState.ts', map: {},
+  },
+  {
     src: 'commons/services/NodeSortPersistence.ets', out: 'NodeSortPersistence.ts', map: {
       '../models/ProxyNode': './ProxyNode.ts',
       './ClashApiService': './stubs.ts',
+      './LatencyState': './LatencyState.ts',
     },
   },
   {

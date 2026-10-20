@@ -18,6 +18,8 @@ export const PRIVATE_TEST_CONFIG_FILE = 'mihomo_test_config.yaml';
 /** 扩展进程回写的跨进程状态文件 */
 export const TUNNEL_STATE_FILES: string[] = [
   'vpn_heartbeat.txt',
+  // 存活租约的原子替换临时文件（先写 .tmp 再 rename 覆盖心跳本体）
+  'vpn_heartbeat.txt.tmp',
   'vpn_start_ok.txt',
   'vpn_start_error.txt',
   // UI 每次拉起前重写、扩展仅在 want 丢参时读一次的路由参数快照；

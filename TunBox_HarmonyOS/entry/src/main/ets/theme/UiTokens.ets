@@ -135,6 +135,11 @@ export class LatencyStyle {
       }
       return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
     }
+    // 上一轮（冷启动从快照恢复）的失败结论 → 标「·旧」并灰显，
+    // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」。
+    if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
+      return `${LatencyPolicy.stateText(rec.state, rec.failKind)}·旧`;
+    }
     return LatencyPolicy.stateText(rec.state, rec.failKind);
   }
 
@@ -159,6 +164,10 @@ export class LatencyStyle {
       return Ui.warning;
     }
     if (rec.state === LatencyState.TIMEOUT || rec.state === LatencyState.FAILED) {
+      // 陈旧的失败结论（上一轮的）→ 中性灰，不顶红字（与 recordText 同口径）
+      if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
+        return Ui.textSecondary;
+      }
       return Ui.error;
     }
     // UNTESTED / TESTING / CANCELLED：中性，不吓唬用户

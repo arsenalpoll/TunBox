@@ -16,7 +16,7 @@
  * 每条结果重建整张列表（106 个节点即 106 次重排）。这里把通知合并到最多每 200ms
  * 一次，仅压缩刷新频率，数值本身不丢。
  */
-import { LatencyChannel, LatencyRecord, LatencyState } from './LatencyState';
+import { LatencyChannel, LatencyPolicy, LatencyRecord, LatencyState } from './LatencyState';
 
 const NOTIFY_COALESCE_MS = 200;
 
@@ -94,6 +94,55 @@ export class LatencyController {
     rec.channel = existing === undefined ? LatencyChannel.CORE : existing.channel;
     LatencyController.map.set(nodeName, rec);
     LatencyController.scheduleNotify();
+  }
+
+  /**
+   * **从持久化快照恢复**一条延迟记录（冷启动时用）。
+   *
+   * ⚠ 与 `set(name, latency)` 的区别 —— 这是 2026-10-20 真机用户反馈
+   * 「刚打开软件还没测速，就显示超时；测完发现这个节点是好的」的根因修复：
+   *
+   *  1. `set()` 只收一个数字 → **失败分类（failKind）被丢掉**，
+   *     「自动切换记账写的失败」「测速通道故障（core_not_ready）」「根本没拨号
+   *     （queue_timeout）」全被压成同一种红色的「超时」。
+   *  2. `set()` 用 `Date.now()` 打时间戳 → **上一轮的旧结论被伪装成本次刚测出来的**。
+   *
+   * 这里的口径：
+   *  - 有数值 → 恢复成实测值，时间戳用**快照的真实测速时间**（于是超过 10 分钟
+   *    自然显示「123ms·旧」）；
+   *  - 失败且属于**非判定**（含空分类 = 旧版自动切换记账）→ 恢复成「未测」
+   *    （显示 `--`），因为它根本不是节点通不通的结论；
+   *  - 失败且是真实结论 → 恢复成失败记录，保留分类与真实时间戳，
+   *    过期后由 UI 标「·旧」并灰显（不是顶着一颗新鲜的红「超时」）。
+   *
+   * @param latency 快照里的延迟：>=1 实测毫秒 / -1 失败 / -2 未测
+   * @param failKind 失败分类（LatencyFailKind.*，空串 = 无分类）
+   * @param atMs 该批次的真实时间戳（快照的 testedAt；<=0 = 年龄未知）
+   */
+  static restore(nodeName: string, latency: number, failKind: string, atMs: number): void {
+    if (latency >= 1) {
+      LatencyController.setRecord(
+        LatencyRecord.measured(nodeName, latency, LatencyChannel.CORE, atMs));
+      return;
+    }
+    if (latency === -1) {
+      if (failKind.length === 0 || LatencyPolicy.isNonVerdictKind(failKind)) {
+        // 非结论失败 → 回到「未测」，绝不显示成红色「超时」。
+        // 空分类（''）：快照里唯一会写出「不带分类的失败」的地方是**旧版自动切换
+        // 记账**（一次连接失败被写成 latency=-1）—— 那不是测速结论。
+        // 测速路径写进快照的失败**一定**带分类（见 NodeSelectionPage.toPersistRecord），
+        // 所以这里把 '' 判成非结论是安全的（方向也是保守的：宁可显示「--」，
+        // 也不显示假的「超时」）。
+        LatencyController.setRecord(LatencyRecord.untested(nodeName));
+        return;
+      }
+      // 真实失败结论：保留分类（switch_failed → 显示「未生效」，其余 → 超时/失败）
+      const state: number = failKind === 'timeout' ? LatencyState.TIMEOUT : LatencyState.FAILED;
+      LatencyController.setRecord(
+        LatencyRecord.failed(nodeName, state, atMs, LatencyChannel.CORE, failKind));
+      return;
+    }
+    LatencyController.setRecord(LatencyRecord.untested(nodeName));
   }
 
   /** 兼容入口：数字 → 记录 */

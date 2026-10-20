@@ -1,24 +1,70 @@
 /**
- * dataTransfer 长时任务的进度心跳（官方要求，见 startBackgroundRunning 官方示例）。
+ * 长时任务进度心跳 —— **按长时任务类型分叉**（dataTransfer / taskKeeping）。
  *
- * 官方原文：「当长时任务类型包含数据传输(dataTransfer)时，应用需要更新进度，其他
- * 类型不需要」；「如果进度长时间（首次更新超过10分钟）未更新，数据传输的长时任务
- * 会被取消」。更新方式 = 用申请时返回的 notificationId 发一帧 downloadTemplate
- * 系统实况通知（typeCode 固定 8 = dataTransfer，slotType 必须为 LIVE_VIEW），
- * 该通道不需要另行申请实况窗场景权益。
+ * ── 官方依据（SDK 头文件 +《Background Tasks Kit 接入规范》）────────────
+ * 1) SDK `BackgroundTaskMode.DATA_TRANSFER` 注释原文：
+ *    「During data transfer, the application needs to update the progress. If the
+ *    progress is not updated for more than 10 minutes, the continuous task of the
+ *    DATA_TRANSFER type will be canceled.」+「The notification type of the progress
+ *    update must be live view.」
+ *    → dataTransfer **必须**周期推实况窗进度（首次更新不得超过 10 分钟）。
+ * 2) 官方《Background Tasks Kit 接入规范》：
+ *    「不得修改长时任务通知内容。**数据传输任务除外**，此时可更新通知中的进度信息，
+ *    但更新内容仅限进度展示，不得用于其他用途。」
+ *    → 反过来说：**taskKeeping（TASK_KEEPING）绝对不能推实况窗进度**，
+ *      也不能以任何方式改动长时任务通知内容。
+ * 3) 官方长时任务类型表：DATA_TRANSFER =「非托管形式的上传、下载」；
+ *    TASK_KEEPING =「计算任务」（场景举例：杀毒软件）→ VPN 隧道保活属于后者。
  *
- * 本实现的取舍：
- *  - 进度值对 VPN 没有真实百分比语义 → 以「已连接分钟数 % 100」推进进度条，
- *    fileName 展示已连接时长；title/text 展示运行状态。更新内容仅限进度展示，
- *    与接入规范对 dataTransfer 的豁免条款（可更新进度信息）保持一致。
- *  - 发布失败（通知被禁用 1600004 / 任务已不存在等）只做节流日志，不重试风暴；
- *    任务被外部取消时由 BackgroundTaskWatch → detach() 止损。
+ * * ── 本实现的取舍 ───────────────────────────────────────────────────────
+ *  - dataTransfer（回退类型）：保持现状 —— 实况窗 LIVE_VIEW + typeCode 8 +
+ *    5 分钟进度心跳；接管长时任务通知 id，并撤掉应用自有常驻通知（避免两条通知）。
+ *  - taskKeeping（目标类型）：**不推**实况窗进度、**不接管**通知 id、
+ *    **不撤**应用自有常驻通知 —— 节点名/速率/运行时长继续由 SsrvpnNotifier 承载
+ *    （updateLive 在没有长时任务通知 id 时自动回落到应用自有通知）。
+ *
+ * ── 通知栏为什么是「两张卡」（2026-10-20 用户反馈，先说清楚再改）─────────
+ *  taskKeeping 是系统强制的长时任务类型，官方**不允许**应用改它的通知内容 ⇒
+ *  系统那张「正在运行计算任务…」的卡**去不掉**（submode 全类型都带通知，
+ *  SDK BackgroundTaskSubmode 无静默项）。因此 taskKeeping 模式下：
+ *    · 系统卡：「正在运行计算任务…」（内容不可改，只能接受）
+ *    · 应用卡：节点名 + **速率 · 运行时长**（一行，2026-10-20 按用户反馈恢复的
+ *      原来的信息口径；此前时长被放进 additionalText，折叠态不显示 = 视觉上丢失）
+ *  想回到「只有一张卡」只能退回 dataTransfer（实况窗卡片由应用写内容），
+ *  代价是重新暴露「低速率被系统取消长时任务 → 保流失效 → 隧道掉线」那条链。
+ *
+ * 进度值对 VPN 没有真实百分比语义 → 以「已连接分钟数 % 100」推进进度条，
+ * fileName 展示已连接时长；title/text 展示运行状态。更新内容仅限进度展示，
+ * 与接入规范对 dataTransfer 的豁免条款（可更新进度信息）保持一致。
+ * 发布失败（通知被禁用 1600004 / 任务已不存在等）只做节流日志，不重试风暴；
+ * 任务被外部取消/暂停时由 BackgroundTaskWatch → detach() 止损。
  */
 import { notificationManager } from '@kit.NotificationKit';
 import { AppLogger } from '../utils/AppLogger';
 import { SsrvpnNotifier } from './SsrvpnNotifier';
 
 const TAG = 'TaskProgressUpdater';
+
+/**
+ * 实际生效的长时任务类型。
+ *
+ * 为什么枚举定义在本文件：长时任务链路上（UiGuardian / BackgroundTaskWatch /
+ * QuickToggleAbility）都要用它，而本文件是链路上**唯一不含跨模块依赖**的基础模块
+ * —— 把定义放这里可以让三方共享同一份定义而不产生循环依赖。
+ *
+ * 取值与 SDK `BackgroundTaskMode` 对应：
+ *  - DATA_TRANSFER = 'dataTransfer'（SDK BackgroundTaskMode.DATA_TRANSFER = 1）
+ *  - TASK_KEEPING  = 'taskKeeping'  （SDK BackgroundTaskMode.MODE_TASK_KEEPING = 9）
+ */
+export enum ContinuousTaskKind {
+  /** 未申请（或已释放） */
+  NONE = 'none',
+  /** 数据传输类型：允许周期更新实况窗进度 */
+  DATA_TRANSFER = 'dataTransfer',
+  /** 计算任务类型：不得修改长时任务通知内容 */
+  TASK_KEEPING = 'taskKeeping'
+}
+
 /** 更新周期：官方窗口为 10 分钟，这里 5 分钟留一倍冗余 */
 const UPDATE_INTERVAL_MS: number = 5 * 60 * 1000;
 /** dataTransfer 类型实况通知固定 typeCode（官方示例：当前仅支持 8） */
@@ -44,6 +90,11 @@ export class TaskProgressUpdater {
    * fileName —— 与「已连接 X 分钟」同一渲染位，不新增第二条通知。长时任务通知
    * 是系统强制的（dataTransfer 连续任务），应用自己的常驻通知与它重复，已合并到
    * 这里。任务通知 id 未拿到（长时任务未挂上）时退回应用自有通知兜底。
+   *
+   * taskKeeping 模式下长时任务通知 id 恒为 -1（不允许改通知内容），
+   * 因此本函数**始终**走应用自有常驻通知（SsrvpnNotifier）—— 这正是
+   * taskKeeping 的预期分工：系统通知只表示"有长时任务在跑"，
+   * 速率/运行时长由应用自己的通知承载。
    */
   static updateLive(nodeText: string, speedLine: string, durationText: string): void {
     TaskProgressUpdater.lastNodeText = nodeText.trim().length > 0 ? nodeText.trim() : 'TunBox';
@@ -51,19 +102,41 @@ export class TaskProgressUpdater {
     TaskProgressUpdater.lastDurationText = durationText;
     const id = TaskProgressUpdater.taskNotificationId;
     if (id < 0) {
-      // 长时任务未挂上：退回应用自有通知（attach 成功时会被 cancel，避免双通知）。
-      // 2026-10-19：同样避免超长——自有通知正文单行，只放速率，时长单独成行。
+      // 长时任务未挂上（或 taskKeeping 模式下**不允许**改它的通知）→ 应用自有常驻通知承载。
+      //
+      // 2026-10-20 用户反馈修正（「通知栏少了运行时间」）：
+      //   时长原先被塞进 `additionalText`（副标题位）。折叠态的通知卡片**不渲染副标题**，
+      //   用户只看到"有速率、没有运行时长" —— 视觉上等于把原来的信息弄丢了。
+      //   原来的实况窗卡片是**一行**：「速率 · 运行时长」（见 push() 的 liveLine）。
+      //   这里恢复同一行口径：可见正文 = 「速率 · 运行时长」，
+      //   节点名进 title，additionalText 仍留节点名（展开态多一行，不丢信息）。
+      const speed = TaskProgressUpdater.compactSpeed(speedLine);
+      const liveLine = durationText.length > 0 ? `${speed} · ${durationText}` : speed;
       SsrvpnNotifier.update(`TunBox · ${TaskProgressUpdater.lastNodeText}`,
-        durationText.length > 0 ? `已运行 ${durationText}` : '',
-        speedLine).catch((): void => {});
+        TaskProgressUpdater.lastNodeText,
+        liveLine).catch((): void => {});
       return;
     }
     TaskProgressUpdater.push();
   }
 
-  /** 长时任务申请成功后调用：接管返回的 notificationId，立即推一帧并起周期心跳。 */
-  static attach(notificationId: number): void {
+  /**
+   * 长时任务申请成功后调用：**按长时任务类型**接管通知 id 与进度心跳。
+   *
+   * @param notificationId 申请返回的长时任务通知 id（只有 dataTransfer 会用它推实况窗）
+   * @param kind 实际生效的长时任务类型（UiGuardian.currentTaskType()）
+   */
+  static attach(notificationId: number, kind: ContinuousTaskKind): void {
     TaskProgressUpdater.detach();
+    if (kind === ContinuousTaskKind.TASK_KEEPING) {
+      // taskKeeping：接入规范「不得修改长时任务通知内容（数据传输任务除外）」——
+      // 因此既不推实况窗进度、也不接管通知 id、更**不撤**应用自有常驻通知
+      // （速率/运行时长继续由 SsrvpnNotifier 承载：updateLive 在没有长时任务
+      // 通知 id 时会自动回落到应用自有通知）。
+      AppLogger.info(TAG,
+        'taskKeeping mode: live-view progress disabled (non-dataTransfer long-running task notification must not be modified)');
+      return;
+    }
     if (typeof notificationId !== 'number' || notificationId < 0) {
       AppLogger.warn(TAG, `attach skipped: invalid notificationId (${notificationId})`);
       return;
@@ -75,10 +148,10 @@ export class TaskProgressUpdater {
     TaskProgressUpdater.timer = setInterval((): void => {
       TaskProgressUpdater.push();
     }, UPDATE_INTERVAL_MS);
-    AppLogger.info(TAG, `progress heartbeat attached (taskNotificationId=${notificationId})`);
+    AppLogger.info(TAG, `progress heartbeat attached (taskNotificationId=${notificationId} type=${kind})`);
   }
 
-  /** 释放 / 断开 / 任务取消时调用（幂等）。 */
+  /** 释放 / 断开 / 任务取消或被暂停时调用（幂等；两种长时任务类型都安全）。 */
   static detach(): void {
     if (TaskProgressUpdater.timer >= 0) {
       clearInterval(TaskProgressUpdater.timer);

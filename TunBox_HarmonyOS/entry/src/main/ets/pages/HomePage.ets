@@ -532,7 +532,11 @@ export struct HomePage {
     if (latencySnapshot !== null) {
       for (const rec of latencySnapshot.records) {
         if (rec.latency !== -2) {
-          LatencyController.set(rec.name, rec.latency);
+          // 恢复**上一轮**的结论：必须带失败分类与真实时间戳。
+          // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」
+          // ——旧写法 `LatencyController.set(rec.name, rec.latency)` 丢掉分类、
+          // 并用 Date.now() 盖时间戳，把旧失败伪装成本次刚测出来的红「超时」。
+          LatencyController.restore(rec.name, rec.latency, rec.failKind, latencySnapshot.testedAt);
         }
       }
       LatencyController.flushNow();

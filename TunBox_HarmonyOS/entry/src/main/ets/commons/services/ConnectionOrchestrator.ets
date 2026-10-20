@@ -1392,13 +1392,23 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (ok) {
         rec.failCount = 0;
         rec.lastOk = true;
-        if (rec.latency < 0) {
+        // 只清理**旧版自动切换记账**留下的失败标记（latency=-1 且没有失败分类）：
+        // 那不是测速结论，节点既然连上了就不该再顶着「超时」。
+        // 真实的测速失败（带失败分类）保留 —— 它是一次真实结论，由 UI 按新鲜度展示。
+        if (rec.latency < 0 && rec.failKind.length === 0) {
           rec.latency = LATENCY_UNTESTED; // 由后续测速填充
         }
       } else {
         rec.failCount = rec.failCount + 1;
         rec.lastOk = false;
-        rec.latency = LATENCY_FAILED;
+        // ⚠ **不要**在这里写 `rec.latency = LATENCY_FAILED`（2026-10-20 真机反馈修复）：
+        // 「一次连接失败」是**自动切换的记账**，不是「测速结论」。
+        // 旧实现把两者写进同一个字段，后果是：
+        //   ① 节点的**真实测速延迟被抹掉**；
+        //   ② 冷启动恢复快照时，这条 -1 被渲染成一颗新鲜的红「超时」——
+        //      用户看到的正是「刚打开软件还没测速就显示超时，测完发现节点是好的」。
+        // 失败记账走 failCount / lastOk（选点评分照旧，见 candidateFromRecord），
+        // 测速结论只由测速批次写。
       }
       settings.nodeSortSnapshot = snap.toJsonText();
       await SettingsService.save(settings);
@@ -1415,7 +1425,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (rec === null) {
       return NodeCandidate.make(name, LATENCY_UNTESTED);
     }
-    return NodeCandidate.fromStats(name, rec.latency, rec.failCount, rec.lastOk, 0, 0);
+    // 评分用的**有效延迟**：失败记账优先（与旧实现同口径 —— 旧实现是把
+    // `rec.latency` 直接覆写成 -1，现在改成在这里派生，快照里的测速结论不再被污染）：
+    //   · 有失败记账（failCount>0 且上次失败）→ 按失败计分；
+    //   · 上次成功但没有有效测速结论 → 按未测计分；
+    //   · 其余 → 用真实测速延迟。
+    let effective: number = rec.latency;
+    if (rec.failCount > 0 && !rec.lastOk) {
+      effective = LATENCY_FAILED;
+    } else if (rec.lastOk && rec.latency < 0) {
+      effective = LATENCY_UNTESTED;
+    }
+    return NodeCandidate.fromStats(name, effective, rec.failCount, rec.lastOk, 0, 0);
   }
 
   private buildCandidates(subs: SubscriptionService, snap: NodeSortSnapshot | null): NodeCandidate[] {

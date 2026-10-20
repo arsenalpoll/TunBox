@@ -63,6 +63,30 @@ const LAUNCH_EPOCH_FILE = 'vpn_launch_epoch.txt';
 const START_PARAMS_MAX_AGE_MS = 180000;
 /** 兼容旧 UI 的事件状态快照文件，不再周期性写入。 */
 const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
+/** 存活租约的原子替换临时文件（先写 .tmp，再 rename 覆盖心跳本体） */
+const HEARTBEAT_TMP_FILE = 'vpn_heartbeat.txt.tmp';
+/**
+ * 存活租约刷新周期（ms）。
+ *
+ * 2026-10-20 自动断开整改：租约刷新与内核探针**彻底解耦**。
+ * 原实现把 `touchLivenessLease()` 放在 10s 的内核探针回调里，而那个回调**第一件事**
+ * 就是同步调 `coreBridge.isCoreAlive()`。该原生调用在旧实现里会一路进入 Go 侧
+ * `coreMu.Lock()`，而 Start()/Stop() 全程持有 coreMu（内含 ApplyConfig 与
+ * executor.Shutdown，可达秒级）—— 于是扩展进程的 ArkTS 线程被阻塞、整条定时器链
+ * 停摆 → 心跳停更 → UI 侧 15s 陈旧窗口判死 → 拆隧道重连。真机表现为 27~36s 一轮的
+ * "自己把自己断掉"。
+ * 现在租约由**独立定时器**刷新，回调内**不做任何原生调用、不做任何 stat**。
+ */
+const LEASE_REFRESH_MS = 5000;
+/** 内核存活探针周期（ms）：只影响"要不要重启内核"，不再参与租约刷新。 */
+const CORE_PROBE_MS = 10000;
+/**
+ * 连续多少次探针判定"内核已死"才动手。
+ *
+ * 误判代价 = 一次无谓的核心重启（不拆 TUN、不动 Kill Switch，代价低），但仍不应为 0：
+ * 探针采样与内核状态切换之间存在瞬态错位，单次采样不足以定性。
+ */
+const CORE_DEATH_CONFIRMATIONS = 2;
 /** Extension 主导的权威运行态文件（事件驱动写入，UI 打开时直接读取真实状态）。 */
 const STATUS_FILE = 'vpn_status.json';
 /**
@@ -141,6 +165,10 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   private lastNetworkGeneration: number = 0;
   /** Core 存活监控与有界恢复状态。 */
   private coreMonitorTimer: number = -1;
+  /** 存活租约独立刷新定时器（与内核探针解耦，见 LEASE_REFRESH_MS 注释）。 */
+  private leaseTimer: number = -1;
+  /** 连续判定"内核已死"的次数（累计到 CORE_DEATH_CONFIRMATIONS 才动手）。 */
+  private coreDeathStrikes: number = 0;
   private recoveryTimer: number = -1;
   /** TUN 重建专用定时器与门控（与内核热恢复互不干扰）。 */
   private rebuildTimer: number = -1;
@@ -426,7 +454,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
 
   private clearStartError(configPath: string): void {
     const dir = configPath.substring(0, configPath.lastIndexOf('/'));
-    const targets: string[] = [START_ERROR_FILE, START_OK_FILE, HEARTBEAT_FILE, STATUS_FILE];
+    const targets: string[] = [START_ERROR_FILE, START_OK_FILE, HEARTBEAT_FILE, HEARTBEAT_TMP_FILE, STATUS_FILE];
     // 逐文件独立容错：一个文件不存在不得阻止其余文件删除
     for (const name of targets) {
       try {
@@ -456,13 +484,15 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     st.seq = ++this.statusSeq;
     st.ts = Date.now();
     st.detail = detail;
-    // 存活租约：每次调用都刷新心跳时间戳（低频，仅随 10s 内核监控与状态事件触发），
-    // 让 UI 的 15s 陈旧窗口判定继续成立；替代旧版 3s 定周期写盘。
-    if (coreAlive && this.connection !== null) {
-      this.touchLivenessLease(st.ts);
-    } else {
-      try { fs.unlinkSync(this.heartbeatDir + '/' + HEARTBEAT_FILE); } catch (e) { /* absent */ }
-    }
+    // 存活租约**不再**由本函数维护，也**绝不**在这里删除心跳文件。
+    //
+    // 2026-10-20 自动断开整改：心跳文件的语义被收敛为「扩展进程还活着」
+    // （由独立的 LEASE_REFRESH_MS 定时器无条件刷新）。旧实现把「内核不活」编码成
+    // 「删掉心跳文件」，于是扩展侧一次探针误判就会把心跳删掉，UI 侧只看到
+    // 「心跳缺失」——**两个不同维度的问题被压成同一个信号**，且无法区分
+    // 「扩展进程死了」和「内核刚重启」，直接触发拆隧道重连。
+    // 现在内核维度的信息走 STATUS_FILE 的 coreAlive 字段（由本类的恢复编排闭环），
+    // 心跳只表示扩展进程存活。
     const text = st.toJson();
     if (text === this.lastStatusJson) {
       return; // 权威态无变化不重复写 STATUS_FILE（事件驱动）
@@ -481,18 +511,43 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     }
   }
 
-  /** 低频存活租约：仅写一个时间戳到心跳文件，供 UI 判断内核/隧道存活。 */
+  /**
+   * 低频存活租约：仅写一个时间戳到心跳文件，供 UI 判断扩展进程/隧道是否还活着。
+   *
+   * 2026-10-20 自动断开整改：改为**原子替换**。
+   * 旧实现用 READ_WRITE|CREATE|TRUNC 打开后再 write —— TRUNC 与 write 之间存在一个
+   * 「文件长度为 0」的窗口，UI 若恰好在此刻读到就是 0 字节（内容为空），而空内容
+   * 此前被当作「无心跳 ⇒ 已死」处理 → 又一次假判死。
+   * 现在写入临时文件后 rename 覆盖：读者要么看到旧内容、要么看到新内容，
+   * **永远读不到半个文件**。
+   */
   private touchLivenessLease(ts: number): void {
+    if (this.heartbeatDir.length === 0) {
+      return;
+    }
+    const target = `${this.heartbeatDir}/${HEARTBEAT_FILE}`;
+    const tmp = `${this.heartbeatDir}/${HEARTBEAT_TMP_FILE}`;
     try {
-      const hb = fs.openSync(`${this.heartbeatDir}/${HEARTBEAT_FILE}`,
-        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      const hb = fs.openSync(tmp, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
       try {
         fs.writeSync(hb.fd, `${ts}`);
       } finally {
         fs.closeSync(hb);
       }
+      fs.renameSync(tmp, target);
     } catch (e) {
       AppLogger.warn(TAG, `liveness lease write failed: ${AppLogger.errText(e)}`);
+      // 原子替换失败时退回就地覆写：宁可读到旧时间戳，也别读到空文件。
+      try {
+        const hb = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        try {
+          fs.writeSync(hb.fd, `${ts}`);
+        } finally {
+          fs.closeSync(hb);
+        }
+      } catch (e2) {
+        AppLogger.warn(TAG, `liveness lease fallback write failed: ${AppLogger.errText(e2)}`);
+      }
     }
   }
 
@@ -786,9 +841,20 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     }
   }
 
-  /** 在 Extension 内直接探测 Core，替代高频文件心跳（10s 低频租约 + 事件驱动状态）。 */
+  /**
+   * 内核存活探针（10s）：只回答"内核是否还活着"，**不参与租约刷新**。
+   *
+   * 2026-10-20 自动断开整改，两处关键改动：
+   * 1) 探针回调**不再**负责刷新心跳 —— 那件事已交给独立的租约定时器。探针链路上的
+   *    任何阻塞（原生调用、Promise 调度延迟）都不再影响租约的连续性。
+   * 2) 单次探针判死**不再**立即动手：必须连续 CORE_DEATH_CONFIRMATIONS 次为假。
+   *    旧实现一次 false 就 writeStatus('recovering', false)，而 writeStatus 旧版会
+   *    **删除心跳文件** → UI 侧立刻判死并拆隧道重连。
+   */
   private startCoreMonitor(): void {
     this.stopCoreMonitor();
+    this.startLeaseTimer();
+    this.coreDeathStrikes = 0;
     this.coreMonitorTimer = setInterval((): void => {
       if (this.connection === null || this.recoveryRunning || this.rebuilding || !this.networkAvailable) {
         return;
@@ -797,24 +863,64 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
         if (this.connection === null || this.recoveryRunning || this.rebuilding) {
           return;
         }
-        if (!alive) {
-          // 内核已死：保持 TUN（Kill Switch），进入恢复编排；刷新租约反映当前相位。
-          this.writeStatus('recovering', false, 'core-not-alive');
-          this.scheduleCoreRecovery('core-not-alive');
+        if (alive) {
+          this.coreDeathStrikes = 0;
           return;
         }
-        // 健康：低频刷新存活租约（每 10s 一次，远低于旧版 3s），维持 UI 陈旧窗口判定。
-        this.touchLivenessLease(Date.now());
+        this.coreDeathStrikes = this.coreDeathStrikes + 1;
+        if (this.coreDeathStrikes < CORE_DEATH_CONFIRMATIONS) {
+          // 首次判死只记账、不动手，也**不**动心跳文件（心跳只表示扩展进程存活）。
+          AppLogger.warn(TAG, `core liveness probe negative `
+            + `(${this.coreDeathStrikes}/${CORE_DEATH_CONFIRMATIONS}), awaiting confirmation`);
+          return;
+        }
+        this.coreDeathStrikes = 0;
+        // 内核已死：保持 TUN（Kill Switch），进入恢复编排。
+        this.writeStatus('recovering', false, 'core-not-alive');
+        this.scheduleCoreRecovery('core-not-alive');
       }).catch((e: Object): void => {
+        // 探针异常（原生调用失败）不是"内核已死"的证据，只告警不升级。
         AppLogger.warn(TAG, `core liveness probe failed: ${AppLogger.errText(e)}`);
       });
-    }, 10000);
+    }, CORE_PROBE_MS);
   }
 
   private stopCoreMonitor(): void {
     if (this.coreMonitorTimer >= 0) {
       clearInterval(this.coreMonitorTimer);
       this.coreMonitorTimer = -1;
+    }
+  }
+
+  /**
+   * 存活租约独立刷新定时器（5s）。
+   *
+   * 回调内**只做一件事**：把当前时间戳原子写进心跳文件。
+   * **不做任何原生调用、不做任何 stat、不解析任何 JSON** —— 目的就是让这条链路的
+   * 耗时恒定在几十微秒量级，绝不会被内核启动/停止这类秒级操作卡住。
+   *
+   * 租约语义 = 「扩展进程还活着且能写盘」，与「内核是否活着」是两个维度：
+   * 后者由 STATUS_FILE 的 coreAlive 字段表达，由本类的恢复编排负责闭环。
+   *
+   * 注意：stopCoreMonitor() **不**停租约定时器 —— 重建 TUN（rebuildTunnel）与
+   * 重启内核（recoverCore）期间隧道仍然存在（Kill Switch 生效中），扩展进程也是
+   * 活着的，此时心跳必须继续刷新，否则 UI 会误以为扩展死了而拆隧道。
+   */
+  private startLeaseTimer(): void {
+    this.stopLeaseTimer();
+    this.touchLivenessLease(Date.now());
+    this.leaseTimer = setInterval((): void => {
+      if (this.connection === null || this.cleanupPromise !== null) {
+        return;
+      }
+      this.touchLivenessLease(Date.now());
+    }, LEASE_REFRESH_MS);
+  }
+
+  private stopLeaseTimer(): void {
+    if (this.leaseTimer >= 0) {
+      clearInterval(this.leaseTimer);
+      this.leaseTimer = -1;
     }
   }
 
@@ -932,12 +1038,13 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     this.connection = null;
     this.platformTunFd = -1;
     this.stopCoreMonitor();
+    this.stopLeaseTimer();
     this.stopNetworkAuthority();
     this.stopProtectMonitor();
     // 状态文件清理：删除权威态与兼容心跳文件，防止其他进程在陈旧窗口内把
     // "已断开"误判为"内核还活着"（与 orchestrator.clearTunnelMarkers 双保险）。
     if (this.heartbeatDir.length > 0) {
-      const stale: string[] = [HEARTBEAT_FILE, STATUS_FILE];
+      const stale: string[] = [HEARTBEAT_FILE, HEARTBEAT_TMP_FILE, STATUS_FILE];
       for (const name of stale) {
         try {
           fs.unlinkSync(`${this.heartbeatDir}/${name}`);

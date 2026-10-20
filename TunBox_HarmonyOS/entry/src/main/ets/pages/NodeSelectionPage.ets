@@ -738,7 +738,9 @@ struct NodeSelectionPage {
     this.sortMode = mode;
     for (const rec of snap.records) {
       if (rec.latency !== -2) {
-        LatencyController.set(rec.name, rec.latency);
+        // 恢复上一轮结论：带失败分类 + 真实测速时间戳（否则旧失败会被渲染成
+        // 一颗新鲜的红「超时」——2026-10-20 真机反馈「还没测速就显示超时」）。
+        LatencyController.restore(rec.name, rec.latency, rec.failKind, snap.testedAt);
       }
     }
     this.pruneStaleLatencyDisplay();

@@ -223,13 +223,19 @@ export class DoHResolver {
   }
 
   /**
-   * 连接路径判据：该域名是否已有可用 pin。
+   * 该域名是否已有**可复用**的 pin（内存缓存里的，或上次落盘、被 loadPersisted
+   * 读回来的）。
    *
-   * ⚠ 2026-10-19 稳定性回退后**已无调用方**：0.4.0 曾用它把连接期 DoH 预算从
-   * 6s 收紧到 1.5s（命中 pin 就认为"关键域名已就绪"），但那样会让备用节点域名
-   * 几乎必然解析不到（见 ConnectionOrchestrator 里 resolveMany 的注释）。
-   * 预算恢复固定 6000ms 后不再需要这个判据。保留此方法仅供诊断/后续优化复用，
-   * 不要再接回连接主路径 —— 除非同时保证备用域名仍能拿到完整预算。
+   * 2026-10-20：接回 resolveMany 的解析主路径 —— 发 DoH 查询之前先问它「有没有
+   * 现成的 pin」，命中就直接复用，省一次 DoH 往返；落盘的 pin 跨进程可用
+   * （见 loadPersisted），所以第二次起的连接几乎零成本。
+   *
+   * ⚠ 用途边界（0.4.0 的教训，务必守住）：它**只**用来回答「这次查询能不能
+   *   省掉」，**绝不能**用来收紧 DoH 预算。0.4.0 曾用它把连接期预算从 6s 收到
+   *   1.5s（命中 pin 就认为"关键域名已就绪"），结果备用节点域名几乎必然解析不到
+   *   （见 ConnectionOrchestrator 里 resolveMany 的注释）。预算固定 6000ms，
+   *   由 scripts/verify-connect-stability.mjs 的 b10 断言守着
+   *   （`hasUsablePin(priorityDomain)` 不得出现在编排器里）。
    */
   static async hasUsablePin(domain: string): Promise<boolean> {
     if (domain.length === 0) {
@@ -255,10 +261,14 @@ export class DoHResolver {
         continue;
       }
       seen.add(d);
-      const cached = DoHResolver.cachedIp(d);
-      if (cached.length > 0) {
-        result[d] = cached;
-      } else if (!DoHResolver.isHeldUnpinnable(d)) {
+      // 已有可用 pin（含从磁盘读回的持久化 pin）就直接复用，不再发 DoH 往返。
+      // ⚠ 这里**只**决定「这一条要不要查」，不参与任何预算判断 —— 预算恒为
+      //   budgetMs，备用域名照样拿满（见 hasUsablePin 的用途边界注释）。
+      if (await DoHResolver.hasUsablePin(d)) {
+        result[d] = DoHResolver.cachedIp(d);
+        continue;
+      }
+      if (!DoHResolver.isHeldUnpinnable(d)) {
         pending.push(d);
       }
       // 命中「短 TTL 不 pin」结论的域名既不进结果也不查询：

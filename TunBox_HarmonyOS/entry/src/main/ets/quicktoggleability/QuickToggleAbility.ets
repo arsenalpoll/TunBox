@@ -9,11 +9,18 @@
  * 上下文），卡片宿主进程被回收后应用组失去一切驻留凭证，`:vpn` 在 0.3 秒内被系统
  * 连带回收（exit 0），表现为「卡片启动代理几秒即断且不自愈、卡片仍显示已连接」。
  * 因此连接成功（'on'/'already'）后本能力不再立即自毁，而是：
- *   1) 用自身 UIAbility 上下文注册 dataTransfer 连续任务（需通知权限，用户侧开启）；
+ *   1) 用自身 UIAbility 上下文注册长时任务（统一走 UiGuardian.applyContinuousTask：
+ *      优先 taskKeeping —— 官方长时任务类型表里「计算任务」才是隧道保活的正确类型；
+ *      未获 ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM 受限权限时自动回退
+ *      dataTransfer，行为与改造前完全一致；需通知权限，用户侧开启）；
  *   2) 保持存活并低频轮询跨进程权威状态（vpn_status 租约），会话终结即释放；
  *   3) 断开/失败/守护被拒 → 释放任务并自毁（removeMissionAfterTerminate 保证不留痕）。
  * 卡片端由此从「message 到 Form 进程内跑连接」改为「router 到本能力」，
  * Form 回调即刻返回，不再长时间占用宿主。
+ *
+ * 长时任务被取消/暂停后的处置（2026-10-20 合规整改）：按 BackgroundTaskWatch
+ * 给出的**取消原因分类**决定 —— 用户主动停止 / 系统判定不合理使用一律不重挂
+ * （接入规范红线），一般性系统取消才允许在退避窗口后重挂，且必须先确认会话仍存活。
  *
  * 历史取证（2026-09-10）：本能力「闪一下」是系统为无页面 UIAbility 建启动窗的
  * 必然副产物而非崩溃；窗口隐形化与自毁时序修正保留（见 blindWindow/scheduleSelfDestroy）。
@@ -22,13 +29,15 @@
 import { UIAbility, AbilityConstant, Want } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
-import wantAgent from '@ohos.app.ability.wantAgent';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { VpnQuickStart } from '../commons/services/VpnQuickStart';
 import { VpnGuardianPolicy } from '../commons/services/VpnGuardianPolicy';
 import { UiGuardian } from '../commons/services/UiGuardian';
-import { BackgroundTaskWatch, ContinuousTaskCancelListener } from '../commons/services/BackgroundTaskWatch';
-import { TaskProgressUpdater } from '../commons/services/TaskProgressUpdater';
+import {
+  BackgroundTaskWatch,
+  ContinuousTaskCancelListener,
+  ContinuousTaskVerdict
+} from '../commons/services/BackgroundTaskWatch';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { FormStateSync } from '../commons/services/FormStateSync';
 import { ShortcutOutcomeLog, ShortcutOutcomeRecord } from '../commons/services/ShortcutOutcomeLog';
@@ -79,7 +88,11 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
   private healing: boolean = false;
   /** 已消耗的自愈次数（退避后重试，耗尽才释放守护） */
   private healAttempts: number = 0;
-  /** 长时任务取消后的重挂防抖定时器(2026-10-19 后台保活整改) */
+  /**
+   * 长时任务取消后的重挂定时器。
+   * 2026-10-20 起时长不再固定：取 BackgroundTaskWatch 分类结论里的退避时长
+   * （一般性系统取消 30s；用户主动停止 / 系统判定不合理使用则根本不重挂）。
+   */
   private rearmTimer: number = -1;
   /** 主窗口句柄：守护接管后用于最小化回桌面（设备不支持时降级为透明悬窗）。 */
   private mainWindow: window.Window | null = null;
@@ -87,7 +100,8 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     this.armLifetimeGuard();
     AppLogger.info(TAG, 'headless host created (no page loaded by design)');
-    // 长时任务取消监听（进程级幂等）：用户删除任务通知/系统取消时刷新记账，绝不自动重申请
+    // 长时任务取消/暂停监听（进程级幂等）：按取消原因分类刷新记账，
+    // 并决定"退避多久后重挂"或"根本不重挂"（见 onContinuousTaskCancel）。
     BackgroundTaskWatch.ensure();
     BackgroundTaskWatch.addListener(this);
     // 卡片/快捷方式拉起本宿主 = 显式用户操作：清除"用户主动停止后台任务"的抑制态
@@ -141,7 +155,8 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
     if (this.bgTaskRegistered) {
       // 兜底：进程被系统直接回收时尽力注销连续任务，避免残留登记。
       this.bgTaskRegistered = false;
-      TaskProgressUpdater.detach();
+      // 记账与进度心跳一并清理（UiGuardian.noteReleased 内部会 detach 进度心跳）。
+      UiGuardian.noteReleased();
       backgroundTaskManager.stopBackgroundRunning(this.context).catch((): void => {
         AppLogger.warn(TAG, 'continuous task cleanup failed at destroy');
       });
@@ -150,21 +165,36 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
   }
 
   /**
-   * 长时任务被外部取消（用户在通知栏删除任务通知 / 系统取消）：
-   * 后台保活整改(2026-10-19,对标 FlClash-ohos):原语义是"只清记账、绝不自动重申请"
-   * —— 与 FlClash 的"取消后 1 秒无条件重挂"正相反,是保活效果差距的最大单一来源。
-   * 现改为:会话仍存活(desiredConnected)时 1 秒后自动重挂 dataTransfer 连续任务;
-   * 会话已断则保持原语义不重挂。
+   * 长时任务被外部取消（用户在通知栏删除任务通知 / 系统取消）。
+   *
+   * 处置按 **BackgroundTaskWatch 给出的原因分类** 走（2026-10-20 合规整改）：
+   *  - 用户主动停止（USER_CANCEL / USER_CANCEL_REMOVE_NOTIFICATION）
+   *    → **不重挂**。官方《Background Tasks Kit 接入规范》把「用户主动停止后
+   *      取消长时任务，随即再次申请」列为违规行为；此时只能等显式用户操作
+   *      （连接按钮 / 卡片 / 快捷方式 → UiGuardian.clearExternalCancelSuppression()）。
+   *  - 系统判定不合理使用（SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED /
+   *    SYSTEM_CANCEL_USE_ILLEGALLY 等）→ 同样不重挂（规范明文）。
+   *  - 一般性系统取消（SYSTEM_CANCEL 等）→ 允许重挂，但**必须退避**
+   *    （verdict.backoffMs，改造前是固定 1 秒），并且要先确认会话仍存活。
+   *
+   * 改造前这里是"1 秒无条件重挂"，同时命中规范里的两条违规红线。
    */
-  onContinuousTaskCancel(id: number, reason: string): void {
-    if (!this.bgTaskRegistered) {
+  onContinuousTaskCancel(id: number, verdict: ContinuousTaskVerdict): void {
+    if (!this.bgTaskRegistered && !verdict.hadRegistration) {
       return;
     }
     this.bgTaskRegistered = false;
     AppLogger.warn(TAG,
-      `guardian continuous task canceled externally (id=${id} reason=${reason}); re-arm in 1s`);
-    // 1 秒防抖后重挂(FlClash 语义);会话是否仍存活由 UiGuardian.rearm 内部
-    // 结合权威租约判断——这里只做延迟触发,避免取消风暴下重复挂。
+      `guardian continuous task canceled: id=${id} reason=${verdict.reasonCode} `
+      + `category=${verdict.category} allowAutoRearm=${verdict.allowAutoRearm} `
+      + `requireUserAction=${verdict.requireUserAction} backoff=${verdict.backoffMs}ms`);
+    if (!verdict.allowAutoRearm) {
+      AppLogger.warn(TAG,
+        `re-arm not allowed (${verdict.summary}); explicit user action required `
+        + '(Background Tasks Kit 接入规范：取消后不得立即再次申请长时任务)');
+      return;
+    }
+    // 退避到期后再重挂（退避时长来自分类结论，不再是固定 1 秒）
     if (this.rearmTimer >= 0) {
       clearTimeout(this.rearmTimer);
     }
@@ -173,12 +203,61 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
       if (this.destroyed) {
         return;
       }
-      UiGuardian.rearm(this.context).then((armed: boolean): void => {
+      this.rearmIfSessionAlive();
+    }, verdict.backoffMs);
+  }
+
+  /**
+   * 长时任务被暂停（suspended=true）/ 从暂停中恢复（suspended=false）。
+   *
+   * 暂停态的关键含义（SDK 官方说明）：长时任务被暂停后，**应用退到后台会被挂起**
+   * ——「一个 UIAbility 申请长时任务后整个应用下的所有进程均不会被挂起」这条
+   * 保底资格随之消失（扩展进程定时器停摆 → 存活租约停更 → UI 误判 core died
+   * → 拆隧道重连）。因此这里必须把"失去不被挂起资格"明确打进日志。
+   *
+   * 暂停**不触发重挂**：任务仍然存在（只是被降级），重复申请既无意义也可能失败；
+   * 交给后续的 continuousTaskCancel 事件走分类流程。
+   */
+  onContinuousTaskSuspend(id: number, verdict: ContinuousTaskVerdict, suspended: boolean): void {
+    if (suspended) {
+      AppLogger.warn(TAG,
+        `guardian continuous task suspended: id=${id} reason=${verdict.reasonCode} `
+        + `category=${verdict.category} summary=${verdict.summary}; `
+        + 'app loses the "never suspended" protection until the task resumes');
+      return;
+    }
+    AppLogger.info(TAG,
+      `guardian continuous task resumed: id=${id}; accounting restored`);
+    this.bgTaskRegistered = UiGuardian.isRegistered();
+  }
+
+  /**
+   * 退避到期后的重挂：先确认会话仍存活（用户意图仍是"连接"），再让 UiGuardian
+   * 走统一的申请函数。
+   *
+   * 存活判据与本文件既有的 selfHeal 分支同源：ConnectionOrchestrator 的权威态
+   * `desiredConnected`（落盘的用户意图）。UiGuardian 不做跨模块意图查询，
+   * 由这里把结论作为参数传进去。
+   */
+  private rearmIfSessionAlive(): void {
+    const orchestrator = ConnectionOrchestrator.instance();
+    orchestrator.init(this.context);
+    orchestrator.authorityState().then((state): void => {
+      if (this.destroyed) {
+        return;
+      }
+      if (!state.desiredConnected) {
+        AppLogger.info(TAG, 're-arm skipped: session intent is no longer "connected"');
+        return;
+      }
+      UiGuardian.rearm(this.context, true).then((armed: boolean): void => {
         if (armed) {
           this.bgTaskRegistered = true;
         }
       });
-    }, 1000);
+    }).catch((error: Error): void => {
+      AppLogger.warn(TAG, `re-arm skipped: authority read failed (${error.message})`);
+    });
   }
 
   /**
@@ -270,37 +349,38 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
   }
 
   /**
-   * 进入守护：用本 UIAbility 的上下文注册 dataTransfer 连续任务。
+   * 进入守护：用本 UIAbility 的上下文注册长时任务。
+   *
+   * 统一走 UiGuardian.applyContinuousTask（全工程唯一调用 startBackgroundRunning
+   * 的地方）：优先 taskKeeping（VPN 隧道保活的正确类型），未获受限权限
+   * ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM 时自动回退 dataTransfer
+   * （实况窗 + 5 分钟进度心跳，与改造前一致）。
    * 成功 → 常驻并低频轮询权威租约；失败（如通知被禁用）→ 如实记录并恢复自毁路径，
    * 让系统按既有语义处理会话，绝不静默伪装成功。
    */
   private async enterGuardian(outcome: string): Promise<void> {
     this.clearLifetimeGuard();
     try {
-      const entryWant: Want = {
-        bundleName: 'com.tunbox.client',
-        moduleName: 'entry',
-        abilityName: 'EntryAbility'
-      };
-      const agentRequest: wantAgent.WantAgentInfo = {
-        wants: [entryWant],
-        operationType: wantAgent.OperationType.START_ABILITY,
-        requestCode: 0,
-        wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
-      };
-      const agent = await wantAgent.getWantAgent(agentRequest);
-      // 字符串数组重载（官方示例形态）是唯一返回任务通知 id 的重载；
-      // 单值枚举重载（BackgroundMode.DATA_TRANSFER = 1）返回 void。
-      const modes: string[] = ['dataTransfer'];
-      const res = await backgroundTaskManager.startBackgroundRunning(this.context, modes, agent);
+      const result = await UiGuardian.applyContinuousTask(this.context);
+      if (!result.ok) {
+        const detail = `guard-denied(${result.detail})`;
+        AppLogger.warn(TAG, `continuous task registration failed: ${detail}`);
+        const record = new ShortcutOutcomeRecord();
+        record.at = Date.now();
+        record.mode = 'guard';
+        record.result = 'failed';
+        record.detail = detail;
+        record.elapsedMs = 0;
+        ShortcutOutcomeLog.record(this.context, record);
+        this.scheduleSelfDestroy();
+        return;
+      }
       this.bgTaskRegistered = true;
       this.guardianActive = true;
       this.guardianMisses = 0;
-      // dataTransfer 官方要求周期更新进度（首次不得超过 10 分钟）：接管任务通知 id
-      TaskProgressUpdater.attach(res !== undefined && res !== null ? res.notificationId : -1);
       this.armGuardianPoll();
       this.retreatToDesktop();
-      AppLogger.info(TAG, `guardian engaged after ${outcome} (dataTransfer continuous task registered)`);
+      AppLogger.info(TAG, `guardian engaged after ${outcome} (type=${result.kind} continuous task registered)`);
     } catch (e) {
       const err = e as BusinessError;
       const detail = `guard-denied(code=${err.code} ${err.message})`;
@@ -439,8 +519,13 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
         AppLogger.warn(TAG, `stopBackgroundRunning failed (${reason})`);
       })
       : Promise.resolve();
+    // 只清理自己持有的登记：若长时任务实际是 EntryAbility 路径挂的，
+    // 这里的 stopBackgroundRunning（本能力上下文）也停不掉它，记账不能跟着清。
+    const owned: boolean = this.bgTaskRegistered;
     this.bgTaskRegistered = false;
-    TaskProgressUpdater.detach();
+    if (owned) {
+      UiGuardian.noteReleased();
+    }
     AppLogger.info(TAG, `guardian released (${reason})`);
     stop.then((): Promise<void> => {
       return FormStateSync.calibrate(this.context).then((snapshot): Promise<void> => {

@@ -330,6 +330,13 @@ export class TunBoxPing {
       }
       return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
     }
+    // 失败结论也可能是**上一轮**的（冷启动从持久化快照恢复）。
+    // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」：
+    // 旧结论不能顶着一颗新鲜的红「超时」出现在列表里 → 标「·旧」并灰显，
+    // 与「123ms·旧」的既有口径一致（过期 = 中性，不是当前结论）。
+    if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
+      return `${LatencyPolicy.stateText(rec.state, rec.failKind)}·旧`;
+    }
     return LatencyPolicy.stateText(rec.state, rec.failKind);
   }
 
@@ -355,6 +362,10 @@ export class TunBoxPing {
       return TunBoxColors.warning;
     }
     if (rec.state === LatencyState.TIMEOUT || rec.state === LatencyState.FAILED) {
+      // 陈旧的失败结论（上一轮的）→ 中性灰，不顶红字（与 recordText 同口径）
+      if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
+        return TunBoxColors.textSecondary;
+      }
       return TunBoxColors.danger;
     }
     return TunBoxColors.textMuted;

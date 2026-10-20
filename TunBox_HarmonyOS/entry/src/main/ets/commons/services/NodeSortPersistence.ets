@@ -15,7 +15,7 @@
  *   default 订阅默认顺序 / auto 按最近测速结果 / manual 用户手动固定顺序
  */
 import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
-import { LatencyFailKind } from './ClashApiService';
+import { LatencyPolicy } from './LatencyState';
 
 /** 排序模式常量 */
 export class NodeSortModes {
@@ -68,11 +68,14 @@ export class NodeLatencyRecord {
     // queue_timeout（C7 起）：排队超时 = 这一轮因为应用侧在途名额耗尽而**没有发起请求**，
     // 对节点健康度零信息量。若当成节点结论落盘 → 节点沉底、排序被「我们自己的排队」污染，
     // 与 core_not_ready 的处理同源，故归入非判定。
-    return failKind === LatencyFailKind.CORE_NOT_READY
-      || failKind === LatencyFailKind.PORT_ONLY
-      || failKind === LatencyFailKind.UNTESTED
-      || failKind === LatencyFailKind.UNSUPPORTED
-      || failKind === LatencyFailKind.QUEUE_TIMEOUT;
+    //
+    // ⚠ 判定表收敛到 **LatencyPolicy.isNonVerdictKind**（唯一真源）：
+    // 冷启动恢复（LatencyController.restore）与快照合并（buildAuto）必须用同一张表，
+    // 否则「写快照时算非判定、恢复时算判定」→ 通道故障又被渲染成红「超时」
+    // （2026-10-20 真机反馈「刚打开软件还没测速就显示超时」）。
+    // 注：**空分类（''）不在表内** —— 写快照时它是「一次没有分类的真实失败」（节点结论），
+    // 必须写进去；只有恢复路径把它当非结论（旧版自动切换记账的残留，见 restore）。
+    return LatencyPolicy.isNonVerdictKind(failKind);
   }
 
   /** 近期成功率: 从未测过为 -1，否则按失败次数估算（0 失败=1.0） */
@@ -232,7 +235,9 @@ export class NodeSortSnapshot {
         }
         const rec = new NodeLatencyRecord();
         rec.name = r.name;
-        rec.latency = typeof r.latency === 'number' && Number.isFinite(r.latency) ? r.latency : -1;
+        // 缺字段/非法值 → **未测(-2)**，不是失败(-1)：没有数据不等于"测出来超时"。
+        // （旧实现默认 -1，2026-10-20 修复：冷启动恢复时会被渲染成红「超时」。）
+        rec.latency = typeof r.latency === 'number' && Number.isFinite(r.latency) ? r.latency : -2;
         rec.failCount = typeof r.failCount === 'number' && r.failCount >= 0 ? Math.floor(r.failCount) : 0;
         rec.lastOk = r.lastOk === true;
         rec.failKind = typeof r.failKind === 'string' && r.failKind.length <= 32 ? r.failKind : '';

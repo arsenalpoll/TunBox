@@ -322,6 +322,51 @@ export class LatencyPolicy {
   }
 
   /**
+   * 「非判定」失败分类（与 ClashApiService.LatencyFailKind 同值）。
+   *
+   * 用字面量而不是引用 LatencyFailKind：本文件与 ClashApiService 互相引用，
+   * 引入会造成循环依赖（同 `stateText` 里 'queue_timeout' 的处理）。
+   *
+   * 非判定 = **这次失败不构成"节点通不通"的结论**：
+   *  - core_not_ready     测速通道/凭证坏了
+   *  - port_reachable_only 只证明端口可达（直连降级）
+   *  - untested           整批硬截止，本次没测出来
+   *  - unsupported        协议无法离线探测
+   *  - queue_timeout      根本没拨号（应用侧在途名额耗尽）
+   *
+   * ⚠ **空分类（''）不在本表里**：写快照时（buildAuto）空分类 = 一次「没有分类的
+   * 真实失败」，它是节点结论，必须写进快照。空分类只在**恢复**路径上被当成
+   * 「非结论」——因为快照里唯一会写出空分类失败的地方是**旧版自动切换记账**
+   * （它把一次连接失败写成 latency=-1 且不带分类），见 LatencyController.restore。
+   *
+   * ⚠ 这些类别**绝不能**在冷启动恢复时渲染成红色的「超时」——2026-10-20 真机
+   * 用户反馈「刚打开软件还没测速就显示超时，测完发现这个节点是好的」。
+   */
+  static isNonVerdictKind(failKind: string): boolean {
+    return failKind === 'core_not_ready'
+      || failKind === 'port_reachable_only'
+      || failKind === 'untested'
+      || failKind === 'unsupported'
+      || failKind === 'queue_timeout';
+  }
+
+  /**
+   * 失败结论是否已陈旧（冷启动恢复的上一轮结论用它决定要不要标「·旧」）。
+   *
+   * `atMs <= 0` = 年龄未知（快照没有测速时间戳）→ **按陈旧处理**：
+   * 不知道多久以前的失败，绝不能当成本次刚测出来的结论顶在列表上。
+   */
+  static isStaleConclusion(rec: LatencyRecord, nowMs: number): boolean {
+    if (!rec.isFailure()) {
+      return false;
+    }
+    if (rec.atMs <= 0) {
+      return true;
+    }
+    return nowMs - rec.atMs > LatencyPolicy.STALE_MS;
+  }
+
+  /**
    * 状态文案（UI 唯一来源，禁止各处自己拼字符串）。
    *
    * @param failKind 失败分类（LatencyFailKind.*）。**只影响「内核代理表里没有这个

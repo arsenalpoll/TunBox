@@ -353,7 +353,18 @@ static napi_value StopCore(napi_env env, napi_callback_info info)
 
 static napi_value IsCoreAlive(napi_env env, napi_callback_info info)
 {
-    const bool alive = loadCore() && g_running.load() && g_alive != nullptr && g_alive() == 1;
+    // 2026-10-20 自动断开整改：**热路径不再同步调用 Go 侧的 g_alive()**。
+    //
+    // g_alive() → bridge.IsRunning() → coreMu.Lock()。而 Start()/Stop() 全程持有
+    // coreMu（内含 hub.ApplyConfig 与 executor.Shutdown，可达秒级），于是 ArkTS
+    // 线程上的 isCoreAlive() 会被阻塞到内核操作结束 —— 扩展进程的定时器链因此
+    // 停摆 → 跨进程存活租约停更 → UI 侧 15s 陈旧窗口判死 → 拆隧道重连。
+    // 真机表现为 27~36s 一轮的"自己把自己断掉"。
+    //
+    // g_running 是 Start/Stop 在 C++ 侧维护的原子量，与 Go 侧 running 标志在稳态下
+    // 等价（Go 侧 running 同样不会在内核意外死亡时自动复位，两者都只反映
+    // "启动成功且尚未停止"），但读取是纳秒级且**绝不与任何写者互斥**。
+    const bool alive = loadCore() && g_running.load();
     napi_value result;
     napi_get_boolean(env, alive, &result);
     return result;

@@ -69,11 +69,16 @@ const kindsStub = `export class LatencyFailKind {\n${
 }\n}\n`;
 fs.writeFileSync(path.join(stage, 'ProxyNode.ts'), stub);
 fs.writeFileSync(path.join(stage, 'ClashApiService.ts'), kindsStub);
+// LatencyState 是纯模型文件（无 import）：真实暂存，供「非判定判定表唯一真源」
+// （LatencyPolicy.isNonVerdictKind）使用（2026-10-20：判定表收敛到一处）。
+fs.writeFileSync(path.join(stage, 'LatencyState.ts'),
+  fs.readFileSync(path.join(svc, 'LatencyState.ets'), 'utf8'));
 
 let src = fs.readFileSync(path.join(svc, 'NodeSortPersistence.ets'), 'utf8');
 src = src
   .replace(/from '\.\.\/models\/ProxyNode'/g, "from './ProxyNode.ts'")
-  .replace(/from '\.\/ClashApiService'/g, "from './ClashApiService.ts'");
+  .replace(/from '\.\/ClashApiService'/g, "from './ClashApiService.ts'")
+  .replace(/from '\.\/LatencyState'/g, "from './LatencyState.ts'");
 ok(!/from '@ohos/.test(src), 'staged module must not import ohos kits');
 fs.writeFileSync(path.join(stage, 'NodeSortPersistence.ts'), src);
 
@@ -228,7 +233,10 @@ check('反序列化丢弃无效记录、夹紧非法数值', () => {
   eq(s.mode, NodeSortModes.DEFAULT, 'unknown mode normalized');
   eq(s.order, ['ok'], 'order filters non-strings/empties');
   eq(s.records.map((r) => r.name), ['good', 'nan', 'neg', 'longkind'], 'drops nameless records');
-  eq(s.recordFor('nan').latency, -1, 'non-numeric latency -> -1 (failed, never 0)');
+  // 2026-10-20：非法/缺失 latency → **未测(-2)**，不是失败(-1)。
+  // 「没有数据」不等于「测出来超时」——冷启动恢复时 -1 会被渲染成红「超时」
+  // （真机反馈「刚打开软件还没测速就显示超时」）。仍然是「绝不变成 0」。
+  eq(s.recordFor('nan').latency, -2, 'non-numeric latency -> -2 (untested, never 0)');
   eq(s.recordFor('neg').failCount, 0, 'negative failCount clamped');
   eq(s.recordFor('longkind').failKind, '', 'over-long failKind rejected');
 });
