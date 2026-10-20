@@ -441,6 +441,10 @@ export struct SubscriptionPage {
       this.latencyBound = true;
       LatencyController.addListener(this.latencyListener);
     }
+    // 预热测速通道（真机取证 2026-10-20）：「点了测速要等几秒才开始」的根因是
+    // 测速通道的准备（未连接时要拉起 headless 测速内核）。进页面时后台把这段
+    // 准备做完，用户点「测速」时通道已热 → 秒开。预热失败不影响任何功能。
+    BackgroundLatencyService.prewarmChannel(ctx).catch((): void => {});
   }
 
   private expandedInitialized: boolean = false;
@@ -681,8 +685,12 @@ export struct SubscriptionPage {
     }
     this.speedTestingIds = this.speedTestingIds.concat([subId]);
     try {
-      this.showToast('正在测速…');
-      await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId);
+      // 两段式提示：通道还没就绪时（可能要拉起测速内核，秒级）先说「准备…」，
+      // 就绪、开始发探测了再切到「正在测速…」。旧实现只提示「正在测速…」，
+      // 用户看到的是「点了没反应，过几秒才出结果」（真机取证 2026-10-20）。
+      this.showToast('准备测速通道…');
+      await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId,
+        (): void => { this.showToast('正在测速…'); });
       this.showToast('✓ 测速完成');
     } catch (e) {
       this.showToast('测速失败，请重试');

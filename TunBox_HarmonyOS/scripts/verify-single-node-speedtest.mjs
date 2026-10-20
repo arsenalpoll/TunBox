@@ -208,7 +208,10 @@ ok('守卫不再包含 subId === DIRECT_GROUP_ID（负对照）',
 ok('speedTestSub 函数体内无任何 DIRECT_GROUP_ID 拦截',
   !/DIRECT_GROUP_ID/.test(fnCode), 'function body still references DIRECT_GROUP_ID');
 ok('speedTestSub 仍调用 BackgroundLatencyService.testSubscription',
-  /await BackgroundLatencyService\.testSubscription\(getContext\(this\) as Context, subId\)/.test(fnCode));
+  // 允许第三个可选参数（通道就绪回调，2026-10-20 测速通道预热整改引入）：
+  // 锁定的是「仍走 BackgroundLatencyService.testSubscription(…, subId)」这件事，
+  // 不是参数个数。
+  /await BackgroundLatencyService\.testSubscription\(getContext\(this\) as Context, subId\s*[,\)]/.test(fnCode));
 ok('speedTestSub 仍在 finally 里清理 speedTestingIds',
   /finally\s*\{[\s\S]{0,200}?this\.speedTestingIds = this\.speedTestingIds\.filter\(\(x: string\) => x !== subId\)/.test(fnCode));
 

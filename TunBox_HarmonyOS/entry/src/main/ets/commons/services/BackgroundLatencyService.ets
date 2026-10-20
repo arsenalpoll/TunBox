@@ -64,11 +64,39 @@ export class BackgroundLatencyService {
   }
 
   /** 订阅导入/刷新成功后只测该订阅的节点 */
-  static async testSubscription(context: Context, subscriptionId: string): Promise<void> {
+  static async testSubscription(context: Context, subscriptionId: string,
+    onChannelReady: (() => void) | null = null): Promise<void> {
     if (subscriptionId.length === 0) {
       return;
     }
-    await BackgroundLatencyService.execute(context, subscriptionId);
+    await BackgroundLatencyService.execute(context, subscriptionId, onChannelReady);
+  }
+
+  /**
+   * 预热测速通道（页面进入时后台调用）。
+   *
+   * 目的（真机取证 2026-10-20）：「点了测速要等几秒才开始」的根因是**测速通道
+   * 的准备**（未连接时要拉起 headless 测速内核：DoH 预解析 → 生成/写配置 →
+   * 停旧扩展 → 启扩展 → 就绪轮询 → 预热 1.5s）。这段准备与用户意图无关，
+   * 提前在进页面时做完，用户点「测速」时通道已热 → 秒开。
+   *
+   * 纪律：预热**不发起任何探测**、不写延迟结论、不动排序快照；
+   * 任何失败一律吞掉（预热失败绝不能影响用户正常使用）。
+   */
+  static async prewarmChannel(context: Context): Promise<void> {
+    try {
+      const orchestrator = ConnectionOrchestrator.instance();
+      orchestrator.init(context);
+      await SettingsService.init(context);
+      const subs = SubscriptionService.instance();
+      await subs.init(context);
+      if (subs.nodes.length === 0) {
+        return;
+      }
+      await orchestrator.prewarmLatencyChannel();
+    } catch (e) {
+      AppLogger.warn(TAG, `latency channel prewarm failed: ${AppLogger.errText(e)}`);
+    }
   }
 
   /**
@@ -114,8 +142,11 @@ export class BackgroundLatencyService {
   /**
    * 执行一次静默批次。
    * @param subscriptionId null = 全部节点
+   * @param onChannelReady 通道就绪（可以开始发探测）时的回调，供 UI 区分
+   *        「准备测速通道…」与「正在测速…」两个阶段
    */
-  private static async execute(context: Context, subscriptionId: string | null): Promise<void> {
+  private static async execute(context: Context, subscriptionId: string | null,
+    onChannelReady: (() => void) | null = null): Promise<void> {
     if (BackgroundLatencyService.running || LatencyEngine.isRunning()) {
       // 单航班：已有批次（不论来自页面还是后台）在跑就不叠加
       AppLogger.info(TAG, 'silent batch skipped: a latency run is already in flight');
@@ -142,6 +173,9 @@ export class BackgroundLatencyService {
       // 通道：已连接复用隧道 controller；未连接尝试无头内核；都不可用则 null
       // → 引擎走离线粗略通道（状态 OFFLINE，绝不冒充代理延迟）
       const api = await orchestrator.ensureLatencyApi();
+      if (onChannelReady !== null) {
+        onChannelReady();
+      }
       const settings = await SettingsService.load();
       // 测速 URL：兜底 → 默认 https；用户自填值 → 原样保留（口径与页面一致）。
       const url: string = BackgroundLatencyService.resolveTestUrl(settings);

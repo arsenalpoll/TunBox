@@ -199,6 +199,26 @@ const TEST_CORE_STOP_ATTEMPTS = 2;
 const TEST_CORE_STOP_RETRY_DELAY_MS = 300;
 /** 测速内核启动失败后的负缓存冷却：避免每次测速都白等一次 15~20s 启动超时 */
 const TEST_CORE_NEGATIVE_COOLDOWN_MS = 45000;
+/**
+ * 测速内核「预热」时长（毫秒）。
+ *
+ * 背景（真机取证 2026-10-17）：headless 内核 ready 后 controller API 仍是冷的
+ * （首批连接/凭证初始化未完成），立刻放行整批并发会把 API 打到
+ * Operation timeout（code=2300028，整批中止）。
+ *
+ * 口径（2026-10-20 整改）：这个窗口是**内核的属性**，不是调用方的固定等待。
+ * 旧实现在 ensureLatencyApi 里无条件睡 1500ms —— **复用路径**（内核已经在服务）
+ * 也要白等这 1.5s，这正是「点了测速，等几秒钟才开始测速」的直接来源之一。
+ * 现在内核就绪时登记「预计变热时刻」（testCoreWarmAt），调用方只等到那一刻：
+ * 复用路径窗口早已过去 → 一句都不等 → 秒开。
+ */
+const TEST_CORE_WARMUP_MS = 1500;
+/**
+ * 预热/测速内核的空闲回收窗口（毫秒）。
+ * 与 LatencyEngine.LATENCY_CORE_IDLE_MS 同值；这里独立定义是为了避免
+ * ConnectionOrchestrator ←→ LatencyEngine 的循环 import。
+ */
+const TEST_CORE_IDLE_RECYCLE_MS = 90000;
 
 /** vpn_start_params.json 的落盘结构（键名与扩展侧 readStartParamsFallback 解析一致） */
 class StartParamsRecord {
@@ -1845,6 +1865,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /** @deprecated 仅作兼容读出口，真实状态看 testCoreFlight.getStatus() */
   testCoreActive: boolean = false;
   private testCoreSecret: string = '';
+  /**
+   * 测速内核「预计变热」的时间戳（ms）。0 = 无预热窗口（不是测速核）。
+   * 内核刚就绪时设成 now + TEST_CORE_WARMUP_MS；复用时窗口早已过去 → 不等待。
+   */
+  private testCoreWarmAt: number = 0;
   /** 单航班状态机：并发启动只生效一次，超时可取消，启停不互损 */
   private testCoreFlight: SingleFlightTestCore | null = null;
   /**
@@ -1950,10 +1975,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         const ready = await this.ensureTestCore(subs, await this.lastSettingsForLatency());
         if (ready) {
           AppLogger.info(TAG, 'latency channel: headless test core ready');
-          // 预热：headless 内核 ready 后 controller API 仍是冷的（首批连接/凭证
-          // 初始化未完成），立刻起 44 节点全并发会把 API 打到 Operation timeout
-          // （真机取证 2026-10-17：code=2300028，整批中止）。等 ~1500ms 再放行。
-          await new Promise<void>((resolve) => setTimeout(() => resolve(), 1500));
+          // 预热等待（2026-10-20 整改）：不再是「无条件睡 1500ms」，
+          // 而是「等到这个内核真正变热的时刻」。
+          //  - 新鲜启动：预热窗口刚开 → 等满剩余窗口（与旧实现同长，总耗时不变）；
+          //  - 复用已在服务的内核：窗口早已过去 → **不等待 → 秒开**。
+          // 旧实现那句无条件 1500ms 正是「点了测速要等一秒半才开始」的直接来源之一。
+          await this.awaitTestCoreWarmup();
+          // 每一次取通道都把回收窗口往后推 90s：否则「进页面预热」挂的那次回收
+          // 可能在用户随后发起的一批测速**进行中**触发 → 把正在服务的测速核停掉，
+          // 整批中止。回收窗口应当从「最后一次使用」起算。
+          this.scheduleTestCoreRecycle(TEST_CORE_IDLE_RECYCLE_MS);
           return this.api;
         }
       } catch (e) {
@@ -1965,6 +1996,73 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     AppLogger.info(TAG, 'latency channel: no core available (offline fallback applies)');
     return null;
+  }
+
+  /**
+   * 等到「测速内核真正变热」为止。
+   *
+   * 背景：headless 内核 ready 后 controller API 仍是冷的（首批连接/凭证初始化
+   * 未完成），立刻放行整批并发会把 API 打到 Operation timeout（真机取证
+   * 2026-10-17：code=2300028，整批中止）。所以内核刚起来后有一个**预热窗口**。
+   *
+   * 关键设计（2026-10-20）：预热窗口是**内核的属性**（testCoreWarmAt），
+   * 不是调用方的固定等待：
+   *  - 复用已在服务的内核 → 窗口早已过去 → 一句都不等 → **秒开**；
+   *  - 新鲜启动 → 等满剩余窗口（与旧实现同长）。
+   * 旧实现是在 ensureLatencyApi 里无条件睡 1500ms，复用路径也在白等 ——
+   * 这正是用户反馈「点了测速要等几秒才开始」的直接来源之一。
+   */
+  private async awaitTestCoreWarmup(): Promise<void> {
+    const warmAt = this.testCoreWarmAt;
+    if (warmAt <= 0) {
+      return;
+    }
+    const waitMs = warmAt - Date.now();
+    if (waitMs <= 0) {
+      return;
+    }
+    await new Promise<void>((resolve) => setTimeout(() => resolve(), waitMs));
+    AppLogger.info(TAG, `latency channel: test core warm-up wait ${waitMs}ms`);
+  }
+
+  /**
+   * 预热测速通道（**不发起任何探测**，只让内核进入可服务状态）。
+   *
+   * ## 为什么需要它（真机取证 2026-10-20）
+   *
+   * 用户反馈「点了测速以后，等几秒钟才开始测速」。实测时间线（未连接场景）：
+   *
+   *   tap → ensureLatencyApi() → ensureTestCore() → DoH 预解析 133 个域名（~850ms）
+   *        → 生成/写配置（~55ms）→ 停旧扩展（+600ms 固定等待）→ 启扩展进程（~165ms）
+   *        → 内核就绪轮询（~190ms）→ **固定预热 1500ms** → 才发出第一个探测
+   *
+   * 也就是说用户点下去后要等 ~3s 才看到第一个结果 —— 而这些准备**与用户意图无关**，
+   * 完全可以提前做完。预热把这段准备挪到「进入订阅页 / 节点选择页」时后台进行，
+   * 用户点「测速」时通道已经热好 → **秒开**。
+   *
+   * ## 安全边界
+   *
+   *  - 已连接/连接中 → 复用真实隧道 controller，无需预热（ensureLatencyApi 内已判）；
+   *  - 编排器忙（连接中/断开中/恢复中）或真实隧道是权威 → ensureTestCore 内部的安全门禁会拒绝启动；
+   *  - 预热**不产生任何网络探测**，不写延迟结论，不动排序快照；
+   *  - 预热成功后必须挂回收，否则内核会一直常驻（与批测后的回收同窗口）。
+   */
+  async prewarmLatencyChannel(): Promise<boolean> {
+    try {
+      const api = await this.ensureLatencyApi();
+      if (api === null) {
+        AppLogger.info(TAG, 'latency channel prewarm: no core available');
+        return false;
+      }
+      // 预热本身没有批次跑完 → 引擎的「批后回收」不会被挂上，这里补挂一次，
+      // 否则内核会常驻到进程结束（空转发、占端口）。
+      this.scheduleTestCoreRecycle(TEST_CORE_IDLE_RECYCLE_MS);
+      AppLogger.info(TAG, 'latency channel prewarmed');
+      return true;
+    } catch (e) {
+      AppLogger.warn(TAG, `latency channel prewarm failed: ${AppLogger.errText(e)}`);
+      return false;
+    }
   }
 
   /**
@@ -2228,12 +2326,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         bundleName: 'com.tunbox.client',
         abilityName: 'VpnExtensionAbility'
       };
+      // 停旧扩展。**只在扩展确实在跑时**才等它真正退出：
+      // stop 抛错 = 本来就没跑（未运行属正常），此时固定 600ms 是纯白等 ——
+      // 对齐 connect() 的既有优化（no live tunnel → skip exit grace）。
+      // 真机证据：冷启动后第一次测速（从未连接过）白白多付 600ms。
+      let extWasRunning: boolean = false;
       try {
         await vpnExtension.stopVpnExtensionAbility(stopWant);
+        extWasRunning = true;
       } catch (e) {
         // 未运行属正常
       }
-      await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
+      if (extWasRunning) {
+        await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
+      } else {
+        AppLogger.info(TAG, 'test core: no running extension to tear down; skip 600ms exit grace');
+      }
       const launchParams: Record<string, string | number> = {};
       launchParams['configPath'] = configPath;
       launchParams['headless'] = 1;
@@ -2257,6 +2365,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           // 挂载内核日志流: 拨号失败的真实原因(DNS/握手/路由)只在内核日志里,
           // API 的 503 响应体是固定文案。转发进 AppLogger → hilog 可远程排查。
           this.startCoreLogStream(this.testCoreSecret);
+          // 预热窗口：ready ≠ 可服务，controller 还要把首批连接/凭证初始化完
+          // （见 TEST_CORE_WARMUP_MS 注释）。
+          //
+          // 这里**只登记「预计何时变热」，不真的睡**：把 1.5s 塞进启动 Promise
+          // 会顶高 SingleFlightTestCore 的 15s 超时上限（慢 DoH + 慢就绪时
+          // 本来能成功的启动会突然被判超时 → 白拆一次再重启）。
+          // 真正等待放在 ensureLatencyApi（awaitTestCoreWarmup）：
+          //  - 新鲜启动 → 等满剩余预热窗口（与旧实现同长，总耗时不变）；
+          //  - 复用已在服务的内核 → 窗口早已过去 → **不等待 → 秒开**。
+          this.testCoreWarmAt = Date.now() + TEST_CORE_WARMUP_MS;
           return true;
         }
         readinessDelayMs = nextReadinessDelayMs(readinessDelayMs);
@@ -2321,6 +2439,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.api.setEndpoint(this.apiPort, '');
     this.testCoreActive = false;
     this.testCoreNegativeUntil = 0;
+    this.testCoreWarmAt = 0;
     this.invalidateStateProbeCache();
     this.clearTestCoreArtifacts();
     if (this.testCoreFlight !== null) {
@@ -2637,6 +2756,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         await SettingsService.setApiSecret(this.apiSecret);
       }
 
+      // 先拆掉可能残留的 headless 测速内核（上一批测速 / 页面预热留下的）：
+      // 它与真实隧道**共用同一个 VpnExtensionAbility 进程**，不先拆就会与下面的
+      // stopVpnExtensionAbility 互相 stop；而且测速通道状态会失真（扩展已死但
+      // 进程内仍记着 ACTIVE）→ 下一批测速会误判「通道不可用」而白拆一次再重启。
+      if (this.testCoreFlight !== null && this.testCoreFlight.isActive()) {
+        AppLogger.info(TAG, 'connect: tearing down test core before starting real tunnel');
+        await this.stopTestCore();
+      }
       // 关键：扩展进程存活时再次 startVpnExtensionAbility 只会累加 startId，
       // 系统不会重新回调 onCreate（TUN/内核启动逻辑不会重放）。
       // 因此每次连接前先停掉既有 VPN 扩展（触发 onDestroy → 内核停止），

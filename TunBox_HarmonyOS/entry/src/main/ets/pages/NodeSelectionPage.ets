@@ -26,6 +26,7 @@ import {
   LATENCY_TIMEOUT_MS, LatencyEngine, LatencyProgress, LatencyRun,
   LatencyRunOptions, GROUP_TEST_TIMEOUT_MS
 } from '../commons/services/LatencyEngine';
+import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { NodeCountryPolicy } from '../commons/services/PublicIpService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import {
@@ -165,6 +166,12 @@ struct NodeSelectionPage {
   @State latencyChannelLabel: string = '';
   /** 本轮因通道（内核/凭证）不可用而中止：结果不能当节点结论，也不能落盘 */
   @State latencyCoreUnavailable: boolean = false;
+  /**
+   * 正在**准备测速通道**（未连接时要拉起 headless 测速内核，秒级）。
+   * 这段等待必须有可见文案，否则用户看到「点了没反应，过几秒才出结果」
+   * （真机取证 2026-10-20：通道准备 = DoH 预解析 + 启扩展 + 就绪轮询 + 预热）。
+   */
+  @State latencyPreparing: boolean = false;
   /**
    * 本轮组测返回 **504（all proxies timeout）** = **所有节点都不通**，但**通道正常**。
    *
@@ -325,6 +332,10 @@ struct NodeSelectionPage {
       LatencyController.addListener(this.latencyListener);
       this.latencyListenerBound = true;
     }
+    // 预热测速通道（真机取证 2026-10-20）：「点了测速要等几秒才开始」的根因是
+    // 通道准备（未连接时要拉起 headless 测速内核）。进页面时后台做完这段准备，
+    // 用户点「测全部」时通道已热 → 秒开。预热本身不发起任何探测。
+    BackgroundLatencyService.prewarmChannel(ctx).catch((): void => {});
     // 进页面不再自动测速（用户要求）：只有用户主动点「测全部」或单节点测速才运行。
   }
 
@@ -973,7 +984,13 @@ struct NodeSelectionPage {
     // 通道由编排器决定：已连接 → 隧道 controller；未连接 → 进程内无头内核；
     // 都没有 → null，引擎据此走**明确标注**的离线粗略通道（状态 OFFLINE，显示 ≈ms）。
     // 这里绝不因为 api === null 就放弃调用 —— 那会让"没连 VPN 时点测速毫无反应"。
-    const api: ClashApiService | null = await this.orchestrator.ensureLatencyApi();
+    let api: ClashApiService | null = null;
+    this.latencyPreparing = true;
+    try {
+      api = await this.orchestrator.ensureLatencyApi();
+    } finally {
+      this.latencyPreparing = false;
+    }
     if (this.batchCancelled) {
       // 用户在这段等待里已经点了取消/离开了页面：别再起批次
       if (driveHeader) {
@@ -1272,7 +1289,13 @@ struct NodeSelectionPage {
       this.latencyDone = 0;
       this.latencyCoreUnavailable = false;
     }
-    const api: ClashApiService | null = await this.orchestrator.ensureLatencyApi();
+    let api: ClashApiService | null = null;
+    this.latencyPreparing = true;
+    try {
+      api = await this.orchestrator.ensureLatencyApi();
+    } finally {
+      this.latencyPreparing = false;
+    }
     if (this.batchCancelled) {
       if (driveHeader) {
         this.batchTesting = false;
@@ -1611,7 +1634,12 @@ struct NodeSelectionPage {
             // 组测一起出结果（约 3 秒），进度条没有意义——已去掉（用户要求）。
             // 通道（内核/凭证）不可用时明确告诉用户原因。
             Row({ space: 8 }) {
-              if (this.latencyCoreUnavailable) {
+              if (this.latencyPreparing) {
+                // 通道还没就绪（要拉起测速内核，秒级）：明确告诉用户在等什么
+                Text('准备测速通道…')
+                  .fontSize(11)
+                  .fontColor(Ui.textSecondary)
+              } else if (this.latencyCoreUnavailable) {
                 Text('内核不可用，本轮未测')
                   .fontSize(11)
                   .fontColor(Ui.warning)
