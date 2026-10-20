@@ -153,6 +153,109 @@ export class LatencyProbeKind {
   }
 }
 
+/**
+ * 探测策略（纯函数，零 import）—— **从 `LatencyState.LatencyPolicy` 迁移而来**。
+ *
+ * 2026-10-20（lead 拍板）：`LatencyPolicy` 长期是「什么都装」的杂货铺，
+ * 把三类完全不同的东西塞在一个类里：
+ *  1. **判定表转调**（isNonVerdictKind / isStale / isStaleConclusion）→ 归 `LatencyProbeKind`；
+ *  2. **探测策略**（有效延迟、内建项/组过滤、环回地址、排序权重）→ **本类**；
+ *  3. **超时数值**（DEFAULT_TIMEOUT_MS / MAX_TIMEOUT_MS）→ 归 `LatencyProbeLimits`。
+ * 本类只装第 2 类：**输入是纯标量/纯字段，不依赖 LatencyRecord 类型**
+ * （那是 services 层的类型，零 import 模块不能引）⇒ 排序权重改成按
+ * 「状态 + 延迟」两个标量入参，由 services 层的薄转调包装成 `compare(a, b)`。
+ */
+export class LatencyStrategy {
+  /**
+   * 0 / 负数 / 缺失都不是有效延迟。
+   *
+   * mihomo 成功时 delay 恒 >= 1；0 表示失败（内核自己就把 delay==0 当失败返回 503）。
+   * 若把 0 当「很快」，死节点会排到最前面。
+   */
+  static isValidDelay(delayMs: number): boolean {
+    return delayMs >= 1 && delayMs < 32767;
+  }
+
+  /** 节点名是否是内建项（不可测） */
+  static isBuiltinNode(name: string): boolean {
+    return name === 'DIRECT' || name === 'REJECT' || name === 'REJECT-DROP'
+      || name === 'COMPATIBLE' || name === 'PASS' || name === 'PASS-RULE'
+      || name === 'GLOBAL' || name === 'REMATCH' || name === 'DNS';
+  }
+
+  /**
+   * 服务器地址是否指向本机/内网。
+   *
+   * 为什么单列一条：离线粗略通道测的是「服务器可达性」，对环回/内网地址测出来的
+   * 是本机自己的握手开销（真机实测会出现 `≈2ms` 这种漂亮但毫无意义的数字，还会
+   * 排到列表最前）。真实内核通道不受影响（那种节点本来就该按真实延迟显示），
+   * 所以只在离线通道里判定。
+   */
+  static isLoopbackOrLocal(server: string): boolean {
+    const s = server.trim().toLowerCase();
+    if (s.length === 0) {
+      return true;
+    }
+    if (s === 'localhost' || s === '::1' || s === '[::1]') {
+      return true;
+    }
+    if (s.startsWith('127.') || s.startsWith('10.') || s.startsWith('192.168.')) {
+      return true;
+    }
+    // 172.16.0.0/12
+    if (s.startsWith('172.')) {
+      const parts = s.split('.');
+      if (parts.length > 1) {
+        const second = Number.parseInt(parts[1], 10);
+        if (second >= 16 && second <= 31) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 组类型是否可测。
+   *
+   * 为什么必须过滤组：实测本项目的 `PROXY.all` 里混着 14 个组条目
+   * （🔰 选择节点 / 🌏 爱奇艺&哔哩哔哩 / 🎮 Steam… ），若不过滤，
+   * 一是会把组当节点测（内核按组当前选择返回，得到的是**别的节点**的延迟，
+   * 结果张冠李戴），二是浪费一轮超时预算。所以只测真实出站节点。
+   */
+  static isTestableType(type: string): boolean {
+    const groups: string[] = ['Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Relay'];
+    if (groups.indexOf(type) >= 0) {
+      return false;
+    }
+    const builtinTypes: string[] = ['Direct', 'Reject', 'RejectDrop', 'Compatible', 'Pass', 'PassRule', 'Dns'];
+    return builtinTypes.indexOf(type) < 0;
+  }
+}
+
+/**
+ * 单节点测速的**超时数值真源**（从 `LatencyState.LatencyPolicy` 迁移而来）。
+ *
+ * ⚠ 与 `LatencyProbeLimits` 的关系：那边装的是**探针自己**的并发/预算参数
+ * （NODE_TIMEOUT_MS / OUTER_EXTRA_MS / WORKERS / MAX_INFLIGHT / QUEUE_WAIT_MAX_MS），
+ * 这边装的是**调用方可见的超时契约**（默认预算 + 内核 16 位解析上限）。
+ * 两者的「5000」必须是同一个值 —— 但 `LatencyProbe.ets` 会 import `models/AppSettings`，
+ * 而 `LatencyEngine` 只引 `ClashApiService`，为免把 probe 整条依赖链拖进引擎，
+ * 这里保留独立常量，并由闸门 `verify-latency-core-v2` 断言两者**数值相等**。
+ */
+export class LatencyTimeout {
+  /**
+   * 单节点探测超时（毫秒）—— 与 FlClash 默认 5s 对齐。
+   *
+   * 沿革：5000 → 3000（嫌等太久）→ 1000（2026-10-18）→ 2500（同日回退）→ **5000**（2026-10-19）。
+   * 1000ms 被真机证伪：飞鸟云 35 个 hysteria2（QUIC/UDP）节点首握需 1~2 RTT，
+   * 同一批 3s 能测出 143/558/560ms，1s 时 measured=0/timeout=31（全部误杀）。
+   */
+  static readonly DEFAULT_TIMEOUT_MS: number = 5000;
+  /** mihomo 的 timeout 用 16 位整数解析，> 32767 直接 400。 */
+  static readonly MAX_TIMEOUT_MS: number = 30000;
+}
+
 /** 一次探测的结果 */
 export class LatencyProbeResult {
   /** 节点名 */

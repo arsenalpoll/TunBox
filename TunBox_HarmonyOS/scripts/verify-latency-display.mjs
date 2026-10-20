@@ -137,7 +137,16 @@ ok('ClashApiService 提供 proxyTableNames（内核代理表全名）',
 //   50 = worker 数（队列深度）；2026-10-20 用户拍板：在途请求数也放开为 LATENCY_INFLIGHT=50
 //   （不再有应用层排队 ⇒ 每个节点的 elapsed 就是它自己那次 /delay 的真实耗时）。
 //   另注：C7 之后「排队等待」不再计入单请求超时预算，故并发度不再是超时算术的前提。
-ok('单节点测速超时为 5000ms', /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*5000/.test(stateSrc));
+// 2026-10-20（lead 拍板迁移）：超时数值真源搬到零 import 的
+// commons/latency/LatencyKinds.ets 的 LatencyTimeout；LatencyState.LatencyPolicy
+// 只剩转调 getter ⇒ 断言改判**真源**，并额外要求转调关系存在（不许留第二份字面量）。
+const kindsSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/latency/LatencyKinds.ets'), 'utf8');
+ok('单节点测速超时为 5000ms（真源 LatencyTimeout.DEFAULT_TIMEOUT_MS）',
+  /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*5000/.test(kindsSrc));
+ok('LatencyPolicy 的超时是转调真源（不留第二份字面量）',
+  /return\s+LatencyTimeout\.DEFAULT_TIMEOUT_MS;/.test(stateSrc)
+  && !/DEFAULT_TIMEOUT_MS:\s*number\s*=\s*\d+/.test(stateSrc));
 ok('并发测速数为 50（C8b：由 88 收敛，worker 口径）', /LATENCY_CONCURRENCY\s*=\s*50/.test(engineSrc));
 ok('在途并发上限为 50（2026-10-20 放开：与 worker 数同宽，无应用层排队）',
   /LATENCY_INFLIGHT\s*=\s*50/.test(engineSrc));

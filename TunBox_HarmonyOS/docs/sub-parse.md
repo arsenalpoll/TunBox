@@ -432,9 +432,13 @@ YAML 样本在 `scripts/fixtures/subs/yaml/`（子目录 ⇒ 顶层 .txt 链接�
 - 迁移时应注意：旧解析器把部分参数**塞进 `rawTemplate`**（`extra` 之类的键），
   新解析层产出的是**规范键 + 明确的 mihomo 字段映射**，接进配置生成器时以新层为准。
 - 旧 `ModernUriCodec.parse*` / `SsrCodec.parse*` 已于 **2026-10-20（B6 旧解析器退场）整体删除**：
-  `ProxyNode.ets` 从 1256 行缩到 375 行，只剩 `ProxyNode`（模型 + `fromUri` → `parseUriNode` → `fromCanonical`）
-  与 `SsrCodec`（**只剩 base64 解码工具**：`b64` / `decoder` / `decodeBase64Url` ——
-  名字保留是为了不碰 `tools/true-chain-harness/compare_forms.mjs`，要不要改名由 lead 定）。
+  `ProxyNode.ets` 从 1256 行缩到 376 行，只剩 `ProxyNode`（模型 + `fromUri` → `parseUriNode` → `fromCanonical`）
+  与 `Base64Codec`（**纯 base64url 工具**：`b64` / `decoder` / `decodeBase64Url`）。
+
+  **2026-10-20 lead 拍板改名 `SsrCodec` → `Base64Codec`**：旧名名不副实 —— 它早已不含
+  任何 SSR 编解码逻辑，只剩 base64 工具，名字却让人以为还有 SSR 解析残留。
+  调用方共 3 处（`SubscriptionParser` / `SubscriptionService` / `compare_forms.mjs`），
+  已同步改完；3 个 credential 闸门的 `ProxyNode.ts` 桩也一并改名。
   删旧解析器时**没有丢协议**：`hysteria v1`（`hysteria://`）在同一天并入了规范层
   （`ProtocolParamTable` 的 `hysteria` 项 + `ProxyNodeAdapter.supportsUdp`），
   并在 `scripts/fixtures/subs/hysteria1.txt` 留了样本盯着。

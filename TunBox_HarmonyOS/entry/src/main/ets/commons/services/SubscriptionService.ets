@@ -24,7 +24,7 @@ import { util } from '@kit.ArkTS';
 import {
   Subscription, SubscriptionImportDiagnostics, SubscriptionRefreshResult, SubscriptionRefreshStatus
 } from '../models/Subscription';
-import { ProxyNode, ProxyNodeType, SsrCodec } from '../models/ProxyNode';
+import { ProxyNode, ProxyNodeType, Base64Codec } from '../models/ProxyNode';
 import { ProxyGroup, ProxyGroupJson } from '../models/ProxyGroup';
 import { AppSettings } from '../models/AppSettings';
 import { SubscriptionParseResult, SubscriptionParser } from './SubscriptionParser';
@@ -3088,7 +3088,7 @@ export class SubscriptionService {
     try {
       const cleaned = body.replace(/\s+/g, '');
       if (!/[:{]/.test(cleaned.substring(0, 200)) && /^[A-Za-z0-9+/=_-]+$/.test(cleaned)) {
-        const decoded = SsrCodec.decodeBase64Url(cleaned);
+        const decoded = Base64Codec.decodeBase64Url(cleaned);
         if (decoded.length > 0) {
           text = decoded;
         }

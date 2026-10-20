@@ -410,3 +410,41 @@ LatencyEngine
 * 「年龄未知（`testedAt<=0`）的**失败结论**算陈旧」这条假红防线**不许丢**
   （`LatencyKinds.isStale` 的 `testedAtMs <= 0 ⇒ return isFailure` 那一支）。
 * 文案：`network_unreachable` ⇒ 红「**拨号失败**」（不是「失败」，也不是用户骂过的「网络不可达」）。
+
+
+---
+
+## 12. `LatencyPolicy` 迁移（2026-10-20 lead 拍板）
+
+`commons/services/LatencyState.ets` 里的 `LatencyPolicy` 长期是「什么都装」的杂货铺，
+三类完全不同的东西混在一个类里。本次按职责拆开：
+
+| 类别 | 成员 | 迁往 | `LatencyPolicy` 现在的角色 |
+|---|---|---|---|
+| 判定表 | `isNonVerdictKind` / `isStale` / `isStaleConclusion` / `STALE_MS` | `latency/LatencyKinds.ets` 的 `LatencyProbeKind` | 转调 getter/别名 |
+| 探测策略 | `isValidDelay` / `isBuiltinNode` / `isLoopbackOrLocal` / `isTestableType` | `latency/LatencyKinds.ets` 的 **`LatencyStrategy`（新）** | 转调别名 |
+| 超时数值 | `DEFAULT_TIMEOUT_MS` / `MAX_TIMEOUT_MS` | `latency/LatencyKinds.ets` 的 **`LatencyTimeout`（新）** | 转调 getter |
+| 记录级排序 | `sortRank` / `compare` | **留在原处** | 唯一实现 |
+
+### 为什么排序不迁
+
+`sortRank` / `compare` 的入参是 `LatencyRecord`（services 层的类型），
+而 `LatencyKinds.ets` 是**零 import** 模块（services 侧能值依赖的必须是零 import，
+否则 Node 侧「扁平暂存」闸门会 ERR_MODULE_NOT_FOUND）。
+把「状态 → 档位」的映射单独下沉也试过，但那只是一张 switch，搬走反而要多传 6 个状态常量
+⇒ 判定：排序留原处，并在类注释里写清理由。
+
+### 为什么超时要留两个常量
+
+`LatencyProbeLimits.NODE_TIMEOUT_MS`（探针自身预算）与
+`LatencyTimeout.DEFAULT_TIMEOUT_MS`（调用方可见的超时契约）数值必须相同（都是 5000），
+但 `LatencyProbe.ets` 会 import `models/AppSettings`，而 `LatencyEngine` 只引
+`ClashApiService` —— 为免把 probe 整条依赖链拖进引擎，两边保留独立常量，
+由 `verify-latency-core-v2` 断言**数值相等**。
+
+### 迁移后的一致性保证
+
+- `LatencyKinds.ets` 仍然**零 import**（`verify-latency-core-v2` 的 I11 断言）。
+- 所有策略/判定只有**一份实现**（`verify-no-divergence` 14/14）。
+- `LatencyPolicy` 里**不许再出现** `DEFAULT_TIMEOUT_MS: number = 5000` 这类字面量
+  （`verify-latency-display` 新增反例断言）。

@@ -10,7 +10,7 @@ const repo = join(here, '..', '..');
 const audit = join(repo, '..', '_audit');
 const G = (n) => pathToFileURL(join(here, 'generated', n)).href;
 const { YamlMerger } = await import(G('YamlMerger.ts'));
-const { SsrCodec, ProxyNode } = await import(G('ProxyNode.ts'));
+const { Base64Codec, ProxyNode } = await import(G('ProxyNode.ts'));
 
 const SCHEMES = ['ssr://', 'ss://', 'vless://', 'vmess://', 'trojan://', 'hysteria2://', 'hy2://',
   'tuic://', 'anytls://', 'hysteria://', 'socks5://', 'http://'];
@@ -21,7 +21,7 @@ function countLinks(text) {
   if (!/:\/\//.test(body.slice(0, 300))) {
     const cleaned = body.replace(/\s+/g, '');
     if (/^[A-Za-z0-9+/=_-]+$/.test(cleaned)) {
-      const dec = SsrCodec.decodeBase64Url(cleaned);
+      const dec = Base64Codec.decodeBase64Url(cleaned);
       if (dec.length > 0) body = dec;
     }
   }

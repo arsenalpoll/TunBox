@@ -1,4 +1,3 @@
-// [harness] generated from entry/src/main/ets/commons/services/LatencyState.ets — 仅 import 目标被重写
 /**
  * 节点延迟状态模型（延迟测试重做，5.6.0）
  *
@@ -32,6 +31,11 @@
  * import 进来跑的；Node 的 strip-only 模式明确拒绝 `enum`，会报
  * ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX）。
  */
+// 失败分类常量**唯一真源** = 零 import 的 LatencyKinds 模块（审计 LP04：
+// 不许在本文件里再写一份分类名字面量 —— 那等于第二份副本）。
+// LatencyKinds 零 import ⇒ Node 侧扁平暂存闸门照样能跑（只需把它一起暂存）。
+import { LatencyProbeKind, LatencyStrategy, LatencyTimeout } from './LatencyKinds.ts';
+
 export class LatencyState {
   static readonly UNTESTED: number = 0;
   static readonly TESTING: number = 1;
@@ -149,135 +153,77 @@ export class LatencyRecord {
 }
 
 /**
- * 结果状态机与排序策略（纯函数）。
+ * 延迟策略的**薄转调层**（2026-10-20 lead 拍板迁移）。
  *
- * 关键约定：
- *  - `0ms` 不是有效延迟。mihomo 成功时 delay 恒 >= 1；0 表示失败（内核自己就
- *    把 delay==0 当失败返回 503）。若把 0 当"很快"，死节点会排到最前面。
- *  - 失败**永不排在最前**：排序权重 last（CMFA 的朴素升序把死节点顶到最上面，
- *    是公认的体验问题）。
+ * ## 为什么拆
+ *
+ * 这个类长期是「什么都装」的杂货铺，三类完全不同的东西混在一起：
+ *  1. **判定表**（isNonVerdictKind / isStale / isStaleConclusion）→ 真源在零 import 的
+ *     `latency/LatencyKinds.ets`（`LatencyProbeKind`），本类只转调；
+ *  2. **探测策略**（有效延迟 / 内建项 / 组过滤 / 环回地址）→ 已迁到
+ *     `latency/LatencyKinds.ets` 的 `LatencyStrategy`，本类只转调；
+ *  3. **超时数值**（DEFAULT_TIMEOUT_MS / MAX_TIMEOUT_MS）→ 已迁到
+ *     `latency/LatencyKinds.ets` 的 `LatencyTimeout`，本类只转调。
+ *
+ * ⇒ 现在本类**只剩两件事**：`LatencyRecord` 级别的排序（compare/sortRank —— 它需要
+ * services 层的记录类型，零 import 模块引不了）与上述三类的**转调别名**。
+ * 新增/修改策略请去 `LatencyKinds.ets`，**不要在这里写第二份实现**。
+ *
+ * ## 保留的约定
+ *  - `0ms` 不是有效延迟（mihomo 成功时 delay 恒 >= 1；0 被内核当失败返回 503）。
+ *  - 失败**永不排在最前**（CMFA 的朴素升序把死节点顶到最上面，是公认的体验问题）。
  *  - CANCELLED / UNTESTED 不带结论，权重排在失败之后。
  */
 export class LatencyPolicy {
   /**
-   * 单节点探测超时：**2500ms**（统一口径，不按协议分档）。
+   * 单节点探测超时 —— **转调别名**，真源在 `latency/LatencyKinds.ets` 的
+   * `LatencyTimeout.DEFAULT_TIMEOUT_MS`（与 FlClash 默认 5s 对齐）。
    *
-   * 沿革：5000ms → 3000ms（用户嫌等太久）→ 1000ms（2026-10-18 要求"判超时快一点"）
-   * → **2500ms（同日回退）**。1000ms 被真机证伪：飞鸟云 35 个节点是 **hysteria2
-   * （QUIC/UDP，sni: localhost）**，首次 QUIC 握手 + TLS 需要 1~2 个 RTT，16 路并发
-   * 建连时更久 —— 同一批节点 3s 超时能测出 143/558/560ms，1s 时 measured=0、
-   * timeout=31（全部判死）。对照 FlClash 默认 5s，两边尺子不同。
-   * 用户裁定：全部统一 2.5s —— 兼顾"别等太久"与"别把好节点误杀"。
-   *
-   * 2026-10-19 用户要求改为 **5s**。理由与上面的取证一致：2.5s 仍会把慢 RTT
-   * 的好节点误杀（真机出现过 measured=0/timeout=31 的整批假死），而 5s 与
-   * FlClash 默认一致 —— 两边尺子不同会让"同一节点在两个客户端表现不同"，
-   * 用户无法判断是节点问题还是客户端问题。
-   *
-   * 这个值同时是发给内核 `/delay` 的 `timeout` 参数；外层 http 超时按它推导
-   * （在途并发 ≤ 8 时 `batchCount=1` → 外层 = `timeout + 1200`），所以整批耗时
-   * 也随之变化。
-   *
-   * ⚠ 2026-10-20 修正：旧注释写的是「外层恒为 timeout+1200」。那只是 lanes ≤ 8
-   * 时才成立的特例 —— 旧实现硬编码 lanes=16 → batchCount=2 → 外层其实是
-   * `2*timeout+1200`，而排队最坏要 11×5s，外层根本兜不住（根因 T2）。
-   * 现在队列化已由应用层信号量负责，lanes 恒为 8（= 在途数），外层回到
-   * `timeout + 1200`。
+   * 沿革（含真机取证）见真源类注释：5000 → 3000 → 1000（被飞鸟云 35 个
+   * hysteria2 节点证伪：1s 时 measured=0/timeout=31 全部误杀）→ 2500 → **5000**。
    */
-  static readonly DEFAULT_TIMEOUT_MS: number = 5000;
-  /** mihomo 的 timeout 用 16 位整数解析，> 32767 直接 400。 */
-  static readonly MAX_TIMEOUT_MS: number = 30000;
-  /** 结果视为"旧"的阈值：超过即灰显，提示用户可能不准 */
-  static readonly STALE_MS: number = 10 * 60 * 1000;
+  static get DEFAULT_TIMEOUT_MS(): number {
+    return LatencyTimeout.DEFAULT_TIMEOUT_MS;
+  }
 
-  /** 0 / 负数 / 缺失都不是有效延迟 */
+  /** mihomo 的 timeout 用 16 位整数解析，> 32767 直接 400 —— 转调别名。 */
+  static get MAX_TIMEOUT_MS(): number {
+    return LatencyTimeout.MAX_TIMEOUT_MS;
+  }
+
+  /**
+   * 结果视为「旧」的阈值 —— **转调别名**，唯一阈值定义在零 import 的内核分类表
+   * （{@link LatencyProbeKind.STALE_MS}）。
+   *
+   * ⚠ 这里**不再**留第二份阈值字面量（那个「10 分钟」的数）—— 阈值只能一份
+   * （审计 ND05）。改成 getter 而不是 `static readonly`，是为了让「阈值定义处」
+   * 在扫描型闸门眼里只有内核那一个。
+   */
+  static get STALE_MS(): number {
+    return LatencyProbeKind.STALE_MS;
+  }
+
+  /** 0 / 负数 / 缺失都不是有效延迟 —— **转调别名**（真源 `LatencyStrategy`）。 */
   static isValidDelay(delayMs: number): boolean {
-    return delayMs >= 1 && delayMs < 32767;
+    return LatencyStrategy.isValidDelay(delayMs);
   }
 
-  /**
-   * 把一次探测的原始结果归一化为状态。
-   * @param httpCode HTTP 状态码（0 = 传输层失败/中止）
-   * @param delayMs  响应体里的 delay（无则 -1）
-   * @param aborted  是否为客户端主动中止（取消），此时绝不是节点结论
-   */
-  static classify(httpCode: number, delayMs: number, aborted: boolean): number {
-    if (aborted) {
-      return LatencyState.CANCELLED;
-    }
-    if (httpCode === 200 && LatencyPolicy.isValidDelay(delayMs)) {
-      return LatencyState.MEASURED;
-    }
-    if (httpCode === 504) {
-      return LatencyState.TIMEOUT;
-    }
-    if (httpCode === 503) {
-      return LatencyState.FAILED;
-    }
-    if (httpCode === 404) {
-      // 节点已不存在（配置变更）：不是"超时"，也不该留在列表里给用户看
-      return LatencyState.FAILED;
-    }
-    // 401/000/其他：内核或凭证层面有问题，不能盖章成节点超时
-    return LatencyState.FAILED;
-  }
-
-  /** 节点名是否是内建项（不可测） */
+  /** 节点名是否是内建项（不可测）—— **转调别名**（真源 `LatencyStrategy`）。 */
   static isBuiltinNode(name: string): boolean {
-    return name === 'DIRECT' || name === 'REJECT' || name === 'REJECT-DROP'
-      || name === 'COMPATIBLE' || name === 'PASS' || name === 'PASS-RULE'
-      || name === 'GLOBAL' || name === 'REMATCH' || name === 'DNS';
+    return LatencyStrategy.isBuiltinNode(name);
   }
 
-  /**
-   * 服务器地址是否指向本机/内网。
-   *
-   * 为什么单列一条：离线粗略通道测的是"服务器可达性"，对环回/内网地址测出来的
-   * 是本机自己的握手开销（真机实测会出现 `≈2ms` 这种漂亮但毫无意义的数字，还会
-   * 排到列表最前）。真实内核通道不受影响（那种节点本来就该按真实延迟显示），
-   * 所以只在离线通道里判定。
-   */
+  /** 服务器地址是否指向本机/内网 —— **转调别名**（真源 `LatencyStrategy`）。 */
   static isLoopbackOrLocal(server: string): boolean {
-    const s = server.trim().toLowerCase();
-    if (s.length === 0) {
-      return true;
-    }
-    if (s === 'localhost' || s === '::1' || s === '[::1]') {
-      return true;
-    }
-    if (s.startsWith('127.') || s.startsWith('10.') || s.startsWith('192.168.')) {
-      return true;
-    }
-    // 172.16.0.0/12
-    if (s.startsWith('172.')) {
-      const parts = s.split('.');
-      if (parts.length > 1) {
-        const second = Number.parseInt(parts[1], 10);
-        if (second >= 16 && second <= 31) {
-          return true;
-        }
-      }
-    }
-    return false;
+    return LatencyStrategy.isLoopbackOrLocal(server);
   }
 
-  /**
-   * 组类型是否可测。
-   *
-   * 为什么必须过滤组：实测本项目的 `PROXY.all` 里混着 14 个组条目
-   * （🔰 选择节点 / 🌏 爱奇艺&哔哩哔哩 / 🎮 Steam… ），若不过滤，
-   * 一是会把组当节点测（内核按组当前选择返回，得到的是**别的节点**的延迟，
-   * 结果张冠李戴），二是浪费一轮超时预算。所以只测真实出站节点。
-   */
+  /** 组类型是否可测 —— **转调别名**（真源 `LatencyStrategy`）。 */
   static isTestableType(type: string): boolean {
-    const groups: string[] = ['Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Relay'];
-    if (groups.indexOf(type) >= 0) {
-      return false;
-    }
-    const builtinTypes: string[] = ['Direct', 'Reject', 'RejectDrop', 'Compatible', 'Pass', 'PassRule', 'Dns'];
-    return builtinTypes.indexOf(type) < 0;
+    return LatencyStrategy.isTestableType(type);
   }
 
+  
   /**
    * 排序权重：实测最快 → 实测较慢 → 离线探测 → 未测/取消 → 超时 → 失败。
    * 失败最后（绝不让坏节点因为"-1 最小"而排最前）。
@@ -318,62 +264,72 @@ export class LatencyPolicy {
     return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
   }
 
-  /** 结果是否已过期（灰显提示，不删除——用户仍可参考） */
+  /**
+   * 结果是否已过期（灰显提示，不删除——用户仍可参考）。
+   *
+   * **判定归真源**：唯一判定表 = 零 import 的内核分类表
+   * {@link LatencyProbeKind.isStale}（含阈值 STALE_MS），本函数只做**转调**，
+   * 不再自己判「多旧算旧」（审计：判定表只能一份）。
+   *
+   * 口径分工（内核表里的两条，缺一不可）：
+   *  - 有时间戳 ⇒ `nowMs - testedAtMs > STALE_MS` 才算旧；
+   *  - 年龄未知（atMs <= 0）且**不是**失败结论 ⇒ 不算旧（无法判断，不标「·旧」）。
+   *
+   * ⚠ 调用方（主题）只在**有值**的结果上问这一句 —— 「有值的旧结果」标「·旧」，
+   * 失败结论的陈旧由 {@link isStaleConclusion} 走另一条分支（见那里的注释）。
+   * ⇒ 这里的 `rec.hasValue()` 是**调用前提**（没测出值的东西谈不上「结果过期」），
+   * 不是第二份陈旧规则；判定本身全部来自内核表。
+   */
   static isStale(rec: LatencyRecord, nowMs: number): boolean {
-    if (rec.atMs <= 0 || !rec.hasValue()) {
+    if (!rec.hasValue()) {
       return false;
     }
-    return nowMs - rec.atMs > LatencyPolicy.STALE_MS;
+    return LatencyProbeKind.isStale(rec.atMs, nowMs, false);
   }
 
   /**
-   * 「非判定」失败分类（与 ClashApiService.LatencyFailKind 同值）。
+   * 「非判定」失败分类 —— **转调别名**。
    *
-   * 用字面量而不是引用 LatencyFailKind：本文件与 ClashApiService 互相引用，
-   * 引入会造成循环依赖（同 `stateText` 里 'queue_timeout' 的处理）。
+   * 唯一判定表 = 零 import 的内核分类表
+   * {@link LatencyProbeKind.isNonVerdictKind}（正表/反表不得并存，审计 ND13）。
+   * 本文件**不再**自带一份分类清单 —— 那是第二张判定表，新增一类失败时两处
+   * 不同步 ⇒ live 路径与恢复路径结论相反。
    *
-   * 非判定 = **这次失败不构成"节点通不通"的结论**：
-   *  - core_not_ready     测速通道/凭证坏了
-   *  - port_reachable_only 只证明端口可达（直连降级）
-   *  - untested           整批硬截止，本次没测出来
-   *  - unsupported        协议无法离线探测
-   *  - queue_timeout      根本没拨号（应用侧在途名额耗尽）
+   * 非判定 = **这次失败不构成「节点通不通」的结论**（清单见内核表）：
+   *  core_not_ready（通道/凭证坏了）/ queue_timeout（根本没拨号）/
+   *  untested（整批硬截止）/ cancelled（主动取消）/ unsupported（协议无法离线探测）/
+   *  port_reachable_only（只证明端口可达）/ unknown（认不出来的失败）。
    *
-   * ⚠ **空分类（''）不在本表里**：写快照时（buildAuto）空分类 = 一次「没有分类的
-   * 真实失败」，它是节点结论，必须写进快照。空分类只在**恢复**路径上被当成
-   * 「非结论」——因为快照里唯一会写出空分类失败的地方是**旧版自动切换记账**
-   * （它把一次连接失败写成 latency=-1 且不带分类），见 LatencyController.restore。
+   * ⚠ **空分类（''）不在表里**（内核表与本别名同口径）：写快照时（buildAuto）
+   * 空分类 = 一次「没有分类的真实失败」，它是节点结论，必须写进快照；空分类只在
+   * **恢复**路径上被当成「非结论」—— 快照里唯一会写出空分类失败的地方是**旧版
+   * 自动切换记账**（它把一次连接失败写成 latency=-1 且不带分类），见
+   * LatencyLiveView.restore。
    *
-   * ⚠ 这些类别**绝不能**在冷启动恢复时渲染成红色的「超时」——2026-10-20 真机
+   * ⚠ 这些类别**绝不能**在冷启动恢复时渲染成红色的「超时」—— 2026-10-20 真机
    * 用户反馈「刚打开软件还没测速就显示超时，测完发现这个节点是好的」。
    */
   static isNonVerdictKind(failKind: string): boolean {
-    return failKind === 'core_not_ready'
-      || failKind === 'port_reachable_only'
-      || failKind === 'untested'
-      || failKind === 'unsupported'
-      || failKind === 'queue_timeout'
-      // unknown = **认不出来的失败**（内核口径：宁可什么都不写，也不冤枉节点）。
-      // 当前发布路径已拦掉它（引擎的 UNKNOWN 分支不落结论），今天没有真实风险；
-      // 但这是**只差一行**的防线：将来任何路径把 'unknown' 写进落盘仓，
-      // 冷启动恢复就会把它渲染成一条**假红条**（latency=-1 且分类非判定 ⇒ 回「未测(--)」）。
-      || failKind === 'unknown';
+    return LatencyProbeKind.isNonVerdictKind(failKind);
   }
 
   /**
    * 失败结论是否已陈旧（冷启动恢复的上一轮结论用它决定要不要标「·旧」）。
    *
-   * `atMs <= 0` = 年龄未知（快照没有测速时间戳）→ **按陈旧处理**：
-   * 不知道多久以前的失败，绝不能当成本次刚测出来的结论顶在列表上。
+   * **判定归真源**：转调零 import 的内核分类表 {@link LatencyProbeKind.isStale}
+   * （isFailure = true 这一支），本函数不自己判（审计：判定表只能一份）。
+   *
+   * ⚠⚠ **必须保住的那条规则**：**年龄未知（testedAtMs <= 0）的失败结论 ⇒ 算陈旧**。
+   * 2026-10-20 真机反馈「刚打开软件还没测速就显示一颗红『超时』、测完发现这个
+   * 节点是好的」的**防线**：不知道多久以前的失败，绝不能当成本次刚测出来的结论
+   * 顶在列表上。内核表的 `isStale(testedAtMs, nowMs, isFailure=true)` 里
+   * 「testedAtMs <= 0 ⇒ return isFailure」这一支就是这条防线 —— **别把它删掉**。
    */
   static isStaleConclusion(rec: LatencyRecord, nowMs: number): boolean {
     if (!rec.isFailure()) {
       return false;
     }
-    if (rec.atMs <= 0) {
-      return true;
-    }
-    return nowMs - rec.atMs > LatencyPolicy.STALE_MS;
+    return LatencyProbeKind.isStale(rec.atMs, nowMs, true);
   }
 
 }
