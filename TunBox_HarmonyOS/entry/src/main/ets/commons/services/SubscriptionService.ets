@@ -171,6 +171,12 @@ export class SubscriptionService {
   /** 最近一次节点恢复（nodes_json → 内存）被丢弃的记录数与原因 */
   lastRestoreInvalidCount: number = 0;
   lastRestoreInvalidReasons: string = '';
+  /**
+   * 最近一次合并 rule-providers 时丢弃的**孤儿字段行**数。
+   * 孤儿 = 出现在任何 provider 键行**之前**、没有归属 provider 的字段行。
+   * 这些行**绝不**塞进上一条 provider（那会造成「字段并错 provider」而且不报错）。
+   */
+  lastProviderOrphanLineCount: number = 0;
 
   /**
    * 网络性拉取失败待重试标记（订阅 id → 失败时刻）。
@@ -2015,6 +2021,14 @@ export class SubscriptionService {
         AppLogger.warn(TAG, `subscription ${id} skipped ${YamlMerger.lastSkippedCount} node(s) `
           + `of unsupported type(s): ${YamlMerger.lastSkippedTypes}`);
       }
+      if (YamlMerger.lastDuplicateKeyCount > 0) {
+        // 【C15】flow-map 节点里含重复键（同一 map 内同名字段）——mihomo 的
+        // yaml.v3 uniqueKeys 默认开启, 重复键会让**整份配置**拒载, 所以解析层
+        // 按「首次出现」保留并去重。这是**降级**不是丢弃(节点仍然可用),
+        // 因此不计入 invalidCount, 只记日志 + 保留 YamlMerger 的静态统计。
+        AppLogger.warn(TAG, `subscription ${id} ${YamlMerger.lastDuplicateKeyCount} node(s) had `
+          + `duplicate keys (kept the first): ${YamlMerger.lastDuplicateKeyReasons.join('; ')}`);
+      }
 
       // ---- proxy-providers：节点放在 provider 段而 proxies 为空的配置也必须导入 ----
       const providerEntries = ProxyProviderParser.parse(body);
@@ -2483,29 +2497,47 @@ export class SubscriptionService {
   /**
    * 全部启用订阅的 rule-providers 块（按订阅顺序合并，同名 provider 先到先得）。
    * 返回的是 2 空格缩进的块式原文（可直接跟在 `rule-providers:` 头之后）。
+   *
+   * 【C16】键行识别改用 **ClashConfigGenerator.parseProviderBlocks**——与配置生成器
+   * **完全同一套**「纯缩进层级」判定（不再另写一份正则）。
+   * 旧实现用 `/^([A-Za-z0-9_-]+):$/` 认 provider 键行，点号名（`my.provider:`）、
+   * 中文名、带引号的名**都不被认成键行** ⇒ 两个后果：
+   * ① 同名 provider **不去重** → 顶层重复键 → mihomo 整份配置拒载（R5）；
+   * ② 引用这些 provider 的 RULE-SET 规则被**静默丢弃**（R1，比拒载更隐蔽：规则不生效、无报错）。
+   *
+   * 去重语义：**同名 provider 整块丢弃**（连同它的**全部**字段行）。绝不只丢键行——
+   * 只丢键行会让字段行落进**上一条** provider 的 mapping → `mapping key "type" already defined`；
+   * 字段键名与上一条不同时**不报错、静默并错 provider**（更隐蔽）。
+   *
+   * 孤儿字段行（任何键行之前出现、没有归属 provider 的字段行）：**丢弃 + 计数 + 日志**。
+   * 绝不静默塞进上一条 provider。
    */
   subscriptionRuleProvidersBlock(): string {
     const lines: string[] = [];
     const seen = new Set<string>();
+    let orphanCount = 0;
     for (const s of this.subscriptions) {
       if (!s.enabled || s.id === DIRECT_GROUP_ID || s.subRuleProviders.length === 0) {
         continue;
       }
-      for (const line of s.subRuleProviders.split('\n')) {
-        const t = line.trim();
-        if (t.length === 0 || t.startsWith('#')) {
+      const parsed = ClashConfigGenerator.parseProviderBlocks(s.subRuleProviders.split('\n'));
+      orphanCount = orphanCount + parsed.orphanLines.length;
+      for (const block of parsed.blocks) {
+        if (seen.has(block.name)) {
+          // 同名 provider：**整块丢弃**（键行 + 全部字段行一起丢，绝不只丢键行）
           continue;
         }
-        // provider 键行是 2 空格缩进的 `name:`；同名 provider 只保留先到者
-        const m = t.match(/^([A-Za-z0-9_-]+):$/);
-        if (m !== null) {
-          if (seen.has(m[1])) {
-            continue;
-          }
-          seen.add(m[1]);
+        seen.add(block.name);
+        lines.push(block.keyLine);
+        for (const field of block.fieldLines) {
+          lines.push(field);
         }
-        lines.push(line);
       }
+    }
+    this.lastProviderOrphanLineCount = orphanCount;
+    if (orphanCount > 0) {
+      AppLogger.warn(TAG, `rule-providers: ${orphanCount} orphan line(s) before any provider key `
+        + '(dropped, not merged into any provider)');
     }
     return lines.join('\n');
   }

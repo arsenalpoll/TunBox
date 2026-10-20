@@ -26,6 +26,7 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { AppLogger } from '../utils/AppLogger';
 import { ensurePrivateDir, chmodPrivate, privateFs } from './PrivateFileStore';
+import { ConfigValidator } from './ConfigValidator';
 
 const TAG = 'RawSubscriptionStore';
 
@@ -44,9 +45,14 @@ export const RAW_SUB_DIR_MODE = 0o700;
 export const RAW_SUB_FILE_MODE = 0o600;
 /** provider 名前缀（与节点名/其他 provider 隔离，避免组内重名） */
 export const RAW_PROVIDER_NAME_PREFIX = 'raw-';
-/** provider 健康检查（file provider 同样支持；失败时的表现需真机确认） */
+/** provider 健康检查（file provider 同样支持；失败时的表现需真机确认）
+ *  URL 必须是 HTTPS：mihomo 的 URLTest 在 unified-delay 开启时连发两次 HEAD，
+ *  官方在该分支告警 "using HTTP may result in failed tests"，并点名
+ *  provider.health-check.url / group.url 应使用 HTTPS。
+ *  明文 HTTP 的 generate_204 在部分机场/运营商链路上会被劫持或重定向，
+ *  表现为「provider 健康检查恒失败」→ 整组节点被判死。 */
 export const RAW_PROVIDER_HEALTH_CHECK_ENABLED: boolean = true;
-export const RAW_PROVIDER_HEALTH_CHECK_URL = 'http://www.gstatic.com/generate_204';
+export const RAW_PROVIDER_HEALTH_CHECK_URL = 'https://www.gstatic.com/generate_204';
 export const RAW_PROVIDER_HEALTH_CHECK_INTERVAL = 300;
 
 /** 落盘结果（ok=false 时 reason 为中文原因，调用方据此记诊断并降级） */
@@ -94,8 +100,15 @@ export class RawProviderStats {
   providerNames: string = '';
 
   detail(): string {
-    return `双轨 provider ${this.enabled ? '开' : '关'}：发出 ${this.emitted}/${this.candidates}`
+    const base = `双轨 provider ${this.enabled ? '开' : '关'}：发出 ${this.emitted}/${this.candidates}`
       + `（缺失文件 ${this.missingFiles}，无对应节点 ${this.orphaned}，path=${this.pathMode}）`;
+    if (this.missingFiles > 0) {
+      // C30（冷启动兜底）：原文文件缺失通常是系统回收了 cacheDir。
+      // 此时双轨 provider 会被跳过（配置里不写 use: 引用 → 内核不会因缺文件起不来），
+      // 但功能是降级的，必须告诉用户「重新拉一次订阅就能恢复」，而不是静默变慢。
+      return `${base}；原文文件缺失（可能被系统清理缓存）：请重新拉取该订阅以恢复双轨 provider`;
+    }
+    return base;
   }
 }
 
@@ -209,7 +222,18 @@ export class RawSubscriptionStore {
 
   /**
    * 写原始订阅内容。任何失败都返回 ok=false（绝不抛出）——调用方必须降级为仅解析链。
-   * 顺序：内容大小校验 → 目录(0700) → 写入 → 权限收窄(0600) → 回读校验长度。
+   * 顺序：内容大小校验 → 目录(0700) → **落盘前 YAML 校验(C26)** → 原子写(C27)
+   *      → 权限收窄(0600) → 回读校验长度。
+   *
+   * C26（落盘前校验）：provider 原文由 **mihomo 自己**做 YAML 解析，
+   *   而 yaml.v3 的 uniqueKeys 默认开启 → 原文里只要有一处同层级重复键，
+   *   整个 provider 加载失败（进而可能拖垮整份配置的加载）。
+   *   所以落盘前先过 ConfigValidator：能降级的就地降级（重复键取首个），
+   *   降级后仍不通过就**拒绝写入**（保留上一份可用原文）并回报原因。
+   *
+   * C27（原子写）：先写同目录临时文件 → fsync → rename 覆盖。
+   *   旧写法是 TRUNC 直写：写到一半失败会把**上一份可用原文**截断成半截文件，
+   *   而这份原文含全部明文凭据、是双轨 provider 的唯一来源 —— 截断等于双轨直接报废。
    */
   static writeRaw(subscriptionId: string, content: string): RawWriteResult {
     const result = new RawWriteResult();
@@ -231,14 +255,30 @@ export class RawSubscriptionStore {
     }
     const dir = RawSubscriptionStore.dirPath();
     const path = RawSubscriptionStore.filePathFor(subscriptionId);
+    // provider 原文由 mihomo 直接做 YAML 解析(双轨 use:),一个控制字符就是
+    // 整份拒载(真机报错 "control characters are not allowed")。落盘前先做
+    // 与 ClashConfigGenerator.sanitizeControlChars 同规则的清洗(两侧必须保持
+    // 一致;不能直接 import 生成器——那会构成模块环)。
+    const cleaned = RawSubscriptionStore.stripControlChars(content);
+    // C26：落盘前 YAML 校验（重复键等会让内核整份拒载）
+    const gate = ConfigValidator.repair(cleaned);
+    if (gate.issues.length > 0) {
+      AppLogger.warn(TAG, `[raw-gate/${subscriptionId}] ${gate.summary()}`);
+    }
+    if (!gate.ok) {
+      result.reason = `订阅原文 YAML 校验未通过（内核会整份拒载）：${gate.summary()}`;
+      return result;
+    }
+    const payload = gate.degraded && gate.text.length > 0 ? gate.text : cleaned;
+    const tmp = `${path}.tmp`;
     try {
       ensurePrivateDir(dir);
       RawSubscriptionStore.tightenMode(dir, RAW_SUB_DIR_MODE);
-      // provider 原文由 mihomo 直接做 YAML 解析(双轨 use:),一个控制字符就是
-      // 整份拒载(真机报错 "control characters are not allowed")。落盘前先做
-      // 与 ClashConfigGenerator.sanitizeControlChars 同规则的清洗(两侧必须保持
-      // 一致;不能直接 import 生成器——那会构成模块环)。
-      privateFs.writePrivate(path, RawSubscriptionStore.stripControlChars(content));
+      // 原子写：临时文件 → fsync → 同目录 rename 覆盖（rename 是原子替换，
+      // 失败时旧文件原封不动，绝不出现「半截原文」）
+      privateFs.writePrivate(tmp, payload);
+      RawSubscriptionStore.tightenMode(tmp, RAW_SUB_FILE_MODE);
+      fs.renameSync(tmp, path);
       RawSubscriptionStore.tightenMode(path, RAW_SUB_FILE_MODE);
       const stat = fs.statSync(path);
       if (stat.size <= 0) {
@@ -250,6 +290,12 @@ export class RawSubscriptionStore {
       result.filePath = path;
       return result;
     } catch (e) {
+      // 清理可能残留的临时文件（不影响旧文件）
+      try {
+        privateFs.remove(tmp);
+      } catch (cleanupError) {
+        AppLogger.warn(TAG, `raw tmp cleanup failed: ${AppLogger.errText(cleanupError)}`);
+      }
       result.reason = AppLogger.errText(e);
       return result;
     }
@@ -459,6 +505,25 @@ export class RawSubscriptionStore {
       entry.nodeEstimate = -1;
       RawSubscriptionStore.upsert(entry);
     }
+  }
+
+  /**
+   * 登记在册、但磁盘上原文已消失的订阅 id（C30 冷启动兜底的判据）。
+   *
+   * 典型触发：系统回收了应用 cacheDir（冷启动/长期后台/存储紧张），
+   * 原文（含明文凭据）随之消失，而订阅状态还停留在 'ready'。
+   * 双轨 provider 会因此被跳过 —— 功能降级但不致命（解析链仍在用），
+   * 所以这里给调用方一个明确的「该重新拉取哪些订阅」的清单。
+   */
+  static missingProviderIds(): string[] {
+    const out: string[] = [];
+    for (const e of RawSubscriptionStore.registry) {
+      if (!RawSubscriptionStore.has(e.subscriptionId)
+        && out.indexOf(e.subscriptionId) < 0) {
+        out.push(e.subscriptionId);
+      }
+    }
+    return out;
   }
 
   /** 单订阅 provider 状态（订阅卡 / 诊断面板） */

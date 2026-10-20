@@ -246,8 +246,11 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   has('gen.dns.strategy', genSrc, 'strategy: prefer_ipv4');
   has('gen.dns.fake-ip-filter', genSrc, 'fake-ip-filter:');
   has('gen.dns.proxy-server-nameserver', genSrc, 'proxy-server-nameserver:');
-  has('gen.profile.store-selections', genSrc, 'store-selections: true');
-  has('gen.find-process-off', genSrc, 'find-process-mode: off');
+  // C22：mihomo RawConfig.Profile 的正确键名是 `store-selected`
+  // （`store-selections` 是错的 —— 内核不认这个键，配置里的「记住选中节点」不生效）
+  has('gen.profile.store-selected', genSrc, 'store-selected: true');
+  // C22：`find-process-mode` 是 string 字段，必须加引号（避免与布尔写法混淆）
+  has('gen.find-process-off', genSrc, 'find-process-mode: "off"');
   // log-level 默认 warning：实现改为动态白名单（debug/info/warning/error/silent，
 // 非法值回落 warning），断言改为检查回落分支仍包含 'warning'（保持默认口径不变）。
 has('gen.log-warning', genSrc, "'warning'));");

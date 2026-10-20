@@ -126,3 +126,30 @@
   static readonly 而非 `enum`。）
 - 真机实证：已连接（隧道 controller）与未连接（headless 内核）各测一轮，
   记录 106 节点的完成耗时与各状态分布。
+
+## 七、2026-10-20 指纹变更说明（订阅解析内核化整改）
+
+`scripts/latency-gen-fingerprint.json` 的 `sha256_16` 由 `24b343b951d49000` 更新为
+`188c5f3fec6c65f5` —— 原因是**配置生成器按整改方案 C16/C17/C18/C19/C20/C21/C22/C24/C4
+被修改**，与测速引擎本身无关。逐条改动如下（供日后回看「谁动了生成器」）：
+
+| 项 | 改动 | 目的 |
+|---|---|---|
+| C16 | 新增公共 API `parseProviderBlocks` / `providerBlockKeyNames`（provider 块按**纯缩进层级**判定，不再用 `/^([A-Za-z0-9_-]+):$/`） | 点号 provider 名（`my.provider:`）不再被误判成字段行 → 修 R1（provider 块被拍平、引用它的 RULE-SET 被静默丢弃） |
+| C19/C20 | provider 去重改为**整块丢弃**（键行 + 全部字段行）；「输出去重集合」与「RULE-SET 引用账本」拆成两个独立集合 | 修 R4（只丢键行 → 字段行落进上一条 provider → `mapping key "type" already defined`）与 R4'/R4'''（字段键名不撞时**静默并错** provider） |
+| C17 | 覆盖层从「整段追加」改为「允许覆盖 + 结构化合并」：同名顶层段整段替换、覆盖层自身重复键留首个、未知顶层键**保留并 warn** | 修 R2（覆盖层写 `dns:` → 与生成段的 `dns:` 撞顶层键 → 整份拒载），同时保住用户能力 |
+| C18 | 覆盖层布尔归一改为**路径感知**（只认已知 bool 字段路径） | 不做全局文本替换，不擅自改用户原文 |
+| C21 | `rules` 行的 `- ` 前缀在生成入口自剥 | 修 R6（`- - RULE` → `cannot unmarshal !!seq into string`） |
+| C22 | `profile.store-selections` → `profile.store-selected`；`find-process-mode: off` → `find-process-mode: "off"` | 前者是**错键名**（内核 `RawConfig.Profile.StoreSelected` 不认 `store-selections`，功能一直失效）；后者消除与布尔写法的歧义 |
+| C4 | `safeGroupUrl` 兜底 `http://` → `https://`（用户/订阅自己声明的 url 原样不动） | 与 T1 的 https 化一致（明文测速地址会被出口劫持） |
+
+同时纠正了生成器内两处**错误注释**：「mihomo 对同一 YAML 里的重复顶层键是后者覆盖前者」
+—— 与 yaml.v3 的 `uniqueKeys` 相反，实际是**报错、整份拒载**；这正是 R2/R4/R5 三条
+根因的认知根源。
+
+> 补充（内核实测结论，与本文档早期推断相反）：
+> `allow-lan: yes` 这类**不带引号**的 YAML 1.1 布尔，真实内核（mihomo Meta 1.10.0，
+> `mihomo.exe -t` 逐例实测）是**接受**的 —— yaml.v3 对 **bool 目标**有 YAML 1.1 兼容分支；
+> 真正会让整份配置拒载的是**带引号**的 `"true"/"false"/"1"/"0"`
+> （`cannot unmarshal !!str \`true\` into bool`）。
+> 交叉验证脚本：`scripts/verify-config-validator-kernel.mjs`。

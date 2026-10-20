@@ -112,7 +112,14 @@ await check('SOURCE ensureConfigMtu rewrites via fresh TRUNC fd (no NUL-hole rea
 
 await check('SOURCE provider raw subscription sanitized before persisting', () => {
   const raw = read('entry/src/main/ets/commons/services/RawSubscriptionStore.ets');
-  assert.match(raw, /writePrivate\(path, RawSubscriptionStore\.stripControlChars\(content\)\)/);
+  // 清洗必须发生在**落盘前**（2026-10-20 起写入改为「临时文件 + rename」的原子写，
+  // 所以断言点从 writePrivate(path, ...) 改成清洗产物的使用处）
+  assert.match(raw, /const cleaned = RawSubscriptionStore\.stripControlChars\(content\)/,
+    'provider 原文必须先清洗再落盘');
+  assert.match(raw, /privateFs\.writePrivate\(tmp, payload\)/,
+    '原子写：先写临时文件（payload = 清洗+校验后的内容）');
+  assert.match(raw, /fs\.renameSync\(tmp, path\)/,
+    '原子写：同目录 rename 覆盖（旧文件在失败时原封不动）');
   // 与生成器规则逐字一致（同一 keep-map）
   const copy = grab(raw, 'private static stripControlChars(value: string): string {', 'stripCopy');
   const genBody = grab(gen, 'static sanitizeControlChars(value: string): string {', 'sanitize');

@@ -19,6 +19,7 @@ import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { coreBridge } from '../../core/CoreBridge';
 import { ClashApiService, TrafficSnapshot } from './ClashApiService';
 import { ClashConfigGenerator } from './ClashConfigGenerator';
+import { ConfigValidator } from './ConfigValidator';
 import { DoHResolver } from './DoHResolver';
 
 import { SubscriptionService } from './SubscriptionService';
@@ -144,10 +145,39 @@ const LAUNCH_EPOCH_WAIT_MS = 5000;
 const LAUNCH_EPOCH_POLL_MS = 30;
 /** Extension 主导的权威运行态文件（事件驱动写入）。 */
 const EXTENSION_STATUS_FILE = 'vpn_status.json';
-/** 扩展进程心跳文件（内核运行期间每 3s 覆写时间戳） */
+/** 扩展进程心跳文件（扩展侧每 5s 原子覆写时间戳） */
 const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
-/** 心跳超过该时长视为内核死亡（ms） */
+/** 存活租约的原子替换临时文件（与扩展侧同名同值，清理时一并删除） */
+const HEARTBEAT_TMP_FILE = 'vpn_heartbeat.txt.tmp';
+/**
+ * 心跳超过该时长视为**扩展进程失联**（ms）。
+ *
+ * 2026-10-20 自动断开整改：心跳语义从「内核活着」收敛为「扩展进程还活着」——
+ * 扩展侧改为 5s 独立定时器无条件刷新（见 VpnExtensionAbility.LEASE_REFRESH_MS），
+ * 且不再在探针判死时删掉心跳文件。「内核是否活着」改由 vpn_status.json 的
+ * coreAlive 字段表达。两个维度混成一个信号，正是假判死的源头。
+ */
 const HEARTBEAT_STALE_MS = 15000;
+/**
+ * 连续多少次「非存活」观测才升级为内核死亡并触发自愈。
+ *
+ * 观测分两档：
+ *  - STALE（心跳过期）：强证据 —— 刷新方已失联 ≥15s，一次顶满；
+ *  - UNKNOWN（心跳读不到：文件缺失/空/损坏）：弱证据 —— 可能只是一次读失败，
+ *    只记 1 票，要连续 3 票才升级。
+ * 旧实现把 UNKNOWN 直接等同于「已死」：一次读失败就拆隧道重连。
+ */
+const CORE_DEATH_CONFIRMATIONS = 3;
+
+/** 心跳观测的三态判定结果 */
+enum LivenessVerdict {
+  /** 心跳新鲜：扩展进程与隧道都在 */
+  ALIVE = 0,
+  /** 心跳过期：刷新方失联（强证据） */
+  STALE = 1,
+  /** 心跳读不到：文件缺失/空/损坏（弱证据，不等于已死） */
+  UNKNOWN = 2
+}
 /** 同一状态同步周期内复用文件探针，避免 heartbeat/start-ok 被重复同步读取。 */
 const STATE_PROBE_CACHE_MS = 120;
 /**
@@ -320,6 +350,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private healthRepairCache: string[] = [];
   private healthRunning: boolean = false;
   private coreLossHandling: boolean = false;
+  /** 连续「非存活」观测票数（累计到 CORE_DEATH_CONFIRMATIONS 才升级为内核死亡）。 */
+  private coreDeathStrikes: number = 0;
   private inRepairConnect: boolean = false;
 
   // ── 第二阶段：连续失败 → 自动切换节点 ──────────────────────────────
@@ -661,6 +693,40 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /**
+   * 写盘前的配置校验闸门（C23 / C23b / C23c）。
+   *
+   * 为什么必须有这道闸门：mihomo 用 go.yaml.in/yaml/v3 v3.0.5，`uniqueKeys` 默认开启 →
+   * 同层级重复键 = TypeError → **整份配置拒载**（不是跳过那个节点）。
+   * 于是「一个节点的字段写坏了」会升级成「用户的整个 VPN 起不来」——
+   * 这正是用户报障原文「VPN 扩展启动异常: parse config:yaml: unmarshal errors:」的形态。
+   *
+   * 策略（受控降级，不是全有全无）：
+   *   · 能安全降级的问题（重复键 / YAML 1.1 布尔）→ **就地降级**并记录到日志；
+   *   · 降级后仍有无法降级的问题 → **保留上一份可用配置**（不覆盖磁盘）并中止本次连接，
+   *     给出可行动的提示（请更新订阅后重试），而不是写出一份内核一定拒载的配置。
+   *
+   * @param yaml 生成的配置文本
+   * @param scene 场景标签（main / hot-reload / test-core），只进日志
+   * @returns 可以安全写盘的配置文本
+   */
+  private prepareConfigYaml(yaml: string, scene: string): string {
+    const result = ConfigValidator.repair(yaml);
+    if (result.issues.length > 0) {
+      AppLogger.warn(TAG, `[config-gate/${scene}] ${result.summary()}`);
+    }
+    if (!result.ok) {
+      const blocking = result.blocking();
+      const head = blocking.length > 0
+        ? `首个问题在第 ${blocking[0].line} 行（${blocking[0].key}）`
+        : '存在无法自动降级的问题';
+      // 关键：**不覆盖磁盘上的旧配置** —— 旧配置是用户最后一份能用的配置。
+      throw new Error(`配置校验未通过（${head}）：${result.summary()}。`
+        + '已保留上一份可用配置未覆盖；请更新订阅后重试，或反馈该订阅链接');
+    }
+    return result.text.length > 0 ? result.text : yaml;
+  }
+
+  /**
    * 规则/强制站点/DNS 等变更的热重载：重写当前节点的 YAML 到同一配置路径，
    * 通过 Mihomo controller 的 PUT /configs?path= 在内核内重建规则链，保持 VPN/TUN
    * 与既有连接不被拆除（对应文档"减少 TUN/Core 重建"）。仅当内核可控时生效；
@@ -682,9 +748,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         this.apiSecret, this.lastUseGeoip, false, this.lastProxyHosts, true, subs.proxyGroups,
         this.isRuleProviderReady(), this.lastUseSmart,
         subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
+      // 写盘前闸门：坏配置绝不落盘（内核对重复键是整份拒载）
+      const safeYaml = this.prepareConfigYaml(yaml, 'hot-reload');
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       ensurePrivateDir(this.context.cacheDir);
-      privateFs.writePrivate(configPath, yaml);
+      privateFs.writePrivate(configPath, safeYaml);
       const reloaded = await this.api.reloadFromPath(configPath);
       if (!reloaded) {
         AppLogger.warn(TAG, `[hot-reload] controller reload failed; caller will fallback (${reason})`);
@@ -1712,10 +1780,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return this.stateProbeHeartbeatAge + Math.max(0, nowMs - this.stateProbeCachedAt);
   }
 
-  /** 异步版内核存活判定（监控循环用） */
-  private async isCoreAliveByHeartbeatAsync(): Promise<boolean> {
+  /**
+   * 异步版存活三态判定（监控循环用）。
+   *
+   * 2026-10-20 自动断开整改：旧实现只返回 true/false，把「心跳读不到」与
+   * 「心跳过期」压成同一个 false，UI 于是把一次读失败当成分身死亡直接拆隧道。
+   * 现在区分三态：
+   *  - ALIVE   心跳新鲜
+   *  - STALE   心跳过期（强证据：刷新方失联）
+   *  - UNKNOWN 心跳读不到（弱证据：可能只是读失败，或文件刚被清理）
+   */
+  private async probeLivenessAsync(): Promise<LivenessVerdict> {
     const age = await this.readHeartbeatAgeAsync();
-    return age >= 0 && age < HEARTBEAT_STALE_MS;
+    if (age < 0) {
+      return LivenessVerdict.UNKNOWN;
+    }
+    return age < HEARTBEAT_STALE_MS ? LivenessVerdict.ALIVE : LivenessVerdict.STALE;
   }
 
   /** 扩展进程是否已回写启动成功标记；同一同步周期复用短时探针缓存。 */
@@ -2120,7 +2200,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
-      privateFs.writePrivate(configPath, yaml);
+      // 写盘前闸门：测速核用的是同一套生成器，坏配置同样会让内核整份拒载
+      privateFs.writePrivate(configPath, this.prepareConfigYaml(yaml, 'test-core'));
       this.clearStartError();
       const stopWant: Want = {
         bundleName: 'com.tunbox.client',
@@ -2696,7 +2777,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       // 含 API secret 与节点口令：最小权限目录(0700) + 文件(0600)，fd 由 writePrivate 兜底关闭
       ensurePrivateDir(this.context.cacheDir);
-      privateFs.writePrivate(configPath, yaml);
+      // 写盘前闸门（C23）：内核对 yaml 重复键是**整份拒载**，
+      // 坏配置一旦落盘就是「整个 VPN 起不来」。校验不通过时**不覆盖旧配置**，
+      // 直接中止本次连接并给出可行动提示。
+      privateFs.writePrivate(configPath, this.prepareConfigYaml(yaml, 'main'));
       AppLogger.info(TAG, `config written: ${configPath} (${yaml.length} bytes)`);
       this.clearStartError();
       // want 可能被系统丢弃（新装首连授权弹窗链路，真机实证 2026-09-19）——
@@ -2970,14 +3054,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 集成点③：连接失败 → 累加节点连续失败统计（复用 NodeSortPersistence 记录结构）
       // want 丢参 / start 被系统竞态吞没 / 内核启动期联网下载阻塞均属拉起环节系统问题
       // （与节点质量无关），不惩罚节点 —— 否则会把可用节点误标失败并触发无谓换节点。
-      if (errorMessage.indexOf('应用分流参数缺失或冲突') < 0 &&
+      // 配置校验未通过同理：**换节点也救不了**（同一份订阅生成的配置一样坏），
+      // 所以既不记节点失败，也不做健康自检/换节点 —— 否则会拿着同一份坏配置反复重连。
+      const configRejected = errorMessage.indexOf('配置校验未通过') >= 0;
+      if (!configRejected &&
+        errorMessage.indexOf('应用分流参数缺失或冲突') < 0 &&
         errorMessage.indexOf('VPN 扩展进程未接收本次拉起') < 0 &&
         errorMessage.indexOf('内核启动超时') < 0) {
         await this.recordNodeFailure(this.lastNodeName);
       }
       // 若本次失败是由修复/切换内部发起的连接，则不再向外级联，避免重连风暴
       const nested = this.inRepairConnect || this.failoverRunning;
-      if (!nested && !this.healthRunning) {
+      if (!configRejected && !nested && !this.healthRunning) {
         // 集成点②：连接失败 → 一次链路自检 + 有限修复（受 healthCheckEnabled 门控）
         const recovered = await this.runHealthSelfCheckAndRepair('connect-failed');
         if (recovered) {
@@ -3042,19 +3130,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   private async disconnectExclusive(): Promise<void> {
     const seq = this.connectSeq;
-    this.state = ConnState.DISCONNECTING;
+    // 2026-10-20 自动断开整改：修复期重连（repairReconnect）里的"断开"只是
+    // 重建隧道的一步，不该把 UI 落成"已断开"——那会让用户以为掉线，卡片也会在
+    // 重连窗口里闪断。修复全程保持 RECOVERING。
+    this.state = this.inRepairConnect ? ConnState.RECOVERING : ConnState.DISCONNECTING;
     this.notify();
     await this.disconnectInternal();
     if (seq !== this.connectSeq) {
       return;
     }
-    this.state = ConnState.DISCONNECTED;
+    this.state = this.inRepairConnect ? ConnState.RECOVERING : ConnState.DISCONNECTED;
     this.startedAt = 0;
     this.traffic = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
     this.api.resetTrafficBaseline();
     this.disconnectRequested = false;
     this.notify();
-    AppLogger.info(TAG, 'disconnected');
+    AppLogger.info(TAG, this.inRepairConnect ? 'repair-disconnected (kept RECOVERING)' : 'disconnected');
   }
 
   /** 后台下载 geoip.metadb 到内核 home 目录（cacheDir），成功后下次连接启用 GEOIP 直连规则 */
@@ -3535,7 +3626,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return;
     }
     const dir = this.context.cacheDir;
-    for (const f of [HEARTBEAT_FILE, START_OK_FILE, START_ERROR_FILE]) {
+    for (const f of [HEARTBEAT_FILE, HEARTBEAT_TMP_FILE, START_OK_FILE, START_ERROR_FILE]) {
       try {
         fs.unlinkSync(`${dir}/${f}`);
       } catch (e) {
@@ -3554,15 +3645,35 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 2026-10-19 保活整改（真机取证 THREAD_BLOCK_3S）：原实现在本定时器里调用
       // 同步版 isCoreAliveByHeartbeat()，内含 statSync + 同步读文件，每 3 秒阻塞
       // 主线程一次；主线程一旦卡住，跑在它上面的自愈/重连就跟着失效。改为异步。
-      this.isCoreAliveByHeartbeatAsync().then((alive: boolean): void => {
-        if (alive || this.state !== ConnState.CONNECTED) {
+      //
+      // 2026-10-20 自动断开整改：判死改为**连续多票**制。
+      // 旧实现只要探针不是"活着"就立刻升级为内核死亡 → 拆隧道重连；而
+      // 「心跳读不到」（文件刚被清、一次读失败）与「心跳过期」被当成同一件事。
+      // 现在：STALE 一次顶满，UNKNOWN 需连续 3 票；观测到 ALIVE 即清零。
+      this.probeLivenessAsync().then((verdict: LivenessVerdict): void => {
+        if (this.state !== ConnState.CONNECTED) {
+          this.coreDeathStrikes = 0;
           return;
         }
-        // 内核死亡：权威判据为「心跳过期/无心跳」→ 升级到链路自检 + 有限修复
+        if (verdict === LivenessVerdict.ALIVE) {
+          this.coreDeathStrikes = 0;
+          return;
+        }
+        this.coreDeathStrikes = this.coreDeathStrikes
+          + (verdict === LivenessVerdict.STALE ? CORE_DEATH_CONFIRMATIONS : 1);
+        const reasonText: string = verdict === LivenessVerdict.STALE ? 'stale' : 'absent';
+        if (this.coreDeathStrikes < CORE_DEATH_CONFIRMATIONS) {
+          AppLogger.info(TAG, `liveness suspect (${reasonText}), `
+            + `strikes=${this.coreDeathStrikes}/${CORE_DEATH_CONFIRMATIONS}`);
+          return;
+        }
+        this.coreDeathStrikes = 0;
+        // 内核死亡：权威判据为「心跳过期（已连续确认）」→ 升级到链路自检 + 有限修复
         // （对应 core_recovery_policy；healthCheckEnabled=false 时退回既有有界恢复）
         this.state = ConnState.RECOVERING;
         this.notify();
-        AppLogger.warn(TAG, `core died (authority: heartbeat stale/absent); escalating to health self-check`);
+        AppLogger.warn(TAG, `core died (authority: heartbeat ${reasonText} confirmed `
+          + `${CORE_DEATH_CONFIRMATIONS}x); escalating to health self-check`);
         this.handleCoreLoss();
       }).catch((e: Error): void => {
         AppLogger.warn(TAG, `liveness probe failed: ${AppLogger.errText(e)}`);
