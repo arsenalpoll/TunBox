@@ -48,17 +48,25 @@ import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'ConfigValidator';
 
-/** 问题类型 */
-export const ConfigIssueKind = {
+/**
+ * 问题类型
+ *
+ * ⚠ 用「class + static readonly」而**不是**对象字面量 `const X = { ... }`：
+ * ArkTS 禁止**无类型对象字面量**（`arkts-no-untyped-obj-literals`），
+ * 对象字面量必须对应一个显式声明的 class/interface —— 直接写 `export const ConfigIssueKind = {…}`
+ * 会让 **hvigor 编译直接失败**（本轮真实踩到：tsc 门禁全绿，DevEco 编译报 10605038）。
+ * 也不用 `enum`：Node 侧的测试台（type-stripping）不吃 `export enum`。
+ */
+export class ConfigIssueKind {
   /** 同层级重复键（yaml.v3 uniqueKeys → 整份拒载） */
-  DUPLICATE_KEY: 'DUPLICATE_KEY',
+  static readonly DUPLICATE_KEY: string = 'DUPLICATE_KEY';
   /** flow map（`{a: 1, a: 2}`）内重复键（yaml.v3 uniqueKeys → 整份拒载） */
-  DUPLICATE_KEY_FLOW: 'DUPLICATE_KEY_FLOW',
+  static readonly DUPLICATE_KEY_FLOW: string = 'DUPLICATE_KEY_FLOW';
   /** rules 段出现嵌套 seq（`- - RULE`）→ `cannot unmarshal !!seq into string` */
-  NESTED_SEQ: 'NESTED_SEQ',
-  /** bool 字段上出现 YAML 1.1 布尔（`yes/no/on/off`）→ `cannot unmarshal !!str into bool` */
-  BOOL_AS_STR: 'BOOL_AS_STR'
-};
+  static readonly NESTED_SEQ: string = 'NESTED_SEQ';
+  /** bool 字段上出现致命写法（带引号的 "true"/"1"/"0" 或裸写的 1/0）→ 内核整份拒载 */
+  static readonly BOOL_AS_STR: string = 'BOOL_AS_STR';
+}
 
 /** 单条问题 */
 export class ConfigIssue {
