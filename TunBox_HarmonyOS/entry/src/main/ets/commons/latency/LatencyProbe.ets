@@ -3,16 +3,22 @@
  *
  * ## 为什么重做（2026-10-20，FlClash 对照后的四条硬差异）
  *
- * 1) **一次请求语义**（FlClash 口径）
+ * 1) **一次请求语义**（探针侧）
  *
- *    mihomo 上游与 FlClash 自带内核的 `adapter/adapter.go` **完全一致**（已逐行 diff），
- *    其中 `var UnifiedDelay = atomic.NewBool(false)` —— **默认关**；FlClash 从不打开它。
- *    而本项目的生成配置写死 `unified-delay: true`（ClashConfigGenerator.ets:186），
- *    于是内核的 URLTest 会**连发两次 HEAD**（adapter.go:259-272），第二次的结果才作数、
- *    且上报的延迟只算第二次的耗时 —— 出口不欢迎第二次 HEAD 时整片节点会被判失败。
- *    ⇒ 探针侧的语义必须与 FlClash 一致：**一次探测 = 一次请求**。
- *      本文件保证探针**自己不重试、不发第二次**；内核侧那次多余的 HEAD 由生成配置的
- *      `unified-delay: false` 消除（config-gen 的改动，不在本文件范围内）。
+ *    mihomo 的 `adapter/adapter.go:202-278`（URLTest）上报的延迟 =
+ *    **代理拨号 + TCP 建连 + TLS 握手 + HTTP 往返** 的总和（`start` 取在拨号之前）。
+ *    `unified-delay: true` 时内核**复用同一个 Transport** 再发一次 HEAD 并把 `start`
+ *    重置为第二次（adapter.go:259-274）⇒ 报的是**已建立连接**上的第二个 HEAD 耗时，
+ *    少付 1~2 个 RTT ⇒ 这就是 FlClash 展示的那个口径。
+ *    ⇒ 探针侧的语义必须是：**一次探测 = 一次请求**（本文件保证探针自己不重试、
+ *      不发第二次）—— 内核侧那个「第二次 HEAD」是 mihomo 的**统一延迟语义**，
+ *      不是重复探测，由生成配置的 `unified-delay: true` 决定（见 ClashConfigGenerator.ets）。
+ *
+ *    ⚠ 2026-10-20 二次取证修正：此前把「mitce 34 节点秒败 503」归因到 unified-delay
+ *    的双 HEAD 是**错的** —— 503 真因是测速核配置里一个节点都没有（凭据被封存未回填），
+ *    当时的旁证就是「装 unified-delay:false 后仍全 503」⇒ 本条已推翻，恢复
+ *    `unified-delay: true`（本机真内核 A/B：unified=false 把 TLS 握手算进去，
+ *    每次凭空多 1~2 个 RTT，实测 +50~1000ms）。
  *
  * 2) **失败响应体完整落日志**（不是 bodyLen）
  *
@@ -66,9 +72,10 @@ const TAG: string = 'LatencyProbe';
  *    可能上百毫秒）。余量太小 → 客户端先超时 → 拿到的是传输层错误而不是内核明确的
  *    504 → 「真超时」被误分类成「通道坏了」。
  *  - `WORKERS` 50：worker 数 = 队列深度（对齐 FlClash 的 client concurrency 50）。
- *  - `MAX_INFLIGHT` 8：**同时在途的 HTTP 请求数**。OHOS 的 http 栈对同一 host
- *    （内核就在 127.0.0.1）有连接数上限，5.6.0 真机实测 ≈ 8；超出即排队，
- *    且排队时间会被算进请求预算 → 假超时（2026-09-23 真机实证）。
+ *  - `MAX_INFLIGHT` 50：**同时在途的 HTTP 请求数**（2026-10-20 用户拍板放开，
+ *    与 worker 数同宽 ⇒ 无应用层排队，elapsed 即节点自身 /delay 的真实耗时）。
+ *    历史取值 8 的依据是「OHOS http 栈同 host 连接池约 8」；放开后若真机出现
+ *    大量 `queueTimeout>0`，说明连接池确实压不住，回退到 24/32。
  *  - `QUEUE_WAIT_MAX_MS` 60000：排队等待上限。排队等待**不计入**节点的超时预算；
  *    超了就是「排队超时」（根本没拨号），归非判定。
  */
@@ -79,8 +86,8 @@ export class LatencyProbeLimits {
   static readonly OUTER_EXTRA_MS: number = 1200;
   /** worker 数 / 队列深度（对齐 FlClash 的 client concurrency 50） */
   static readonly WORKERS: number = 50;
-  /** 同时在途的 HTTP 请求数（OHOS 同 host 连接池上限 ≈ 8） */
-  static readonly MAX_INFLIGHT: number = 8;
+  /** 同时在途的 HTTP 请求数（2026-10-20 起与 WORKERS 同宽 = 50，无应用层排队） */
+  static readonly MAX_INFLIGHT: number = 50;
   /** 排队等待上限（超过 = 排队超时；等待时间不计入节点超时预算） */
   static readonly QUEUE_WAIT_MAX_MS: number = 60000;
   /** 取消后等待在途请求收尾的宽限期 */

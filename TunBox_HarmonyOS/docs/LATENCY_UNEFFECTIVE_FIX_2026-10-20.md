@@ -320,3 +320,84 @@ proxies:                      # 77 个节点，含凭据 ✓（回填生效）
 剩下的失败也分清楚了：16 个是**节点服务器真的不响应**（域名能解析 ✓，机场侧的事），
 2 个是订阅里混进来的**「信息条」假节点**（马上剔除 ✓）。
 下次再整批失败，App 会直接告诉你**是域名解析不了、还是服务器不响应**，不再笼统一句「失败」。
+
+---
+
+## 八、延迟偏高（2026-10-20 二次整改）
+
+### 8.1 用户报障（原文）
+
+> 继续，并且延迟有点高，我在当前 Windows 测速 oc2 的订阅，基本上只有几十 ms 只有两个节点 300 多 ms，
+> tunbox 最新的代码测出来全部都是 100 多 ms 以上的
+
+### 8.2 取证过程（三条假设，逐条证伪/证实）
+
+这一轮**没有拍脑袋改**，先在 Windows 上用**真内核**（`mihomo-smart`，与 App 同一份二进制）
+跑同一批 oc2 节点做 A/B，再上真机复验。
+
+**先排掉一个取证陷阱**：我第一次上真机得到的「改后仍是 119/123/184/213ms」是**假的** ——
+`hdc install` 报 `signature verification failed due to not trusted app source`，
+设备上跑的其实还是旧包。判据：hilog 里 `lanes=8`（旧代码）而不是 `lanes=50`（新代码）。
+**教训：装包失败必须当场看 install 返回码 + 用日志里的新常量做「新包真的装上了」的判据。**
+
+| 假设 | 实验 | 结果 | 结论 |
+|---|---|---|---|
+| H1 `unified-delay: false` 把 TLS 握手算进延迟 | 本机真内核 A/B：`unified-delay` true/false × `https`/`http` 测速地址 | false+https ⇒ 1034/202/321/381/1431/486ms；true+https ⇒ 53/41/168/100/326/77ms | **成立**：`adapter.go:209` 的 `start` 取在**拨号之前**、`t = time.Since(start)`（277 行）⇒ 报的是「拨号+TCP+TLS+HTTP」总和；unified=true 时复用同一 Transport 再发第二次 HEAD 并把 `start` 重置（259-274 行）⇒ 少付 1~2 个 RTT |
+| H2 测速请求并发太高导致读数膨胀 | 本机 6 节点：串行 vs 6 路并发 | 并发读数明显高于串行（`{"delay":402/116/178/201/749/438}`） | **部分成立**：并发确实会抬读数；但用户要求把并发**放开到 50 路**，所以不靠降并发解决 |
+| H3 DoH 预解析被计入节点耗时 | 代码审阅 `LatencyProbe.probeOne` / `gatedProbe` | DoH 预解析在**探测之前**独立完成，`elapsedMs` 从 `/delay` 请求发出才计时 | **不成立**，排除 |
+
+### 8.3 改动
+
+| 文件 | 改动 | 理由 |
+|---|---|---|
+| `ClashConfigGenerator.ets` | `unified-delay: false` → **`true`** | 与 FlClash / Clash Verge 同口径：报**已建立连接**上第二个 HEAD 的耗时 = 真实链路 RTT。false 会把 TLS 握手算进去，每次凭空多 1~2 个 RTT |
+| `LatencyEngine.ets` | `LATENCY_INFLIGHT` 8 → **50**（与 `LATENCY_CONCURRENCY` 同宽） | 用户拍板：**50 路并发**。在途数与 worker 数同宽 ⇒ 应用层不再排队，每个节点的 `elapsed` 就是它自己那次 `/delay` 的真实耗时 |
+| `LatencyProbe.ets` | `LatencyProbeLimits.MAX_INFLIGHT` 8 → **50** | 同上（参数集中区同步） |
+
+**为什么推翻早先「关掉 unified-delay」的决策**：当时把「mitce 34 节点秒败 503」归因到双 HEAD，
+但 ① 503 真因是测速核配置里**一个节点都没有**（凭据被封存未回填），
+② 当时的旁证本身就是「装 `unified-delay:false` 后仍全 503」，
+③ 源码里 `unifiedDelay` 的 else 分支只打日志、保留第一次的结果 ⇒ **不存在「第二次 HEAD 失败就整批判失败」的路径**。
+
+### 8.4 闸门同步（同一提交）
+
+| 闸门 | 改动 |
+|---|---|
+| `scripts/verify-latency-core-v2.mjs` | B6 由「不得开启 unified-delay」改为「**必须开启**」；G1 `MAX_INFLIGHT` 8 → 50 |
+| `scripts/verify-vpn-architecture.mjs` | `gen.unified-delay` 断言 8 → 50 口径（`unified-delay: true`） |
+| `scripts/test-latency-engine.js` | 生成器断言改为「必须 `unified-delay: true`」 |
+| `scripts/verify-latency-concurrency.mjs` | A1/A2/A3 常量与 lanes 改 50；**A4/A5 的节点数必须跟着改**——在途数=worker 数时闸门**永远不会排队**，「排队超时」路径会变成死代码，故 B 组用 `stageEngine(dirB, 300, 8)` 显式把在途数收窄到 8 才能覆盖 |
+| `scripts/verify-latency-display.mjs` | 「在途上限 8」→ 50 |
+| `scripts/latency-gen-fingerprint.json` | sha256_16 → `668f5269db380849` + 变更说明 |
+
+### 8.5 真机验收（新包，`lanes=50`）
+
+装包判据：hilog 出现 `lanes=50`（旧包是 `lanes=8`）。
+
+**oc2 组（用户报障的那一组）实测**：
+
+| 节点 | 改前 | 改后 |
+|---|---|---|
+| Google-HK-Hysteria2 | 123ms | **55ms** |
+| Google-TW-Hysteria2 | 119ms | **63ms** |
+| AWS-日本-Hysteria2 | 184ms | **75ms** |
+| YF香港-VLESS-WS-CF | 523ms | **76ms** |
+| AWS新加坡-Hysteria2 | 213ms | **105ms** |
+| YF新加坡-VLESS-WS-CF·住宅·KR | 1464ms | **305ms** |
+| AWS-L-Hysteria2 | 786ms | **313ms** |
+
+⇒ **与用户 Windows 侧的观感完全吻合**：「基本只有几十 ms，只有两个节点 300 多 ms」
+（那两个 300+ 就是 `YF新加坡` 305ms 与 `AWS-L` 313ms）。
+
+对照组 ikuuu（46 节点）：**21/21/21/22/23/23/24/25/28/29/40/55/60ms** ——
+全部落在几十 ms 区间，与 Windows 侧同量级。
+
+`latency batch done nodes=7 measured=7 timeout=0 failed=0 queueTimeout=0` ⇒
+放开 50 路后**没有出现**排队超时或假超时（连接池压得住）。
+
+### 8.6 代价
+
+- 内核每个节点多打**一次 HEAD**（unified-delay 的语义），整批墙钟略增；
+  实测 oc2 组 `elapsed=2269ms`（7 节点）、ikuuu `elapsed=5998ms`（46 节点），可接受。
+- 50 路并发对内核/连接池压力更大。**判定标准**：若真机出现 `queueTimeout>0` 或大量假超时，
+  说明连接池压不住，回退到 24/32（**不要退回 8**，那是性能问题）。

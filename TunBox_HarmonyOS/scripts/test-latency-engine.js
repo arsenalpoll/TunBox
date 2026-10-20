@@ -396,12 +396,13 @@ check('ClashConfigGenerator 逐字节未变（除 unified-delay 以外本次不�
   assert.strictEqual(hash, expected,
     `ClashConfigGenerator changed (${hash} != ${expected}); if intentional, update latency-gen-fingerprint.json`);
 });
-check('生成器关闭 unified-delay（与 FlClash 对齐：单次请求）', () => {
+check('生成器开启 unified-delay（FlClash 口径：报第二次 HEAD 的耗时 = 真实 RTT）', () => {
   const gen = fs.readFileSync(rel(svc + 'ClashConfigGenerator.ets'), 'utf8');
-  // mihomo 的 UnifiedDelay 默认 false；FlClash 从不打开。打开会让 URLTest 连发两次
-  // HEAD，第二次的结果才作数 → 出口不欢迎第二次 HEAD 时整批节点被判失败。
-  assert.ok(/unified-delay: false/.test(gen), 'unified-delay must stay disabled (FlClash parity)');
-  assert.ok(!/unified-delay: true/.test(gen), 'unified-delay must not be enabled');
+  // mihomo adapter/adapter.go:259-274：unified=true 时复用同一 Transport 再发一次 HEAD，
+  // 并把 start 重置为第二次 ⇒ 报的是**已建立连接**上的第二个 HEAD 耗时（少付 TLS 握手）。
+  // unified=false 则把 TLS 握手算进延迟，每次测速凭空多 1~2 个 RTT（真机实测 +50~1000ms）。
+  assert.ok(/unified-delay: true/.test(gen), 'unified-delay must be enabled (FlClash parity: report the 2nd HEAD)');
+  assert.ok(!/unified-delay: false/.test(gen), 'unified-delay must not be disabled (it charges TLS handshake to the delay)');
 });
 
 // ── 12. 文档 ──────────────────────────────────────────────────────────────

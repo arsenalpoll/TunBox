@@ -187,15 +187,34 @@ export class ClashConfigGenerator {
     // 配合 VpnExtensionAbility 的 IPv4-only TUN，消除 IPv6 绕过及泄漏通道。
     lines.push('ipv6: false');
     lines.push('disable-ipv6: true');
-    // 【FlClash 对齐 · 2026-10-20】mihomo 的 UnifiedDelay **默认就是 false**
-    // （adapter.go: `var UnifiedDelay = atomic.NewBool(false)`），FlClash 从不打开它。
-    // 打开后 mihomo 的 URLTest 会**连发两次 HEAD**（adapter.go 的 unifiedDelay 分支）：
-    // 第二次的结果才作数，上报的延迟只算**第二次**请求的耗时。
-    // 于是「出口不欢迎第二次 HEAD」（第二次被劫持/超时/连接被关）时，
-    // **整批可用节点会被判失败** —— 真机 2026-10-20：mitce.io 34 个节点秒失败 503，
-    // 同批其它订阅正常、隧道用同一个节点也能连通（节点本身完全没问题）。
-    // 与 FlClash 对齐 = 关掉：单次请求，延迟 = 连接建立 + 响应，语义与 FlClash 一致。
-    lines.push('unified-delay: false');
+    // 【unified-delay: true · 2026-10-20 二次取证修正】
+    //
+    // mihomo `adapter/adapter.go:202-278`（URLTest）的事实：
+    //  - `start := time.Now()` 在**拨号之前**（209 行），`t = time.Since(start)`（277 行）
+    //    ⇒ 上报的延迟 = 代理拨号 + TCP 建连 + **TLS 握手** + HTTP 往返 的总和。
+    //  - `unifiedDelay` 分支（259-274）：**复用同一个 http.Transport** 再发一次 HEAD，
+    //    并把 `start` 重置为第二次 ⇒ **报的是第二次 HEAD 的耗时**。
+    //    第二次走的是**已建立的连接**（TLS 已握手完）⇒ 少付 1~2 个 RTT ⇒ 数字回到
+    //    「纯链路 RTT」口径 —— 这就是 FlClash / Clash Verge 展示的那个口径。
+    //  - unifiedDelay=false ⇒ 报的是**第一次** HEAD 的完整耗时（含 TLS 握手）
+    //    ⇒ 每次测速**凭空多 1~2 个 RTT**（实测 +50~1000ms）。
+    //
+    // 本机真内核 A/B 实测（2026-10-20，oc2 订阅 7 节点，同一台 Windows、同一份配置）：
+    //    unified=false + https://www.gstatic.com/generate_204 ⇒ 1034/202/321/381/1431/486ms
+    //    unified=false + http://www.gstatic.com/generate_204  ⇒  189/ 44/ 80/ 94/ 325/362ms
+    //    unified=true  + https://www.gstatic.com/generate_204 ⇒   53/ 41/168/100/ 326/ 77ms
+    //    unified=true  + http://www.gstatic.com/generate_204  ⇒   52/ 41/ 73/ 99/ 325/ 87ms
+    // ⇒ unified=true 的读数与用户在同一批节点上用 Windows 侧客户端测到的
+    //   「基本几十 ms、两个 300 多 ms」**完全吻合**（AWS-L-Hysteria2 = 325ms 即那批里的 300+）。
+    //
+    // 【为什么推翻 2026-10-20 早先那次「关掉」的决策】
+    // 当时把「mitce 34 节点秒败 503」归因到 unified-delay 的双 HEAD，但：
+    //  ① 503 的真因是**测速核配置里一个节点都没有**（订阅凭据被封存、生成器未回填），
+    //     与 unified-delay 无关；当时同一份记录的旁证就是「装 unified-delay:false 后仍全 503」。
+    //  ② unifiedDelay=true 时**第二次 HEAD 失败不会判失败**：源码 else 分支只打日志，
+    //     `resp`/`start` 保留第一次的结果 ⇒ 不存在「整批判失败」的路径。
+    // ⇒ 结论：恢复 unified-delay: true（与 FlClash 口径一致），测速读数回到真实 RTT。
+    lines.push('unified-delay: true');
     lines.push('tcp-concurrent: true');
     // 长连接与会话复用参数：降低频繁握手、弱网切换后的僵尸连接和后台功耗。
     lines.push('keep-alive-idle: 30');

@@ -223,7 +223,7 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   has('gen.keepalive-interval', genSrc, 'keep-alive-interval:');
   has('gen.udp-timeout', genSrc, 'udp-timeout:');
   has('gen.tcp-concurrent', genSrc, 'tcp-concurrent: true');
-  has('gen.unified-delay', genSrc, 'unified-delay: false');
+  has('gen.unified-delay', genSrc, 'unified-delay: true');
   has('gen.dns.fallback', genSrc, "lines.push('  fallback:')");
   // 坑 40：fallback 非空会让内核在 config.Parse 阶段加载 MMDB（默认
   // fallback-filter.geoip=true），geoip.metadb 未就绪时启动被联网下载挂死。

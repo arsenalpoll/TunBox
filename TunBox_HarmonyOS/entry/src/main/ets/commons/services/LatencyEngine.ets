@@ -55,40 +55,43 @@ import { LatencyDnsVerdict, LatencyDnsStatus } from '../latency/LatencyDnsVerdic
 const TAG = 'LatencyEngine';
 
 /**
- * 并发探测数（2026-10-20 复核定为 50）= **并发 worker 数**（批次队列深度）。
+ * 并发探测数 = **并发 worker 数**（批次队列深度）。
  *
  * ⚠ 语义澄清（这一层长期被混淆 —— 方案 C8b）：
  *  · `LATENCY_CONCURRENCY`（本常量，50）= **同时处于探测中的任务数**（worker 数），
  *    即批次队列深度。它**不是**同时发出的 HTTP 请求数。
- *  · `LATENCY_INFLIGHT`（另一个常量，8）= **同时在飞的 HTTP 请求数** ——
- *    OHOS http 栈对同一 host 的连接池容量（真机实测约 8，超出即排队）。
- *  · 50 个 worker 里**只有 8 个在飞**，其余阻塞在应用层信号量（LatencyInflightGate）上。
+ *  · `LATENCY_INFLIGHT`（另一个常量）= **同时在飞的 HTTP 请求数**。
+ *  · **2026-10-20 起两者都是 50**（用户拍板放开）：不再有应用层排队，
+ *    每个节点的 elapsed 就是它自己那次 /delay 的真实耗时。
  *
  * 为什么是 50：与 FlClash 的 `maxConcurrentDelayTests = 50` **数值对齐**（口径一致，
  * 便于日后做同口径对比）。⚠ 但**数值对齐 ≠ 机制对齐**：FlClash 的 50 是内核
  * mBatch 限流（IPC 通道），本项目的 50 是客户端 REST 侧的队列深度 ——
- * 真正同时拨号的数量仍由连接池（8）决定（根因 T3：REST 通道拿不到核内并发）。
+ * 真正同时拨号的数量由内核自身调度决定（根因 T3：REST 通道拿不到核内并发）。
  *
- * 最坏墙钟：⌈50/8⌉ × 5s ≈ 35s < BATCH_DEADLINE_MS(90s) → deadline 不会砍掉队尾。
+ * 最坏墙钟：⌈50/50⌉ × 5s ≈ 5s < BATCH_DEADLINE_MS(90s) → deadline 不会砍掉队尾。
  *
  * ⚠ 历史真机取证（2026-10-17）：冷内核 44 节点**全并发**把 controller API
- * 拖到 Operation timeout；OHOS http 单 host 约 8 并发上限，超过即排队。
- * 若真机复现「测速卡住/大量假超时」，优先回退到 24 或 32。
+ * 拖到 Operation timeout；当时测得 OHOS http 单 host 约 8 并发上限。
+ * 2026-10-20 用户要求放开到 50 并重测：若真机复现「测速卡住/大量假超时」，
+ * 优先回退到 24 或 32。
  */
 export const LATENCY_CONCURRENCY = 50;
 /**
- * 同时在飞的 HTTP 请求数（= OHOS 同 host 连接池容量，真机实测约 8）。
+ * 同时在飞的 HTTP 请求数（2026-10-20 用户拍板：改为 **50 路**，与 worker 数同宽）。
  *
- * 这个数**不是** worker 数：worker 数是 `LATENCY_CONCURRENCY`（50，队列深度）。
- * 两者必须分开，因为「同时在飞的请求数」决定每个请求能否在 `timeoutMs + 1200`
- * 内拿到**真实判定**（200/504/503/404）—— 超出连接池容量的请求会在 HTTP 栈
- * 内部排队，而排队时间被算进请求预算后，排队中的请求必然先在客户端侧超时 →
- * 被误判成通道故障（根因 T2）→ 连击作废整批 → 用户看到「测速全部失败」。
+ * 历史：这个值原为 8，依据是「OHOS http 栈对同一 host 的连接池约 8，超出即排队，
+ * 排队时间被算进请求预算 → 假超时（2026-09-23 真机实证）」。
+ * 现在按用户要求放开到 50：worker 数与在途数一致，**不再有应用层排队**，
+ * 每个节点的 `elapsed` 就是它自己那次 /delay 的真实耗时（口径更干净）。
  *
- * 因此：应用层用信号量把在途数压到 8，**排队等待不计入请求超时**
- * （见 `LatencyInflightGate` 与 `LatencyRun.gatedProbe`）。
+ * ⚠ 代价与验证要求（改这一行的人必须重跑真机验收）：
+ *  - 若真机复现「测速卡住 / 大量假超时 / queueTimeout>0」，说明连接池确实压不住 50 路，
+ *    应回退到 24 或 32（**不要直接退回 8**，那是性能问题）。
+ *  - 判定看 `latency batch done ... timeout= queueTimeout=` 两个计数：
+ *    timeout 高 = 节点真慢；queueTimeout 高 = 连接池排队。
  */
-export const LATENCY_INFLIGHT = 8;
+export const LATENCY_INFLIGHT = 50;
 /**
  * 信号量排队等待上限（毫秒）。
  *

@@ -387,10 +387,10 @@ check('B5 源码断言：probeOne 里只有一次 transport.get（探针不重�
   const hits = body.split('transport.get(').length - 1;
   eq(hits, 1, `probeOne 里的 transport.get 调用次数（${hits}）`);
 });
-check('B6 一次请求语义（配置侧）：生成配置不得开启 unified-delay（FlClash 口径）', () => {
+check('B6 统一延迟口径（配置侧）：生成配置开启 unified-delay（报第二次 HEAD 的耗时 = 真实 RTT）', () => {
   const src = fs.readFileSync(path.join(servicesDir, 'ClashConfigGenerator.ets'), 'utf8');
-  ok(src.indexOf("'unified-delay: true'") < 0, '生成配置里仍有 unified-delay: true（内核会连发两次 HEAD）');
-  ok(src.indexOf("'unified-delay: false'") >= 0, '生成配置里找不到 unified-delay: false');
+  ok(src.indexOf("'unified-delay: true'") >= 0, '生成配置里找不到 unified-delay: true（unified=false 会把 TLS 握手算进延迟，每次凭空多 1~2 个 RTT）');
+  ok(src.indexOf("'unified-delay: false'") < 0, '生成配置里仍有 unified-delay: false');
 });
 
 console.log('── C. 失败分类表完备 + 非判定失败不落结论 ──');
@@ -756,7 +756,7 @@ check('G1 参数常量区的取值', () => {
   eq(LatencyProbeLimits.NODE_TIMEOUT_MS, 5000, 'NODE_TIMEOUT_MS');
   eq(LatencyProbeLimits.OUTER_EXTRA_MS, 1200, 'OUTER_EXTRA_MS');
   eq(LatencyProbeLimits.WORKERS, 50, 'WORKERS');
-  eq(LatencyProbeLimits.MAX_INFLIGHT, 8, 'MAX_INFLIGHT');
+  eq(LatencyProbeLimits.MAX_INFLIGHT, 50, 'MAX_INFLIGHT');
   eq(LatencyProbeLimits.QUEUE_WAIT_MAX_MS, 60000, 'QUEUE_WAIT_MAX_MS');
 });
 check('G2 源码断言：超时/并发魔数只出现在 LatencyProbeLimits 类里', () => {
