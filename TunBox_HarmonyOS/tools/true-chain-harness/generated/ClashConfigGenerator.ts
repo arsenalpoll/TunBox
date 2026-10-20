@@ -81,6 +81,38 @@ export class ProxyDropStats {
   }
 }
 
+/**
+ * rule-providers 块条目（**纯缩进层级**判定，见 ClashConfigGenerator.parseProviderBlocks）。
+ *
+ * 用**显式 class** 而不是 interface：ArkTS 禁止未标注类型的对象字面量
+ * （arkts-no-untyped-obj-literals），跨文件构造这些结构必须用有类型的类；
+ * interface 只在类型标注层面可用，无法 new 出来。
+ */
+export class ProviderBlockEntry {
+  /** provider 名（键行冒号前的文本去引号、去首尾空白） */
+  name: string = '';
+  /** 归一后的键行：两空格缩进 + 原键行内容 */
+  keyLine: string = '';
+  /** 归一后的字段行：四空格缩进 + 原字段行内容 */
+  fieldLines: string[] = [];
+}
+
+/** parseProviderBlocks 的返回值：解析出的 provider 块 + 结构异常的前置字段行 */
+export class ProviderBlockParseResult {
+  /** 按出现顺序的 provider 块 */
+  blocks: ProviderBlockEntry[] = [];
+  /** 出现在任何键行之前的字段行（结构异常，调用方需处理） */
+  orphanLines: string[] = [];
+}
+
+/** YAML 顶层段（一个顶层键 + 其下所有更深缩进的行） */
+export class YamlTopLevelBlock {
+  /** 顶层键名（去引号）；空串 = 首个键行之前的前导内容（注释等） */
+  key: string = '';
+  /** 该段的全部原始行（含键行本身） */
+  lines: string[] = [];
+}
+
 export class ClashConfigGenerator {
   /**
    * 内核 smart 组（自动选择）的固定组名。
@@ -141,8 +173,8 @@ export class ClashConfigGenerator {
     lines.push('mixed-port: ' + mixedPort);
     lines.push('external-controller: 127.0.0.1:' + apiPort);
     lines.push('secret: "' + apiSecret + '"');
-    // 代理模式（upstream settings.proxyMode）：rule=规则 / global=全局
-    lines.push('mode: ' + (settings.proxyMode === 'global' ? 'global' : 'rule'));
+    // 代理模式（upstream settings.proxyMode）：rule=规则 / global=全局 / direct=直连
+    lines.push('mode: ' + (settings.proxyMode === 'global' ? 'global' : (settings.proxyMode === 'direct' ? 'direct' : 'rule')));
     // 内核日志级别可调（诊断排查时临时调到 debug/info；默认 warning 减少稳态 I/O）。
     // 白名单外的值一律回落 warning，防止脏设置写出非法 YAML。
     const level = (settings.coreLogLevel ?? '').trim().toLowerCase();
@@ -158,7 +190,9 @@ export class ClashConfigGenerator {
     lines.push('keep-alive-idle: 30');
     lines.push('keep-alive-interval: 15');
     lines.push('udp-timeout: 300');
-    lines.push('find-process-mode: off');
+    // 【C18】该字段是 string（mihomo process.FindProcessMode），但裸 off 在
+    // YAML 1.1 语境下有歧义 → 加引号消除歧义。
+    lines.push('find-process-mode: "off"');
     lines.push('');
     lines.push('dns:');
     lines.push('  enable: true');
@@ -240,12 +274,26 @@ export class ClashConfigGenerator {
     // 代理服务器, 全部 i/o timeout —— 真机 core.log 实证), 用真实 DNS 直出。
     // 内核以 respectRules=false 解析本项，且永不套 fake-ip，所以这是防
     // 「解析代理域名 → 又需要代理解析代理域名」回环的关键，**不可删**。
-    // 这里保留明文 UDP 是刻意的取舍：这些域名在 UI 进程已被 DoH 预解析并写进
-    // YAML hosts:（见 pinProxyServerHosts），运行期几乎不会被真的问到；
-    // 若改成 DoT，一旦该 DoT 端点抖动，所有节点域名同时不可解析 = 全面断线。
+    //
+    // ## 2026-10-19 稳定性：明文 UDP/53 → 加密 DoT（**必须与 pin 策略同源**）
+    //
+    // 旧注释的前提是「这些域名在 UI 进程已被 DoH 预解析并写进 YAML hosts:，
+    // 运行期几乎不会被真的问到」，因此用明文 UDP 换取「DoT 抖动时仍可解析」的鲁棒性。
+    // 但 0.4.0 起 DoHResolver 改成「短 TTL 记录一律不 pin」（机场入口域名 TTL 实测
+    // 60~120s，见该文件头真机取证），于是这个前提**不再成立**：
+    // 绝大多数节点域名不会被写进 hosts:，内核运行期**必须自己解析它们**，
+    // 而明文 UDP/53 在国内网络会被投毒（实测：www.google.com 明文返回
+    // 185.45.5.35，DoH 返回 142.251.155.119）→ 拨代理服务器打到假 IP →
+    // 全部节点超时 → 「连上了但没有出口 / 公网 IP 查不到」。
+    //
+    // 所以这里改为与 `nameserver` 相同的**加密 DoT**（223.5.5.5 / 1.12.12.12，
+    // 均实测直连可达且证书含 IP SAN）。两个端点互为冗余，单点抖动仍可解析；
+    // 且 DoT 走 853/TCP，不经 UDP/53，不受投毒影响。
+    // ⚠ 与 DoHResolver 的 pin 策略是**同一件事的两面**：如果将来恢复「短 TTL 也 pin」，
+    //    这里才可以考虑退回明文（但没必要——加密只多几毫秒握手，且有缓存）。
     lines.push('  proxy-server-nameserver:');
-    lines.push('    - 223.5.5.5');
-    lines.push('    - 119.29.29.29');
+    lines.push('    - tls://223.5.5.5:853');
+    lines.push('    - tls://1.12.12.12:853');
     // ── 国内域名显式钉到国内加密 DoT ──
     // direct-nameserver 已覆盖 DIRECT 分支，这里再加一层是为了让意图可审计、
     // 且不依赖内核对 direct-nameserver 的适用面判断。
@@ -317,7 +365,9 @@ export class ClashConfigGenerator {
     }
     lines.push('profile:');
     // 连接复用：存储已选策略，减少重连后的重复握手与选点抖动。
-    lines.push('  store-selections: true');
+    // 【C22】键名是 store-selected（mihomo RawConfig.Profile.StoreSelected），
+    // 旧写法 store-selections 是**错键** → 内核不认 → 「记住选择」静默失效。
+    lines.push('  store-selected: true');
     lines.push('  store-fake-ip: true');
     lines.push('');
     lines.push('tun:');
@@ -424,6 +474,7 @@ export class ClashConfigGenerator {
     // 与订阅组合并后统一交给 planProxyGroups：名字冲突时覆盖层组优先（覆盖订阅组），
     // 订阅组的 health-check url/interval 等测速语义保真不受影响。
     const overrideGroupNames = new Set<string>();
+    let overrideGroups: ProxyGroup[] = [];
     for (const og of overrideGroups) {
       overrideGroupNames.add(og.name);
     }
@@ -551,15 +602,15 @@ export class ClashConfigGenerator {
       }
     }
     // ── YAML 覆盖层的 rules/rule-providers 预解析 ─────────────────────────
-    // mihomo 对同一 YAML 里的重复顶层键是「后者覆盖前者」：把覆盖层原文直接追加在
-    // 配置尾部、且覆盖层带 rules: 的话，覆盖层会整段替换掉订阅/规则页的分流规则
-    // （订阅与规则页的规则全部失效 —— 真机实证 2026-10-16 的根因之一）。
-    // 所以这里把覆盖层的 rules/rule-providers 段提取出来，按键合并进上方已生成的
-    // 同段（见下方规则发射），其余顶层键（dns 等）仍按 P2 语义追加原文。
+    // 【2026-10-20 认知纠正】mihomo 用 go.yaml.in/yaml/v3，**uniqueKeys 默认开启**：
+    // 同一层级的重复键是 **TypeError → 整份配置拒载**（全有全无），
+    // **不是**「后者覆盖前者」（旧注释写的正是后者，是错的，也是 R2/R4/R5 的认知根源）。
+    // 所以这里把覆盖层的 rules/rule-providers 段**提取**出来，按键合并进上方已生成的
+    // 同段（见下方规则发射）；其余顶层键走 C17 的「允许覆盖 + 结构化合并」
+    // （同名则删掉生成器那一整段，绝不再出现两个同名顶层键）。
     let overrideBody = '';
     let overrideRuleLines: string[] = [];
     let overrideProviderLines: string[] = [];
-    let overrideGroups: ProxyGroup[] = [];
     const override = (settings.yamlOverride ?? '').trim();
     if (override.length > 0 && ClashConfigGenerator.validateYamlOverride(override)) {
       try {
@@ -599,70 +650,99 @@ export class ClashConfigGenerator {
           YamlMerger.removeSection(override, 'rules'), 'rule-providers'), 'proxy-groups').trim()
         : override;
     }
-    // 已声明 provider 名账本：订阅/覆盖层的 RULE-SET 引用必须落在已声明的 provider 上，
-    // 否则内核 config.Parse 阶段直接拒载整份配置（「引用未声明的 provider」）。
-    const emittedProviderNames = new Set<string>();
-    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
-      emittedProviderNames.add('hyper-adrules');
-    }
-    for (const ruleSet of settings.customRuleSets) {
-      emittedProviderNames.add(`rs-${ruleSet.name}`);
-    }
     // ── rule-providers 声明段（单一合并段）────────────────────────────
     // 真机实证 2026-10-16：多个 rule-providers: 顶层键（hyper/自定义/订阅/覆盖层各发
     // 一个头）会让 yaml.v3 报重复键拒载；订阅 provider 块原样回写在缩进不规范时
     // 报「did not find expected key」。所以这里统一收集、按键去重、逐条重缩进，
     // 最后只发一个 rule-providers: 头。
-    const providerEntryLines: string[] = [];
+    //
+    // 【2026-10-20 C16/C19/C20】三处修复合并落地：
+    // ① 块边界改为「纯缩进层级」判定（parseProviderBlocks）—— 旧实现用
+    //    /^([A-Za-z0-9_-]+):\s*$/ 认键行，点号名（my.provider:）不被认成键行
+    //    → 键行消失、字段行变成 rule-providers 的兄弟键 → 内核报
+    //    cannot unmarshal !!null/!!str into map[string]interface {}（R1），
+    //    且引用它的 RULE-SET 规则被静默丢弃（比拒载更隐蔽）。
+    // ② 去重改为**整块丢弃**（绝不只丢键行）—— 只丢键行会让字段行落进上一条
+    //    provider 的 mapping → mapping key "type" already defined（R4）；
+    //    字段键名与上一条不同时**不报错、静默并错 provider**（R4'''，更隐蔽）。
+    // ③ 两个集合严格分离：
+    //    declaredProviderNames = 引用校验账本（RULE-SET 引用必须落在已声明 provider 上）
+    //    emittedProviderKeys    = 输出去重判定（已实际输出的块名）
+    //    旧实现两者合一且**预置**了自产的 rs-*/hyper-adrules → 自己刚生成的块
+    //    被自己判成重复块丢掉（R4'：键行被丢、字段行成孤儿）。
+    const providerCandidates: ProviderBlockEntry[] = [];
+    // ① hyper-adrules（自产）：优先级最高（与旧实现「预置账本」的语义一致 ——
+    //    订阅里同名 provider 被丢弃，不会两个 provider 抢同一个名字）。
+    //    声明与下方 RULE-SET 引用同受「本地 path 文件就绪」闸门约束：
+    //    ruleProviderReady=false 时不声明、不引用，避免内核启动期联网下载阻塞。
+    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
+      const hyperBlock = new ProviderBlockEntry();
+      hyperBlock.name = 'hyper-adrules';
+      hyperBlock.keyLine = '  hyper-adrules:';
+      hyperBlock.fieldLines = [
+        '    type: http',
+        '    behavior: domain',
+        '    format: mrs',
+        '    interval: 86400',
+        '    path: ./ruleset/hyper_adrules_ads.mrs',
+        '    url: "https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs"',
+      ];
+      providerCandidates.push(hyperBlock);
+    }
+    // ② 用户自定义远程规则集（rs-*）：同样优先于订阅/覆盖层的同名块
     if (settings.rulesEnabled && settings.customRuleSets.length > 0) {
       for (const ruleSet of settings.customRuleSets) {
-        providerEntryLines.push(`  rs-${ruleSet.name}:`);
-        providerEntryLines.push('    type: http');
-        providerEntryLines.push(`    behavior: ${ruleSet.behavior}`);
-        providerEntryLines.push(`    format: ${ruleSet.format}`);
-        providerEntryLines.push(`    interval: ${ruleSet.interval}`);
-        providerEntryLines.push(`    path: ./ruleset/custom_rs_${ClashConfigGenerator.sanitizeFileKey(ruleSet.name)}`);
-        providerEntryLines.push(`    url: "${ClashConfigGenerator.escapeYaml(ruleSet.url)}"`);
+        const block = new ProviderBlockEntry();
+        block.name = `rs-${ruleSet.name}`;
+        block.keyLine = `  rs-${ruleSet.name}:`;
+        block.fieldLines = [
+          '    type: http',
+          `    behavior: ${ruleSet.behavior}`,
+          `    format: ${ruleSet.format}`,
+          `    interval: ${ruleSet.interval}`,
+          `    path: ./ruleset/custom_rs_${ClashConfigGenerator.sanitizeFileKey(ruleSet.name)}`,
+          `    url: "${ClashConfigGenerator.escapeYaml(ruleSet.url)}"`,
+        ];
+        providerCandidates.push(block);
       }
     }
+    // ③ 订阅带来的 provider 块
     if (settings.rulesEnabled && subscriptionRuleProviders.length > 0) {
-      for (const line of ClashConfigGenerator.normalizeProviderBlock(subscriptionRuleProviders.split('\n'))) {
-        providerEntryLines.push(line);
+      const parsed = ClashConfigGenerator.parseProviderBlocks(subscriptionRuleProviders.split('\n'));
+      if (parsed.orphanLines.length > 0) {
+        AppLogger.warn(TAG, `subscription rule-providers: ${parsed.orphanLines.length} orphan line(s) `
+          + 'before any provider key (dropped)');
+      }
+      for (const block of parsed.blocks) {
+        providerCandidates.push(block);
       }
     }
+    // ④ 覆盖层 provider 块
     if (overrideProviderLines.length > 0) {
-      for (const line of ClashConfigGenerator.normalizeProviderBlock(overrideProviderLines)) {
-        providerEntryLines.push(line);
+      const parsed = ClashConfigGenerator.parseProviderBlocks(overrideProviderLines);
+      if (parsed.orphanLines.length > 0) {
+        AppLogger.warn(TAG, `override rule-providers: ${parsed.orphanLines.length} orphan line(s) `
+          + 'before any provider key (dropped)');
+      }
+      for (const block of parsed.blocks) {
+        providerCandidates.push(block);
       }
     }
-    // 按键去重（先到先得：hyper/自定义 → 订阅 → 覆盖层）
-    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
-      emittedProviderNames.add('hyper-adrules');
-    }
-    for (const ruleSet of settings.customRuleSets) {
-      emittedProviderNames.add(`rs-${ruleSet.name}`);
-    }
+    // 整块去重（先到先得）：命中重复名 → **整块丢弃**（键行 + 全部字段行一起丢）
+    const emittedProviderKeys = new Set<string>();
+    const declaredProviderNames = new Set<string>();
     const finalProviderLines: string[] = [];
-    for (const line of providerEntryLines) {
-      const m = line.match(/^  ([A-Za-z0-9_-]+):$/);
-      if (m !== null) {
-        if (emittedProviderNames.has(m[1])) {
-          continue;
-        }
-        emittedProviderNames.add(m[1]);
+    for (const block of providerCandidates) {
+      if (emittedProviderKeys.has(block.name)) {
+        AppLogger.warn(TAG, `duplicate rule-provider "${block.name}" dropped (whole block)`);
+        continue;
       }
-      finalProviderLines.push(line);
-    }
-    // hyper-adrules 声明（去广告）与下方 RULE-SET 引用同受该闸门约束：
-    // 本地 path 文件缺失（ruleProviderReady=false）时不声明、不引用，避免内核启动期联网下载阻塞。
-    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
-      finalProviderLines.push('  hyper-adrules:');
-      finalProviderLines.push('    type: http');
-      finalProviderLines.push('    behavior: domain');
-      finalProviderLines.push('    format: mrs');
-      finalProviderLines.push('    interval: 86400');
-      finalProviderLines.push('    path: ./ruleset/hyper_adrules_ads.mrs');
-      finalProviderLines.push('    url: "https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs"');
+      emittedProviderKeys.add(block.name);
+      declaredProviderNames.add(block.name);
+      finalProviderLines.push(block.keyLine);
+      for (const field of block.fieldLines) {
+        finalProviderLines.push(field);
+      }
     }
     if (finalProviderLines.length > 0) {
       lines.push('');
@@ -686,37 +766,74 @@ export class ClashConfigGenerator {
         lines.push(`  - ${customRule}`);
       }
       // ── 订阅自带 rules（导入订阅时落账）──────────────────────────────
-      // 策略目标必须是已声明的代理组或内置策略、RULE-SET 必须引用已声明的 provider；
-      // 不合法的行跳过并计数（静态账本 lastSkippedUserRules），绝不整份拒载。
+      // 策略目标必须是**实际写进 proxy-groups 段的组**或内置策略；RULE-SET 必须引用
+      // 已声明的 provider。不合法的行跳过并计数（静态账本 lastSkippedUserRules），
+      // 绝不整份拒载。
+      //
+      // ⚠ 2026-10-19 真机报障修复：这里原先遍历的是 mergedGroups（**过滤前**），
+      // 而 proxy-groups 段实际由 emittedGroups（planProxyGroups 过滤后）写出。
+      // 二者不等价 —— planProxyGroups 会丢弃「类型不支持 / 与节点同名 / 空成员 /
+      // 循环引用无法落地」的组。于是订阅里被丢弃的组仍被当作合法目标，引用它的规则
+      // 照常写入，内核 config.Parse 直接报
+      //   parse config:rules[0] [DOMAIN-SUFFIX,local, 本地直连] error: proxy not found
+      // 整份配置拒载 → 启动代理失败（用户报障原文）。必须用 emittedGroups。
       const groupTargets = new Set<string>(['DIRECT', 'PROXY', 'REJECT', 'REJECT-DROP',
-        'PASS', 'GLOBAL', 'COMPATIBLE', 'REJECT-DROP', ClashConfigGenerator.SMART_GROUP_NAME]);
-      for (const g of mergedGroups) {
+        'PASS', 'GLOBAL', 'COMPATIBLE']);
+      for (const g of emittedGroups) {
         groupTargets.add(g.name);
+      }
+      // ♻️ 自动选择组只在 emitSmart 为真时才真正声明（见上方 proxy-groups 段），
+      // 未声明就不能算合法目标，否则同理会写出指向不存在组的规则。
+      if (emitSmart) {
+        groupTargets.add(ClashConfigGenerator.SMART_GROUP_NAME);
       }
       let skippedUserRules = 0;
       // GEOIP 规则依赖 geoip.metadb（坑 40 同源）：metadb 缺失/损坏时内核会在
       // config.Parse 阶段同步联网下载 MMDB（国内不可达）→ 启动卡死超时。
       // 内置 GEOIP 已按 useGeoip 降级；订阅/覆盖层自带的 GEOIP 规则必须同闸门，
       // 否则一条订阅规则就能把启动重新拖死。metadb 后台补齐后下次连接恢复。
-      for (const ruleLine of subscriptionRules) {
+      for (const rawRule of subscriptionRules) {
+        // 【C21】入口自己剥离行首 '- '（不依赖调用方）：rules 段的每一项必须是
+        // **纯字符串**，写成 '- - RULE' 会变成嵌套 seq → 内核报
+        // cannot unmarshal !!seq into string 整份拒载（R6）。
+        const ruleLine = ClashConfigGenerator.stripRuleListPrefix(rawRule);
+        if (ruleLine.length === 0) {
+          skippedUserRules = skippedUserRules + 1;
+          continue;
+        }
         if (!useGeoip && ruleLine.toUpperCase().startsWith('GEOIP,')) {
           skippedUserRules = skippedUserRules + 1;
           continue;
         }
-        if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, emittedProviderNames, groupTargets)) {
-          lines.push(`  - ${ruleLine}`);
+        if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, declaredProviderNames, groupTargets)) {
+          const normalized = ClashConfigGenerator.normalizeRuleLine(ruleLine);
+          if (normalized.length === 0) {
+            skippedUserRules = skippedUserRules + 1;
+            continue;
+          }
+          lines.push(`  - ${normalized}`);
         } else {
           skippedUserRules = skippedUserRules + 1;
         }
       }
       // ── YAML 覆盖层的 rules（同段合并，与订阅规则共存而不是整段替换）──
-      for (const ruleLine of overrideRuleLines) {
+      for (const rawRule of overrideRuleLines) {
+        const ruleLine = ClashConfigGenerator.stripRuleListPrefix(rawRule);
+        if (ruleLine.length === 0) {
+          skippedUserRules = skippedUserRules + 1;
+          continue;
+        }
         if (!useGeoip && ruleLine.toUpperCase().startsWith('GEOIP,')) {
           skippedUserRules = skippedUserRules + 1;
           continue;
         }
-        if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, emittedProviderNames, groupTargets)) {
-          lines.push(`  - ${ruleLine}`);
+        if (ClashConfigGenerator.isValidUserRuleLine(ruleLine, declaredProviderNames, groupTargets)) {
+          const normalized = ClashConfigGenerator.normalizeRuleLine(ruleLine);
+          if (normalized.length === 0) {
+            skippedUserRules = skippedUserRules + 1;
+            continue;
+          }
+          lines.push(`  - ${normalized}`);
         } else {
           skippedUserRules = skippedUserRules + 1;
         }
@@ -760,14 +877,69 @@ export class ClashConfigGenerator {
     // bypassDomesticApps 的语义收敛为"国内直连分流是否启用"(见上方 GEOIP/cn 规则),
     // 不再影响兜底 —— 兜底永远是 PROXY, 否则 VPN 没有意义。
     lines.push('  - MATCH,PROXY');
-    // YAML 覆盖层（P2，对标 Stash JS Override 的无脚本形态）：用户 YAML 原文
-    // 追加在配置尾部。mihomo 解析语义：重复键后者覆盖前者 —— 用户可覆盖
-    // dns/rules/proxies 之外的任何顶层键（覆盖 rules/proxies 由 UI 白名单拦截）。
-    // 覆盖层本身经过控制字符净化，脏输入不会导致整份配置拒载。
+    // ── YAML 覆盖层合并（C17 + C18）──────────────────────────────────
+    // 【2026-10-20 认知纠正】mihomo 用 go.yaml.in/yaml/v3（uniqueKeys **默认开启**）：
+    // 同一层级的重复键 = TypeError = **整份配置拒载**（全有全无，一个节点坏整个
+    // VPN 起不来），**不是**「后者覆盖前者」。旧实现把覆盖层原文整段追加在配置
+    // 尾部 → 与生成器自己的 dns:/mode:/profile:/mixed-port:/log-level:/ipv6:/
+    // sniffer:/hosts: 等顶层键重复 → mapping key "dns" already defined（R2）。
+    //
+    // 新实现（产品口径：**允许覆盖 + 结构化合并**，用户能力不丢）：
+    //   ① 覆盖层顶层键与生成器顶层键同名 → **删掉生成器那一整段**，改用覆盖层版本；
+    //   ② 覆盖层自身的重复顶层键去重（保留首个）——否则照样整份拒载；
+    //   ③ 未知顶层键 → **保留**并 AppLogger.warn 记录键名（绝不静默删除）；
+    //   ④ 合并后再做布尔值归一（C18，路径感知，只改已知 bool 字段）。
+    // rules / rule-providers / proxy-groups 三段已在前面按「提取合并」路径处理，
+    // 不再出现在覆盖层正文里（提取失败时才会原样保留，此时同样走「同名删生成段」）。
     if (overrideBody.length > 0) {
+      const overrideBlocks = ClashConfigGenerator.splitTopLevelBlocks(overrideBody.split('\n'));
+      const overrideKeys = new Set<string>();
+      const mergedOverrideLines: string[] = [];
+      let droppedOverrideDup = 0;
+      for (const block of overrideBlocks) {
+        if (block.key.length === 0) {
+          // 首个键行之前的前导内容（注释/空行）：原样保留
+          for (const l of block.lines) {
+            mergedOverrideLines.push(l);
+          }
+          continue;
+        }
+        if (overrideKeys.has(block.key)) {
+          // 覆盖层自身重复顶层键 → 保留首个，其余整段丢弃（否则整份拒载）
+          droppedOverrideDup = droppedOverrideDup + 1;
+          continue;
+        }
+        if (!ClashConfigGenerator.blockHasContent(block)) {
+          // 空段（只有键行 + 注释/空行）→ 整段跳过：
+          // 既不删生成器的同名段（否则生成器内容被抹掉），也不原样追加
+          // （否则多出一个空的同名顶层键 → 重复键 → 整份拒载）。
+          AppLogger.warn(TAG, `yaml override: empty top-level key "${block.key}" ignored`);
+          continue;
+        }
+        overrideKeys.add(block.key);
+        for (const l of block.lines) {
+          mergedOverrideLines.push(l);
+        }
+        if (!ClashConfigGenerator.KNOWN_TOP_LEVEL_KEYS.has(block.key)) {
+          AppLogger.warn(TAG, `yaml override: unknown top-level key "${block.key}" kept as-is`);
+        }
+      }
+      if (droppedOverrideDup > 0) {
+        AppLogger.warn(TAG, `yaml override: ${droppedOverrideDup} duplicate top-level key(s) dropped (first wins)`);
+      }
+      // ① 生成器同名顶层段整段删除 → 改用覆盖层版本
+      const keptLines = ClashConfigGenerator.stripTopLevelBlocks(lines, overrideKeys);
+      lines.length = 0;
+      for (const l of keptLines) {
+        lines.push(l);
+      }
+      // ④ 布尔归一（路径感知；只改白名单里的已知 bool 字段）
+      const normalizedOverride = ClashConfigGenerator.normalizeOverrideBooleans(mergedOverrideLines);
       lines.push('');
       lines.push('# ---- user override (P2) ----');
-      lines.push(overrideBody);
+      for (const l of normalizedOverride) {
+        lines.push(l);
+      }
     }
     // 最终出口净化：无论上游哪条路径漏进控制字符（rawTemplate/逐字 ws 值/持久化脏数据），
     // 落盘配置必然 YAML-printable，内核不会因 "control characters are not allowed" 拒载。
@@ -780,24 +952,69 @@ export class ClashConfigGenerator {
    * 控制内核管理面，同样拦截。返回 true = 允许处理。
    * rules/rule-providers/proxy-groups 三键不再整段拦截：由 generate() 提取后
    * 按键合并进生成的同段（覆盖层 proxy-groups 聚合 + rules 同段合并），
-   * 其余顶层键（dns 等）仍按 P2 语义追加原文。
+   * 其余顶层键（dns 等）走 C17 的「允许覆盖 + 结构化合并」。
+   *
+   * 【C17】被拒时**必须报出具体键名**：旧实现整段丢弃且**完全静默**，
+   * 用户只看到「覆盖层没生效」却没有任何线索。现在返回值语义不变（false =
+   * 整段不生效），但会 AppLogger.warn 出具体被拒的键名。
    */
   static validateYamlOverride(text: string): boolean {
     if (text.length > 8 * 1024) {
+      AppLogger.warn(TAG, 'yaml override rejected: exceeds 8KB limit (whole override ignored)');
       return false;
     }
     const blocked = /^(proxies|external-controller|secret|tun)\s*:/;
+    const rejected: string[] = [];
     for (const line of text.split('\n')) {
-      if (blocked.test(line.trim())) {
-        return false;
+      const m = line.trim().match(blocked);
+      if (m !== null) {
+        rejected.push(m[1]);
       }
+    }
+    if (rejected.length > 0) {
+      AppLogger.warn(TAG, `yaml override rejected: blocked top-level key(s) `
+        + `${rejected.join(', ')} — the whole override is ignored`);
+      return false;
     }
     return true;
   }
 
   /**
+   * 剥掉规则行的列表项前缀（'- ' / '- - ' 反复剥）。
+   * rules 段的每一项在 mihomo RawConfig 里是**纯字符串**（Rule []string），
+   * 写成 '- - RULE' 会变成嵌套 seq → cannot unmarshal !!seq into string 整份拒载（R6）。
+   */
+  private static stripRuleListPrefix(raw: string): string {
+    let text = raw.trim();
+    while (text.startsWith('- ') || text === '-') {
+      text = text.startsWith('- ') ? text.substring(2).trim() : '';
+    }
+    return text;
+  }
+
+  /**
+   * 规范化用户规则行的逗号空白：`DOMAIN-SUFFIX,local, 本地直连` → `DOMAIN-SUFFIX,local,本地直连`。
+   *
+   * 2026-10-19：isValidUserRuleLine 校验时对每个逗号段做了 trim，但写盘用的是原始行。
+   * 校验通过、写盘却带空白，会让内核侧「策略目标精确匹配」的语义与校验不一致
+   * （用户报障原文里规则正是 `DOMAIN-SUFFIX,local, 本地直连`，逗号后带空格）。
+   * 这里把两侧统一到同一个规范形态，消除歧义。
+   */
+  static normalizeRuleLine(rule: string): string {
+    const text = rule.trim();
+    // 【C21】以 '- ' 开头的是**列表项**而不是规则内容：写进 rules: 段会变成嵌套
+    // seq（cannot unmarshal !!seq into string）→ 整份拒载。这里直接拒绝（返回空串），
+    // 调用方据此跳过该行。
+    if (text.startsWith('- ') || text === '-') {
+      return '';
+    }
+    return text.split(',').map((v: string) => v.trim()).join(',');
+  }
+
+  /**
    * 单条用户规则行（订阅自带 rules / 覆盖层 rules）是否可安全写入 rules 段：
-   * - 策略目标（最后一个逗号字段，容忍 no-resolve 参数）必须是已声明的代理组或内置策略；
+   * - 策略目标（最后一个逗号字段，容忍 no-resolve 参数）必须是**实际写进 proxy-groups
+   *   段的组**或内置策略（见 generate() 里 groupTargets 的构建，务必传 emittedGroups）；
    * - RULE-SET 引用的 provider 必须已声明（声明段与引用同受校验）。
    * 不合法的行由调用方跳过并计数 —— 内核 config.Parse 对「引用未声明的 provider /
    * 不存在的组」会直接拒载整份配置，所以这里必须在生成侧兜底。
@@ -833,27 +1050,362 @@ export class ClashConfigGenerator {
   }
 
   /**
-   * 把 provider 声明块重缩进为规范 2/4 空格（provider 键行 2 空格、字段行按相对缩进 + 2）。
-   * 真实订阅的 rule-providers 缩进不规范（tab、缩进深度不一）时原样回写，会让
-   * yaml.v3 报「did not find expected key」整份拒载（真机实证 2026-10-16），
-   * 所以这里逐条重缩进，字段值原样保留。tab 归一为 2 空格，注释/空行剔除。
+   * rule-providers 块解析（**纯缩进层级**判定，C16）。
+   *
+   * 为什么必须「只看缩进层级、不看键名长什么样」：旧实现用
+   * `/^([A-Za-z0-9_-]+):\s*$/` 认键行，点号名（`my.provider:`）、中文名、
+   * 带引号的名**都不被认成键行** → 键行消失、它的字段行变成 `rule-providers:`
+   * 的**兄弟键** → mihomo（RuleProvider map[string]map[string]any）报
+   * `cannot unmarshal !!null/!!str into map[string]interface {}` 整份拒载（R1），
+   * 且引用它的 RULE-SET 规则被**静默丢弃**（比拒载更隐蔽：规则不生效、无报错）。
+   * 同一套判定此前在**三处各写一份正则**（本文件解析/去重 + SubscriptionService
+   * 的引用账本），三处不一致 → 隐患。本方法是**唯一权威实现**，其余调用方复用。
+   *
+   * 判定规则：
+   * - 预处理：去掉 `\r`、tab 换 2 空格、去行尾空白；空行与 `#` 注释行丢弃；
+   * - indent = 行首空格数；
+   * - indent >= 4 → 字段行；indent === 2 → 键行；
+   * - indent <= 1 → 仅当冒号后为空值（`key:` 后面没有内容，忽略尾部注释）时
+   *   才是键行，否则算字段行；
+   * - 键行冒号前的文本去引号 = provider 名；名为空 → 视为字段行（结构异常）；
+   * - 字段行归属于它前面**最近**的键行；任何键行之前的字段行进 orphanLines。
    */
-    static normalizeProviderBlock(rawLines: string[]): string[] {
-    const out: string[] = [];
-    for (const raw of rawLines) {
-      const line = raw.replace(/\t/g, '  ').replace(/\r$/, '');
-      const t = line.trim();
-      if (t.length === 0 || t.startsWith('#')) {
+  static parseProviderBlocks(lines: string[]): ProviderBlockParseResult {
+    const result = new ProviderBlockParseResult();
+    // 当前块栈（正常只有 1 层：块内不再嵌套块）
+    const stack: ProviderBlockEntry[] = [];
+    for (const raw of lines) {
+      const line = raw.replace(/\r/g, '').replace(/\t/g, '  ');
+      const body = line.trim();
+      if (body.length === 0 || body.startsWith('#')) {
         continue;
       }
-      // provider 声明是平铺结构：键行（name: 无值）规范 2 空格，其余字段行规范 4 空格。
-      // 不依赖源缩进 —— 真机实证 2026-10-16：extractSection 对某些段的归一化会产出
-      // 键 0/字段 4 的错位行，原样回写让 yaml.v3 报「did not find expected key」拒载。
-      const m = t.match(/^([A-Za-z0-9_-]+):\s*$/);
-      if (m !== null) {
-        out.push('  ' + t);
+      const indent = ClashConfigGenerator.leadingSpaces(line);
+      let isKeyLine = false;
+      if (indent >= 4) {
+        isKeyLine = false;
+      } else if (indent === 2) {
+        isKeyLine = true;
       } else {
-        out.push('    ' + t);
+        isKeyLine = ClashConfigGenerator.isEmptyValueKeyLine(body);
+      }
+      if (isKeyLine) {
+        const name = ClashConfigGenerator.providerNameOf(body);
+        if (name.length > 0) {
+          const entry = new ProviderBlockEntry();
+          entry.name = name;
+          entry.keyLine = '  ' + body;
+          result.blocks.push(entry);
+          stack.push(entry);
+          continue;
+        }
+      }
+      // 字段行：归属于前面最近的键行；没有键行 → 结构异常（orphan）
+      if (stack.length === 0) {
+        result.orphanLines.push('    ' + body);
+      } else {
+        stack[stack.length - 1].fieldLines.push('    ' + body);
+      }
+    }
+    return result;
+  }
+
+  /** 只要 provider 块名（引用账本 / 去重判定的轻量入口）。 */
+  static providerBlockKeyNames(lines: string[]): string[] {
+    const parsed = ClashConfigGenerator.parseProviderBlocks(lines);
+    const out: string[] = [];
+    for (const block of parsed.blocks) {
+      out.push(block.name);
+    }
+    return out;
+  }
+
+  /**
+   * 把 provider 声明块重缩进为规范 2/4 空格（provider 键行 2 空格、字段行 4 空格）。
+   *
+   * 实现改为调用 parseProviderBlocks（**纯缩进层级**判定），
+   * 保留本方法名以免破坏既有调用方。语义不变：把 provider 块重缩进为 2/4 空格。
+   * 真实订阅的 rule-providers 缩进不规范（tab、缩进深度不一）时原样回写，会让
+   * yaml.v3 报「did not find expected key」整份拒载（真机实证 2026-10-16）。
+   */
+  static normalizeProviderBlock(rawLines: string[]): string[] {
+    const parsed = ClashConfigGenerator.parseProviderBlocks(rawLines);
+    const out: string[] = [];
+    for (const block of parsed.blocks) {
+      out.push(block.keyLine);
+      for (const field of block.fieldLines) {
+        out.push(field);
+      }
+    }
+    return out;
+  }
+
+  /** 行首空格数（tab 已在调用前归一为 2 空格）。 */
+  private static leadingSpaces(line: string): number {
+    let count = 0;
+    while (count < line.length && line.charAt(count) === ' ') {
+      count = count + 1;
+    }
+    return count;
+  }
+
+  /**
+   * 按**第一个引号外的冒号**切分 key/value；没有冒号时返回 ['', '']。
+   * 引号感知是必需的：provider 名可以是 `"my.provider":`。
+   */
+  static splitKeyValue(text: string): string[] {
+    let quote = '';
+    for (let i = 0; i < text.length; i++) {
+      const ch = text.charAt(i);
+      if (quote.length > 0) {
+        if (ch === quote) {
+          quote = '';
+        }
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === ':') {
+        return [text.substring(0, i), text.substring(i + 1)];
+      }
+    }
+    return ['', ''];
+  }
+
+  /** 剥掉标量外层成对引号（provider 名 / 顶层键名都可能是带引号的）。 */
+  private static unquoteKey(text: string): string {
+    let value = text.trim();
+    if (value.length >= 2
+      && ((value.startsWith('"') && value.endsWith('"'))
+        || (value.startsWith("'") && value.endsWith("'")))) {
+      value = value.substring(1, value.length - 1).trim();
+    }
+    return value;
+  }
+
+  /** 去掉值的尾部注释（`' #'` 之后才算注释，避免砍掉值里的 '#'）。 */
+  private static stripYamlComment(value: string): string {
+    const text = value.trim();
+    if (text.startsWith('#')) {
+      return '';
+    }
+    const idx = text.indexOf(' #');
+    if (idx >= 0) {
+      return text.substring(0, idx).trim();
+    }
+    return text;
+  }
+
+  /** 该行是否是「键行」：冒号存在，且冒号后为空值（忽略尾部注释）。 */
+  private static isEmptyValueKeyLine(text: string): boolean {
+    const parts = ClashConfigGenerator.splitKeyValue(text);
+    if (parts[0].trim().length === 0) {
+      return false;
+    }
+    return ClashConfigGenerator.stripYamlComment(parts[1]).length === 0;
+  }
+
+  /** 键行的 provider 名（冒号前文本去引号）。 */
+  private static providerNameOf(text: string): string {
+    const parts = ClashConfigGenerator.splitKeyValue(text);
+    return ClashConfigGenerator.unquoteKey(parts[0]);
+  }
+
+  /**
+   * 「已知顶层键」清单（生成器产出 + mihomo 常见顶层键）。
+   * 覆盖层出现**不在此清单**的顶层键 → **保留**并 AppLogger.warn 记录键名
+   * （绝不静默删除）；内核大概率不认这个键，提示用户避免"写了没生效"。
+   */
+  private static readonly KNOWN_TOP_LEVEL_KEYS: Set<string> = new Set<string>([
+    'mixed-port', 'port', 'socks-port', 'redir-port', 'tproxy-port', 'mixed-port-range',
+    'external-controller', 'external-controller-cors', 'external-controller-tls',
+    'external-ui', 'external-ui-name', 'external-ui-url', 'secret',
+    'mode', 'log-level', 'ipv6', 'disable-ipv6', 'unified-delay', 'tcp-concurrent',
+    'keep-alive-idle', 'keep-alive-interval', 'udp-timeout', 'find-process-mode',
+    'allow-lan', 'bind-address', 'disable-keep-alive', 'authentication', 'listeners',
+    'interface-name', 'routing-mark', 'global-client-fingerprint', 'geodata-mode',
+    'geodata-loader', 'geox-url', 'geosite-matcher', 'experimental', 'iptables',
+    'etag-support', 'cfw-latency-url', 'cfw-bypass',
+    'dns', 'sniffer', 'profile', 'tun', 'hosts',
+    'proxies', 'proxy-providers', 'proxy-groups', 'rule-providers', 'rules', 'sub-rules',
+  ]);
+
+  /**
+   * 覆盖层布尔字段白名单（C18）：只有这些**路径**上的 yes/no/on/off 才会被改写成
+   * true/false。路径 = 缩进栈推导出的「顶层键 → 子键」链（如 dns.enable）。
+   *
+   * 为什么需要：mihomo 用 YAML 1.2 core schema（go.yaml.in/yaml/v3），
+   * `yes`/`no`/`on`/`off` 解析为 **!!str**（不是 bool）→ 落进 RawConfig 的 bool
+   * 字段（allow-lan / dns.enable / tun.enable …）就是
+   * `cannot unmarshal !!str 'yes' into bool` → 整份配置拒载（R3）。
+   *
+   * 刻意**保守**：只列 RawConfig 里确定是 bool 的字段；未知路径上的 yes/no
+   * **原样保留**（内核对不认识的字段宽容，我们不擅自改写用户原文）。
+   */
+  private static readonly OVERRIDE_BOOL_PATHS: Set<string> = new Set<string>([
+    'allow-lan', 'ipv6', 'unified-delay', 'tcp-concurrent', 'disable-keep-alive',
+    'dns.enable', 'dns.ipv6', 'dns.disable-cache', 'dns.direct-nameserver-follow-policy',
+    'dns.respect-rules',
+    'tun.enable', 'tun.auto-route', 'tun.auto-detect-interface', 'tun.strict-route',
+    'sniffer.enable', 'sniffer.override-destination', 'sniffer.parse-pure-ip',
+    'sniffer.force-dns-mapping',
+    'profile.store-selected', 'profile.store-fake-ip',
+  ]);
+
+  /**
+   * 按「顶层键」切分 YAML 文本块（C17）。
+   *
+   * 段落边界：一个 indent 0 的 `key:` 行开始一段，直到下一个 indent 0 的 `key:` 行
+   * （或 EOF）为止；段内所有更深缩进的行属于该段；**段内缩进为 0 的注释行不结束
+   * 当前段**（仍归当前段）。
+   */
+  static splitTopLevelBlocks(lines: string[]): YamlTopLevelBlock[] {
+    const out: YamlTopLevelBlock[] = [];
+    // 当前块栈（顶层块不会嵌套：块内更深缩进的行都归它）
+    const stack: YamlTopLevelBlock[] = [];
+    for (const raw of lines) {
+      const line = raw.replace(/\r$/, '');
+      const indent = ClashConfigGenerator.leadingSpaces(line);
+      const trimmed = line.trim();
+      let key = '';
+      if (indent === 0 && trimmed.length > 0 && !trimmed.startsWith('#')
+        && !trimmed.startsWith('- ')) {
+        const parts = ClashConfigGenerator.splitKeyValue(trimmed);
+        if (parts[0].trim().length > 0) {
+          key = ClashConfigGenerator.unquoteKey(parts[0]);
+        }
+      }
+      if (key.length > 0) {
+        const block = new YamlTopLevelBlock();
+        block.key = key;
+        block.lines.push(line);
+        out.push(block);
+        stack.push(block);
+        continue;
+      }
+      if (stack.length === 0) {
+        const preamble = new YamlTopLevelBlock();
+        preamble.lines.push(line);
+        out.push(preamble);
+        continue;
+      }
+      stack[stack.length - 1].lines.push(line);
+    }
+    return out;
+  }
+
+  /**
+   * 从一段 YAML 行里**整段删除**指定的顶层键（C17）。
+   * 段落边界与 splitTopLevelBlocks 同源；段内缩进为 0 的注释行不结束当前段。
+   * 纯函数（不改入参），可直接被 Node 侧回归脚本抽出来跑。
+   */
+  static stripTopLevelBlocks(lines: string[], keys: Set<string>): string[] {
+    if (keys.size === 0) {
+      return lines.slice();
+    }
+    const out: string[] = [];
+    let skipping = false;
+    for (const raw of lines) {
+      const line = raw.replace(/\r$/, '');
+      const indent = ClashConfigGenerator.leadingSpaces(line);
+      const trimmed = line.trim();
+      if (indent === 0 && trimmed.length > 0 && !trimmed.startsWith('#')
+        && !trimmed.startsWith('- ')) {
+        const parts = ClashConfigGenerator.splitKeyValue(trimmed);
+        if (parts[0].trim().length > 0) {
+          skipping = keys.has(ClashConfigGenerator.unquoteKey(parts[0]));
+        }
+      }
+      if (!skipping) {
+        out.push(raw);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 该顶层段是否「有内容」。
+   *
+   * 用途：覆盖层里出现一个**空段**（例如 `rules:` 下面只有注释）时，
+   * 既不能拿它去删掉生成器的同名段（会把生成器的规则整段抹掉 → 配置无规则），
+   * 也不能把它原样追加（会多出一个空的同名顶层键 → 重复键 → 整份拒载）。
+   * 判定：键行自身有非空值，或段内存在非注释非空的子行 → 有内容。
+   */
+  private static blockHasContent(block: YamlTopLevelBlock): boolean {
+    for (let i = 0; i < block.lines.length; i++) {
+      const text = block.lines[i].trim();
+      if (text.length === 0 || text.startsWith('#')) {
+        continue;
+      }
+      if (i === 0) {
+        const parts = ClashConfigGenerator.splitKeyValue(text);
+        if (parts[0].trim().length > 0
+          && ClashConfigGenerator.stripYamlComment(parts[1]).length > 0) {
+          return true;
+        }
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 覆盖层布尔值归一（C18）：**路径感知**，只改白名单路径上的 yes/no/on/off。
+   *
+   * 用缩进栈推导「顶层键 → 子键」路径；值是 yes/no/on/off（任意大小写）时改写成
+   * true/false。**不做全局文本替换** —— 未知路径上的 yes/no 原样保留。
+   * 引号包裹的值（"yes"）同样按布尔处理并去掉引号（内核只认裸 true/false）。
+   */
+  static normalizeOverrideBooleans(lines: string[]): string[] {
+    const out: string[] = [];
+    const stackKeys: string[] = [];
+    const stackIndents: number[] = [];
+    for (const raw of lines) {
+      const line = raw.replace(/\r$/, '');
+      const trimmed = line.trim();
+      if (trimmed.length === 0 || trimmed.startsWith('#')) {
+        out.push(raw);
+        continue;
+      }
+      const indent = ClashConfigGenerator.leadingSpaces(line);
+      while (stackIndents.length > 0 && stackIndents[stackIndents.length - 1] >= indent) {
+        stackIndents.pop();
+        stackKeys.pop();
+      }
+      if (trimmed.startsWith('- ') || trimmed === '-') {
+        // 序列项：不是键值对，也不改写
+        out.push(raw);
+        continue;
+      }
+      const parts = ClashConfigGenerator.splitKeyValue(trimmed);
+      const rawKey = parts[0];
+      const key = ClashConfigGenerator.unquoteKey(rawKey);
+      if (key.length === 0) {
+        out.push(raw);
+        continue;
+      }
+      const path = stackKeys.length > 0 ? `${stackKeys.join('.')}.${key}` : key;
+      const valueRaw = parts[1];
+      const value = ClashConfigGenerator.stripYamlComment(valueRaw);
+      const unquoted = ClashConfigGenerator.unquoteKey(value);
+      const lower = unquoted.toLowerCase();
+      let rewritten = raw;
+      if (ClashConfigGenerator.OVERRIDE_BOOL_PATHS.has(path)
+        && (lower === 'yes' || lower === 'no' || lower === 'on' || lower === 'off')) {
+        const boolText = (lower === 'yes' || lower === 'on') ? 'true' : 'false';
+        const prefix = line.substring(0, indent);
+        const commentIdx = valueRaw.indexOf(' #');
+        const comment = commentIdx >= 0 ? valueRaw.substring(commentIdx) : '';
+        rewritten = `${prefix}${rawKey.trim()}: ${boolText}${comment}`;
+      }
+      out.push(rewritten);
+      if (value.length === 0) {
+        // 可能是嵌套块（`dns:`）→ 压栈，后续更深缩进的行挂在它下面
+        stackKeys.push(key);
+        stackIndents.push(indent);
       }
     }
     return out;
@@ -964,13 +1516,17 @@ export class ClashConfigGenerator {
 
   /**
    * 组测速 URL 安全化：仅接受 http(s) 明文链接且不含 YAML 破坏字符；
-   * 非法/未声明回退内核默认口径 gstatic generate_204（与旧版行为一致）。
+   * 非法/未声明回退内核默认口径 gstatic generate_204。
+   *
+   * 【C4】兜底值改为 **https**：mihomo 官方点名 `group.url` 应使用 HTTPS
+   * （明文地址会被出口劫持，测速结果不可信）。**用户/订阅自己声明的 url
+   * 保持原样不动**（个别出口掐 gstatic 的 TLS SNI 是真机实证过的合法用法）。
    */
   static safeGroupUrl(raw: string): string {
     const url = raw.trim();
     if (url.length === 0 || url.length > 2048 || !ClashConfigGenerator.isSafeText(url)
       || !(url.startsWith('http://') || url.startsWith('https://'))) {
-      return 'http://www.gstatic.com/generate_204';
+      return 'https://www.gstatic.com/generate_204';
     }
     return ClashConfigGenerator.escapeYaml(url);
   }
@@ -1358,12 +1914,22 @@ export class ClashConfigGenerator {
     // 对下面这些协议有必填凭据/参数:一个空 password/uuid 的节点会让**整份配置**
     // 解析失败(真机报错 `proxy "N": has unset fields:password`,内核完全起不来)。
     // 因此必须在生成前按内核必填字段丢弃,统一进「无效节点」账本提示。
-    if (proxyType === 'tuic' && (n.password.length === 0 || n.uuid.length === 0)) {
-      return ProxyDropReason.MISSING_CREDENTIAL;
+    //
+    // 判定口径必须与**实际写进内核的键**一致,否则会误丢可用节点:
+    //  · tuic v4 = uuid + password;tuic v5 = token(只认 token,不认 uuid/password)。
+    //    token 走 extraOpts 原样透传(不能回填到 password 槽 —— 那会让内核 v5 收到
+    //    一个它不认的 password 键),所以这里要查 extraOpts。
+    //  · hysteria v1 的凭据是 auth-str/auth_str(已由 YamlMerger 回填进 password 槽);
+    //    它的 `protocol` 是**传输协议**(udp/wechat-video/faketcp,默认 udp)、
+    //    `up`/`down` 是带宽(mihomo 自带默认值)——都不是必填凭据,不能拿来判死节点。
+    if (proxyType === 'tuic') {
+      const hasToken = ClashConfigGenerator.hasExtraKey(n.extraOpts, 'token');
+      const hasV4 = n.password.length > 0 && n.uuid.length > 0;
+      if (!hasToken && !hasV4) {
+        return ProxyDropReason.MISSING_CREDENTIAL;
+      }
     }
-    if (proxyType === 'hysteria'
-      && (n.password.length === 0 || n.protocol.length === 0
-        || n.hyUp.length === 0 || n.hyDown.length === 0)) {
+    if (proxyType === 'hysteria' && n.password.length === 0) {
       return ProxyDropReason.MISSING_CREDENTIAL;
     }
     if (proxyType === 'anytls' && n.password.length === 0) {
@@ -1460,6 +2026,24 @@ export class ClashConfigGenerator {
   }
 
   /**
+   * extraOpts 里是否存在某个键（用于按「实际写进内核的键」判定凭据齐不齐）。
+   *
+   * 例：tuic v5 的凭据键是 `token`，它走中继透传留在 extraOpts 里，
+   * 结构化槽位 password/uuid 都是空的 —— 判定必须查这里，否则 v5 节点被误丢。
+   */
+  private static hasExtraKey(extraOpts: string, key: string): boolean {
+    if (extraOpts.length === 0) {
+      return false;
+    }
+    for (const pair of YamlMerger.parseExtraOpts(extraOpts)) {
+      if (pair[0] === key) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * 提取 extras 里以 `ws-opts.<sub>` 前缀保全的 WS 高级子键（max-early-data 等），
    * 返回 [subKey, 发射值]：布尔/数字原样、其余引号，供并入 ws-opts 结构。
    */
@@ -1503,6 +2087,22 @@ export class ClashConfigGenerator {
    * 且**幂等**：第二次调用时名字已唯一，不会再追加序号。
    * 注意 originalName 不动，所以 proxy-groups 里按面板原始名写的成员
    * 仍能通过 planProxyGroups 的 originalToDisplay 映射解析到改名后的显示名。
+   *
+   * 【C24 覆盖范围核实结论 —— 已核实，规格如下】
+   * 改名后的节点名必须在**所有引用处**同步，当前已全部覆盖（逐处核实）：
+   *   ① `proxies:` 段 —— 改名在写 proxies 之前完成（generate() 里的调用点
+   *      早于任何 proxyYamlLine 输出），落盘的就是新名；
+   *   ② `proxy-groups` 的 `proxies:` 成员 —— 成员以**原始名**声明，
+   *      planProxyGroups 用 originalToDisplay 把原始名映射到**改名后的显示名**
+   *      （planProxyGroups 拿到的 validNodes 已是改名后的对象）；
+   *   ③ 内建 `PROXY` 组的成员列表 —— 直接写 n.name（改名后的）；
+   *   ④ smart（♻️ 自动选择）组的成员列表 —— 直接写 n.name（改名后的）；
+   *   ⑤ `use:` 引用 —— 引用的是**订阅 provider 名**（不是节点名），与节点改名无关。
+   * 已知残留缺口（不在本函数职责内，且开关默认关闭）：双轨 provider
+   * （settings.useRawProviderConfig=true）时，provider 原文里的节点名由**内核自己**
+   * 解析，不经过本函数 → 与我们 `proxies:` 段里的同名节点可能撞名
+   * （内核报 "proxy X is the duplicate name"）。要根治需在 RawSubscriptionStore
+   * 落盘时给 provider 内节点名加前缀（属于方案组 C 的 provider 生命周期改造）。
    *
    * @returns 实际改名的节点数（0 = 本来就没有重名）
    */
@@ -1584,6 +2184,12 @@ export class ClashConfigGenerator {
         && n.password.length > 0)) {
       // 口令类协议: vless/vmess 用 uuid, 其余(含 tuic/hysteria/socks5/http)用 password
       fields.push(`password: ${q(n.password)}`);
+      // hysteria v1 的凭据键在 mihomo 里是 auth-str/auth_str（password 是较新内核的
+      // 别名）。与 URI 导入路径（ProxyNode.parseHysteria）保持同一口径：password 与
+      // auth-str 一起写，缺一个就可能让内核认不出凭据 → 节点连不上。
+      if (proxyType === 'hysteria') {
+        fields.push(`auth-str: ${q(n.password)}`);
+      }
     }
     if (proxyType === 'ssr') {
       fields.push(`protocol: ${q(n.protocol)}`);

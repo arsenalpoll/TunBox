@@ -269,9 +269,11 @@ export class YamlMerger {
       if (indent < minIndent) {
         minIndent = indent;
       }
-      // 基准缩进以条目行(`- `)为准：分节内可能夹入顶层噪声行(锚点定义段等)，
-      // 它们不得把基准拉到 0，否则全部条目会被额外缩进而提取为 0 条。
-      if (trimmed.startsWith('- ') && indent < listIndent) {
+      // 基准缩进以条目行为准：既有 `- {...}` 带尾随空格，也有部分面板/生成器
+      //（如 mitce v2Net 订阅）写成裸连字符 `  -` 且后续键缩进承载的块式条目。
+      // 裸 `-` 行同样是序列项起点，必须计入基准，否则 listIndent 退化为 999 →
+      // minIndent 取最小缩进，全部条目被额外缩进，proxyItemGroups 切出 0 个条目组。
+      if ((trimmed.startsWith('- ') || trimmed === '-') && indent < listIndent) {
         listIndent = indent;
       }
     }
@@ -307,7 +309,12 @@ export class YamlMerger {
     const items: string[][] = [];
     let current: string[] | null = null;
     for (const line of lines) {
-      if (line.startsWith('  - ')) {
+      // 条目起点兼容两种 YAML 块序列写法：
+      //   1) "  - {...}" / "  - key: value"（带尾随空格，绝大多数 Clash 生成器）
+      //   2) "  -"（裸连字符，name/type/server 等键由后续更深缩进行承载 ——
+      //      mitce v2Net 等面板的订阅格式）。此前只认 1)，第 2) 种订阅整份
+      //      切出 0 个条目组，表现为「导入失败 / 0 节点」。
+      if (line.startsWith('  - ') || YamlMerger.isBareSequenceItem(lines, line)) {
         if (current !== null) {
           items.push(current);
         }
@@ -320,6 +327,26 @@ export class YamlMerger {
       items.push(current);
     }
     return items;
+  }
+
+  /**
+   * 裸连字符序列项（`  -`，无尾随空格）判定：该行恰为缩进 + `-`，且其后第一个
+   * 非空行缩进**更深**（键由子行承载）才算真条目。用于兼容块式写法，避免把
+   * 普通缩进内容误当条目。lines 为 normalizedSectionLines 的输出。
+   */
+  private static isBareSequenceItem(lines: string[], line: string): boolean {
+    if (!line.startsWith('  ') || line.trim() !== '-') {
+      return false;
+    }
+    const baseIndent = line.length - line.trimStart().length;
+    for (let j = lines.indexOf(line) + 1; j < lines.length; j++) {
+      const next = lines[j];
+      if (next.trim().length === 0) {
+        continue;
+      }
+      return (next.length - next.trimStart().length) > baseIndent;
+    }
+    return false;
   }
 
   /**
@@ -1436,12 +1463,93 @@ export class YamlMerger {
    * 随后「缺少 uuid / 缺少 password / 缺少 cipher」的必需字段校验会把整条节点判错丢弃。
    */
   private static readonly STRUCTURED_TYPES: Set<string> = new Set<string>([
-    'ss', 'ssr', 'vless', 'vmess', 'trojan', 'hysteria2'
+    'ss', 'ssr', 'vless', 'vmess', 'trojan', 'hysteria2',
+    // anytls 同样有独立结构化槽位（password/sni/tls/skip-cert-verify）。若不列入，
+    // 它会走 isRelayType 的中继透传分支 —— 该分支只保留 name/type/server/port 四个
+    // 核心字段，password/sni 落进 extraOpts，ProxyNode.password 为空，随后
+    // ClashConfigGenerator.dropReasonFor 把整批判为「缺必需字段：凭据缺失」丢弃
+    // （真机实证：某订阅 36 个 anytls 全部丢失，测速全部 404「Resource not found」，
+    // UI 表现为「全部超时/失败」，而节点实际可用）。
+    'anytls'
   ]);
 
   /** 支持 alpn 的协议 (ss/ssr 不支持 alpn 键) */
   private static readonly ALPN_TYPES: Set<string> = new Set<string>([
     'vless', 'vmess', 'trojan', 'hysteria2', 'hysteria', 'tuic', 'anytls'
+  ]);
+
+  /**
+   * 中继透传（relayMode）下**额外回填**到结构化槽位的键。
+   *
+   * 中继分支默认只保留 name/type/server/port 四个核心字段，其余键原样进 extraOpts。
+   * 但「凭据类」键如果只留在 extraOpts，ProxyNode 的结构化槽位就是空的，而
+   * ClashConfigGenerator.dropReasonFor 按**结构化槽位**判定内核必填字段
+   * （`has unset fields:password` 会让整份配置起不来），于是整批节点被丢弃、
+   * 内核代理表里没有它们、测速全部 404「Resource not found」。
+   *
+   * 回填只**增加**结构化槽位的值，extraOpts 里的原键仍保留（生成时
+   * 「与已输出键重名以结构化字段为准」，不会重复输出；未被结构化覆盖的键
+   * 仍原样透传）。口径与 URI 导入路径完全一致（见 ProxyNode.parseHysteria /
+   * parseTuic：口令进 password 槽，hysteria v1 的 auth-str 同样进 password 槽，
+   * up/down 进 hyUp/hyDown）。
+   *
+   * 注意 `token` **不**在此表：tuic v5 的凭据键是 token，回填到 password 槽会让
+   * 生成端输出 `password:` 而内核 v5 只认 token → 反而生成非法配置。
+   * tuic v5 的 token 保持透传，由 dropReasonFor 查 extraOpts 判定。
+   */
+  private static readonly RELAY_CREDENTIAL_SLOTS: Map<string, string> = new Map<string, string>([
+    ['password', 'password'],
+    ['uuid', 'uuid'],
+    // hysteria v1 的凭据键（mihomo 用 auth-str/auth_str，订阅里也常见 auth）
+    ['auth-str', 'password'],
+    ['auth_str', 'password'],
+    ['auth', 'password'],
+    // 带宽（hysteria/hysteria2）
+    ['up', 'up'],
+    ['upmbps', 'up'],
+    ['down', 'down'],
+    ['downmbps', 'down'],
+    // hysteria v1 的传输协议（udp/wechat-video/faketcp）——不是凭据，但归一化槽位
+    ['protocol', 'protocol']
+  ]);
+
+  /**
+   * 允许回填「口令/uuid」槽位的中继协议。
+   *
+   * 只有**有认证概念**的协议才回填：tuic(v4 uuid+password)、hysteria(v1 auth-str)、
+   * http/socks5(代理认证)、naive、anytls。snell 用 psk、wireguard/mieru/ssh
+   * 没有口令概念，回填只会给生成端塞一个内核不认的 password 键。
+   *
+   * ⚠⚠ **回填是按「类型字符串精确匹配」做的**（`RELAY_CREDENTIAL_TYPES.has(type)`），
+   * **不做任何同族推断**。原文这里写的是「naive(anytls 同族)」—— 作者以为 naive 已经
+   * 覆盖了 anytls，可 `anytls` ≠ `naive`，精确匹配匹配不上 ⇒ anytls 的 password
+   * **只进 extraOpts、不回填结构化槽** ⇒ ProxyNode.password 为空 ⇒
+   * ClashConfigGenerator.dropReasonFor 判「缺必需字段：凭据缺失」把**整批**节点丢弃 ⇒
+   * 节点不在内核 `proxies:` 段 ⇒ REST `/proxies/{name}/delay` 返回 404 ⇒ 测速全红。
+   * **真机实证：某订阅 36 个 anytls 全部丢失，而节点实际可用、代理正常。**
+   * ⇒ 结论（后人务必记住）：本表**必须逐个类型显式列出**，
+   * 「看着像同族」绝不能作为不列出的理由。
+   *
+   * 附注（当前 HEAD 状态，2026-10-20 逐行核实）：`anytls` 同时列在下面的
+   * `STRUCTURED_TYPES` 里 ⇒ `relayMode = isRelayType('anytls') && !hasStructuredSlots('anytls')`
+   * 为 false ⇒ anytls 走**结构化白名单**路径，本闸门当前**不命中**。
+   * 但本表条目是**防回归的兜底**：一旦 anytls 被移出 STRUCTURED_TYPES（改回中继透传），
+   * 这里就能把 password 救回结构化槽，而不是重演「36 个 anytls 全丢」。
+   * ⇒ 结论不变：anytls **必须**在本表里显式列出。
+   */
+  private static readonly RELAY_CREDENTIAL_TYPES: Set<string> = new Set<string>([
+    'tuic', 'hysteria', 'http', 'socks5', 'naive', 'anytls'
+  ]);
+
+  /**
+   * 允许回填「带宽/传输协议」槽位的中继协议。
+   *
+   * hysteria v1 的 `protocol` 是**传输协议**（udp/wechat-video/faketcp），
+   * 不是 hysteria2 那种混淆协议；`up`/`down` 是带宽。放在独立表里，
+   * 避免把 hysteria2 的 obfs 语义套到 v1 上。
+   */
+  private static readonly RELAY_BANDWIDTH_TYPES: Set<string> = new Set<string>([
+    'hysteria'
   ]);
 
   /** 本轮解析因「协议不支持/缺关键字段」被跳过的节点统计, 供上层提示用户 */
@@ -1476,6 +1584,30 @@ export class YamlMerger {
   static lastDialerProxyBroken: number = 0;
   static lastDialerProxyReasons: string[] = [];
 
+  /**
+   * flow-map 节点内**重复键**的诊断（用户可见）。
+   *
+   * 背景：mihomo 用 go.yaml.in/yaml/v3 v3.0.5，`uniqueKeys` **默认开启**
+   * （decode.go:344）：同层级重复键 = TypeError = **整份配置拒载**（全有全无：
+   * 一个节点坏 → 整个 VPN 起不来）。而 rawTemplate 是**逐字**保留订阅 flow-map 原文的，
+   * 订阅里写了 `cipher: aes-256-gcm, cipher: aes-128-gcm` 就会原样进产物 → 拒载。
+   * 触发面很宽：各类「转换器/聚合面板」生成的订阅极常见，用户**不需要做任何事**。
+   *
+   * 降级规则（**必须显式化**）：重复键**保留首次出现**的那一对。这是**产品策略**，
+   * **不代表第一个值正确** —— 所以必须同时留下诊断，让上层/日志能看见「这个节点有重复键、
+   * 已按首个保留」，而不是静默改掉订阅语义。
+   *
+   * 诊断通道选择：**本文件的静态统计机制**（与 lastInvalidCount / lastInvalidReasons /
+   * lastSkippedCount / lastLimitSkippedCount 同款），**不**在 MergedProxy 上加字段 ——
+   * MergedProxy 会被持久化（见 SubscriptionService），加字段会牵动持久化格式；
+   * 而「解析期统计」本就是本文件的既有惯例（上层通过 resetSkipStats + 这些静态量读取）。
+   *
+   * 语义：lastDuplicateKeyCount = **受影响节点数**（不是被去重的键数）。
+   */
+  static lastDuplicateKeyCount: number = 0;
+  /** 重复键降级明细（中文，去重，最多 12 条） */
+  static lastDuplicateKeyReasons: string[] = [];
+
   static resetSkipStats(): void {
     YamlMerger.lastSkippedCount = 0;
     YamlMerger.lastSkippedTypes = '';
@@ -1486,6 +1618,8 @@ export class YamlMerger {
     YamlMerger.lastDialerProxyMissing = 0;
     YamlMerger.lastDialerProxyBroken = 0;
     YamlMerger.lastDialerProxyReasons = [];
+    YamlMerger.lastDuplicateKeyCount = 0;
+    YamlMerger.lastDuplicateKeyReasons = [];
   }
 
   /** 登记一个因单节点/单字段限额被跳过的节点(计数 + 去重原因, 最多 12 条) */
@@ -1793,7 +1927,7 @@ export class YamlMerger {
    */
   private static applyPair(key: string, rawValue: string, relayMode: boolean,
     supportedKeys: Set<string>, fields: Map<string, string>, extras: string[][],
-    extraSeen: Set<string>): void {
+    extraSeen: Set<string>, type: string = ''): void {
     // `*alias` 别名先解引用: 命中锚点则用锚点原始值继续解析, 未命中等价于「字段缺失」。
     const value = YamlMerger.resolveAlias(rawValue);
     if (relayMode) {
@@ -1804,6 +1938,45 @@ export class YamlMerger {
           // 核心字段无法解析: 交由后续必需字段校验拒绝该节点
         }
       } else {
+        // 凭据/带宽类键**额外**回填结构化槽位：只放进 extraOpts 时 ProxyNode 的
+        // password/uuid/hyUp/hyDown 为空，dropReasonFor 会把整批判为「缺凭据」
+        // 丢弃（内核里根本没有这些节点 → 测速全部 404）。原键仍保留在 extraOpts，
+        // 生成时「重名以结构化字段为准」不会重复输出。
+        // 回填**按协议限定**：只有真的有认证/带宽概念的协议才回填，
+        // 免得给 snell/wireguard 这类塞一个内核不认的键。
+        const normalizedType = type.trim().toLowerCase();
+        if (YamlMerger.RELAY_CREDENTIAL_TYPES.has(normalizedType)) {
+          if (key === 'password' || key === 'uuid') {
+            if (!fields.has(key)) {
+              try {
+                fields.set(key, YamlMerger.decodeScalar(value));
+              } catch (e) {
+                // 值解析失败: 留空，由后续必需字段校验按「缺凭据」处理
+              }
+            }
+          }
+        }
+        if (YamlMerger.RELAY_BANDWIDTH_TYPES.has(normalizedType)) {
+          if (key === 'auth-str' || key === 'auth_str' || key === 'auth') {
+            if (!fields.has('password')) {
+              try {
+                fields.set('password', YamlMerger.decodeScalar(value));
+              } catch (e) {
+                // 同上
+              }
+            }
+          } else if (key === 'up' || key === 'upmbps' || key === 'down'
+            || key === 'downmbps' || key === 'protocol') {
+            const slot = YamlMerger.RELAY_CREDENTIAL_SLOTS.get(key);
+            if (slot !== undefined && !fields.has(slot)) {
+              try {
+                fields.set(slot, YamlMerger.decodeScalar(value));
+              } catch (e) {
+                // 同上
+              }
+            }
+          }
+        }
         const captured = YamlMerger.captureExtraOpt(key, value);
         if (captured !== null) {
           extraSeen.add(key);
@@ -1919,19 +2092,35 @@ export class YamlMerger {
             continue;
           }
           YamlMerger.applyPair(key, pair.substring(idx + 1).trim(), relayMode, supportedKeys,
-            fields, extras, extraSeen);
+            fields, extras, extraSeen, declaredType);
         }
       } else {
         // 块式条目: 只有条目自身层级(`- ` 行及其同级键)的行参与字段解析。缩进更深的
         // 子键(ws-opts/reality-opts/grpc-opts/smux/headers 后的 path/Host/...)属于
         // 上级键的嵌套值, 由 nestedValueOf 合成 flow 结构 —— 历史缺陷是它们被当成
         // 顶层键, 于是 `path:` 以额外字段身份漏到生成的配置里。
-        const baseIndent = YamlMerger.lineIndent(parseLines[0]);
+        //
+        // 基准缩进有两种形态:
+        //  - `- name: x` + 同级键(缩进相同) → 基准 = `- ` 行缩进;
+        //  - 裸 `-` 单独一行 + 更深缩进的键(块式序列, mitce v2Net 等面板)→
+        //    基准必须取**首个键行**的缩进, 否则所有键都被当成"缩进子键"跳过,
+        //    节点因缺 name/type/server 被整条丢弃。
+        let baseIndent = YamlMerger.lineIndent(parseLines[0]);
+        if (parseLines[0].trim() === '-') {
+          for (let bi = 1; bi < parseLines.length; bi++) {
+            const bl = parseLines[bi];
+            if (bl.trim().length === 0 || bl.trim().startsWith('#')) {
+              continue;
+            }
+            baseIndent = YamlMerger.lineIndent(bl);
+            break;
+          }
+        }
         for (let li = 0; li < parseLines.length; li++) {
           const line = parseLines[li];
           const t = line.trim().replace(/^- /, '');
-          if (t.length === 0 || t.startsWith('#') || t.startsWith('- ')) {
-            continue; // 空行/注释/数组子项, 跳过
+          if (t.length === 0 || t === '-' || t.startsWith('#') || t.startsWith('- ')) {
+            continue; // 空行/裸连字符标记/注释/数组子项, 跳过
           }
           if (YamlMerger.lineIndent(line) > baseIndent) {
             continue; // 缩进子键
@@ -1968,7 +2157,7 @@ export class YamlMerger {
             rawValue = YamlMerger.blockScalarBody(parseLines, li, rawValue);
           }
           YamlMerger.applyPair(key, rawValue, relayMode, supportedKeys,
-            fields, extras, extraSeen);
+            fields, extras, extraSeen, declaredType);
         }
       }
     } catch (e) {
@@ -1992,7 +2181,8 @@ export class YamlMerger {
         if (mk.length === 0 || mk === '<<' || fields.has(mk) || extraSeen.has(mk)) {
           continue;
         }
-        YamlMerger.applyPair(mk, pair[1], relayMode, supportedKeys, fields, extras, extraSeen);
+        YamlMerger.applyPair(mk, pair[1], relayMode, supportedKeys, fields, extras, extraSeen,
+          declaredType);
       }
     }
     const name = fields.get('name') ?? '';
@@ -2107,7 +2297,7 @@ export class YamlMerger {
     }
     // 逐字模板：flow-map 原文剔除 name 与凭据键（凭据走加密层，模板可安全持久化）。
     // 块式写法/URI 节点无模板 → 生成端回退结构化路径。
-    p.rawTemplate = flowInner !== null ? YamlMerger.buildRawTemplate(flowInner) : '';
+    p.rawTemplate = flowInner !== null ? YamlMerger.buildRawTemplate(flowInner, p.name) : '';
     return p;
   }
 
@@ -2118,41 +2308,179 @@ export class YamlMerger {
   ]);
 
   /**
+   * rawTemplate 去重的**最大嵌套层数**（flow-map 里的 map 再嵌 map）。
+   * mihomo 的传输选项实际最多嵌 2 层（`ws-opts` / `headers`），4 层足够；
+   * 超限时该层**原样保留**（不删内容）—— 极端病态输入才可能命中。
+   */
+  private static readonly RAW_TEMPLATE_MAX_NEST_DEPTH: number = 4;
+
+  /**
    * 由 flow-map 原文构造逐字模板：保留除 name/凭据外所有键的**原始文本**
    * （含 xhttp-opts、reality-opts、headers、null 值等），生成端原样回写。
    * 结构异常或超长返回 ''（回退结构化路径）。
+   *
+   * 【C15】**按 key 去重（留首次出现）**。
+   * 为什么必须去重：mihomo 用 go.yaml.in/yaml/v3 v3.0.5，`uniqueKeys` **默认开启**
+   * （decode.go:344），同层级重复键 = TypeError = **整份配置拒载**（全有全无：
+   * 一个节点坏 → 整个 VPN 起不来）。本模板**逐字**保留订阅原文，订阅里写了
+   * `cipher: aes-256-gcm, cipher: aes-128-gcm` 就会原样进产物 → 拒载。
+   * 只有 **flow-map 写法**会炸（块式写法走结构化路径，解析期「重复键取首个」已消化）。
+   *
+   * ⚠ **降级规则必须显式化**：两个 `cipher` 时留第一个是**产品策略**，
+   * **不代表第一个正确**。所以同时留下一条诊断（节点名 + 被去重的 key 名列表），
+   * 让上层/日志能看见「这个节点有重复键、已按首个保留」—— 诊断通道是本文件的静态统计机制
+   * （`lastDuplicateKeyCount` / `lastDuplicateKeyReasons`，见其上方注释）。
+   *
+   * 其它约定：
+   * - 去重只在**保留的键之间**进行（name/凭据类键本就被剔除，不参与去重）；
+   * - 嵌套 map（`ws-opts: {path: /a, path: /b}`，R0b）同样按 key 去重；
+   * - `<<`（YAML 合并键）不参与去重（多个合并键另有语义，不在此处裁剪）；
+   * - 有重复键但**无法安全重建**（结构异常）时，**返回 '' 回退结构化路径**——
+   *   与「结构异常/超长返回 ''」的既有行为一致，绝不产出会让内核拒载的模板。
    */
-  private static buildRawTemplate(inner: string): string {
+  private static buildRawTemplate(inner: string, nodeName: string): string {
     const trimmed = inner.trim();
     if (trimmed.length === 0 || trimmed.length > 8192) {
       return '';
     }
     const kept: string[] = [];
+    const keptKeys: Set<string> = new Set<string>();
+    /** 被去重掉的 key（留首次出现） */
+    const dupKeys: string[] = [];
+    /** 检出但无法安全重建的重复键（→ 回退结构化路径） */
+    const unremovable: string[] = [];
     try {
       for (const pair of YamlMerger.splitFlowMap(trimmed)) {
-        const idx = YamlMerger.findUnquotedColon(pair);
+        const pairText = pair.trim();
+        const idx = YamlMerger.findUnquotedColon(pairText);
         if (idx <= 0) {
           continue;
         }
         let key = '';
         try {
-          key = YamlMerger.decodeScalar(pair.substring(0, idx).trim());
+          key = YamlMerger.decodeScalar(pairText.substring(0, idx).trim());
         } catch (e) {
           continue;
         }
         if (key.length === 0 || YamlMerger.RAW_TEMPLATE_STRIP_KEYS.has(key) || key === '<<') {
           continue;
         }
-        const pairText = pair.trim();
         if (pairText.includes('\n') || pairText.includes('\r')) {
           continue;
         }
-        kept.push(pairText);
+        // 重复键：**留首次出现**（显式降级规则，见上方注释）
+        if (keptKeys.has(key)) {
+          dupKeys.push(key);
+          continue;
+        }
+        keptKeys.add(key);
+        kept.push(YamlMerger.dedupeNestedFlowMap(pairText, idx, dupKeys, unremovable, 0));
       }
     } catch (e) {
       return '';
     }
+    if (unremovable.length > 0) {
+      // 检出重复键但无法安全重建 → 宁可回退结构化路径（既有行为），也不能产出会被内核拒载的模板
+      YamlMerger.noteRawTemplateDuplicate(nodeName, unremovable.concat(dupKeys));
+      return '';
+    }
+    if (dupKeys.length > 0) {
+      YamlMerger.noteRawTemplateDuplicate(nodeName, dupKeys);
+    }
     return kept.join(', ');
+  }
+
+  /**
+   * flow-map 内部的 pair 列表按 key 去重（保留首次出现），并递归处理嵌套 map。
+   * 非 key:value 片段（无法识别的裸文本）原样保留，不计入重复键；
+   * `<<`（合并键）不参与去重。dupKeys 收集被去掉的 key，unremovable 收集检出去不掉的。
+   */
+  private static dedupeFlowMapPairs(inner: string, dupKeys: string[], unremovable: string[],
+    depth: number): string {
+    const kept: string[] = [];
+    const seen: Set<string> = new Set<string>();
+    for (const pair of YamlMerger.splitFlowMap(inner)) {
+      const pairText = pair.trim();
+      const idx = YamlMerger.findUnquotedColon(pairText);
+      if (idx <= 0) {
+        kept.push(pairText);
+        continue;
+      }
+      let key = '';
+      try {
+        key = YamlMerger.decodeScalar(pairText.substring(0, idx).trim());
+      } catch (e) {
+        kept.push(pairText);
+        continue;
+      }
+      if (key.length === 0 || key === '<<') {
+        kept.push(pairText);
+        continue;
+      }
+      if (seen.has(key)) {
+        dupKeys.push(key);
+        continue;
+      }
+      seen.add(key);
+      if (depth < YamlMerger.RAW_TEMPLATE_MAX_NEST_DEPTH) {
+        kept.push(YamlMerger.dedupeNestedFlowMap(pairText, idx, dupKeys, unremovable, depth));
+      } else {
+        kept.push(pairText);
+      }
+    }
+    return kept.join(', ');
+  }
+
+  /**
+   * 对一个 pair 的**值**做嵌套 map 去重（`ws-opts: {path: /a, path: /b}` 这类 R0b 形态）。
+   * 值里没有重复键时**原文逐字返回**（不重建、不改任何空白）；有重复键才重建该 pair。
+   */
+  private static dedupeNestedFlowMap(pair: string, idx: number, dupKeys: string[],
+    unremovable: string[], depth: number): string {
+    const value = pair.substring(idx + 1).trim();
+    if (!value.startsWith('{')) {
+      return pair;
+    }
+    const close = YamlMerger.matchingClose(value, 0);
+    if (close < 0) {
+      // 未闭合的嵌套 map：无法安全重建（交由调用方回退结构化路径）
+      unremovable.push('(nested-map)');
+      return pair;
+    }
+    const before = dupKeys.length;
+    const deduped = YamlMerger.dedupeFlowMapPairs(value.substring(1, close), dupKeys, unremovable,
+      depth + 1);
+    if (dupKeys.length === before) {
+      return pair; // 无重复键 → 原文逐字保留
+    }
+    return pair.substring(0, idx + 1) + ' {' + deduped + '}' + value.substring(close + 1);
+  }
+
+  /**
+   * 登记「flow-map 节点含重复键」的诊断（计数 + 去重理由，最多 12 条）。
+   * 诊断通道 = 本文件的静态统计机制（见 lastDuplicateKeyCount 上方注释）。
+   */
+  private static noteRawTemplateDuplicate(nodeName: string, dupKeys: string[]): void {
+    YamlMerger.lastDuplicateKeyCount = YamlMerger.lastDuplicateKeyCount + 1;
+    const uniq: string[] = [];
+    for (const k of dupKeys) {
+      if (uniq.indexOf(k) < 0) {
+        uniq.push(k);
+      }
+    }
+    let text = `节点「${nodeName}」含重复键（${uniq.join('、')}），已按首次出现保留`
+      + '（重复键会让 mihomo 整份配置拒载）';
+    if (text.length > 120) {
+      text = text.substring(0, 120);
+    }
+    for (const it of YamlMerger.lastDuplicateKeyReasons) {
+      if (it === text) {
+        return;
+      }
+    }
+    if (YamlMerger.lastDuplicateKeyReasons.length < 12) {
+      YamlMerger.lastDuplicateKeyReasons.push(text);
+    }
   }
 
   /** 带宽值规整（Hysteria2 up/down）: 仅接受 数字[单位]；非法则丢弃 */

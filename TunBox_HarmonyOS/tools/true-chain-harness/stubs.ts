@@ -23,6 +23,57 @@ class Base64HelperStub {
   }
 }
 
+/**
+ * @kit.BasicServicesKit 的 BusinessError 替身。
+ * 系统错误对象：{ code: number, message: string }。
+ * 真实代码里用 `err.code` / `err.message` 取值，且会 `instanceof BusinessError` 判断；
+ * 替身保持同样的字段与原型链。
+ */
+export class BusinessError extends Error {
+  code: number = 0;
+  constructor(code: number = 0, message: string = '') {
+    super(message);
+    this.code = code;
+    this.name = 'BusinessError';
+  }
+}
+
+/**
+ * @kit.NotificationKit 替身：只提供被测代码真正用到的那几个成员
+ * （ContentType 枚举 + publish），不做任何真实通知行为。
+ */
+export const notificationManager = {
+  ContentType: {
+    NOTIFICATION_CONTENT_BASIC_TEXT: 0,
+    NOTIFICATION_CONTENT_LONG_TEXT: 1
+  },
+  async publish(_request: AnyObj): Promise<void> {
+    // 替身：丢弃通知（测试不关心系统通知）
+  }
+};
+
+/**
+ * SettingsService 替身：load/save 走内存，测试里不碰 preferences。
+ */
+export class SettingsService {
+  private static current: AnyObj = {};
+  static async load(): Promise<AnyObj> {
+    return SettingsService.current;
+  }
+  static async save(settings: AnyObj): Promise<void> {
+    SettingsService.current = settings;
+  }
+}
+
+/** CredentialStore 的别名生成器替身（与真实实现同构，避免链路里出现不同的 key）。 */
+export function nodeAlias(nodeId: string, field: string): string {
+  return `ssrvpn_node|${nodeId}|${field}`;
+}
+
+export function subAlias(subscriptionId: string): string {
+  return `ssrvpn_sub|${subscriptionId}|headerValue`;
+}
+
 export const util = {
   Type: UTIL_TYPE,
   Base64Helper: Base64HelperStub,

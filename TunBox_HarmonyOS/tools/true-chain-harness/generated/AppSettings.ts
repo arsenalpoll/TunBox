@@ -65,6 +65,12 @@ export class AppSettingsJson {
   appRoutingMode: string | undefined = undefined;
   appRoutingNeedsReview: boolean = false;
   appRoutingCustomApps: AppRoutingCustomApp[] = [];
+  /**
+   * 已被用户从「应用分流」目录里删除的**预置**包名（2026-10-18 用户要求：
+   * 自带包名也要能删）。预置列表是代码里的常量、rebuild() 每次都会重新加入，
+   * 所以必须单独记一份"用户已删除"的名单，否则删掉后立刻又冒出来。
+   */
+  appRoutingRemovedPresets: string[] = [];
   forceProxySites: string[] = [];
   forceDirectSites: string[] = [];
   /**
@@ -78,7 +84,7 @@ export class AppSettingsJson {
   preferredNodeSubscriptionId: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
-  testLatencyUrl: string = 'http://www.gstatic.com/generate_204';
+  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default' 订阅默认顺序 / 'auto' 按最近测速结果 / 'manual' 用户手动固定顺序 */
   nodeSortMode: string = 'default';
@@ -158,6 +164,29 @@ export class AppSettingsJson {
 }
 
 export class AppSettings {
+  /**
+   * 出厂默认测速地址（**HTTPS**）。
+   *
+   * 为什么默认 https（2026-10-20 定案）：
+   *  - 5.6.0 真机基线就是 https（59 节点 13.14s 跑通，`unavailable=false`），
+   *    后来版本改回 http 属于**退化**；
+   *  - mihomo 官方明确告警：`provider.health-check.url` 与 `group.url` 应使用 HTTPS
+   *    （明文测速地址会被机场/落地劫持 → 测速整批红）；
+   *  - FlClash 的默认值同样是 https。
+   *
+   * ⚠ **只约束「出厂默认 / 历史默认值」**，绝不改写用户自填的 http 地址
+   *   （见 `upgradeLegacyTestUrl`）。
+   */
+  static readonly DEFAULT_TEST_URL: string = 'https://www.gstatic.com/generate_204';
+  /**
+   * 本客户端历史上写过的两个 **http** 默认值（升级用）。
+   *
+   * 只有**恰好等于**这两个字符串的历史默认值才会被单向升级为 https；
+   * 其余用户自填的 http 地址（带路径/参数/端口的）一律原样保留。
+   */
+  static readonly LEGACY_TEST_URL_GSTATIC: string = 'http://www.gstatic.com/generate_204';
+  static readonly LEGACY_TEST_URL_CLOUDFLARE: string = 'http://cp.cloudflare.com/generate_204';
+
   /** 跟随系统 / 暗色 / 亮色 */
   themeMode: number = 0; // 0=system, 1=dark, 2=light
   autoConnectOnBoot: boolean = true;
@@ -169,6 +198,8 @@ export class AppSettings {
   /** 旧版双名单冲突/非法数据必须由 UI 保存确认，普通设置保存不得清除。 */
   appRoutingNeedsReview: boolean = false;
   appRoutingCustomApps: AppRoutingCustomApp[] = [];
+  /** 用户已删除的预置包名（见 AppSettings.appRoutingRemovedPresets 注释） */
+  appRoutingRemovedPresets: string[] = [];
   forceProxySites: string[] = [];
   /** 强制直连网站（始终 DIRECT, 不走代理） */
   forceDirectSites: string[] = [];
@@ -178,8 +209,8 @@ export class AppSettings {
   preferredNodeSubscriptionId: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
-  testLatencyUrl: string = 'http://www.gstatic.com/generate_204';
-  /** 代理模式：rule = 规则 / global = 全局（对应 upstream settings.proxyMode） */
+  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
+  /** 代理模式：rule = 规则 / global = 全局 / direct = 直连（对应 upstream settings.proxyMode） */
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default'=订阅默认顺序, 'auto'=按最近测速结果, 'manual'=手动固定顺序 */
   nodeSortMode: string = 'default';
@@ -258,6 +289,7 @@ export class AppSettings {
     j.appRoutingMode = this.appRoutingMode;
     j.appRoutingNeedsReview = this.appRoutingNeedsReview;
     j.appRoutingCustomApps = this.appRoutingCustomApps;
+    j.appRoutingRemovedPresets = this.appRoutingRemovedPresets;
     j.forceProxySites = this.forceProxySites;
     j.forceDirectSites = this.forceDirectSites;
     j.forceBlockSites = this.forceBlockSites;
@@ -292,6 +324,43 @@ export class AppSettings {
     return j;
   }
 
+  /**
+   * 测速 URL 规范化：**只把本客户端自己写过的历史 http 默认值**单向升级为 https。
+   *
+   * ## 为什么不是「把所有 http 都改成 https」
+   *
+   * 明文测速地址确实有真实风险（机场/落地劫持 + mihomo 官方点名
+   * `provider.health-check.url` / `group.url` 应使用 HTTPS），但**一刀切会改坏用户的
+   * 合法配置**：真机 commit `a3fe45d` 实证 —— 个别出口会掐 gstatic 的 TLS SNI，
+   * 同一个出口 **https Timeout 而 http 1158ms**。用户自填 http 是**有意为之**，
+   * 客户端无权替他改。
+   *
+   * 所以规则是**精确匹配 + 单向**：
+   *  - 恰好等于本客户端历史上写过的两个 http 默认值 → 升级为对应 https
+   *    （存量用户落盘的旧默认值在**本次加载**时被迁移，用户不需要手动改）；
+   *  - 其余任何值（用户自填的 http、https、带路径/参数/端口的地址）→ **原样保留**；
+   *  - 空串 / 非法值（不是 `http(s)://` 开头的地址）→ 回落默认 https。
+   *
+   * ⚠ 本方法**绝不**把 https 降级回 http：用户手填 https 是明确意图。
+   */
+  static upgradeLegacyTestUrl(value: string): string {
+    const raw: string = typeof value === 'string' ? value.trim() : '';
+    if (raw.length === 0) {
+      return AppSettings.DEFAULT_TEST_URL;
+    }
+    if (raw === AppSettings.LEGACY_TEST_URL_GSTATIC) {
+      return 'https://www.gstatic.com/generate_204';
+    }
+    if (raw === AppSettings.LEGACY_TEST_URL_CLOUDFLARE) {
+      return 'https://cp.cloudflare.com/generate_204';
+    }
+    if (!/^https?:\/\/\S+$/.test(raw)) {
+      // 非法值（没有协议头 / 带空白）→ 默认 https
+      return AppSettings.DEFAULT_TEST_URL;
+    }
+    return raw;
+  }
+
   static fromJson(j: AppSettingsJson): AppSettings {
     const s = new AppSettings();
     s.themeMode = j.themeMode === 1 || j.themeMode === 2 ? j.themeMode : 0;
@@ -323,6 +392,11 @@ export class AppSettings {
         s.appRoutingCustomApps.push(custom);
       }
     }
+    // 用户已删除的预置包名（只接受合法字符串，长度与包名上限一致）
+    s.appRoutingRemovedPresets = Array.isArray(j.appRoutingRemovedPresets)
+      ? AppRoutingPolicy.normalizePackages(j.appRoutingRemovedPresets
+        .filter((v: string) => typeof v === 'string'))
+      : [];
     s.forceProxySites = Array.isArray(j.forceProxySites)
       ? j.forceProxySites.filter((v: string) => typeof v === 'string') : [];
     s.forceDirectSites = Array.isArray(j.forceDirectSites)
@@ -334,11 +408,23 @@ export class AppSettings {
       ? j.preferredNodeSubscriptionId : '';
     s.autoUpdateSubscription = typeof j.autoUpdateSubscription === 'boolean' ? j.autoUpdateSubscription : true;
     s.selectedSubscriptionId = typeof j.selectedSubscriptionId === 'string' ? j.selectedSubscriptionId : '';
-    s.testLatencyUrl = typeof j.testLatencyUrl === 'string' && j.testLatencyUrl.length > 0
-      ? (j.testLatencyUrl === 'https://www.gstatic.com/generate_204'
-        ? 'http://www.gstatic.com/generate_204' : j.testLatencyUrl)
-      : 'http://www.gstatic.com/generate_204';
-    s.proxyMode = j.proxyMode === 'global' ? 'global' : 'rule';
+    // 测速地址：**只做「历史 http 默认值 → https」的单向升级**（C3）。
+    // 早期版本在这里做过**反向降级**（把用户手填的 https 改回 http）—— 那是罪魁祸首：
+    // 用户明确填 https 也会被悄悄改掉。现在不再有任何降级路径。
+    s.testLatencyUrl = AppSettings.upgradeLegacyTestUrl(
+      typeof j.testLatencyUrl === 'string' ? j.testLatencyUrl : '');
+    // ── 代理模式恢复：`direct` **不跨重启持久化**（2026-10-19 稳定性裁定）──
+    //
+    // `direct` 是 0.4.0 新增的第三态（首页「直连」按钮）。它的语义是「所有流量
+    // 绕过代理直连」，一旦被持久化，用户误触一次之后每次启动、每次连接都仍然直连，
+    // 表现就是「VPN 连上了但代理完全不生效、公网 IP 是本地出口」——这正是 0.4.0
+    // 被反馈的一类故障形态，而且用户很难自己发现是模式问题。
+    //
+    // 因此：`direct` 只在**本次运行期**有效（运行期切模式走 ClashApiService.setMode，
+    // 热更新不改磁盘语义），重启后一律回落 `rule`。需要直连的场景重新点一下按钮即可，
+    // 代价是点一次，收益是**不可能被粘在直连态**。
+    const parsedMode: string = j.proxyMode;
+    s.proxyMode = parsedMode === 'global' ? 'global' : 'rule';
     s.nodeSortMode = NodeSortModes.normalize(j.nodeSortMode);
     s.nodeSortSnapshot = typeof j.nodeSortSnapshot === 'string' ? j.nodeSortSnapshot : '';
     s.proxyGroupSelections = typeof j.proxyGroupSelections === 'string' ? j.proxyGroupSelections : '';

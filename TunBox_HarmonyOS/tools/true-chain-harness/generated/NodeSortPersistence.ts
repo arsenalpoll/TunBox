@@ -335,24 +335,40 @@ export class NodeProtocolInfo {
  * REALITY 通过 realityPublicKey / realityShortId 存在与否判定（vless 场景）。
  */
 export class NodeProtocolPolicy {
-  /** 提取协议键（小写）。未知返回 '' */
+  /**
+   * 需要**规范化**的协议（展示名与键不一致的，或有别名的）。
+   * 键 → 规范键。
+   */
+  private static readonly ALIAS: Map<string, string> = new Map([
+    ['hy2', 'hysteria2'],
+    ['hysteria2', 'hysteria2'],
+    ['shadow-tls', 'shadowtls'],
+    ['ss2022', 'ss2022'],
+  ]);
+
+  /**
+   * 提取协议键（小写）。
+   *
+   * ⚠ 2026-10-19 修正：原实现是**白名单**语义 —— 不在白名单里的 proxyType 一律
+   * 返回 ''，UI 显示「未知」。白名单漏了 `ss` → ikuuu 订阅的 34 个 ss 节点
+   * 全部显示「未知」（同订阅的 vmess 正常，因为 vmess 在白名单里）。
+   * 机场的协议种类不可穷举（ss/hysteria/snell/mieru/ssh/ss2022/juicity…），
+   * 白名单模式等于"每加一个协议就坏一批节点"。
+   *
+   * 现在改成：**白名单内的按别名规范化，白名单外的原样返回（小写）**。
+   * 展示层再把未知协议大写显示（SS/HYSTERIA/SNELL…），既不误报「未知」，
+   * 也不丢信息。
+   */
   static protocolKey(proxyType: string, typeValue: string, realityPubKey: string): string {
     const p = proxyType.length > 0 ? proxyType.toLowerCase() : '';
-    if (p === 'vless' || p === 'vmess' || p === 'trojan' || p === 'hysteria2'
-      || p === 'tuic' || p === 'anytls' || p === 'naive' || p === 'shadowtls'
-      || p === 'shadow-tls' || p === 'wireguard') {
-      // hysteria2 / hy2 统一规范化为 hysteria2
-      return p;
-    }
-    if (p === 'hy2') {
-      return 'hysteria2';
-    }
     if (p.length > 0) {
-      return '';
+      const alias = NodeProtocolPolicy.ALIAS.get(p);
+      return alias !== undefined ? alias : p;
     }
     const t = typeValue.length > 0 ? typeValue.toLowerCase() : '';
-    if (t === 'ssr' || t === 'ss') {
-      return t;
+    if (t.length > 0) {
+      const alias = NodeProtocolPolicy.ALIAS.get(t);
+      return alias !== undefined ? alias : t;
     }
     return '';
   }
@@ -395,7 +411,27 @@ export class NodeProtocolPolicy {
         return new NodeProtocolInfo('ss', 'SS', false);
       case 'ssr':
         return new NodeProtocolInfo('ssr', 'SSR', false);
+      // 2026-10-19 补的常见协议展示名（原来会落进 default → 大写原名，
+      // hysteria 会显示成 HYSTERIA 而 HYSTERIA2 才规范；ss2022 同理）。
+      case 'hysteria':
+        return new NodeProtocolInfo('hysteria', 'HYSTERIA', false);
+      case 'ss2022':
+        return new NodeProtocolInfo('ss2022', 'SS2022', false);
+      case 'snell':
+        return new NodeProtocolInfo('snell', 'SNELL', false);
+      case 'http':
+        return new NodeProtocolInfo('http', 'HTTP', false);
+      case 'socks5':
+        return new NodeProtocolInfo('socks5', 'SOCKS5', false);
+      case 'mieru':
+        return new NodeProtocolInfo('mieru', 'MIERU', false);
+      case 'ssh':
+        return new NodeProtocolInfo('ssh', 'SSH', false);
+      case 'juicity':
+        return new NodeProtocolInfo('juicity', 'Juicity', false);
       default:
+        // 兜底：至少显示协议本身（大写），不显示「未知」——
+        // 「未知」只留给**真的**没有协议信息（proxyType 与 type 都空）的情况。
         return new NodeProtocolInfo(key, key.length > 0 ? key.toUpperCase() : '未知', false);
     }
   }
