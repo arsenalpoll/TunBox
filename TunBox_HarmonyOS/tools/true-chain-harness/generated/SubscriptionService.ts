@@ -47,6 +47,12 @@ import { AppLogger } from './stubs.ts';
 import {
   ConcurrentRefresh, RefreshBatchProgress, RefreshBatchSummary, RefreshItemOutcome, RefreshPrepOutcome
 } from './ConcurrentRefresh.ts';
+import { BodyDispatch, BodyDispatchResult, BodyKind } from './BodyDispatch.ts';
+import { YamlNodeAdapter } from './YamlNodeAdapter.ts';
+import { NodeAvailability, UnusableCategory } from './NodeUsability.ts';
+// 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退走**规范解析层**，不再走 ProxyNode.fromUri
+import { parse as parseUriNode, ParseError, ParsedNode } from './UriNodeParser.ts';
+import { UnusableLedger, UnusableRecord } from './UnusableLedger.ts';
 
 const TAG = 'SubscriptionService';
 const PREF_NAME = 'ssrvpn_subscriptions';
@@ -146,6 +152,60 @@ export class SubscriptionService {
   private constructor() {
   }
 
+  /** 已通知过的节点集指纹（'' = 尚未通知过） */
+  private lastNotifiedNodeFingerprint: string = '';
+
+  /**
+   * 节点集指纹：内核代理表里「有哪些节点」的身份集合。
+   *
+   * 口径（与编排器的测速核配置闸门共用同一份实现）：
+   *  - 身份部分（subscriptionId + name + server + port）：节点增删/改名/换服务器；
+   *  - 凭据完整度（password/uuid 非空的节点数）：导入/刷新后凭据被封存时，
+   *    生成器会按「缺凭据」把节点整条跳过 → 节点不在内核代理表里。
+   * 两者任一变化，都意味着「已生成的内核配置不再对应当前节点集」。
+   *
+   * 用长度前缀拼串而不是直接拼接，避免节点名里含分隔符时出现碰撞。
+   */
+  static nodeSetFingerprint(nodes: ProxyNode[]): string {
+    let acc: string = `${nodes.length}`;
+    let credFilled: number = 0;
+    for (const n of nodes) {
+      acc += `|${n.subscriptionId.length}:${n.subscriptionId}`;
+      acc += `|${n.name.length}:${n.name}`;
+      acc += `|${n.server.length}:${n.server}|${n.port}`;
+      if (n.password.length > 0 || n.uuid.length > 0) {
+        credFilled += 1;
+      }
+    }
+    return `${acc}|cred=${credFilled}`;
+  }
+
+  /**
+   * 节点集变化监听（编排器注册）。
+   *
+   * 用途：订阅导入/刷新/增删之后，「已生成的 mihomo 配置」与当前节点集脱节
+   * —— 配置**只在内核启动那一刻生成一次**，不重建就等于让新节点永远测不了
+   * （/delay 404 → UI「未生效」，真机 2026-10-20）。监听方据此作废测速核
+   * 并按新节点集重建，用户点测速时通道既是热的、配置也是新的。
+   */
+  private static nodeSetListeners: Array<(reason: string) => void> = [];
+
+  static onNodeSetChanged(listener: (reason: string) => void): void {
+    if (SubscriptionService.nodeSetListeners.indexOf(listener) < 0) {
+      SubscriptionService.nodeSetListeners.push(listener);
+    }
+  }
+
+  private static notifyNodeSetChanged(reason: string): void {
+    for (const l of SubscriptionService.nodeSetListeners) {
+      try {
+        l(reason);
+      } catch (e) {
+        AppLogger.warn(TAG, `node set listener failed: ${AppLogger.errText(e)}`);
+      }
+    }
+  }
+
   private store: preferences.Preferences | null = null;
   /** 敏感凭据专用偏好（只放一次性绑定，不放凭据本体） */
   private credStore: preferences.Preferences | null = null;
@@ -178,6 +238,25 @@ export class SubscriptionService {
    * 这些行**绝不**塞进上一条 provider（那会造成「字段并错 provider」而且不报错）。
    */
   lastProviderOrphanLineCount: number = 0;
+
+  /**
+   * 最近一次导入里的「不可用节点」清单（旁挂台账，供 UI 展示）。
+   *
+   * 口径（详见 docs/sub-parse.md 第 4 节）：
+   * - `unusableDefinitions()`：**定义不完整**（缺 uuid / reality public-key /
+   *   password / server / port）—— 这类节点**不进内核代理表、不进测速集合**，
+   *   但在这里**可见并带原因**（不伪装成"节点失败/网络不可达"）。
+   * - 「域名无法解析」**不在这里**：那是解析层的结论（机场侧入口域名下线），
+   *   由编排器的 hostSnapshot() 提供，不属于"节点定义有问题"。
+   */
+  public static unusableDefinitions(): UnusableRecord[] {
+    return UnusableLedger.excludedList();
+  }
+
+  /** 不可用节点的一句话汇总（UI 顶部提示用；空串表示没有） */
+  public static unusableSummary(): string {
+    return UnusableLedger.summary();
+  }
 
   /**
    * 网络性拉取失败待重试标记（订阅 id → 失败时刻）。
@@ -888,7 +967,11 @@ export class SubscriptionService {
     }
     let parsed: ProxyNode | null = null;
     try {
-      parsed = ProxyNode.fromUri(uri, n.subscriptionId, n.id);
+      // 2026-10-20（B6）：走规范解析层（旧解析器已退场）
+      const canonical: ParsedNode | ParseError = parseUriNode(uri, n.subscriptionId);
+      if (!(canonical instanceof ParseError)) {
+        parsed = ProxyNode.fromCanonical(canonical, n.subscriptionId, n.id);
+      }
     } catch (e) {
       AppLogger.warn(TAG, 'rawUri fallback parse failed');
       return out;
@@ -1386,11 +1469,13 @@ export class SubscriptionService {
   private static parseProviderBody(body: string, subscriptionId: string,
     providerLabel: string, diagnostics: SubscriptionImportDiagnostics): ProxyNode[] {
     YamlMerger.resetSkipStats();
-    if (YamlMerger.proxyItemGroups(body).length > 0) {
-      const merged: MergedProxy[] = YamlMerger.merge([body],
+    // 先解码再判是不是 YAML 文档（base64 包裹的 Clash YAML 不能掉进链接分支）
+    const dispatch = BodyDispatch.classify(body);
+    if (dispatch.kind === BodyKind.YAML) {
+      const merged: MergedProxy[] = YamlMerger.merge([dispatch.body],
         providerLabel.length > 0 ? providerLabel : 'provider', '');
       SubscriptionService.absorbYamlMergeStats(diagnostics);
-      const nodes = SubscriptionService.mergedToNodes(merged, subscriptionId, diagnostics);
+      const nodes = SubscriptionService.mergedToNodes(merged, subscriptionId, diagnostics, dispatch.body);
       diagnostics.inputCount = diagnostics.inputCount + nodes.length + diagnostics.invalidCount
         + diagnostics.unsupportedCount;
       return nodes;
@@ -1411,13 +1496,40 @@ export class SubscriptionService {
   /**
    * 合并结果 → 节点模型（仅映射白名单结构化字段，proxyType 保留真实类型）。
    * server/port 缺失的条目必须计数并回报（漏洞 E：此前是静默丢弃）。
+   *
+   * 【2026-10-20】加一道**必填闸门**（与分享链接路径同一张参数表）：
+   * 定义不完整（缺 uuid / reality public-key / password / server / port）的条目
+   * **整条不可用** —— 不进内核代理表、不进测速集合，但写进旁挂台账让 UI 可见并带原因。
+   * 半条节点进代理表 = 内核握手秒失败 = 整片测速 503（2026-10-20 mitce 事故的形状）。
+   *
+   * @param sourceBody 订阅原文（用于判断某条是否**声明过** reality-opts：
+   *        结构化槽位为空但原文有该段 ⇒ 解析层把 public-key 丢了 ⇒ 整条不可用）
    */
   private static mergedToNodes(merged: MergedProxy[], subscriptionId: string,
-    diagnostics?: SubscriptionImportDiagnostics): ProxyNode[] {
+    diagnostics?: SubscriptionImportDiagnostics, sourceBody?: string): ProxyNode[] {
     const out: ProxyNode[] = [];
     let counter = 0;
     let dropped = 0;
-    for (const m of merged) {
+    let unusable = 0;
+    // ── 保真 + 必填闸门（与分享链接路径同一张参数表、同一套口径）──
+    // plan 一次算清三件事：
+    //   ① 每条合并结果的规范键视图 + 可用性结论；
+    //   ② 定义不完整 ⇒ 整条不可用（不进代理表、不进测速集合）；
+    //   ③ 原文声明但合并阶段没产出的节点（缺凭据）—— 不让它"人间蒸发"，一并记账。
+    const plan = YamlNodeAdapter.plan(merged, sourceBody !== undefined ? sourceBody : '');
+    for (const item of plan.dropped) {
+      unusable = unusable + 1;
+      SubscriptionService.recordUnusableText(item.reason, 'yaml', subscriptionId,
+        item.name, item.server, item.port, diagnostics);
+    }
+    for (const entry of plan.entries) {
+      const m = entry.merged;
+      if (entry.excluded) {
+        unusable = unusable + 1;
+        SubscriptionService.recordUnusable(entry.canonical.availability, 'yaml', subscriptionId,
+          m.name, m.server, m.port, diagnostics);
+        continue;
+      }
       const n = new ProxyNode();
       n.id = `${subscriptionId}-m${counter++}`;
       n.subscriptionId = subscriptionId;
@@ -1472,7 +1584,64 @@ export class SubscriptionService {
       SubscriptionService.noteInvalid(diagnostics, `合并映射丢弃 ${dropped} 条（缺 server 或 port）`);
       AppLogger.warn(TAG, `mergedToNodes dropped ${dropped} node(s) without server/port`);
     }
+    if (unusable > 0) {
+      SubscriptionService.noteInvalid(diagnostics,
+        `定义不完整 ${unusable} 条（缺必填参数，整条不可用，不进代理表也不参与测速）`);
+      AppLogger.warn(TAG, `mergedToNodes marked ${unusable} node(s) unusable (missing required params)`);
+    }
     return out;
+  }
+
+  /**
+   * 记一条「定义不完整」的不可用节点（带明确原因文本的变体）。
+   *
+   * 用于「原文声明了、但合并阶段没产出」的节点 —— 它们连 NodeAvailability
+   * 都没有（根本没走到规范键那一步），但同样必须：
+   * **不进**内核代理表、**不进**测速集合、**UI 可见**且带原因。
+   */
+  private static recordUnusableText(reason: string, source: string, subscriptionId: string,
+    name: string, server: string, port: string,
+    diagnostics?: SubscriptionImportDiagnostics): void {
+    const record = new UnusableRecord();
+    record.subscriptionId = subscriptionId;
+    record.source = source;
+    record.name = name;
+    record.server = server;
+    record.port = parseInt(port);
+    record.category = UnusableCategory.INCOMPLETE;
+    record.excluded = true;
+    record.reason = reason;
+    record.detail = '定义不完整：合并阶段未能产出该节点（凭据/地址不完整）。'
+      + '该节点不会进入内核代理表，也不会参与测速。';
+    UnusableLedger.record(record);
+    SubscriptionService.noteInvalid(diagnostics, reason);
+  }
+
+  /**
+   * 记一条「定义不完整」的不可用节点。
+   *
+   * 口径（docs/sub-parse.md 第 4 节）：
+   * - **不进**内核代理表、**不进**测速集合（调用方已经 continue 掉了）；
+   * - **UI 可见**且带原因（旁挂台账 + diagnostics.invalidReasons）；
+   * - 绝不伪装成"节点失败/网络不可达" —— 这是参数问题，是我们的锅。
+   */
+  private static recordUnusable(availability: NodeAvailability, source: string, subscriptionId: string,
+    name: string, server: string, port: number,
+    diagnostics?: SubscriptionImportDiagnostics): void {
+    const record = new UnusableRecord();
+    record.subscriptionId = subscriptionId;
+    record.source = source;
+    record.protocol = availability.protocol;
+    record.name = name;
+    record.server = server;
+    record.port = port;
+    record.category = availability.category;
+    record.excluded = true;
+    record.reason = availability.reason;
+    record.detail = availability.detail;
+    record.missing = availability.missing;
+    UnusableLedger.record(record);
+    SubscriptionService.noteInvalid(diagnostics, availability.reason);
   }
 
   public static mapNodes(json: Object, diagnostics?: SubscriptionImportDiagnostics): ProxyNode[] {
@@ -1651,6 +1820,14 @@ export class SubscriptionService {
     // 放在唯一 persist 收口点，避免逐个入口（导入/刷新/删订阅/加本地 yaml…）漏改。
     AppStorage.setOrCreate('subscription_revision',
       (AppStorage.get<number>('subscription_revision') ?? 0) + 1);
+    // 节点集变化通知（2026-10-20 整改）：订阅导入/刷新/增删之后，内核里已生成的
+    // 配置与当前节点集脱节（配置只在启动那一刻生成一次）。通知编排器作废测速核
+    // 并按新节点集重建 —— 否则新节点在核心里查不到，测速整屏显示「未生效」。
+    const fingerprint: string = SubscriptionService.nodeSetFingerprint(this.nodes);
+    if (fingerprint !== this.lastNotifiedNodeFingerprint) {
+      this.lastNotifiedNodeFingerprint = fingerprint;
+      SubscriptionService.notifyNodeSetChanged('subscription set changed');
+    }
     return credentialFailed;
   }
 
@@ -1966,13 +2143,17 @@ export class SubscriptionService {
       let parsed: ProxyNode[];
       let parsedGroups: ProxyGroup[] = [];
       YamlMerger.resetSkipStats();
-      const structuredYaml = YamlMerger.proxyItemGroups(body).length > 0;
+      // 该订阅的不可用台账先清空（重新导入 ⇒ 台账反映最新一次结果）
+      UnusableLedger.clearFor(sub.id);
+      // 先解码再判是不是 YAML 文档（base64 包裹的 Clash YAML 不能掉进链接分支）
+      const dispatch = BodyDispatch.classify(body);
+      const structuredYaml = dispatch.kind === BodyKind.YAML;
       if (structuredYaml) {
         // Clash YAML 订阅：走合并引擎（跨刷新保留节点名称，限额与去重对齐 upstream）
         const prev = this.store !== null ? await this.store.get(`yaml_cache_${id}`, '') as string : '';
         let merged: MergedProxy[] = [];
         try {
-          merged = YamlMerger.merge([body], sub.name, prev);
+          merged = YamlMerger.merge([dispatch.body], sub.name, prev);
         } catch (mergeError) {
           if (mergeError instanceof YamlMergeError) {
             // 合并引擎限额（10k 节点 / 1000 来源 / 字段长度 / 单条大小）属「超限」，
@@ -1993,10 +2174,10 @@ export class SubscriptionService {
         }
         // 合并阶段被跳过的节点（不支持的协议类型）与逐条失败的原因并入同一次诊断
         SubscriptionService.absorbYamlMergeStats(diagnostics);
-        parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
-        parsedGroups = SubscriptionParser.parseProxyGroups(body, sub.id);
+        parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics, dispatch.body);
+        parsedGroups = SubscriptionParser.parseProxyGroups(dispatch.body, sub.id);
         // 订阅自带 rules/rule-providers 段落账（无规则段时清空旧值）
-        SubscriptionService.applyRulesSections(sub, body);
+        SubscriptionService.applyRulesSections(sub, dispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -2263,14 +2444,17 @@ export class SubscriptionService {
       YamlMerger.resetSkipStats();
       let parsed: ProxyNode[];
       let parsedGroups: ProxyGroup[] = [];
-      const structuredYaml = YamlMerger.proxyItemGroups(body).length > 0;
+      // 该订阅的不可用台账先清空（重新导入 ⇒ 台账反映最新一次结果）
+      UnusableLedger.clearFor(id);
+      // 先解码再判是不是 YAML 文档（base64 包裹的 Clash YAML 不能掉进链接分支）
+      const dispatch = BodyDispatch.classify(body);
+      const structuredYaml = dispatch.kind === BodyKind.YAML;
       if (structuredYaml) {
-        const merged: MergedProxy[] = YamlMerger.merge([body], sub.name, '');
-        SubscriptionService.absorbYamlMergeStats(diagnostics);
-        parsed = SubscriptionService.mergedToNodes(merged, id, diagnostics);
-        parsedGroups = SubscriptionParser.parseProxyGroups(body, id);
+        const merged: MergedProxy[] = YamlMerger.merge([dispatch.body], sub.name, '');        SubscriptionService.absorbYamlMergeStats(diagnostics);
+        parsed = SubscriptionService.mergedToNodes(merged, id, diagnostics, dispatch.body);
+        parsedGroups = SubscriptionParser.parseProxyGroups(dispatch.body, id);
         // 本地伪订阅刷新：自带 rules/rule-providers 段同样重新落账（原文可能已变化）
-        SubscriptionService.applyRulesSections(sub, body);
+        SubscriptionService.applyRulesSections(sub, dispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length
           + diagnostics.invalidCount + diagnostics.unsupportedCount;
       } else {
@@ -2358,14 +2542,15 @@ export class SubscriptionService {
     let localEligible = false;
     try {
       YamlMerger.resetSkipStats();
-      localEligible = YamlMerger.proxyItemGroups(trimmed).length > 0;
+      const localDispatch = BodyDispatch.classify(trimmed);
+      localEligible = localDispatch.kind === BodyKind.YAML;
       if (localEligible) {
-        const merged: MergedProxy[] = YamlMerger.merge([trimmed], sub.name, '');
+        const merged: MergedProxy[] = YamlMerger.merge([localDispatch.body], sub.name, '');
         SubscriptionService.absorbYamlMergeStats(diagnostics);
-        parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics);
-        parsedGroups = SubscriptionParser.parseProxyGroups(trimmed, sub.id);
+        parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics, localDispatch.body);
+        parsedGroups = SubscriptionParser.parseProxyGroups(localDispatch.body, sub.id);
         // 本地 YAML 导入：自带 rules/rule-providers 段随订阅一并落账
-        SubscriptionService.applyRulesSections(sub, trimmed);
+        SubscriptionService.applyRulesSections(sub, localDispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -2731,7 +2916,11 @@ export class SubscriptionService {
     diagnostics.inputCount = 1;
     let node: ProxyNode | null = null;
     try {
-      node = ProxyNode.fromUri(uri, DIRECT_GROUP_ID, util.generateRandomUUID());
+      // 2026-10-20（B6）：走规范解析层（旧解析器已退场）
+      const canonical: ParsedNode | ParseError = parseUriNode(uri, DIRECT_GROUP_ID);
+      if (!(canonical instanceof ParseError)) {
+        node = ProxyNode.fromCanonical(canonical, DIRECT_GROUP_ID, util.generateRandomUUID());
+      }
     } catch (e) {
       SubscriptionService.noteInvalid(diagnostics, `链接解析异常：${SubscriptionService.describeError(e)}`);
       AppLogger.warn(TAG, `direct node parse failed: ${SubscriptionService.describeError(e)}`);
@@ -2802,7 +2991,11 @@ export class SubscriptionService {
       }
       let node: ProxyNode | null = null;
       try {
-        node = ProxyNode.fromUri(uri, DIRECT_GROUP_ID, util.generateRandomUUID());
+        // 2026-10-20（B6）：走规范解析层（旧解析器已退场）
+        const canonical: ParsedNode | ParseError = parseUriNode(uri, DIRECT_GROUP_ID);
+        if (!(canonical instanceof ParseError)) {
+          node = ProxyNode.fromCanonical(canonical, DIRECT_GROUP_ID, util.generateRandomUUID());
+        }
       } catch (e) {
         node = null;
       }

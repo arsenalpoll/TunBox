@@ -1,0 +1,19 @@
+## VLESS + REALITY 订阅样本
+##
+## 形态照抄真实机场的分享链接（含 encryption=none / security=reality / pbk / sid / spx /
+## fp / flow / type=ws|grpc|xhttp 等），但**凭据全是假的**：
+##   - 域名一律走 example.test（保留真实链接的标签风格，不是真机可达的地址）
+##   - UUID / REALITY 公钥 / short-id / obfs 口令都是占位串
+##   - 没有任何一条来自真实机场的真实凭据
+##
+## 格式：逐行一条 URI；`##` 开头是注释行。
+## 配套闸门：scripts/verify-sub-parse-fidelity.mjs
+
+vless://11111111-1111-4111-8111-111111111111@hk-reality-01.example.test:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=x8K2mQ7pR3vN9wT5yB1cF4gH6jL0zD2e&sid=a1b2c3d4&spx=%2F&type=tcp&flow=xtls-rprx-vision#%E9%A6%99%E6%B8%AF%20REALITY%2001
+vless://11111111-1111-4111-8111-111111111111@jp-reality-ws.example.test:443?encryption=none&security=reality&sni=www.apple.com&fp=firefox&pbk=x8K2mQ7pR3vN9wT5yB1cF4gH6jL0zD2e&sid=00ff11aa&type=ws&host=jp-reality-ws.example.test&path=%2Fws-path&ed=2048&eh=Sec-WebSocket-Protocol#%E4%B8%9C%E4%BA%AC%20REALITY%20WS
+vless://11111111-1111-4111-8111-111111111111@sg-reality-grpc.example.test:443?encryption=none&security=reality&sni=www.cloudflare.com&fp=chrome&pbk=x8K2mQ7pR3vN9wT5yB1cF4gH6jL0zD2e&sid=deadbeef&type=grpc&serviceName=grpc-svc-name&mode=gun&authority=www.cloudflare.com#%E6%96%B0%E5%8A%A0%E5%9D%A1%20REALITY%20gRPC
+vless://11111111-1111-4111-8111-111111111111@hk-reality-02.example.test:8443?encryption=none&security=reality&sni=hk-reality-02.example.test&fp=safari&pbk=x8K2mQ7pR3vN9wT5yB1cF4gH6jL0zD2e&sid=1234abcd&type=tcp&allowInsecure=1&alpn=h2%2Chttp%2F1.1&tfo=true#%E9%A6%99%E6%B8%AF%20REALITY%2002
+vless://11111111-1111-4111-8111-111111111111@us-reality-xhttp.example.test:443?encryption=none&security=reality&sni=us-reality-xhttp.example.test&fp=chrome&pbk=x8K2mQ7pR3vN9wT5yB1cF4gH6jL0zD2e&sid=0a0b0c0d&type=xhttp&path=%2Fxhttp&host=us-reality-xhttp.example.test&headerType=none&packet-encoding=xudp&ip-version=ipv4#%E7%BE%8E%E5%9B%BD%20xHTTP
+vless://11111111-1111-4111-8111-111111111111@kr-reality-alias.example.test:443?encryption=none&security=reality&sni=www.microsoft.com&public-key=x8K2mQ7pR3vN9wT5yB1cF4gH6jL0zD2e&short-id=cafe0011&client-fingerprint=chrome&type=tcp#%E9%9F%A9%E5%9B%BD%20REALITY%20%E5%88%AB%E5%90%8D
+vless://55555555-5555-4555-8555-555555555555@sg-vless-tls.example.test:443?encryption=none&security=tls&sni=sg-vless-tls.example.test&fp=chrome&type=grpc&serviceName=svc-name&mode=gun#%E6%96%B0%E5%8A%A0%E5%9D%A1%20VLESS%20TLS%20gRPC
+vless://55555555-5555-4555-8555-555555555555@de-vless-tcp.example.test:8443?encryption=none&security=tls&sni=de-vless-tcp.example.test&fp=chrome&type=tcp&flow=xtls-rprx-vision&mptcp=true&smux=smux-1&dialer-proxy=DIRECT#%E5%BE%B7%E5%9B%BD%20VLESS%20TCP

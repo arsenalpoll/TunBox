@@ -12,14 +12,14 @@ import { router, promptAction } from '@kit.ArkUI';
 import { TunBoxMotion } from '../theme/TunBoxTokens';
 import { Ui, LatencyStyle, NodeDisplay } from '../theme/UiTokens';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
+import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
 import { Subscription } from '../commons/models/Subscription';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ProxyNode, ProxyNodeType } from '../commons/models/ProxyNode';
 import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ProxyGroup } from '../commons/models/ProxyGroup';
-import { LatencyController } from '../commons/services/LatencyController';
-import { ClashApiService, GroupLatencyResult, LatencyFailKind } from '../commons/services/ClashApiService';
+import { ClashApiService, GroupLatencyResult } from '../commons/services/ClashApiService';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
 import { LatencyChannel, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
 import {
@@ -27,6 +27,11 @@ import {
   LatencyRunOptions, GROUP_TEST_TIMEOUT_MS
 } from '../commons/services/LatencyEngine';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
+import { effectiveTestUrl } from '../commons/latency/LatencyProbe';
+// 失败分类常量**唯一真源** = 测速内核（LatencyKinds.LatencyProbeKind）——
+// 旧的 ClashApiService.LatencyFailKind 已随内核收敛删除（审计 LP04）。
+import { LatencyProbeKind } from '../commons/latency/LatencyKinds';
+import { LatencyStore } from '../commons/latency/LatencyStore';
 import { NodeCountryPolicy } from '../commons/services/PublicIpService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import {
@@ -183,6 +188,21 @@ struct NodeSelectionPage {
    */
   @State latencyAllTimedOut: boolean = false;
   /**
+   * **组级诊断条**文案（空串 = 不显示）。
+   *
+   * 整组**同因**全败时折叠成一条，而不是铺 N 条同色红条。
+   * 真机取证（2026-10-20，lead 追加）：那批全败节点的服务器域名在
+   * 阿里/Cloudflare/Google/腾讯**全部 NXDOMAIN** —— 失败在**域名解析**，
+   * 不是网络不通。用户原话：「你就把失败改成网络不可达，你糊弄谁呢」。
+   * 于是「34/34 个节点域名无法解析，疑似机场域名下线，请联系机场换线路
+   * 或更换订阅」必须**说在前面**，而不是让用户对着 34 条一样的红条自己猜。
+   *
+   * 口径：同一失败分类占本批失败总数的比例 ≥ 80%（且 ≥ 2 个）才折叠；
+   * 只统计**判定类**失败（通道没就绪/没排上队这类「我们自己的问题」不算
+   * 节点结论，它们由顶栏的「内核不可用」提示）。
+   */
+  @State latencyGroupDiagnosis: string = '';
+  /**
    * 本轮是否被取消（用户点取消 / 页面退出）。
    * 引擎的 LatencyProgress 只统计「取消时正好在探测的节点」，无法回答"这一批是否
    * 被取消"，所以取消动作在这里记账：被取消的批次不是完整结论 → 不落盘、不弹完成 toast。
@@ -264,7 +284,7 @@ struct NodeSelectionPage {
     // 轮询只在视图可见期间存在，离开必须停 —— 否则页面退到后台还在每 3s 打内核 API
     this.stopSmartPoll();
     if (this.latencyListenerBound) {
-      LatencyController.removeListener(this.latencyListener);
+      LatencyStoreBridge.removeListener(this.latencyListener);
       this.latencyListenerBound = false;
     }
   }
@@ -329,7 +349,7 @@ struct NodeSelectionPage {
       }, 350);
     }
     if (!this.latencyListenerBound) {
-      LatencyController.addListener(this.latencyListener);
+      LatencyStoreBridge.addListener(this.latencyListener);
       this.latencyListenerBound = true;
     }
     // 预热测速通道（真机取证 2026-10-20）：「点了测速要等几秒才开始」的根因是
@@ -378,7 +398,7 @@ struct NodeSelectionPage {
       };
       rows.push(row);
     }
-    LatencyController.retainOnly(activeNames);
+    LatencyStoreBridge.retainOnly(activeNames);
 
     // ── 自动选择视图 ────────────────────────────────────────────────
     // 显示内核**当前实际在用**的出口节点（来自 /connections 的 chains）。
@@ -674,7 +694,7 @@ struct NodeSelectionPage {
       if (row.isSmart === true) {
         return -1;
       }
-      const v = LatencyController.latencyFor(row.node.name);
+      const v = LatencyStoreBridge.latencyFor(row.node.name);
       return (v === null || v < 0) ? Number.MAX_SAFE_INTEGER : v;
     };
     arr.sort((a: NodeRow, b: NodeRow): number => key(a) - key(b));
@@ -731,9 +751,16 @@ struct NodeSelectionPage {
   }
 
   /**
-   * 页面初始化时恢复排序状态:
-   * 从设置里反序列化最近一次测速快照 + 排序模式，并把快照中的延迟回填到
-   * LatencyController（否则重启后列表顺序对了但延迟数字仍显示"未测试"）。
+   * 页面初始化时恢复**排序**状态:
+   * 从设置里反序列化最近一次测速快照 + 排序模式。
+   *
+   * ⚠ 这里**不再**从快照回填测速结论（审计 F4）：
+   * 结论的真源是 **LatencyStore**（字段级落盘），应用启动时已按
+   * 「无记录或更新才覆盖」的规则恢复进进程内。
+   * 若这里再用旧快照盖一遍，旧快照就能盖掉更新的结论 ——
+   * 用户看到的就是「刚测出来是好的，一进节点页又变超时」。
+   * 快照在这里只负责**排序**（手动固定顺序 / 自动排序的输入）。
+   *
    * 快照损坏 / 无数据时回退 default（订阅原始顺序）。
    */
   private restoreSortState(): void {
@@ -747,40 +774,34 @@ struct NodeSelectionPage {
     }
     this.sortSnapshot = snap;
     this.sortMode = mode;
-    for (const rec of snap.records) {
-      if (rec.latency !== -2) {
-        // 恢复上一轮结论：带失败分类 + 真实测速时间戳（否则旧失败会被渲染成
-        // 一颗新鲜的红「超时」——2026-10-20 真机反馈「还没测速就显示超时」）。
-        LatencyController.restore(rec.name, rec.latency, rec.failKind, snap.testedAt);
-      }
-    }
-    this.pruneStaleLatencyDisplay();
   }
 
   /**
-   * 清理「没有结论」的显示残留：控制器里的旧值（例如上一轮的 -1）会被
-   * LatencyStyle 渲染成「超时」，而快照里该节点其实是「未测 / 核心不可用 /
-   * 端口可达」。只保留快照中**有有效延迟结论**的节点，其余剔除（回到「未测」）。
+   * 落盘排序模式 + 测速快照（**字段级**，审计 F2）。
+   *
+   * 两类字段各有各的主人，绝不互相覆盖：
+   *  - 测速结论（latency / failKind / 手动顺序）→ 测速分片，**只有测速路径能写**；
+   *  - 记账（failCount / lastOk）→ 记账分片，自动切换那条线的事，这里不碰。
+   * 旧实现把整份快照塞进 AppSettings 再整单覆盖 → 自动切换记下的失败次数会被
+   * 这里这份陈旧副本盖回 0（坏节点又被选中），新一轮测速结论也会被记账那次
+   * 写入盖掉（审计 F2 的两个症状）。
+   *
+   * 注：旧实现里还有一个 `pruneStaleLatencyDisplay()`（按快照裁剪控制器里的
+   * 旧值）。它的前提是「快照 = 结论真源」；新真源是 LatencyStore，控制器里的
+   * 值本来就来自它，裁剪既无必要又会误伤（单节点手测的结论不在快照里），
+   * 因此该方法已删除（订阅变更时的清理走 LatencyStoreBridge.retainOnly）。
    */
-  private pruneStaleLatencyDisplay(): void {
-    const snap = this.sortSnapshot;
-    if (snap === null) {
-      return;
-    }
-    const valid: string[] = [];
-    for (const rec of snap.records) {
-      if (rec.latency !== -2) {
-        valid.push(rec.name);
-      }
-    }
-    LatencyController.retainOnly(valid);
-  }
-
-  /** 落盘排序模式 + 测速快照（随 AppSettings 持久化，无需重连隧道） */
   private async persistSortState(): Promise<void> {
     this.settings.nodeSortMode = this.sortMode;
-    this.settings.nodeSortSnapshot = this.sortSnapshot === null ? '' : this.sortSnapshot.toJsonText();
-    await SettingsService.save(this.settings);
+    const snapshotText: string = this.sortSnapshot === null ? '' : this.sortSnapshot.toJsonText();
+    await SettingsService.nodeSortSnapshotWrite(snapshotText);
+    // 排序模式是设置字段：走字段级写入口（mutator 拿到的是盘上最新值）。
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.nodeSortMode = this.sortMode;
+    });
+    // 刷新内存副本：让它等于「盘上的合并视图」，后续任何整单写都不会带着
+    // 陈旧的记账数据去覆盖自动切换刚记下的失败次数。
+    this.settings.nodeSortSnapshot = await SettingsService.loadNodeSortSnapshot();
   }
 
   /** 排序模式中文说明（用于 toast） */
@@ -941,17 +962,14 @@ struct NodeSelectionPage {
    *   同一个出口 https Timeout 而 http 1158ms。用户自填 http 是**有意为之**，
    *   客户端无权替他改（旧实现在这里「非 https 一律回落」，注释与代码长期相反，
    *   且会静默改掉用户的合法配置）。
+   *
+   * ⚠ 这里**不再自己实现**这套口径：前台批 / 后台批 / 生成器 smart 组三处
+   *   各写一份必然漂移（审计 F12）。统一走测速内核的**单一真源**
+   *   `effectiveTestUrl`（commons/latency/LatencyProbe）—— 它同时负责
+   *   「两个历史 http 默认值单向升级到 https」与「非法值回落默认 https」。
    */
   private testUrlForLatency(): string {
-    const configured: string = this.settings.testLatencyUrl.trim();
-    if (configured.length > 0 && /^https?:\/\/\S+$/.test(configured)) {
-      return configured;
-    }
-    if (configured.length > 0) {
-      AppLogger.warn(TAG, `test url "${configured}" is invalid; `
-        + `falling back to default ${AppSettings.DEFAULT_TEST_URL}`);
-    }
-    return AppSettings.DEFAULT_TEST_URL;
+    return effectiveTestUrl(this.settings);
   }
 
   /**
@@ -1023,7 +1041,10 @@ struct NodeSelectionPage {
       // 被打断（取消/离页）或通道不可用的节点，引擎不会为它发布任何记录，那条记录
       // 会永远停在 TESTING —— 行上就是一个永不停止的转圈。这不是节点结论，收回 `--`。
       this.clearTestingMarks(list);
-      LatencyController.flushNow();
+      LatencyStoreBridge.flushNow();
+      // 组级诊断（同因全败 → 折叠成一条）：本批结束后重算，
+      // 新批次没有同因失败时自动收起。
+      this.latencyGroupDiagnosis = this.computeGroupDiagnosis(list);
       if (driveHeader) {
         this.batchTesting = false;
       }
@@ -1041,6 +1062,9 @@ struct NodeSelectionPage {
       // force=true：用户明确点了这一行就一定要重测，绝不拿缓存糊弄（旧实现用
       // 「5 分钟内的缓存」直接返回 toast，用户点了像没反应）。
       await this.runLatency([node], true, false);
+      // 新真源：单节点手测的结论也落进 LatencyStore（字段级）——
+      // 冷启动恢复只认它，否则这次手测的结论重启后就没了。
+      await LatencyStoreBridge.persistConclusions([node.name]);
     } finally {
       this.testingName = '';
     }
@@ -1094,10 +1118,10 @@ struct NodeSelectionPage {
    *
    * @param tested 本轮参与测速的节点（快照只覆盖它们，其余节点沿用旧结论）
    */
-  private commitLatencySnapshot(tested: ProxyNode[]): void {
+  private async commitLatencySnapshot(tested: ProxyNode[]): Promise<void> {
     const collected: NodeLatencyRecord[] = [];
     for (const node of tested) {
-      const rec = LatencyController.recordFor(node.name);
+      const rec = LatencyStoreBridge.recordFor(node.name);
       collected.push(rec === null
         ? this.untestedPersistRecord(node.name) : this.toPersistRecord(rec));
     }
@@ -1109,6 +1133,26 @@ struct NodeSelectionPage {
     this.sortMode = NodeSortModes.AUTO;
     // 状态徽标来自快照，重建行才会刷新
     this.rebuildRows();
+    // 新真源：结论落进 LatencyStore（**字段级**：每个 (节点, 字段) 一个槽）。
+    // 排序快照仍是「手动固定顺序 + 排序模式」的载体，而**测速结论**的落盘真源
+    // 是 LatencyStore —— 两者不再互相整单覆盖（审计 F2/F4）。
+    const names: string[] = [];
+    for (const node of tested) {
+      names.push(node.name);
+    }
+    await LatencyStoreBridge.persistConclusions(names);
+  }
+
+  /**
+   * 组级诊断（**唯一实现**在 LatencyStoreBridge.groupDiagnosis —— 节点页与
+   * 订阅页共用同一份聚合口径与同一句文案，避免同一句话两处实现）。
+   */
+  private computeGroupDiagnosis(tested: ProxyNode[]): string {
+    const names: string[] = [];
+    for (const node of tested) {
+      names.push(node.name);
+    }
+    return LatencyStoreBridge.groupDiagnosis(names);
   }
 
   /** 无记录 = 本次没得出节点结论：保持「未测」，交给 buildAuto 沿用旧结论 */
@@ -1116,7 +1160,7 @@ struct NodeSelectionPage {
     const out = new NodeLatencyRecord();
     out.name = name;
     out.latency = -2;
-    out.failKind = LatencyFailKind.UNTESTED;
+    out.failKind = LatencyProbeKind.UNTESTED;
     return out;
   }
 
@@ -1138,23 +1182,30 @@ struct NodeSelectionPage {
     }
     if (rec.state === LatencyState.MEASURED) {
       out.latency = rec.delayMs;
-      out.failKind = LatencyFailKind.NONE;
+      out.failKind = LatencyProbeKind.NONE;
       return out;
     }
     if (rec.state === LatencyState.TIMEOUT) {
       out.latency = -1;
-      out.failKind = LatencyFailKind.TIMEOUT;
+      out.failKind = LatencyProbeKind.TIMEOUT;
       return out;
     }
     if (rec.state === LatencyState.FAILED) {
+      // ⚠ **不要**在这里编造失败分类（审计 F13）。
+      // 旧实现把「没有分类的失败」一律盖成 network_unreachable（网络不可达），
+      // 于是用户看到「网络不可达」→ 以为节点坏了；实际这次失败可能来自
+      // 任何原因（甚至只是这一次探测异常），把它说成「网络不可达」是**假结论**。
+      // 正确做法：分类留空（''），由唯一真源 LatencyPolicy.stateText 渲染成
+      // 中性的「失败」；落盘后冷启动恢复时，'' 按既定口径算「非结论」
+      // （见 LatencyStoreBridge.restore）→ 显示「--」，宁可少说也不说错。
       out.latency = -1;
-      out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
+      out.failKind = '';
       return out;
     }
     // OFFLINE（仅端口可达）/ TESTING / CANCELLED / UNTESTED：不是节点结论
     out.latency = -2;
     out.failKind = rec.state === LatencyState.OFFLINE
-      ? LatencyFailKind.PORT_ONLY : LatencyFailKind.UNTESTED;
+      ? LatencyProbeKind.PORT_ONLY : LatencyProbeKind.UNTESTED;
     return out;
   }
 
@@ -1168,8 +1219,8 @@ struct NodeSelectionPage {
    */
   private clearTestingMarks(names: ProxyNode[]): void {
     for (const node of names) {
-      if (LatencyController.stateFor(node.name) === LatencyState.TESTING) {
-        LatencyController.set(node.name, -2);
+      if (LatencyStoreBridge.stateFor(node.name) === LatencyState.TESTING) {
+        LatencyStoreBridge.set(node.name, -2);
       }
     }
   }
@@ -1189,7 +1240,10 @@ struct NodeSelectionPage {
     }
     if (wasSelected) {
       this.settings.preferredNodeId = '';
-      await SettingsService.save(this.settings);
+      // 字段级写：只改这一个字段，不覆盖别人（设置页/自动切换）刚写进去的值
+      await SettingsService.patchSettings((s: AppSettings): void => {
+        s.preferredNodeId = '';
+      });
       this.selectedName = this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '';
     }
     this.rebuildRows();
@@ -1235,8 +1289,10 @@ struct NodeSelectionPage {
       AppLogger.warn(TAG, 'group latency batch aborted: core unavailable, results voided');
       return;
     }
-    this.commitLatencySnapshot(list);
+    await this.commitLatencySnapshot(list);
     await this.persistSortState();
+    // 组级诊断：整组同因全败 → 折叠成一条诊断条（不铺 N 条同色红条）
+    this.latencyGroupDiagnosis = this.computeGroupDiagnosis(list);
     AppLogger.info(TAG, `group latency batch done: total=${progress.total} measured=${progress.measured} `
       + `timeout=${progress.timeout} failed=${progress.failed} channel=${progress.channel}`);
     if (this.latencyAllTimedOut) {
@@ -1315,7 +1371,7 @@ struct NodeSelectionPage {
     this.applyProgress(progress, driveHeader);
     // 先全部标记「测试中」（转圈），结果落地后逐个覆盖
     for (const n of list) {
-      LatencyController.markTesting(n.name);
+      LatencyStoreBridge.markTesting(n.name);
     }
     this.groupTestApi = api;
     // 组测用**带分类**的接口：只有它能区分 504（全部成员超时，通道正常）与
@@ -1334,11 +1390,11 @@ struct NodeSelectionPage {
     if (this.batchCancelled) {
       // 用户取消：被中断的节点收回「未测」
       for (const n of list) {
-        if (LatencyController.stateFor(n.name) === LatencyState.TESTING) {
-          LatencyController.setRecord(LatencyRecord.untested(n.name));
+        if (LatencyStoreBridge.stateFor(n.name) === LatencyState.TESTING) {
+          LatencyStoreBridge.setRecord(LatencyRecord.untested(n.name));
         }
       }
-      LatencyController.flushNow();
+      LatencyStoreBridge.flushNow();
       if (driveHeader) {
         this.batchTesting = false;
       }
@@ -1351,11 +1407,11 @@ struct NodeSelectionPage {
       AppLogger.warn(TAG, `group latency channel failure: code=${groupRes.httpCode} `
         + `kind=${groupRes.failKind} detail=${groupRes.detail}`);
       for (const n of list) {
-        if (LatencyController.stateFor(n.name) === LatencyState.TESTING) {
-          LatencyController.setRecord(LatencyRecord.untested(n.name));
+        if (LatencyStoreBridge.stateFor(n.name) === LatencyState.TESTING) {
+          LatencyStoreBridge.setRecord(LatencyRecord.untested(n.name));
         }
       }
-      LatencyController.flushNow();
+      LatencyStoreBridge.flushNow();
       if (driveHeader) {
         this.batchTesting = false;
       }
@@ -1380,8 +1436,8 @@ struct NodeSelectionPage {
     // 否则用户看到的是"全红"，会以为节点坏了（真机 2026-10-19：36 个 anytls
     // 被丢弃 → 内核 404 → 测速全红，节点实际可用、代理正常）。
     // ⚠ 二者**不得**混为一谈（C10b）：
-    //   · 不在内核代理表 → LatencyFailKind.SWITCH_FAILED（节点没进内核 = 未生效）
-    //   · 在内核表但本轮没测到 → LatencyFailKind.TIMEOUT（真超时）
+    //   · 不在内核代理表 → LatencyProbeKind.SWITCH_FAILED（节点没进内核 = 未生效）
+    //   · 在内核表但本轮没测到 → LatencyProbeKind.TIMEOUT（真超时）
     // 504（全部成员超时）时结果集为空，全部走失败分支：这些节点在内核表里
     // （组存在才谈得上 504），因此判 TIMEOUT —— 结论与逐节点路径一致。
     const delays: Map<string, number> = groupRes.delays;
@@ -1399,7 +1455,7 @@ struct NodeSelectionPage {
     for (const n of list) {
       const delay = delays.get(n.name);
       if (delay !== undefined && delay > 0) {
-        LatencyController.setRecord(
+        LatencyStoreBridge.setRecord(
           LatencyRecord.measured(n.name, delay, LatencyChannel.CORE, Date.now()));
         progress.measured = progress.measured + 1;
       } else {
@@ -1411,10 +1467,10 @@ struct NodeSelectionPage {
         const failedRec = LatencyRecord.failed(n.name,
           notInCore ? LatencyState.FAILED : LatencyState.TIMEOUT, Date.now(),
           LatencyChannel.CORE,
-          notInCore ? LatencyFailKind.SWITCH_FAILED : LatencyFailKind.TIMEOUT);
+          notInCore ? LatencyProbeKind.SWITCH_FAILED : LatencyProbeKind.TIMEOUT);
         failedRec.source = source;
         failedRec.runId = 0;
-        LatencyController.setRecord(failedRec);
+        LatencyStoreBridge.setRecord(failedRec);
         if (notInCore) {
           progress.failed = progress.failed + 1;
         } else {
@@ -1424,16 +1480,16 @@ struct NodeSelectionPage {
       progress.finished = progress.finished + 1;
       this.latencyDone = progress.finished;
       this.applyProgress(progress, driveHeader);
-      LatencyController.flushNow();
+      LatencyStoreBridge.flushNow();
     }
     // 双保险：provider 节点等组内成员不在 App 表的，TESTING 残留统一收回
     let testing = 0;
     for (const n of list) {
-      if (LatencyController.stateFor(n.name) === LatencyState.TESTING) {
+      if (LatencyStoreBridge.stateFor(n.name) === LatencyState.TESTING) {
         const leftover = LatencyRecord.failed(n.name, LatencyState.TIMEOUT, Date.now(),
           LatencyChannel.CORE);
         leftover.source = source;
-        LatencyController.setRecord(leftover);
+        LatencyStoreBridge.setRecord(leftover);
         testing = testing + 1;
       }
     }
@@ -1442,7 +1498,7 @@ struct NodeSelectionPage {
       progress.finished = progress.total;
     }
     progress.running = false;
-    LatencyController.flushNow();
+    LatencyStoreBridge.flushNow();
     // **重建行数据**：页面行渲染的是 rebuildRows() 预构建的 status 字段，
     // 只 bump 重绘信号（flushNow）不会更新行内容 —— 组测结束必须主动重建，
     // 否则用户要返回主页再进才能看到延迟（手动刷新的旧观感）。
@@ -1478,7 +1534,10 @@ struct NodeSelectionPage {
     }
     selections[this.groupKey(parent)] = strategy.name;
     this.settings.proxyGroupSelections = JSON.stringify(selections);
-    await SettingsService.save(this.settings);
+    // 字段级写：整单覆盖会把别的写者刚写进去的字段盖回旧值（审计 F2）
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.proxyGroupSelections = JSON.stringify(selections);
+    });
     // bump @State 计数让 ForEach 键变化，立即刷新组头摘要与策略行选中标记。
     this.latencyTick = this.latencyTick + 1;
     const didRestart = await this.orchestrator.restartIfConnected('proxyGroup=' + strategy.name);
@@ -1495,7 +1554,10 @@ struct NodeSelectionPage {
     if (node.id === SMART_ROW_ID) {
       this.settings.autoSelectMode = AutoSelectModes.AUTO;
       this.autoSelectMode = AutoSelectModes.AUTO;
-      await SettingsService.save(this.settings);
+      // 字段级写：只改这一个字段
+      await SettingsService.patchSettings((s: AppSettings): void => {
+        s.autoSelectMode = AutoSelectModes.AUTO;
+      });
       const pool: ProxyNode[] = this.subs.nodes;
       let target: ProxyNode | null = null;
       for (const n of pool) {
@@ -1537,7 +1599,10 @@ struct NodeSelectionPage {
     }
     this.settings.preferredNodeId = node.id;
     this.selectedName = node.name;
-    await SettingsService.save(this.settings);
+    // 字段级写：只改这一个字段
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.preferredNodeId = node.id;
+    });
     // 节点切换始终执行完整重连。Mihomo controller 返回 2xx 只能证明请求被接受，
     // 不能证明现有连接已迁移到新节点；此前因此错误提示“未重建隧道”，但流量仍走旧节点。
     const didRestart = await this.orchestrator.reconnectWithNode(node, this.subs, 'preferredNode=' + node.id);
@@ -1677,6 +1742,30 @@ struct NodeSelectionPage {
         .width('100%')
         .height(56)
         .padding({ left: 16, right: 16 })
+
+        // ── 组级诊断条 ──
+        // 整组同因全败时，折叠成**一条**能说清原因的诊断条
+        // （例：「34/34 个节点域名无法解析，疑似机场域名下线，请联系机场换线路
+        // 或更换订阅」），而不是让用户对着 34 条一模一样的红条自己猜。
+        if (this.latencyGroupDiagnosis.length > 0) {
+          Row({ space: 8 }) {
+            Image($r('app.media.ic_warning'))
+              .width(16).height(16)
+              .fillColor(Ui.warning)
+            Text(this.latencyGroupDiagnosis)
+              .fontSize(12)
+              .fontColor(Ui.warning)
+              .layoutWeight(1)
+              .maxLines(3)
+          }
+          .width('100%')
+          .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+          .margin({ left: 16, right: 16, top: 10 })
+          .borderRadius(10)
+          .backgroundColor(Ui.surfaceMuted)
+          .borderWidth(1)
+          .borderColor(Ui.warning)
+        }
 
         // ── 订阅筛选 chips ──
         if (this.subChips.length > 0) {
@@ -2029,16 +2118,16 @@ struct NodeSelectionPage {
             // 延迟徽标：五态可区分（未测 `--` / 测试中转圈 / 实测 ms / 离线粗略 ≈ms / 超时·失败）。
             // 旧实现把「没测过」「失败」「超时」一律画成「超时」，这是本页最大的可信度问题。
             Row({ space: 2 }) {
-              if (LatencyController.stateFor(row.node.name) === LatencyState.TESTING) {
+              if (LatencyStoreBridge.stateFor(row.node.name) === LatencyState.TESTING) {
                 LoadingProgress()
                   .width(16)
                   .height(16)
                   .color(Ui.primary)
               } else {
-                Text(LatencyStyle.recordText(LatencyController.recordFor(row.node.name), Date.now()))
+                Text(LatencyStyle.recordText(LatencyStoreBridge.recordFor(row.node.name), Date.now()))
                   .fontSize(14)
                   .fontWeight(FontWeight.Bold)
-                  .fontColor(LatencyStyle.recordColor(LatencyController.recordFor(row.node.name), Date.now()))
+                  .fontColor(LatencyStyle.recordColor(LatencyStoreBridge.recordFor(row.node.name), Date.now()))
               }
               Image($r('app.media.ic_refresh'))
                 .width(14).height(14)

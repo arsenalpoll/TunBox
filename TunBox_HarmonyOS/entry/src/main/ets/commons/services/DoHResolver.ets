@@ -90,8 +90,30 @@ class DoHPin {
   }
 }
 
+/**
+ * 一次 `resolveMany()` 的**过程报告**（谁真的查了、查成没成）。
+ *
+ * 为什么需要它：「解析失败」这个结论**必须**能区分三件事 ——
+ *   ① 查了，查到了（resolved）；
+ *   ② 查了，没查到（failed ⇒ 真·NXDOMAIN ⇒ 判 dns_unresolved）；
+ *   ③ **根本没查**（skipped：短 TTL 域名被故意不 pin；或域名不在本批）。
+ * ②与③混为一谈就会**误报**「域名无法解析」（实测教训：2026-10-20 真机）。
+ */
+export class DoHResolveReport {
+  /** 真的发过 DoH 查询的域名（小写）。 */
+  queried: string[] = [];
+  /** 查到了地址的域名（小写；含后续因易变/劫持嫌疑被丢弃的）。 */
+  resolved: string[] = [];
+  /** 查了但没拿到地址的域名（小写）⇒ 真·解析失败。 */
+  failed: string[] = [];
+  /** 故意没查的域名（小写：短 TTL / 不 pin）⇒ 没试过，不能下结论。 */
+  skipped: string[] = [];
+}
+
 export class DoHResolver {
   private static cache: Map<string, DoHPin> = new Map<string, DoHPin>();
+  /** 最近一次 resolveMany 的过程报告（供测速侧判定 DNS 结论）。 */
+  static lastReport: DoHResolveReport = new DoHResolveReport();
   private static readonly CACHE_MAX_ENTRIES: number = 512;
   private static readonly WORKERS: number = 16;
   private static loaded: boolean = false;
@@ -249,6 +271,7 @@ export class DoHResolver {
     priorityDomains: string[] = []): Promise<Record<string, string>> {
     await DoHResolver.ensureLoaded();
     const result: Record<string, string> = {};
+    const report: DoHResolveReport = new DoHResolveReport();
     const seen = new Set<string>();
     let pending: string[] = [];
     const priority = new Set<string>();
@@ -266,10 +289,13 @@ export class DoHResolver {
       //   budgetMs，备用域名照样拿满（见 hasUsablePin 的用途边界注释）。
       if (await DoHResolver.hasUsablePin(d)) {
         result[d] = DoHResolver.cachedIp(d);
+        report.resolved.push(d);
         continue;
       }
       if (!DoHResolver.isHeldUnpinnable(d)) {
         pending.push(d);
+      } else {
+        report.skipped.push(d);
       }
       // 命中「短 TTL 不 pin」结论的域名既不进结果也不查询：
       // 它会被写进 hosts 就会钉住会轮换的 IP，而内核自己按 TTL 解析是对的。
@@ -285,8 +311,10 @@ export class DoHResolver {
         workers.push((async (): Promise<void> => {
           while (Date.now() < deadline && idx < current.length) {
             const d = current[idx++];
+            report.queried.push(d);
             const ip = await DoHResolver.resolveANoCache(d, deadline);
             if (ip.length > 0) {
+              report.resolved.push(d);
               // 只有**真的被 pin 住**的域名才允许进 hosts（短 TTL 的 cachePut 会
               // 直接拒收，此时 cachedIp 为空 → 该域名不进结果，交给内核现解析）。
               const pinned = DoHResolver.cachedIp(d);
@@ -294,6 +322,7 @@ export class DoHResolver {
                 result[d] = pinned;
               }
             } else {
+              report.failed.push(d);
               remaining.push(d);
             }
           }
@@ -338,6 +367,7 @@ export class DoHResolver {
       }
       AppLogger.warn(TAG, `doh hijack suspicion: ${list.length} domains -> ${ip}, pins dropped`);
     }
+    DoHResolver.lastReport = report;
     if (volatileDropped.length > 0 || collisionDropped.length > 0) {
       const filtered: Record<string, string> = {};
       for (const d of Object.keys(result)) {

@@ -10,10 +10,22 @@ import { util } from '@kit.ArkTS';
 import { AppSettings, AppSettingsJson } from '../models/AppSettings';
 import { AppLogger } from '../utils/AppLogger';
 import { RawSubscriptionStore } from './RawSubscriptionStore';
+import { NodeLatencyRecord, NodeSortModes, NodeSortSnapshot } from './NodeSortPersistence';
 
 const TAG = 'SettingsService';
 const PREF_NAME = 'ssrvpn_settings';
 const KEY_SETTINGS = 'app_settings_json';
+/**
+ * 测速结论分片（字段级落盘）：只装**测速路径拥有**的字段
+ * （latency / failKind / 手动顺序 / 批次时间戳）。
+ * 只由 `nodeSortSnapshotWrite()` 写 —— 别的写者永远碰不到它。
+ */
+const KEY_NODE_SORT_LATENCY = 'node_sort_latency_json';
+/**
+ * 记账分片（字段级落盘）：只装**自动切换记账拥有**的字段（failCount / lastOk）。
+ * 只由 `saveNodeSortStats()` 写。
+ */
+const KEY_NODE_SORT_STATS = 'node_sort_stats_json';
 const ASSET_SERVICE = 'ssrvpn_service';
 const ASSET_SECRET_KEY = 'api_secret';
 const KEY_SNAPSHOT = 'connection_snapshot_json';
@@ -66,6 +78,49 @@ export class AppRoutingSnapshot {
   ts: number = 0;
 }
 
+/**
+ * 设置的**字段级写入**入口：mutator 拿到的是「刚从盘上读出来的最新设置」，
+ * 在它上面改，改完立刻落盘。
+ *
+ * 为什么不能直接 `save(settings)`：那个 API 收的是**调用方自己那份内存副本**，
+ * 而内存副本可能是几分钟前 load 出来的 —— 两个写者各持一份陈旧副本时，
+ * 后写者会把先写者的字段整片盖回旧值（审计 F2）。
+ */
+export type SettingsMutator = (settings: AppSettings) => void;
+
+/** 测速结论分片里的单条记录（只有测速路径拥有的字段） */
+class NodeSortLatencyEntry {
+  name: string = '';
+  latency: number = -2;
+  failKind: string = '';
+}
+
+/** 测速结论分片（latency / failKind / 手动顺序 / 批次时间戳） */
+class NodeSortLatencyShard {
+  testedAt: number = 0;
+  mode: string = NodeSortModes.DEFAULT;
+  order: string[] = [];
+  records: NodeSortLatencyEntry[] = [];
+}
+
+/** 记账分片里的单条记录（只有自动切换记账拥有的字段） */
+class NodeSortStatsEntry {
+  name: string = '';
+  failCount: number = 0;
+  lastOk: boolean = false;
+}
+
+/** 记账分片（failCount / lastOk） */
+class NodeSortStatsShard {
+  records: NodeSortStatsEntry[] = [];
+}
+
+/** 两个分片的容器（读一次盘拿全） */
+class NodeSortShards {
+  latency: NodeSortLatencyShard = new NodeSortLatencyShard();
+  stats: NodeSortStatsShard = new NodeSortStatsShard();
+}
+
 export class SettingsService {
   private static store: preferences.Preferences | null = null;
   /** 本进程内「双轨 provider」开关的上一次生效值：用于识别 true → false 的关闭动作 */
@@ -91,6 +146,10 @@ export class SettingsService {
         throw new Error('设置格式无效');
       }
       const settings = AppSettings.fromJson(j);
+      // 测速快照**不再**以整单 JSON 里的 nodeSortSnapshot 字段为真源：
+      // 它被拆成两个「字段级」分片（测速结论 / 记账），各自只有一个写者。
+      // 这里给调用方的仍是**合并视图**（旧形状），所以所有既有读点零改动。
+      settings.nodeSortSnapshot = await SettingsService.loadNodeSortSnapshot();
       // 双轨开关是全局闸门：任何一次加载都把持久化值同步给落盘仓，
       // 持久化为关闭 → 顺带清掉历史落盘原文（含进程被杀后残留）。
       SettingsService.syncRawProviderGate(settings.useRawProviderConfig);
@@ -111,9 +170,325 @@ export class SettingsService {
     // 保存前经 fromJson(toJson()) 归一化：非法值夹取、缺字段补默认，
     // 保证「保存两次 = 同一 JSON」（幂等），且不回写脏值。
     const normalized = AppSettings.fromJson(settings.toJson());
-    await SettingsService.store.put(KEY_SETTINGS, JSON.stringify(normalized.toJson()));
+    // 整单 JSON **不再携带测速快照**：快照已拆成两个字段级分片（见
+    // KEY_NODE_SORT_LATENCY / KEY_NODE_SORT_STATS）。留着它就等于留了第二份
+    // 真源 —— 整单覆盖会把另一个写者的分片盖回旧值（审计 F2 的根因）。
+    const stored = normalized.toJson();
+    stored.nodeSortSnapshot = '';
+    await SettingsService.store.put(KEY_SETTINGS, JSON.stringify(stored));
     await SettingsService.store.flush();
     SettingsService.syncRawProviderGate(normalized.useRawProviderConfig);
+    // 快照按「谁拥有哪个字段」分别路由：测速结论只在新批次出现时写，
+    // 记账只写**相对盘上发生变化**的节点。两者互不覆盖。
+    await SettingsService.routeSnapshotWrite(normalized.nodeSortSnapshot);
+  }
+
+  /**
+   * 字段级写入的**单一入口**：读-改-写在同一次串行操作内完成。
+   *
+   * mutator 拿到的是**刚从盘上读出来的最新设置**，因此它只改自己关心的字段，
+   * 不会把别的写者刚写进去的字段盖回旧值（审计 F2）。
+   */
+  static async patchSettings(mutator: SettingsMutator): Promise<void> {
+    const task = SettingsService.writeChain.then(async (): Promise<void> => {
+      const current = await SettingsService.load();
+      mutator(current);
+      await SettingsService.save(current);
+    });
+    SettingsService.writeChain = task.then((): void => {}, (): void => {});
+    return task;
+  }
+
+  /** 设置写入的串行链：避免两个写者同时读-改-写互相穿插 */
+  private static writeChain: Promise<void> = Promise.resolve();
+
+  /**
+   * 测速快照**单独写**（字段级写入口，导出让测速路径直接调用）。
+   *
+   * 只写「测速结论」分片（latency / failKind / 手动顺序），
+   * **绝不碰记账分片** —— 记账（failCount / lastOk）属于自动切换那条线，
+   * 测速批次无权改它；反之记账那条线也碰不到测速结论。
+   * 这条「字段级 + 单一写者」的边界，就是审计 F2 要求的
+   * 「后写者把先写者的字段盖回旧值」的根治点。
+   */
+  static async nodeSortSnapshotWrite(text: string): Promise<void> {
+    const shard = new NodeSortLatencyShard();
+    const snap = NodeSortSnapshot.fromJsonText(text);
+    if (snap !== null) {
+      shard.testedAt = snap.testedAt;
+      shard.mode = NodeSortModes.normalize(snap.mode);
+      shard.order = snap.order.slice();
+      for (const r of snap.records) {
+        const entry = new NodeSortLatencyEntry();
+        entry.name = r.name;
+        entry.latency = r.latency;
+        entry.failKind = r.failKind;
+        shard.records.push(entry);
+      }
+    }
+    await SettingsService.putShard(KEY_NODE_SORT_LATENCY, JSON.stringify(shard));
+  }
+
+  /**
+   * 记账路径的**单一写入口**（只写记账分片）。
+   * 绝不碰测速结论分片 —— 一次连接失败不是测速结论。
+   */
+  static async saveNodeSortStats(text: string): Promise<void> {
+    const shard = new NodeSortStatsShard();
+    const snap = NodeSortSnapshot.fromJsonText(text);
+    if (snap !== null) {
+      for (const r of snap.records) {
+        const entry = new NodeSortStatsEntry();
+        entry.name = r.name;
+        entry.failCount = r.failCount;
+        entry.lastOk = r.lastOk;
+        shard.records.push(entry);
+      }
+    }
+    await SettingsService.putShard(KEY_NODE_SORT_STATS, JSON.stringify(shard));
+  }
+
+  /**
+   * 测速快照的**合并视图**（旧形状的 JSON 文本）—— 所有既有读点零改动。
+   *
+   * 合并规则：测速结论取自「测速结论分片」，记账取自「记账分片」，
+   * 同一个节点的两半拼成一条记录。
+   */
+  static async loadNodeSortSnapshot(): Promise<string> {
+    const shards = await SettingsService.readShards();
+    if (shards.latency.records.length > 0 || shards.stats.records.length > 0) {
+      return SettingsService.mergeShards(shards);
+    }
+    // 旧装机：整单 JSON 里还留着 nodeSortSnapshot → 迁移一次到分片 key。
+    // 迁移后整单里的那份不再被信任（否则它又是一份真源）。
+    const legacy = await SettingsService.readLegacySnapshotField();
+    if (legacy.length === 0) {
+      return '';
+    }
+    await SettingsService.nodeSortSnapshotWrite(legacy);
+    await SettingsService.saveNodeSortStats(legacy);
+    return legacy;
+  }
+
+  /**
+   * 测速地址的**单一真源在测速内核**（`commons/latency/LatencyProbe.effectiveTestUrl`）。
+   *
+   * ⚠ 这里**刻意不再提供**一份实现：前台批（节点页）、后台批（静默批次）、
+   * 生成器 smart 组三处各写一份 URL 口径必然漂移（审计 F12）——
+   * 同一份「用户填的 http 到底保不保留」的规则在三处各解释一次，早晚解释不一致。
+   * 统一去 LatencyProbe 取；等它成为唯一真源后，删掉旧调用点即可。
+   */
+
+  /** 读两个分片（一次读盘拿全） */
+  private static async readShards(): Promise<NodeSortShards> {
+    const shards = new NodeSortShards();
+    if (SettingsService.store === null) {
+      return shards;
+    }
+    const rawLatency = await SettingsService.store.get(KEY_NODE_SORT_LATENCY, '') as string;
+    if (rawLatency.length > 0) {
+      try {
+        const j = JSON.parse(rawLatency) as NodeSortLatencyShard;
+        if (j !== null && typeof j === 'object') {
+          shards.latency.testedAt = typeof j.testedAt === 'number' ? j.testedAt : 0;
+          shards.latency.mode = NodeSortModes.normalize(j.mode);
+          if (Array.isArray(j.order)) {
+            for (const n of j.order) {
+              if (typeof n === 'string' && n.length > 0) {
+                shards.latency.order.push(n);
+              }
+            }
+          }
+          if (Array.isArray(j.records)) {
+            for (const r of j.records) {
+              if (r === null || r === undefined || typeof r.name !== 'string' || r.name.length === 0) {
+                continue;
+              }
+              const entry = new NodeSortLatencyEntry();
+              entry.name = r.name;
+              entry.latency = typeof r.latency === 'number' && Number.isFinite(r.latency) ? r.latency : -2;
+              entry.failKind = typeof r.failKind === 'string' && r.failKind.length <= 32 ? r.failKind : '';
+              shards.latency.records.push(entry);
+            }
+          }
+        }
+      } catch (e) {
+        AppLogger.warn(TAG, `node sort latency shard is corrupt: ${AppLogger.errText(e)}`);
+      }
+    }
+    const rawStats = await SettingsService.store.get(KEY_NODE_SORT_STATS, '') as string;
+    if (rawStats.length > 0) {
+      try {
+        const j = JSON.parse(rawStats) as NodeSortStatsShard;
+        if (j !== null && typeof j === 'object' && Array.isArray(j.records)) {
+          for (const r of j.records) {
+            if (r === null || r === undefined || typeof r.name !== 'string' || r.name.length === 0) {
+              continue;
+            }
+            const entry = new NodeSortStatsEntry();
+            entry.name = r.name;
+            entry.failCount = typeof r.failCount === 'number' && r.failCount >= 0 ? Math.floor(r.failCount) : 0;
+            entry.lastOk = r.lastOk === true;
+            shards.stats.records.push(entry);
+          }
+        }
+      } catch (e) {
+        AppLogger.warn(TAG, `node sort stats shard is corrupt: ${AppLogger.errText(e)}`);
+      }
+    }
+    return shards;
+  }
+
+  /** 两个分片 → 旧形状的快照 JSON（读点零改动） */
+  private static mergeShards(shards: NodeSortShards): string {
+    const snap = new NodeSortSnapshot();
+    snap.testedAt = shards.latency.testedAt;
+    snap.mode = shards.latency.mode;
+    snap.order = shards.latency.order.slice();
+    const statsByName = new Map<string, NodeSortStatsEntry>();
+    for (const s of shards.stats.records) {
+      statsByName.set(s.name, s);
+    }
+    const seen = new Set<string>();
+    for (const l of shards.latency.records) {
+      seen.add(l.name);
+      const rec = new NodeLatencyRecord();
+      rec.name = l.name;
+      rec.latency = l.latency;
+      rec.failKind = l.failKind;
+      const st = statsByName.get(l.name);
+      if (st !== undefined) {
+        rec.failCount = st.failCount;
+        rec.lastOk = st.lastOk;
+      }
+      snap.records.push(rec);
+    }
+    // 只有记账、没有测速结论的节点也要出现在视图里（记账先于测速发生）。
+    for (const s of shards.stats.records) {
+      if (seen.has(s.name)) {
+        continue;
+      }
+      const rec = new NodeLatencyRecord();
+      rec.name = s.name;
+      rec.latency = -2;
+      rec.failKind = '';
+      rec.failCount = s.failCount;
+      rec.lastOk = s.lastOk;
+      snap.records.push(rec);
+    }
+    return snap.toJsonText();
+  }
+
+  /**
+   * 路由快照**单独写**（字段级写入口，导出让外部写者直接调用）。
+   *
+   * 用途：自动切换记账那条线（ConnectionOrchestrator）把「一次连接失败」写进
+   * 快照时，**只调这一个入口**，不再把整份快照塞回 AppSettings 再整单覆盖 ——
+   * 整单覆盖会把测速路径刚写进去的新结论整片盖掉（审计 F2/F4）。
+   *
+   * 分派规则（按字段所有权）：
+   *  - 测速结论（latency / failKind）：只有携带的批次**比盘上更新**才写；
+   *  - 记账（failCount / lastOk）：只写**相对盘上真的变了**的节点。
+   * 两类字段各有各的主人，互不覆盖。
+   */
+  static async routeSnapshotWrite(carriedText: string): Promise<void> {
+    if (carriedText.length === 0) {
+      return;
+    }
+    const carried = NodeSortSnapshot.fromJsonText(carriedText);
+    if (carried === null) {
+      return;
+    }
+    const shards = await SettingsService.readShards();
+    if (carried.testedAt > shards.latency.testedAt) {
+      const shard = new NodeSortLatencyShard();
+      shard.testedAt = carried.testedAt;
+      shard.mode = NodeSortModes.normalize(carried.mode);
+      shard.order = carried.order.slice();
+      for (const r of carried.records) {
+        const entry = new NodeSortLatencyEntry();
+        entry.name = r.name;
+        entry.latency = r.latency;
+        entry.failKind = r.failKind;
+        shard.records.push(entry);
+      }
+      await SettingsService.putShard(KEY_NODE_SORT_LATENCY, JSON.stringify(shard));
+    }
+    const changed = SettingsService.changedStatsEntries(shards.stats, carried);
+    if (changed.length > 0) {
+      for (const entry of changed) {
+        let replaced = false;
+        for (const cur of shards.stats.records) {
+          if (cur.name === entry.name) {
+            cur.failCount = entry.failCount;
+            cur.lastOk = entry.lastOk;
+            replaced = true;
+            break;
+          }
+        }
+        if (!replaced) {
+          shards.stats.records.push(entry);
+        }
+      }
+      await SettingsService.putShard(KEY_NODE_SORT_STATS, JSON.stringify(shards.stats));
+    }
+  }
+
+  /** 记账分片里「相对盘上真的变了」的条目 */
+  private static changedStatsEntries(current: NodeSortStatsShard, carried: NodeSortSnapshot): NodeSortStatsEntry[] {
+    const out: NodeSortStatsEntry[] = [];
+    for (const r of carried.records) {
+      const entry = new NodeSortStatsEntry();
+      entry.name = r.name;
+      entry.failCount = r.failCount;
+      entry.lastOk = r.lastOk;
+      let found = false;
+      for (const cur of current.records) {
+        if (cur.name === r.name) {
+          found = true;
+          if (cur.failCount !== r.failCount || cur.lastOk !== r.lastOk) {
+            out.push(entry);
+          }
+          break;
+        }
+      }
+      if (!found) {
+        // 新出现的节点：只有真的记了东西才写（failCount=0 且从未成功 = 无信息）。
+        if (r.failCount > 0 || r.lastOk) {
+          out.push(entry);
+        }
+      }
+    }
+    return out;
+  }
+
+  /** 读整单 JSON 里那个**已废弃**的 nodeSortSnapshot 字段（只用于旧装机迁移） */
+  private static async readLegacySnapshotField(): Promise<string> {
+    if (SettingsService.store === null) {
+      return '';
+    }
+    const raw = await SettingsService.store.get(KEY_SETTINGS, '') as string;
+    if (raw.length === 0) {
+      return '';
+    }
+    try {
+      const j = JSON.parse(raw) as AppSettingsJson;
+      if (j === null || typeof j !== 'object') {
+        return '';
+      }
+      return typeof j.nodeSortSnapshot === 'string' ? j.nodeSortSnapshot : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /** 写一个分片 key */
+  private static async putShard(key: string, value: string): Promise<void> {
+    if (SettingsService.store === null) {
+      return;
+    }
+    await SettingsService.store.put(key, value);
+    await SettingsService.store.flush();
   }
 
   /**

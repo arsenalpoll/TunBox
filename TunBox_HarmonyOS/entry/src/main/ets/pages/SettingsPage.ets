@@ -25,6 +25,7 @@ import { TopNavBar } from '../components/TopNavBar';
 import { AppInfo } from '../commons/utils/AppInfo';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
+import { LatencyTestUrl } from '../commons/latency/LatencyProbe';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { GeoAssetStatus } from '../commons/services/ConnectionOrchestrator';
@@ -74,6 +75,11 @@ export struct SettingsView {
   @State assetSource: string = 'auto';
   @State geoUpdatingId: string = '';
   @State quotaNotifyEnabled: boolean = true;
+  // ── 测速地址 ──
+  /** 输入框里的测速地址（未保存的编辑态） */
+  @State testLatencyUrl: string = '';
+  /** 合法性提示（空串 = 合法） */
+  @State testUrlError: string = '';
   // ── 关于与隐私 ──
   @State privacyUrl: string = '';
   /** 顶栏标题（app.string.settings_title 的本地化取值；TopNavBar.title 为 string 型） */
@@ -112,6 +118,7 @@ export struct SettingsView {
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
     this.assetSource = this.settings.assetSource;
+    this.testLatencyUrl = this.settings.testLatencyUrl;
     this.refreshGeoStatuses();
     this.refreshNodeAndSwitchInfo();
     this.refreshPrivacyLink();
@@ -177,7 +184,10 @@ export struct SettingsView {
   private setQuotaNotify(v: boolean): void {
     this.quotaNotifyEnabled = v;
     this.settings.quotaNotifyEnabled = v;
-    SettingsService.save(this.settings).then((): void => {
+    // 字段级写：只改这一个字段（整单覆盖会把别的写者刚写的值盖回旧值）
+    SettingsService.patchSettings((s: AppSettings): void => {
+      s.quotaNotifyEnabled = v;
+    }).then((): void => {
       promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
     }).catch((): void => {
       promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
@@ -224,11 +234,61 @@ export struct SettingsView {
     }
     this.assetSource = source;
     this.settings.assetSource = source;
-    SettingsService.save(this.settings).then((): void => {
+    // 字段级写：只改这一个字段
+    SettingsService.patchSettings((s: AppSettings): void => {
+      s.assetSource = source;
+    }).then((): void => {
       promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
     }).catch((): void => {
       promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
     });
+  }
+
+  // ── 测速地址（前台批 / 后台批 / 生成器 smart 组共用同一真源）──
+
+  /**
+   * 测速地址的合法性校验（**判定表唯一真源在测速内核**：
+   * `LatencyTestUrl.isValid` —— 同一套规则既管「能不能存」也管「怎么回落」，
+   * 免得 UI 判一套、内核判另一套，审计 F12）。
+   * @return 空串 = 合法；非空 = 提示文案（此时**不落盘**，绝不静默改写用户填的值）
+   */
+  private validateTestUrl(raw: string): string {
+    const url: string = raw.trim();
+    if (url.length === 0) {
+      return '';
+    }
+    if (!LatencyTestUrl.isValid(url)) {
+      return '格式无效：需以 http:// 或 https:// 开头，且不能含空格';
+    }
+    return '';
+  }
+
+  /** 保存测速地址（字段级写：只改这一个字段） */
+  private async saveTestUrl(): Promise<void> {
+    const raw: string = this.testLatencyUrl.trim();
+    const problem: string = this.validateTestUrl(raw);
+    this.testUrlError = problem;
+    if (problem.length > 0) {
+      // 非法值**不落盘**：宁可让用户看见报错，也不替他猜一个地址。
+      promptAction.showToast({ message: problem });
+      return;
+    }
+    // 留空 = 用默认地址（https）。用户自填的 http 原样保存（个别出口掐 TLS SNI，
+    // http 才能测通 —— 真机 a3fe45d）。
+    const value: string = raw.length === 0 ? LatencyTestUrl.DEFAULT_URL : raw;
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.testLatencyUrl = value;
+    });
+    this.settings.testLatencyUrl = value;
+    this.testLatencyUrl = value;
+    promptAction.showToast({ message: '测速地址已保存' });
+  }
+
+  /** 恢复默认测速地址 */
+  private async resetTestUrl(): Promise<void> {
+    this.testLatencyUrl = LatencyTestUrl.DEFAULT_URL;
+    this.testUrlError = '';
+    await this.saveTestUrl();
   }
 
   // ── UI ────────────────────────────────────────────────────────────
@@ -316,6 +376,60 @@ export struct SettingsView {
             .backgroundColor(TunBoxColors.surfaceCard)
             .border({ width: 1, color: TunBoxColors.cardBorder })
             .onClick(() => router.pushUrl({ url: 'pages/RulesPage' }))
+
+            // ── 测速地址（前台批 / 后台批 / 生成器 smart 组共用同一真源）──
+            Column({ space: 10 }) {
+              Row({ space: 8 }) {
+                Row() {
+                  Image($r('app.media.ic_radar'))
+                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                }
+                .width(28).height(28).borderRadius(8)
+                .backgroundColor(TunBoxColors.primaryLight)
+                .justifyContent(FlexAlign.Center)
+                Text('测速地址').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Blank()
+              }.width('100%').alignItems(VerticalAlign.Center)
+              TextInput({ text: this.testLatencyUrl, placeholder: LatencyTestUrl.DEFAULT_URL })
+                .height(40)
+                .fontSize(13)
+                .backgroundColor(TunBoxColors.surfaceSubtle)
+                .borderRadius(10)
+                .onChange((value: string): void => {
+                  this.testLatencyUrl = value;
+                  this.testUrlError = this.validateTestUrl(value);
+                })
+              if (this.testUrlError.length > 0) {
+                Text(this.testUrlError)
+                  .fontSize(11).fontColor(TunBoxColors.danger).width('100%')
+              } else {
+                Text('留空＝使用默认地址。默认走 HTTPS：明文测速地址容易被机场/落地劫持，'
+                  + '会让整批测速变红。自填的 http 会原样使用（个别出口掐 TLS SNI，http 才测得通）。')
+                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+              }
+              Row({ space: 8 }) {
+                Text('保存')
+                  .fontSize(13).fontWeight(FontWeight.Bold)
+                  .fontColor(this.testUrlError.length > 0 ? TunBoxColors.textMuted : TunBoxColors.primary)
+                  .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+                  .borderRadius(12)
+                  .backgroundColor(TunBoxColors.surfaceCard)
+                  .border({ width: 1, color: TunBoxColors.cardBorder })
+                  .onClick((): void => { this.saveTestUrl(); })
+                Text('恢复默认')
+                  .fontSize(13).fontWeight(FontWeight.Bold)
+                  .fontColor(TunBoxColors.textSecondary)
+                  .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+                  .borderRadius(12)
+                  .backgroundColor(TunBoxColors.surfaceCard)
+                  .border({ width: 1, color: TunBoxColors.cardBorder })
+                  .onClick((): void => { this.resetTestUrl(); })
+              }.width('100%')
+            }
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
 
             // ── 诊断（保留订阅配额提醒）──
             Column({ space: 12 }) {

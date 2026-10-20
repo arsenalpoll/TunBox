@@ -396,9 +396,12 @@ check('ClashConfigGenerator 逐字节未变（除 unified-delay 以外本次不�
   assert.strictEqual(hash, expected,
     `ClashConfigGenerator changed (${hash} != ${expected}); if intentional, update latency-gen-fingerprint.json`);
 });
-check('生成器仍启用 unified-delay（测速 URL 必须 HTTPS 的原因）', () => {
+check('生成器关闭 unified-delay（与 FlClash 对齐：单次请求）', () => {
   const gen = fs.readFileSync(rel(svc + 'ClashConfigGenerator.ets'), 'utf8');
-  assert.ok(/unified-delay: true/.test(gen), 'unified-delay must stay enabled');
+  // mihomo 的 UnifiedDelay 默认 false；FlClash 从不打开。打开会让 URLTest 连发两次
+  // HEAD，第二次的结果才作数 → 出口不欢迎第二次 HEAD 时整批节点被判失败。
+  assert.ok(/unified-delay: false/.test(gen), 'unified-delay must stay disabled (FlClash parity)');
+  assert.ok(!/unified-delay: true/.test(gen), 'unified-delay must not be enabled');
 });
 
 // ── 12. 文档 ──────────────────────────────────────────────────────────────

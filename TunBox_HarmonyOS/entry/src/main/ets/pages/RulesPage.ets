@@ -99,7 +99,10 @@ export struct RulesView {
   private async saveYamlOverride(): Promise<void> {
     const text = this.yamlOverrideText.slice(0, 8192);
     this.settings.yamlOverride = text;
-    await SettingsService.save(this.settings);
+    // 字段级写入口（审计 F2）：只写覆盖层这一个字段。
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.yamlOverride = text;
+    });
     promptAction.showToast({ message: '覆盖层已保存，下次连接/热重载生效' });
   }
 
@@ -133,7 +136,10 @@ export struct RulesView {
     this.settings.customRuleSets = normalized;
     this.rsName = '';
     this.rsUrl = '';
-    await SettingsService.save(this.settings);
+    // 字段级写入口（审计 F2）：只写规则集这一个字段。
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.customRuleSets = normalized;
+    });
     const outcome = await this.orchestrator.applyRulesChanged('rulesChanged');
     const effect = outcome === 'hot' ? '已即时生效（未重建隧道）'
       : (outcome === 'reconnect' ? '正在自动重连' : '下次连接生效');
@@ -149,7 +155,10 @@ export struct RulesView {
     }
     this.ruleSets = kept;
     this.settings.customRuleSets = kept;
-    await SettingsService.save(this.settings);
+    // 字段级写入口（审计 F2）：只写规则集这一个字段。
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.customRuleSets = kept;
+    });
     const outcome = await this.orchestrator.applyRulesChanged('rulesChanged');
     const effect = outcome === 'hot' ? '已即时生效（未重建隧道）'
       : (outcome === 'reconnect' ? '正在自动重连' : '下次连接生效');
@@ -167,7 +176,13 @@ export struct RulesView {
     this.settings.customRuleSets = this.ruleSets;
     this.customRulesText = normalized.join('\n');
     this.refreshRuleErrors();
-    await SettingsService.save(this.settings);
+    // 字段级写入口（审计 F2）：只写这四个字段，其余字段从盘上最新值原样带走。
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.rulesEnabled = this.rulesEnabled;
+      s.hyperAdRulesEnabled = this.hyperAdRulesEnabled;
+      s.customRules = normalized;
+      s.customRuleSets = this.ruleSets;
+    });
     const outcome = await this.orchestrator.applyRulesChanged('rulesChanged');
     const suffix = invalidCount > 0 ? `，已忽略 ${invalidCount} 条无效规则` : '';
     const effect = outcome === 'hot' ? '已即时生效（未重建隧道）'

@@ -1,0 +1,9 @@
+## AnyTLS 订阅样本
+##
+## 形态：anytls://口令@host:port?sni=…&insecure=1&alpn=…&fp=…#名称
+## 历史上出过「36 个 anytls 因解析丢凭据被丢弃」——这里逐条盯住凭据（口令）与
+## 证书指纹（pcs/pinSHA256），闸门用 sha256 摘要比对证明它们一字未改。
+## 凭据全假。
+
+anytls://fake-anytls-password@sg-anytls-01.example.test:443?sni=sg-anytls-01.example.test&insecure=1&alpn=h2%2Chttp%2F1.1&fp=chrome&idle_session_check_interval=30&idle_session_timeout=30&min_idle_session=0#%E6%96%B0%E5%8A%A0%E5%9D%A1%20AnyTLS%2001
+anytls://fake-anytls-password-2@jp-anytls-02.example.test:8443?sni=jp-anytls-02.example.test&fp=firefox&pcs=8xK2mQ7pR3vN9wT5yB1cF4gH6jL0zD2eK1sV0bM#%E6%97%A5%E6%9C%AC%20AnyTLS%2002

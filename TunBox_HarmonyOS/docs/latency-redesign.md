@@ -153,3 +153,20 @@
 > 真正会让整份配置拒载的是**带引号**的 `"true"/"false"/"1"/"0"`
 > （`cannot unmarshal !!str \`true\` into bool`）。
 > 交叉验证脚本：`scripts/verify-config-validator-kernel.mjs`。
+
+## 八、2026-10-20 指纹变更说明（A12c：测速地址单一真源）
+
+`scripts/latency-gen-fingerprint.json` 的 `sha256_16` 由 `a51e7dd946dcb136` 更新为
+`4f1c772e9662ca2c` —— 原因是**测速地址此前有两份实现**（审计 F12），本次把规则收敛到唯一真源
+`commons/latency/LatencyTestUrl.ets`（零 import ⇒ 不会形成循环依赖）。与测速引擎本身无关。
+
+| 项 | 改动 | 目的 |
+|---|---|---|
+| A12c-1 | 新增 `import { LatencyTestUrl } from '../latency/LatencyTestUrl'` | 测速地址规则的唯一真源（`LatencyTestUrl.effective()`） |
+| A12c-2 | `generate()` 末尾新增**可选**参数 `smartTestUrl: string = ''`；调用方（`RuntimeConfigBuilder`）传入用户填的原始值 | 生成器**不再自己读用户的测速设置**，也不再有「参数从哪来」的第二条通路 |
+| A12c-3 | smart 组的 `url` 改由 `LatencyTestUrl.effective(smartTestUrl)` 决定 | 原来直接读 `settings.testLatencyUrl`，**非法值不校验**（能写进 YAML）；现在非法/空 → 默认 https（与内核默认一致） |
+| A12c-4 | `safeGroupUrl()` 去掉自带的 `http(s)` 前缀判定与 gstatic 兜底常量，改调 `LatencyTestUrl.effective()` / `LatencyTestUrl.DEFAULT_URL` | 订阅自己声明的 url **仍原样保留**、YAML 安全检查与转义**不变**；只有「合法性/默认值」这一段规则改由真源决定（历史 http 默认值按真源口径升级为 https） |
+
+> 复现门禁：`node scripts/verify-latency-core-v2.mjs`（A12c 项，本次 **65 passed / 0 failed**）
+> 与 `node scripts/verify-generator-fingerprint.mjs`（指纹一致）。
+> 与本次改动同批的还有 `scripts/verify-config-single-source.mjs`（唯一生成入口，42/0）。

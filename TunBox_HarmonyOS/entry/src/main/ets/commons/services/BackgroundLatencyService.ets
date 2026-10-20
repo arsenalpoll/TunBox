@@ -19,19 +19,20 @@
  *
  *  - 冷启动后静默补齐缺失的延迟（`scheduleStartup`）；
  *  - 新订阅导入后只测该订阅的节点（`testSubscription`）；
- *  - 不产生 Toast / 弹窗 / 进度提示，只渐进更新 `LatencyController`；
+ *  - 不产生 Toast / 弹窗 / 进度提示，只渐进更新进程内实时视图（LatencyLiveView）；
  *  - 走真实内核协议栈（`ensureLatencyApi`），不把 TCP 可达性冒充代理延迟。
  *    内核确实不可用时，引擎会退化为**明确标注**的离线粗略通道（状态 OFFLINE），
  *    且**绝不**把通道故障写成节点超时。
  */
 import { AppLogger } from '../utils/AppLogger';
 import { ConnectionOrchestrator } from './ConnectionOrchestrator';
-import { LatencyController } from './LatencyController';
+import { LatencyLiveView } from './LatencyLiveView';
 import { LatencyEngine, LatencyRunOptions, LATENCY_TIMEOUT_MS } from './LatencyEngine';
 import { AppSettings } from '../models/AppSettings';
 import { ProxyNode } from '../models/ProxyNode';
 import { SettingsService } from './SettingsService';
 import { SubscriptionService } from './SubscriptionService';
+import { effectiveTestUrl } from '../latency/LatencyProbe';
 
 const TAG = 'BackgroundLatency';
 /** 冷启动静默测速的延迟：让首屏渲染与订阅加载先完成，别和 UI 抢资源。 */
@@ -117,7 +118,9 @@ export class BackgroundLatencyService {
   }
 
   /**
-   * 本批使用的测速 URL（**与 `NodeSelectionPage.testUrlForLatency` 同一口径**）。
+   * 本批使用的测速 URL —— **走测速内核的单一真源**
+   * `effectiveTestUrl`（commons/latency/LatencyProbe；审计 F12：
+   * 前台批 / 后台批 / 生成器 smart 组曾各写一份口径，必然漂移）。
    *
    *  - **兜底目标**（用户没填 / 填了非法值）→ 默认 **HTTPS** 测速地址。
    *    理由：明文测速地址会被机场/落地劫持（mihomo 官方点名
@@ -126,17 +129,11 @@ export class BackgroundLatencyService {
    *  - **用户自填的 URL**（http 或 https 都算）→ **原样保留**，这里不做任何改写。
    *    真机 commit `a3fe45d` 实证：个别出口掐 gstatic 的 TLS SNI，
    *    同一个出口 https Timeout 而 http 1158ms —— 用户自填 http 是有意为之。
+   *
+   * 保留本方法只为兼容既有调用点；新代码直接用 LatencyProbe 的 effectiveTestUrl。
    */
   static resolveTestUrl(settings: AppSettings): string {
-    const configured: string = settings.testLatencyUrl.trim();
-    if (configured.length > 0 && /^https?:\/\/\S+$/.test(configured)) {
-      return configured;
-    }
-    if (configured.length > 0) {
-      AppLogger.warn(TAG, `silent batch test url "${configured}" is invalid; `
-        + `falling back to default ${AppSettings.DEFAULT_TEST_URL}`);
-    }
-    return AppSettings.DEFAULT_TEST_URL;
+    return effectiveTestUrl(settings);
   }
 
   /**
@@ -185,11 +182,11 @@ export class BackgroundLatencyService {
       opts.timeoutMs = LATENCY_TIMEOUT_MS;
       opts.source = 'auto';            // 静默批：auto 来源的失败 UI 显示中性「未测」
       opts.onProgress = null;          // 静默：不驱动任何 UI
-      opts.onResult = null;            // LatencyController 自己会通知监听者
+      opts.onResult = null;            // 实时视图自己会通知监听者
       const run = LatencyEngine.start(api, nodes, url, opts);
       const progress = await run.run();
       LatencyEngine.release(run);
-      LatencyController.flushNow();
+      LatencyLiveView.flushNow();
 
       AppLogger.info(TAG, `silent batch done nodes=${nodes.length} `
         + `channel=${progress.channel} measured=${progress.measured} timeout=${progress.timeout} `

@@ -1,0 +1,56 @@
+# Clash YAML 样本：完整节点（YAML 路径保真的正例）
+# 全部是假凭据 / example.test 域名，不得含任何真实凭据。
+proxies:
+  - name: "Y-REALITY-01"
+    type: vless
+    server: de152710bb8b70d108ec13c7.mitce-nocontact.com
+    port: 443
+    uuid: 11111111-2222-3333-4444-555555555555
+    network: ws
+    tls: true
+    servername: www.example.test
+    client-fingerprint: chrome
+    flow: xtls-rprx-vision
+    reality-opts:
+      public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      short-id: 0123456789abcdef
+    ws-opts:
+      path: /ray
+      headers:
+        Host: www.example.test
+  - name: "Y-VMESS-01"
+    type: vmess
+    server: vmess.example.test
+    port: 443
+    uuid: 66666666-7777-8888-9999-000000000000
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: vmess.example.test
+    network: ws
+    ws-opts:
+      path: /vm
+      headers:
+        Host: vmess.example.test
+  - name: "Y-TROJAN-01"
+    type: trojan
+    server: trojan.example.test
+    port: 443
+    password: trojan-pass-001
+    sni: trojan.example.test
+  - name: "Y-SS-01"
+    type: ss
+    server: ss.example.test
+    port: 8388
+    cipher: aes-256-gcm
+    password: ss-pass-001
+  - name: "Y-HY2-01"
+    type: hysteria2
+    server: hy2.example.test
+    port: 443
+    password: hy2-pass-001
+    sni: hy2.example.test
+    obfs: salamander
+    obfs-password: hy2-obfs-001
+    up: "50Mbps"
+    down: "200Mbps"

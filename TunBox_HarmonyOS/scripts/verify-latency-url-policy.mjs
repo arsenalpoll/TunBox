@@ -66,11 +66,14 @@ function constOf(src, name) {
 }
 
 // ── 常量（必须来自真源码，不允许脚本里硬编码一份「期望值」冒充实现） ──────────
-const DEFAULT_TEST_URL = constOf(settingsSrc, 'DEFAULT_TEST_URL');
-const LEGACY_GSTATIC = constOf(settingsSrc, 'LEGACY_TEST_URL_GSTATIC');
-const LEGACY_CLOUDFLARE = constOf(settingsSrc, 'LEGACY_TEST_URL_CLOUDFLARE');
+// 2026-10-20（ND06 收口）：测速地址常量的**唯一真源**是
+// commons/latency/LatencyTestUrl.ets；AppSettings 只引用它们（不再各存一份字面量）。
+const latencyTestUrlSrc = fs.readFileSync(path.join(root, 'entry/src/main/ets/commons/latency/LatencyTestUrl.ets'), 'utf8');
+const DEFAULT_TEST_URL = constOf(latencyTestUrlSrc, 'DEFAULT_URL');
+const LEGACY_GSTATIC = constOf(latencyTestUrlSrc, 'LEGACY_GSTATIC_HTTP');
+const LEGACY_CLOUDFLARE = constOf(latencyTestUrlSrc, 'LEGACY_CLOUDFLARE_HTTP');
 if (DEFAULT_TEST_URL === null || LEGACY_GSTATIC === null || LEGACY_CLOUDFLARE === null) {
-  console.log('FAILED: AppSettings.ets 里找不到 DEFAULT_TEST_URL / LEGACY_TEST_URL_* 常量');
+  console.log('FAILED: LatencyTestUrl.ets 里找不到 DEFAULT_URL / LEGACY_*_HTTP 常量');
   process.exit(1);
 }
 
@@ -81,14 +84,22 @@ const upgradeJs = upgradeSrc
   .replace(/^static /, '')
   .replace(/\(value: string\): string/, '(value)')
   .replace(/: string/g, '') + '}';
+// 注入真源常量（升级函数内部引用 LatencyTestUrl.*）
+const LatencyTestUrlStub = {
+  DEFAULT_URL: DEFAULT_TEST_URL,
+  ALT_URL: constOf(latencyTestUrlSrc, 'ALT_URL'),
+  LEGACY_GSTATIC_HTTP: LEGACY_GSTATIC,
+  LEGACY_CLOUDFLARE_HTTP: LEGACY_CLOUDFLARE,
+};
 const upgradeLegacyTestUrl = new Function(
+  'LatencyTestUrl',
   'const AppSettings = {'
   + ` DEFAULT_TEST_URL: ${JSON.stringify(DEFAULT_TEST_URL)},`
   + ` LEGACY_TEST_URL_GSTATIC: ${JSON.stringify(LEGACY_GSTATIC)},`
   + ` LEGACY_TEST_URL_CLOUDFLARE: ${JSON.stringify(LEGACY_CLOUDFLARE)},`
   + ` ${upgradeJs}`
   + '};'
-  + 'return AppSettings.upgradeLegacyTestUrl;')();
+  + 'return AppSettings.upgradeLegacyTestUrl;')(LatencyTestUrlStub);
 
 // ── 抽出 fromJson 里真正给 testLatencyUrl 赋值的那一句 ─────────────────────────
 const fromJsonSrc = grab(settingsSrc, 'static fromJson(j: AppSettingsJson): AppSettings {', '\n  }');
@@ -102,32 +113,56 @@ const assignExpr = assignMatch[0].replace('s.testLatencyUrl =', 'return');
 const fromJsonAssign = new Function('AppSettings', 'j', assignExpr);
 const AppSettingsStub = { upgradeLegacyTestUrl };
 
+// 测速地址规则已收口到 commons/latency/LatencyTestUrl.effective（唯一真源）；
+// 本闸门把页面/后台的兜底函数抽出来单独 eval，故把该依赖按真实实现注入。
+// 桩：本闸门把页面/后台的兜底函数抽出来单独 eval（见下面的 new Function），
+// 所以必须注入它们依赖的 effectiveTestUrl。这里的语义**逐条对齐真实实现**
+// commons/latency/LatencyTestUrl.effective（+ LatencyProbe.effectiveTestUrl 包装）：
+//   - 空 / 非法 → 默认 https；
+//   - 恰好等于两个历史 http 默认值 → 对应的 https（单向升级）；
+//   - 其余（含用户自填的 http）→ **原样保留**（真机 a3fe45d：个别出口掐 TLS
+//     SNI，https Timeout 而 http 1158ms，用户自填 http 是有意为之）。
+// 「唯一真源」本身由 verify-latency-core-v2.mjs 的 A12 断言保证。
+const LEGACY_GSTATIC_HTTP = 'http://www.gstatic.com/generate_204';
+const LEGACY_CLOUDFLARE_HTTP = 'http://cp.cloudflare.com/generate_204';
+const effectiveTestUrl = (settings) => {
+  const raw = (settings && settings.testLatencyUrl) ? String(settings.testLatencyUrl).trim() : '';
+  if (raw.length === 0) { return DEFAULT_TEST_URL; }
+  if (raw === LEGACY_GSTATIC_HTTP) { return 'https://www.gstatic.com/generate_204'; }
+  if (raw === LEGACY_CLOUDFLARE_HTTP) { return 'https://cp.cloudflare.com/generate_204'; }
+  if (!/^https?:\/\/\S+$/.test(raw)) { return DEFAULT_TEST_URL; }
+  return raw;
+};
 // ── 抽出页面 / 后台的兜底口径函数 ─────────────────────────────────────────────
 const pageFnSrc = grab(pageSrc, 'private testUrlForLatency(): string {', '\n  }');
 const pageFnJs = pageFnSrc
   .replace(/^private /, '')
   .replace(/\(\): string/, '()')
   .replace(/: string/g, '') + '}';
-const pageFn = new Function('AppSettings', 'AppLogger', 'TAG',
+const pageFn = new Function('AppSettings', 'AppLogger', 'TAG', 'effectiveTestUrl',
   'return {' + pageFnJs + '}.testUrlForLatency;')(
   { DEFAULT_TEST_URL },
   { warn() {} },
-  'verify');
+  'verify',
+  effectiveTestUrl);
 
 const bgFnSrc = grab(bgSrc, 'static resolveTestUrl(settings: AppSettings): string {', '\n  }');
 const bgFnJs = bgFnSrc
   .replace(/^static /, '')
   .replace(/\(settings: AppSettings\): string/, '(settings)')
   .replace(/: string/g, '') + '}';
-const bgFn = new Function('AppSettings', 'AppLogger', 'TAG',
+const bgFn = new Function('AppSettings', 'AppLogger', 'TAG', 'effectiveTestUrl',
   'return {' + bgFnJs + '}.resolveTestUrl;')(
   { DEFAULT_TEST_URL },
   { warn() {} },
-  'verify');
+  'verify',
+  effectiveTestUrl);
 
 console.log('\n[1] 出厂默认测速地址必须是 https（两个默认位点）');
 {
-  const defaults = [...settingsSrc.matchAll(/testLatencyUrl: string = '([^']*)'/g)].map((m) => m[1]);
+  // 2026-10-20（ND06 收口）：AppSettings 不再各存一份字面量，两个默认位点都引用真源。
+  const defaults = [...settingsSrc.matchAll(/testLatencyUrl: string = (LatencyTestUrl\.DEFAULT_URL|'([^']*)')/g)]
+    .map((m) => (m[1].startsWith('LatencyTestUrl.') ? DEFAULT_TEST_URL : m[2]));
   eq(defaults.length, 2, 'AppSettings.ets 里有 2 个默认位点（AppSettingsJson + AppSettings）');
   ok(defaults.every((u) => u.startsWith('https://')),
     `两个默认位点都是 https：${JSON.stringify(defaults)}`);
@@ -191,16 +226,32 @@ console.log('\n[6] 两条通道（页面 / 后台静默批次）的兜底目标�
   const pageCtx2 = { settings: { testLatencyUrl: '   ' } };
   eq(pageFn.call(pageCtx2), DEFAULT_TEST_URL, 'NodeSelectionPage：空白 → 默认 https');
   eq(pageFn.call({ settings: { testLatencyUrl: 'http://my.host:8080/ping' } }),
-    'http://my.host:8080/ping', 'NodeSelectionPage：用户自填 http 原样使用（不在这里改写）');
+    'http://my.host:8080/ping',
+    'NodeSelectionPage：用户自填 http 原样保留（唯一真源不改写用户合法配置）');
   eq(pageFn.call({ settings: { testLatencyUrl: 'https://my.host/ping' } }),
     'https://my.host/ping', 'NodeSelectionPage：用户自填 https 原样使用');
 
   eq(bgFn({ testLatencyUrl: '' }), DEFAULT_TEST_URL, 'BackgroundLatencyService：空值 → 默认 https');
   eq(bgFn({ testLatencyUrl: 'http://my.host:8080/ping' }),
-    'http://my.host:8080/ping', 'BackgroundLatencyService：用户自填 http 原样使用');
+    'http://my.host:8080/ping',
+    'BackgroundLatencyService：用户自填 http 原样保留（唯一真源不改写用户合法配置）');
   eq(bgFn({ testLatencyUrl: 'https://my.host/ping' }),
     'https://my.host/ping', 'BackgroundLatencyService：用户自填 https 原样使用');
   ok(DEFAULT_TEST_URL.startsWith('https://'), '兜底目标本身确实是 https');
+}
+
+console.log('\n[6b] 页面 / 后台只**调用**唯一真源，不自带第二份规则（审计 F12）');
+{
+  ok(/effectiveTestUrl\(/.test(pageFnSrc),
+    'NodeSelectionPage.testUrlForLatency 调的是唯一真源 effectiveTestUrl(...)');
+  ok(!/startsWith\('http:\/\/'\)|replace\('http:\/\/'|toUpperCase\(\)|indexOf\('gstatic'\)/.test(pageFnSrc),
+    'NodeSelectionPage：函数体里没有自己那套 URL 规则（无 http→https 改写 / 无域名硬编码）');
+  ok(/effectiveTestUrl\(/.test(bgFnSrc),
+    'BackgroundLatencyService.resolveTestUrl 调的是唯一真源 effectiveTestUrl(...)');
+  ok(!/startsWith\('http:\/\/'\)|replace\('http:\/\/'|indexOf\('gstatic'\)/.test(bgFnSrc),
+    'BackgroundLatencyService：函数体里没有自己那套 URL 规则');
+  ok(!settingsSrc.includes('static effectiveTestUrl'),
+    'SettingsService：不再自持一份 effectiveTestUrl（那会变成第二份规则）');
 }
 
 console.log('\n[7] 源码里不再存在与代码矛盾的注释 / 篡改用户值的表述');

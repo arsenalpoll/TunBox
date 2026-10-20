@@ -49,7 +49,9 @@ const KNOWN_BASELINE_FAILURES = {
     reason: '需要真实订阅 fixture（test/fixtures/real-subscription.yaml），仓库不含该文件；'
       + '脚本按设计在"没跑"时返回失败，避免把"没验证"当成"通过"',
     howToConfirm: '无 fixture 时脚本自身打印「0 passed, 0 failed, 0 run — 视为失败」'
-  }
+  },
+  // 2026-10-20：旧实现清退闸门**已达成**（LP01..LP13 全绿，LP14/LP15 为永久豁免）
+  // ⇒ 已从白名单里删除，不再豁免。
 };
 
 /** 需要额外参数的脚本：给它们准备好参数，否则它们会因为"用法错误"失败。 */

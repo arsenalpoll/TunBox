@@ -55,6 +55,14 @@ const stripEnums = (s) => s.replace(/export enum (\w+) \{([\s\S]*?)\n\}/g, (m, n
 const stage1 = (f) => stripEnums(flatten(fs.readFileSync(f, 'utf8')));
 
 w('ProxyNode.ts', stage1(path.join(models, 'ProxyNode.ets')));
+// 2026-10-20（yaml-sub 的订阅解析内核化）：ProxyNode 已改走规范解析层，
+// 这几个模块是它的运行时依赖，必须一起暂存，否则 import 解析不到直接挂。
+const subDir = path.join(ets, 'commons/subscription');
+w('ProtocolParamTable.ts', stage1(path.join(subDir, 'ProtocolParamTable.ets')));
+w('NodeUsability.ts', stage1(path.join(subDir, 'NodeUsability.ets')));
+w('UnusableLedger.ts', stage1(path.join(subDir, 'UnusableLedger.ets')));
+w('UriNodeParser.ts', stage1(path.join(subDir, 'UriNodeParser.ets')));
+w('ProxyNodeAdapter.ts', stage1(path.join(subDir, 'ProxyNodeAdapter.ets')));
 w('AppLogger.ts', `
 export class AppLogger {
   static info() {}

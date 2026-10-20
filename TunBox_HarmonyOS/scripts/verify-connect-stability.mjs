@@ -226,6 +226,8 @@ const settingsRaw = readText(settingsPath);
 const homeRaw = readText(homePath);
 
 const orch = codeOnly(orchRaw);
+// 2026-10-20（ND11）：DoH hosts 的唯一来源是 RuntimeConfigBuilder（预算常量在这里）。
+const builderLit = stripComments(readText(path.join(etsRoot, 'commons', 'config', 'RuntimeConfigBuilder.ets')));
 const orchLit = stripComments(orchRaw);
 const api = codeOnly(apiRaw);
 const apiLit = stripComments(apiRaw);
@@ -387,8 +389,12 @@ console.log('[B9] 钉选失败不得静默（抛错或留痕 + 读回校验）')
 // ═══════════════════════════════════════════════════════════════════════
 console.log('[B10] DoH 预算固定 6000ms（不得再有 1500 收紧分支）');
 {
-  ok('b10.budget-6000-literal', /DoHResolver\.resolveMany\(serverDomains,\s*6000,\s*priorityDomains\)/.test(orch),
-    '缺少 `DoHResolver.resolveMany(serverDomains, 6000, priorityDomains)`');
+  // 2026-10-20（ND11 收口）：DoH 解析入口收口到 RuntimeConfigBuilder.resolveSharedHosts
+  // ⇒ 编排器不再自己调 resolveMany ⇒ 预算常量的真源变成 RuntimeConfigBuilder.DOH_BUDGET_MS。
+  const dohBudgetConst = /static readonly DOH_BUDGET_MS:\s*number\s*=\s*6000/.test(builderLit)
+    || /resolveMany\(domains,\s*6000,/.test(builderLit);
+  ok('b10.budget-6000-literal', dohBudgetConst,
+    'DoH 预算必须是固定 6000ms（真源：RuntimeConfigBuilder.DOH_BUDGET_MS）');
   ok('b10.no-dynamic-budget', !/dohBudgetMs/.test(orch),
     '仍存在 `dohBudgetMs` 动态预算（0.4.0 的 1500ms 收紧分支）');
   ok('b10.no-pin-shortcut', !/hasUsablePin\(priorityDomain\)/.test(orch),
@@ -483,12 +489,15 @@ console.log("[D14] HomePage.applyProxyMode 在 mode === 'direct' 时不落盘");
   }
   ok('d14.direct-guard', guardBody !== null,
     "缺少 `if (mode !== 'direct') { ... }` 守卫（direct 不得写盘）");
-  ok('d14.save-inside-guard', guardBody !== null && /SettingsService\.save\s*\(/.test(guardBody),
-    '守卫块里没有 SettingsService.save —— 非 direct 模式仍应落盘');
+  // 落盘入口：整单 save() 或字段级 patchSettings() 都算「落盘」
+  // （审计 F2 后设置页一律走字段级入口 patchSettings）。
+  const persistRe = /SettingsService\.(save|patchSettings)\s*\(/;
+  ok('d14.save-inside-guard', guardBody !== null && persistRe.test(guardBody),
+    '守卫块里没有落盘调用 —— 非 direct 模式仍应落盘');
 
-  const saves = at.match(/SettingsService\.save\s*\(/g) || [];
+  const saves = at.match(/SettingsService\.(save|patchSettings)\s*\(/g) || [];
   ok('d14.save-only-once', saves.length === 1,
-    `applyProxyMode 里 SettingsService.save 应只有 1 处（在 direct 守卫内），实际 ${saves.length} 处`);
+    `applyProxyMode 里落盘调用应只有 1 处（在 direct 守卫内），实际 ${saves.length} 处`);
 }
 
 // ── 汇总 ──────────────────────────────────────────────────────────────

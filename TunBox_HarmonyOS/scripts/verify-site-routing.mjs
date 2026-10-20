@@ -41,6 +41,20 @@ const extract = (source, pattern, label) => {
 const method = (source, name) => extract(source,
   new RegExp('^  (?:private )?(?:static )?(?:async )?' + name + '\\([^\\n]*\\{[\\s\\S]*?^  \\}', 'm'), name);
 const sort = extract(read('commons/services/NodeSortPersistence.ets'), /export class NodeSortModes \{[\s\S]*?^\}/m, 'NodeSortModes');
+// 测速地址真源（LatencyTestUrl）被 ClashConfigGenerator 引用 —— 本闸门不测它，
+// 桩一份最小实现，避免「生成器 import 了一个本闸门没暂存的模块」而整个崩掉。
+const latencyTestUrlStub = `
+export class LatencyTestUrl {
+  static readonly DEFAULT_URL: string = 'https://www.gstatic.com/generate_204';
+  static readonly MAX_LENGTH: number = 512;
+  static effective(url: string): string {
+    return url.length === 0 ? LatencyTestUrl.DEFAULT_URL : url;
+  }
+  static isValid(url: string): boolean {
+    return url.length > 0 && url.length <= LatencyTestUrl.MAX_LENGTH;
+  }
+}
+`;
 // Preserve every real field/method before the first page @Builder. Remove only
 // whole-line @State annotations, not "@..." in strings, callbacks or decorators
 // from the separate SiteInputDialog. The dialog builder alone is an SDK stub.
@@ -73,11 +87,15 @@ export class SettingsService {
   static store = store;
   static async init() {}
   static syncRawProviderGate() {} // unrelated raw subscription cleanup boundary
+  // 测速快照分片与本闸门无关（闸门验的是路由规则的读写语义）：
+  // 桩掉这两个新入口，别让「分片」把规则读写的结论搅进来。
+  static async loadNodeSortSnapshot() { return ''; }
+  static async routeSnapshotWrite() {}
 ${method(service, 'load')}
 ${method(service, 'save')}
 }
 `;
-const code = sort + '\n' + read('commons/services/AppRoutingPolicy.ets') + '\n' + policy + '\n'
+const code = latencyTestUrlStub + '\n' + sort + '\n' + read('commons/services/AppRoutingPolicy.ets') + '\n' + policy + '\n'
   + settings.replace(/^import .*;\r?\n/gm, '') + '\n' + harness + '\n' + pageClass;
 const js = stripTypeScriptTypes(code, { mode: 'strip' });
 const mod = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'));

@@ -1,0 +1,12 @@
+## Shadowsocks / ShadowsocksR 订阅样本
+##
+## ss 的两种形态都要认：
+##  - SIP002：ss://base64(method:password)@host:port#名称
+##  - 旧形态：ss://base64(method:password@host:port)#名称
+## ssr：ssr://base64(host:port:protocol:method:obfs:password/?obfsparam=…&protoparam=…&remarks=…)
+## 凭据全假。
+
+ss://YWVzLTI1Ni1nY206ZmFrZS1zcy1wYXNzd29yZA==@hk-ss-01.example.test:8388#%E9%A6%99%E6%B8%AF%20SS%2001
+ss://YWVzLTI1Ni1nY206ZmFrZS1zcy1wYXNzd29yZEBoay1zcy0wMS5leGFtcGxlLnRlc3Q6ODM4OA#%E9%A6%99%E6%B8%AF%20SS%2002
+ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpmYWtlLXNzLXBhc3N3b3JkLTJAc2ctc3MtMDIuZXhhbXBsZS50ZXN0Ojg4ODg#%E6%96%B0%E5%8A%A0%E5%9D%A1%20SS%2003
+ssr://aGstc3NyLTAxLmV4YW1wbGUudGVzdDo4Mzg4OmF1dGhfYWVzMTI4X21kNTphZXMtMTI4LWNmYjp0bHMxLjJfdGlja2V0X2F1dGg6ZmFrZS1zc3ItcGFzc3dvcmQvP29iZnNwYXJhbT0mcHJvdG9wYXJhbT0mcmVtYXJrcz02YWFaNXJpdklGTlRVaUF3TVE

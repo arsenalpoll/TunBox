@@ -92,20 +92,42 @@ const args = [
   '--incremental'
 ];
 
-const r = spawnSync(nodeExe, args, {
-  env,
-  cwd: root,
-  encoding: 'utf8',
-  maxBuffer: 128 * 1024 * 1024
-});
-const out = `${r.stdout || ''}\n${r.stderr || ''}`;
+/**
+ * 跑一次真编译。
+ *
+ * 返回 { out, arktsErrors, buildOk }。
+ *
+ * ⚠ 2026-10-20（settings-ui 实测反馈）：**ArkTS 错误数为 0 但打包/签名阶段失败**是工具链偶发
+ *   （实测一次 `Sign lib error msg : null AT entry : libs/arm64-v8a/libssrvpn_core_napi.so`，
+ *   紧接着重跑一次就 BUILD SUCCESSFUL）⇒ 这种「不是代码问题」的失败要**自动重试一次**再判红，
+ *   否则会把工具链抖动误报成代码回归（用户看到「编译红了」会去查代码，实际代码是干净的）。
+ */
+function runOnce() {
+  const r = spawnSync(nodeExe, args, {
+    env,
+    cwd: root,
+    encoding: 'utf8',
+    maxBuffer: 128 * 1024 * 1024
+  });
+  const out = `${r.stdout || ''}\n${r.stderr || ''}`;
+  const arktsErrors = out
+    .split('\n')
+    .filter((l) => /ArkTS Compiler Error|ERROR: 10605\d+|arkts-no-|Failed :entry:default@CompileArkTS|CompileArkTS.*error/i.test(l));
+  const buildOk = /BUILD SUCCESSFUL/.test(out);
+  return { out, arktsErrors, buildOk };
+}
+
+let run = runOnce();
+if (run.arktsErrors.length === 0 && !run.buildOk) {
+  console.log('  ⟳ ArkTS 错误数 = 0 但构建失败（签名/打包阶段）⇒ 自动重试一次（工具链偶发，不判红）');
+  run = runOnce();
+}
+const out = run.out;
 
 // ArkTS 编译错误 = 真失败（与签名/打包等环境问题区分开）
-const arktsErrors = out
-  .split('\n')
-  .filter((l) => /ArkTS Compiler Error|ERROR: 10605\d+|arkts-no-|Failed :entry:default@CompileArkTS|CompileArkTS.*error/i.test(l));
+const arktsErrors = run.arktsErrors;
 const compiled = /Finished :entry:default@CompileArkTS|UP-TO-DATE :entry:default@CompileArkTS/.test(out);
-const buildOk = /BUILD SUCCESSFUL/.test(out);
+const buildOk = run.buildOk;
 
 let passed = 0;
 let failed = 0;

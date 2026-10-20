@@ -27,6 +27,14 @@ const ets = etsArg >= 0 && process.argv[etsArg + 1]
 const read = path => readFileSync(resolve(ets, path), 'utf8').replace(/\r\n/g, '\n');
 const policySource = read('commons/services/AppRoutingPolicy.ets');
 const settingsSource = read('commons/models/AppSettings.ets');
+// 2026-10-20（ND06 收口）：AppSettings 的测速地址常量引用 LatencyTestUrl（唯一真源），
+// 而本闸门会剥掉 import ⇒ 这里按**真源码**把该模块的常量注入进来。
+const latencyTestUrlSrc = read('commons/latency/LatencyTestUrl.ets');
+const latencyTestUrlConst = (name) => {
+  const m = latencyTestUrlSrc.match(new RegExp("static readonly " + name + ": string = '([^']*)'"));
+  if (m === null) { throw new Error('LatencyTestUrl.ets 里找不到常量 ' + name); }
+  return m[1];
+};
 const sortSource = read('commons/services/NodeSortPersistence.ets');
 const orchestrator = read('commons/services/ConnectionOrchestrator.ets');
 const extension = read('vpnability/VpnExtensionAbility.ets');
@@ -48,11 +56,24 @@ export class MemorySettingsStore {
 export class SettingsService {
   static store = null;
   static syncRawProviderGate() {} // unrelated file cleanup boundary, no routing behavior
+  // 测速快照分片与本闸门无关（闸门验的是路由规则的读写语义）：
+  // 桩掉这两个新入口，别让「分片」把规则读写的结论搅进来。
+  static async loadNodeSortSnapshot() { return ''; }
+  static async routeSnapshotWrite() {}
 ${loadMethod}
 ${saveMethod}
 }
 `;
-const code = sortClass + '\n' + policySource + '\n' + settingsSource.replace(/^import .*;\r?\n/gm, '') + serviceHarness;
+const latencyTestUrlStub = [
+  'class LatencyTestUrl {',
+  `  static readonly DEFAULT_URL: string = ${JSON.stringify(latencyTestUrlConst('DEFAULT_URL'))};`,
+  `  static readonly ALT_URL: string = ${JSON.stringify(latencyTestUrlConst('ALT_URL'))};`,
+  `  static readonly LEGACY_GSTATIC_HTTP: string = ${JSON.stringify(latencyTestUrlConst('LEGACY_GSTATIC_HTTP'))};`,
+  `  static readonly LEGACY_CLOUDFLARE_HTTP: string = ${JSON.stringify(latencyTestUrlConst('LEGACY_CLOUDFLARE_HTTP'))};`,
+  '}'
+].join('\n');
+const code = latencyTestUrlStub + '\n' + sortClass + '\n' + policySource + '\n'
+  + settingsSource.replace(/^import .*;\r?\n/gm, '') + serviceHarness;
 const js = stripTypeScriptTypes(code, { mode: 'strip' });
 const mod = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'));
 const P = mod.AppRoutingPolicy;
@@ -210,7 +231,7 @@ const recover = extension.slice(extension.indexOf('  private async recoverCore('
 check('SOURCE connect validates settings before VPN stop/start and YAML generation', () => {
   const gate = connect.indexOf('AppRoutingPolicy.runtime(');
   assert.ok(gate >= 0 && gate < connect.indexOf('stopVpnExtensionAbility('));
-  assert.ok(gate < connect.indexOf('ClashConfigGenerator.generate('));
+  assert.ok(gate < connect.indexOf('RuntimeConfigBuilder.buildRuntimeConfig('));
   assert.ok(gate < connect.indexOf('startVpnExtensionAbility(want)'));
 });
 check('SOURCE explicit mode and one JSON list in every normal start Want', () => {

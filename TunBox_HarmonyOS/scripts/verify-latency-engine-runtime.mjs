@@ -10,7 +10,6 @@
  *   - ClashApiService 桩：可编程的 testLatencyDetailed（按节点名返回结果/抛错/延迟）
  *   - ConnectionOrchestrator 桩：记录 scheduleTestCoreRecycle 调用 + refreshLatencyEndpoint
  *   - AppLogger 桩：吞日志
- *   - DirectLatencyTester 桩：离线通道
  *   - LatencyState / LatencyController / ProxyNode：用真实实现（也是真跑的一部分）
  */
 import fs from 'node:fs';
@@ -21,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.join(here, '..');
 const svc = path.join(appRoot, 'entry/src/main/ets/commons/services/');
+const latencyDir = path.join(appRoot, 'entry/src/main/ets/commons/latency/');
 
 let passed = 0;
 let failed = 0;
@@ -61,11 +61,26 @@ const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'latency-engine-'));
 const w = (n, s) => fs.writeFileSync(path.join(stage, n), s, 'utf8');
 
 // 真实现（真跑）
-for (const f of ['LatencyState', 'LatencyController']) {
+for (const f of ['LatencyState', 'LatencyLiveView']) {
   const src = fs.readFileSync(path.join(svc, f + '.ets'), 'utf8')
-    .replace(/from '(\.\/[A-Za-z0-9_]+)'/g, "from '$1.ts'");
+    .replace(/from '(\.\/[A-Za-z0-9_]+)'/g, "from '$1.ts'")
+    // ⚠ services 侧现在会值依赖 `../latency/LatencyKinds`（零 import 的分类表）：
+    //   扁平沙箱里没有那一层目录 ⇒ 必须改写成同目录 './LatencyKinds.ts'。
+    .replace(/from '\.\.\/latency\/([A-Za-z0-9_]+)'/g, "from './$1.ts'")
+    ;
   w(f + '.ts', src);
 }
+
+// 真实现：DNS 预检结论（**零 import** 的纯模块 => 扁平沙箱可直接暂存）
+w('LatencyDnsVerdict.ts',
+  fs.readFileSync(path.join(latencyDir, 'LatencyDnsVerdict.ets'), 'utf8')
+    .replace(/from '(\.[A-Za-z0-9_/]+)'/g, "from '$1.ts'"));
+
+// 真实现：失败分类表 + 探测结果类型（**零 import** 的纯模块 => 扁平沙箱可直接暂存）
+// ⚠ 分类表住在零 import 的 LatencyKinds.ets：services 侧只值依赖零 import 模块，
+//   Node 行为闸门把 services 扁平暂存时才不会 ERR_MODULE_NOT_FOUND。
+w('LatencyKinds.ts',
+  fs.readFileSync(path.join(latencyDir, 'LatencyKinds.ets'), 'utf8'));
 
 // 桩：ProxyNode
 w('ProxyNode.ts', `
@@ -94,25 +109,9 @@ export class AppLogger {
 }
 `);
 
-// 桩：ClashApiService（含 LatencyFailKind / LatencyProbeResult 真形状）
+// 桩：ClashApiService（分类表与结果类型用**真源** LatencyKinds.ets）
 w('ClashApiService.ts', `
-export class LatencyFailKind {
-  static readonly NONE: string = '';
-  static readonly CORE_NOT_READY: string = 'core_not_ready';
-  static readonly SWITCH_FAILED: string = 'switch_failed';
-  static readonly NETWORK_UNREACHABLE: string = 'network_unreachable';
-  static readonly TIMEOUT: string = 'timeout';
-  static readonly UNSUPPORTED: string = 'unsupported';
-  static readonly PORT_ONLY: string = 'port_reachable_only';
-  static readonly UNTESTED: string = 'untested';
-  static readonly CANCELLED: string = 'cancelled';
-}
-export class LatencyProbeResult {
-  delayMs: number = -1;
-  failKind: string = '';
-  httpCode: number = 0;
-  detail: string = '';
-}
+import { LatencyProbeKind, LatencyProbeResult } from './LatencyKinds.ts';
 /** 可编程内核桩：由测试注入 handler(name) -> LatencyProbeResult | Promise。
  *  cancelInflight 忠实模拟真实实现：真实代码里是 req.destroy() → req.request 抛错
  *  → classifyTransportError() → CORE_NOT_READY（见 ClashApiService.ets:406）。
@@ -131,9 +130,17 @@ export class ClashApiService {
     ClashApiService._inflight = 0;
     ClashApiService.cancelled = 0;
     ClashApiService._pending = [];
+    ClashApiService.dnsShortCircuits = [];
   }
-  async testLatencyDetailed(name, url, timeoutMs) {
-    ClashApiService.calls.push({ name, url, timeoutMs });
+  /** DNS 预检判 unresolved 的节点：内核**一次请求都不发**（见 LatencyProbe.probeOne） */
+  static dnsShortCircuits = [];
+  async testLatencyDetailed(name, url, timeoutMs, lanes = 1, dns = null) {
+    if (dns !== null && dns !== undefined && dns.status === 'unresolved') {
+      // 忠实模拟内核行为：不记入 calls（= 没发 /delay），直接给结论
+      ClashApiService.dnsShortCircuits.push({ name, url, timeoutMs, lanes, dns });
+      return probeResult(-1, LatencyProbeKind.DNS_UNRESOLVED, 0);
+    }
+    ClashApiService.calls.push({ name, url, timeoutMs, lanes, dns });
     ClashApiService._inflight++;
     if (ClashApiService._inflight > ClashApiService.maxInflight) {
       ClashApiService.maxInflight = ClashApiService._inflight;
@@ -147,7 +154,7 @@ export class ClashApiService {
       const r = await h(name, url, timeoutMs);
       if (state.aborted) {
         // 被 destroy 的请求在真实实现里抛错并被归类为通道不可用
-        return probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0);
+        return probeResult(-1, LatencyProbeKind.CORE_NOT_READY, 0);
       }
       return r;
     } finally {
@@ -171,19 +178,6 @@ export function probeResult(delayMs, failKind = '', httpCode = 0) {
 }
 `);
 
-// 桩：DirectLatencyTester（离线通道）
-w('DirectLatencyTester.ts', `
-export class DirectLatencyTester {
-  static handler = null;
-  static reset() { DirectLatencyTester.handler = null; }
-  static async testNode(node, _timeoutMs) {
-    const h = DirectLatencyTester.handler;
-    if (h === null) { return 30; }
-    return await h(node);
-  }
-}
-`);
-
 // 桩：DoHResolver（入口域名 pin 自愈：节点 TIMEOUT 时丢 pin）
 w('DoHResolver.ts', `
 export class DoHResolver {
@@ -195,14 +189,24 @@ export class DoHResolver {
 
 // 桩：ConnectionOrchestrator（记录回收/自愈调用）
 w('ConnectionOrchestrator.ts', `
+export class LatencyHostSnapshot {
+  pins: Record<string, string> = {};
+  attempted: string[] = [];
+}
 export class ConnectionOrchestrator {
   static recycles = [];
   static recoverCalls = 0;
   static recoverResult = true;
+  /** 可配置的 DNS 快照：{ pins: {...}, attempted: [...] } */
+  static snapshot = null;
+  /** hostSnapshot() 被调用的次数（引擎应当**每批一次**） */
+  static snapshotCalls = 0;
   static reset() {
     ConnectionOrchestrator.recycles = [];
     ConnectionOrchestrator.recoverCalls = 0;
     ConnectionOrchestrator.recoverResult = true;
+    ConnectionOrchestrator.snapshot = null;
+    ConnectionOrchestrator.snapshotCalls = 0;
   }
   static _inst = null;
   static instance() {
@@ -210,6 +214,16 @@ export class ConnectionOrchestrator {
       ConnectionOrchestrator._inst = new ConnectionOrchestrator();
     }
     return ConnectionOrchestrator._inst;
+  }
+  hostSnapshot() {
+    ConnectionOrchestrator.snapshotCalls++;
+    const s = new LatencyHostSnapshot();
+    const cfg = ConnectionOrchestrator.snapshot;
+    if (cfg !== null) {
+      s.pins = cfg.pins || {};
+      s.attempted = cfg.attempted || [];
+    }
+    return s;
   }
   scheduleTestCoreRecycle(ms) { ConnectionOrchestrator.recycles.push(ms); }
   async refreshLatencyEndpoint(_api) {
@@ -226,22 +240,24 @@ engSrc = engSrc
   .replace(/from '\.\/ClashApiService'/g, "from './ClashApiService.ts'")
   .replace(/from '\.\/ConnectionOrchestrator'/g, "from './ConnectionOrchestrator.ts'")
   .replace(/from '\.\/LatencyState'/g, "from './LatencyState.ts'")
-  .replace(/from '\.\/LatencyController'/g, "from './LatencyController.ts'")
+  .replace(/from '\.\/LatencyLiveView'/g, "from './LatencyLiveView.ts'")
   .replace(/from '\.\.\/models\/ProxyNode'/g, "from './ProxyNode.ts'")
-  .replace(/from '\.\/DirectLatencyTester'/g, "from './DirectLatencyTester.ts'")
-  .replace(/from '\.\/DoHResolver'/g, "from './DoHResolver.ts'");
+  .replace(/from '\.\/DoHResolver'/g, "from './DoHResolver.ts'")
+  .replace(/from '\.\.\/latency\/LatencyDnsVerdict'/g, "from './LatencyDnsVerdict.ts'")
+  .replace(/from '\.\.\/latency\/LatencyKinds'/g, "from './LatencyKinds.ts'");
 ok(!/from '@ohos/.test(engSrc), 'staged engine must not import ohos kits');
 w('LatencyEngine.ts', engSrc);
 
 const E = await import(pathToFileURL(path.join(stage, 'LatencyEngine.ts')).href);
 const { LatencyEngine, LatencyRunOptions, LATENCY_CONCURRENCY, BATCH_DEADLINE_MS } = E;
-const { LatencyController } = await import(pathToFileURL(path.join(stage, 'LatencyController.ts')).href);
+const { LatencyLiveView } = await import(pathToFileURL(path.join(stage, 'LatencyLiveView.ts')).href);
 const { LatencyState, LatencyChannel } = await import(pathToFileURL(path.join(stage, 'LatencyState.ts')).href);
-const { ClashApiService, LatencyFailKind, probeResult } =
+const { ClashApiService, probeResult } =
   await import(pathToFileURL(path.join(stage, 'ClashApiService.ts')).href);
+const { LatencyProbeKind } =
+  await import(pathToFileURL(path.join(stage, 'LatencyKinds.ts')).href);
 const { ConnectionOrchestrator } = await import(pathToFileURL(path.join(stage, 'ConnectionOrchestrator.ts')).href);
 const { ProxyNode } = await import(pathToFileURL(path.join(stage, 'ProxyNode.ts')).href);
-const { DirectLatencyTester } = await import(pathToFileURL(path.join(stage, 'DirectLatencyTester.ts')).href);
 const { DoHResolver } = await import(pathToFileURL(path.join(stage, 'DoHResolver.ts')).href);
 
 const URL_ = 'https://www.gstatic.com/generate_204';
@@ -251,9 +267,8 @@ function nodes(n) {
   return out;
 }
 function fresh() {
-  LatencyController.clearAll();
+  LatencyLiveView.clearAll();
   ClashApiService.reset();
-  DirectLatencyTester.reset();
   ConnectionOrchestrator.reset();
   DoHResolver.reset();
 }
@@ -301,7 +316,7 @@ await checkAsync('每个探测都显式带 HTTPS url 与合法 timeout', async (
   LatencyEngine.release(run);
   for (const c of ClashApiService.calls) {
     eq(c.url, URL_, 'url passed through');
-    ok(c.url.startsWith('https://'), 'must be https (unified-delay + hijacking proxies)');
+    ok(c.url.startsWith('https://'), 'must be https (hijacking proxies: 明文地址会被机场劫持)');
     ok(c.timeoutMs > 0 && c.timeoutMs <= 32767, `timeout ${c.timeoutMs} must be 1..32767`);
   }
 });
@@ -311,37 +326,37 @@ await checkAsync('结果按五态落库：实测/超时/失败各自可区分', 
   fresh();
   const table = {
     'node-0': probeResult(42),
-    'node-1': probeResult(-1, LatencyFailKind.TIMEOUT, 504),
-    'node-2': probeResult(-1, LatencyFailKind.NETWORK_UNREACHABLE, 503),
-    'node-3': probeResult(-1, LatencyFailKind.SWITCH_FAILED, 404),
+    'node-1': probeResult(-1, LatencyProbeKind.TIMEOUT, 504),
+    'node-2': probeResult(-1, LatencyProbeKind.NETWORK_UNREACHABLE, 503),
+    'node-3': probeResult(-1, LatencyProbeKind.SWITCH_FAILED, 404),
   };
   ClashApiService.handler = async (name) => table[name];
   const run = LatencyEngine.start(new ClashApiService(), nodes(4), URL_, opts());
   const p = await run.run();
   LatencyEngine.release(run);
-  eq(LatencyController.stateFor('node-0'), LatencyState.MEASURED, 'measured');
-  eq(LatencyController.recordFor('node-0').delayMs, 42, 'delay value');
-  eq(LatencyController.stateFor('node-1'), LatencyState.TIMEOUT, 'timeout');
-  eq(LatencyController.stateFor('node-2'), LatencyState.FAILED, 'network unreachable -> failed');
-  eq(LatencyController.stateFor('node-3'), LatencyState.FAILED, 'switch failed -> failed');
+  eq(LatencyLiveView.stateFor('node-0'), LatencyState.MEASURED, 'measured');
+  eq(LatencyLiveView.recordFor('node-0').delayMs, 42, 'delay value');
+  eq(LatencyLiveView.stateFor('node-1'), LatencyState.TIMEOUT, 'timeout');
+  eq(LatencyLiveView.stateFor('node-2'), LatencyState.FAILED, 'network unreachable -> failed');
+  eq(LatencyLiveView.stateFor('node-3'), LatencyState.FAILED, 'switch failed -> failed');
   eq(p.measured, 1, 'progress measured');
   eq(p.timeout, 1, 'progress timeout');
   eq(p.failed, 2, 'progress failed');
   // 超时与失败必须是不同的状态（旧实现把两者都画成"超时"）
-  ok(LatencyController.stateFor('node-1') !== LatencyController.stateFor('node-2'),
+  ok(LatencyLiveView.stateFor('node-1') !== LatencyLiveView.stateFor('node-2'),
     'timeout and failure must stay distinguishable');
 });
 
 // ── 4. delay==0 绝不当有效延迟 ────────────────────────────────────────────
 await checkAsync('内核回 200 但 delay==0（失败语义）不得记为有效延迟', async () => {
   fresh();
-  ClashApiService.handler = async () => probeResult(0, LatencyFailKind.NONE, 200);
+  ClashApiService.handler = async () => probeResult(0, LatencyProbeKind.NONE, 200);
   const run = LatencyEngine.start(new ClashApiService(), nodes(3), URL_, opts());
   const p = await run.run();
   LatencyEngine.release(run);
   eq(p.measured, 0, 'must not count as measured');
   for (const n of ['node-0', 'node-1', 'node-2']) {
-    ok(LatencyController.stateFor(n) !== LatencyState.MEASURED, `${n} must not be MEASURED`);
+    ok(LatencyLiveView.stateFor(n) !== LatencyState.MEASURED, `${n} must not be MEASURED`);
   }
 });
 
@@ -353,7 +368,7 @@ await checkAsync('内核回 200 但 delay==0（失败语义）不得记为有效
 await checkAsync('内核全程不可用：不留未测、搁置节点补超时，且绝不写成失败', async () => {
   fresh();
   ConnectionOrchestrator.recoverResult = false; // 自愈失败 -> 通道不可用
-  ClashApiService.handler = async () => probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0);
+  ClashApiService.handler = async () => probeResult(-1, LatencyProbeKind.CORE_NOT_READY, 0);
   const run = LatencyEngine.start(new ClashApiService(), nodes(30), URL_, opts());
   const p = await run.run();
   LatencyEngine.release(run);
@@ -363,7 +378,7 @@ await checkAsync('内核全程不可用：不留未测、搁置节点补超时�
   let untested = 0;
   let testing = 0;
   for (let i = 0; i < 30; i++) {
-    const st = LatencyController.stateFor('node-' + i);
+    const st = LatencyLiveView.stateFor('node-' + i);
     if (st === LatencyState.UNTESTED) untested++;
     if (st === LatencyState.TESTING) testing++;
     ok(st !== LatencyState.FAILED, `node-${i} must not be FAILED (got ${st})`);
@@ -389,7 +404,7 @@ await checkAsync('中途失联但自愈成功：批次继续跑完', async () =>
     attempts.set(name, a + 1);
     const alwaysFails = name === 'node-0' || name === 'node-1' || name === 'node-2';
     return (alwaysFails && a < 3)
-      ? probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0)
+      ? probeResult(-1, LatencyProbeKind.CORE_NOT_READY, 0)
       : probeResult(77);
   };
   const run = LatencyEngine.start(new ClashApiService(), nodes(12), URL_, opts());
@@ -425,7 +440,7 @@ await checkAsync('取消：不产生节点结论、不留 TESTING，被打断的
   let timeoutCount = 0;
   let untested = 0;
   for (let i = 0; i < 40; i++) {
-    const st = LatencyController.stateFor('node-' + i);
+    const st = LatencyLiveView.stateFor('node-' + i);
     if (st === LatencyState.TESTING) testing++;
     if (st === LatencyState.FAILED) failedCount++;
     if (st === LatencyState.TIMEOUT) timeoutCount++;
@@ -459,7 +474,7 @@ await checkAsync('新批次抢占旧批次：旧批次作废且不留 TESTING', 
   ok(r1.finished < 30, 'first batch must be aborted by preemption');
   let testing = 0;
   for (let i = 0; i < 30; i++) {
-    if (LatencyController.stateFor('node-' + i) === LatencyState.TESTING) testing++;
+    if (LatencyLiveView.stateFor('node-' + i) === LatencyState.TESTING) testing++;
   }
   eq(testing, 0, 'preemption must not leave TESTING behind');
 });
@@ -470,26 +485,26 @@ await checkAsync('新批次抢占旧批次：旧批次作废且不留 TESTING', 
 // isTestingOwnedBy 必须按 runId 区分批次。机制一旦回归，这里立刻失败。
 await check('TESTING 归属：runId 不同则不算本批（旧批不得清新批）', () => {
   fresh();
-  LatencyController.markTesting('shared-node', 1);
-  const rec = LatencyController.recordFor('shared-node');
+  LatencyLiveView.markTesting('shared-node', 1);
+  const rec = LatencyLiveView.recordFor('shared-node');
   ok(rec !== null && rec.runId === 1,
     `record must carry runId, got ${rec === null ? 'null' : rec.runId}`);
-  ok(LatencyController.isTestingOwnedBy('shared-node', 1), 'runId 1 owns its own mark');
-  ok(!LatencyController.isTestingOwnedBy('shared-node', 2), 'runId 2 must NOT own runId 1 mark');
+  ok(LatencyLiveView.isTestingOwnedBy('shared-node', 1), 'runId 1 owns its own mark');
+  ok(!LatencyLiveView.isTestingOwnedBy('shared-node', 2), 'runId 2 must NOT own runId 1 mark');
   // 新批覆盖标记后，旧批彻底失去归属（这正是"旧批清新批"的防线）
-  LatencyController.markTesting('shared-node', 2);
-  ok(!LatencyController.isTestingOwnedBy('shared-node', 1),
+  LatencyLiveView.markTesting('shared-node', 2);
+  ok(!LatencyLiveView.isTestingOwnedBy('shared-node', 1),
     'after re-mark by runId 2, runId 1 must lose ownership');
-  ok(LatencyController.isTestingOwnedBy('shared-node', 2), 'runId 2 keeps its own mark');
+  ok(LatencyLiveView.isTestingOwnedBy('shared-node', 2), 'runId 2 keeps its own mark');
 });
 
 await check('TESTING 归属：runId=0 保持旧调用点宽松语义', () => {
   fresh();
-  LatencyController.markTesting('legacy-node', 0);
-  const rec = LatencyController.recordFor('legacy-node');
+  LatencyLiveView.markTesting('legacy-node', 0);
+  const rec = LatencyLiveView.recordFor('legacy-node');
   ok(rec !== null && rec.runId === 0, 'unmanaged mark keeps runId 0');
-  ok(LatencyController.isTestingOwnedBy('legacy-node', 0), 'runId 0 matches itself');
-  ok(LatencyController.isTestingOwnedBy('legacy-node', 7),
+  ok(LatencyLiveView.isTestingOwnedBy('legacy-node', 0), 'runId 0 matches itself');
+  ok(LatencyLiveView.isTestingOwnedBy('legacy-node', 7),
     'runId 0 mark is treated as unowned-by-all (legacy tolerance)');
 });
 
@@ -512,13 +527,13 @@ await checkAsync('force=false：新鲜结果跳过，过期结果重测', async 
 
   // 把其中两个标记为过期 -> 只有它们重测
   const old = Date.now() - 11 * 60 * 1000;
-  LatencyController.setRecord({
+  LatencyLiveView.setRecord({
     name: 'node-1', state: LatencyState.MEASURED, delayMs: 55,
     atMs: old, channel: LatencyChannel.CORE,
     measured: () => true, failed: () => false, untested: () => false, hasValue: () => true,
     isFailure: () => false,
   });
-  LatencyController.setRecord({
+  LatencyLiveView.setRecord({
     name: 'node-2', state: LatencyState.MEASURED, delayMs: 55,
     atMs: old, channel: LatencyChannel.CORE,
     measured: () => true, failed: () => false, untested: () => false, hasValue: () => true,
@@ -531,62 +546,42 @@ await checkAsync('force=false：新鲜结果跳过，过期结果重测', async 
   eq(ClashApiService.calls.length, 6, 'the two stale nodes re-probed');
 });
 
-// ── 10. 离线通道：api=null ────────────────────────────────────────────────
-// 注意：progress.measured 统计"测出了值"的节点（离线值也算，否则顶栏
-// 60/106 会与列表里 88 个数字对不上）；OFFLINE 状态本身才是"不是代理延迟"
-// 的判据，不参与排序结论。断言要按这个真实语义写。
-await checkAsync('无内核时走离线通道：标 OFFLINE（≈ms），不是失败也不是代理结论', async () => {
+// ── 10. 没有内核通道：api=null ⇒ **不探测**（旧离线兜底通道已下线）────────
+// 旧实现走「离线直连兜底」：测的是**服务器可达**（TCP/TLS 握手），不是代理延迟，
+// 于是「服务器近」被当成「线路快」混进延迟列（UI 上还带 ≈ 前缀）。该通道已下线：
+// 现在没有内核通道就**一个请求都不发**，节点保持「未测(--)」。
+await checkAsync('没有内核通道（api=null）：不探测，节点保持未测，不冒充延迟', async () => {
   fresh();
-  DirectLatencyTester.handler = async () => 25;
   const run = LatencyEngine.start(null, nodes(5), URL_, opts());
   const p = await run.run();
   LatencyEngine.release(run);
-  eq(p.channel, LatencyChannel.OFFLINE, 'channel must be labelled offline');
-  for (let i = 0; i < 5; i++) {
-    eq(LatencyController.stateFor('node-' + i), LatencyState.OFFLINE, `node-${i} offline`);
-  }
-  eq(p.failed, 0, 'offline is not a failure');
-  eq(p.timeout, 0, 'offline is not a timeout');
+  eq(ClashApiService.calls.length, 0, 'no request must be sent without a core channel');
+  eq(p.measured, 0, 'nothing measured');
+  eq(p.failed, 0, 'not a failure');
+  eq(p.timeout, 0, 'not a timeout');
+  eq(p.skipped, 0, 'not skipped either — we simply did not probe');
+  eq(p.finished, 5, 'progress still closes out');
   eq(ConnectionOrchestrator.recycles.length, 0, 'no core -> no recycle scheduled');
-  // 离线值必须走 OFFLINE 状态，UI 才会加 ≈ 前缀
-  ok(LatencyController.recordFor('node-0').channel === LatencyChannel.OFFLINE,
-    'record channel must be OFFLINE so the UI shows ≈');
-});
-
-await checkAsync('离线探测返回 -2（不支持）：保持未测，不算失败', async () => {
-  fresh();
-  DirectLatencyTester.handler = async () => -2;
-  const run = LatencyEngine.start(null, nodes(4), URL_, opts());
-  const p = await run.run();
-  LatencyEngine.release(run);
-  eq(p.failed, 0, '-2 must not be a failure');
-  eq(p.skipped, 4, 'unsupported offline probes are skipped');
-  for (let i = 0; i < 4; i++) {
-    ok(LatencyController.stateFor('node-' + i) !== LatencyState.FAILED,
-      `node-${i} must not be marked failed`);
+  for (let i = 0; i < 5; i++) {
+    eq(LatencyLiveView.stateFor('node-' + i), LatencyState.UNTESTED, `node-${i} stays untested`);
+    eq(LatencyLiveView.recordFor('node-' + i), null, `node-${i} has no record at all`);
   }
 });
 
-// ── 11. 离线通道跳过环回/内网地址 ─────────────────────────────────────────
-await checkAsync('离线通道跳过环回/内网地址（≈2ms 毫无意义）', async () => {
+await checkAsync('没有内核通道：不写任何 ≈ 离线读数（不得冒充代理延迟）', async () => {
   fresh();
-  DirectLatencyTester.handler = async () => 2;
   const list = [
     new ProxyNode('local-127', '127.0.0.1'),
-    new ProxyNode('local-10', '10.0.0.5'),
-    new ProxyNode('local-192', '192.168.1.9'),
-    new ProxyNode('local-172', '172.20.3.4'),
     new ProxyNode('public', '8.8.8.8'),
   ];
   const run = LatencyEngine.start(null, list, URL_, opts());
   const p = await run.run();
   LatencyEngine.release(run);
-  for (const n of ['local-127', 'local-10', 'local-192', 'local-172']) {
-    ok(LatencyController.stateFor(n) !== LatencyState.OFFLINE,
-      `${n} must not get a meaningless ≈2ms reading`);
+  eq(p.measured, 0, 'no ≈ reading at all');
+  for (const n of ['local-127', 'public']) {
+    ok(LatencyLiveView.stateFor(n) !== LatencyState.OFFLINE,
+      `${n} must not get an offline ≈ reading`);
   }
-  eq(LatencyController.stateFor('public'), LatencyState.OFFLINE, 'public server still probed');
-  eq(p.skipped, 4, 'loopback/private skipped');
 });
 
 // ── 12. 内核通道结束后挂回收（且只在有内核时） ────────────────────────────
@@ -622,10 +617,10 @@ await checkAsync('探测直接抛异常：只影响该节点，整批照常跑�
   eq(threw, false, 'a single throwing probe must not reject the whole batch');
   let testing = 0;
   for (let i = 0; i < 5; i++) {
-    if (LatencyController.stateFor('node-' + i) === LatencyState.TESTING) testing++;
+    if (LatencyLiveView.stateFor('node-' + i) === LatencyState.TESTING) testing++;
   }
   eq(testing, 0, 'a throwing probe must not leave TESTING behind');
-  const st1 = LatencyController.stateFor('node-1');
+  const st1 = LatencyLiveView.stateFor('node-1');
   ok(st1 !== LatencyState.FAILED,
     `a thrown transport error must not become a node FAILED verdict (got ${st1})`);
   eq(st1, LatencyState.UNTESTED, 'the throwing node stays untested');
@@ -681,7 +676,7 @@ await checkAsync('硬截止后剩余节点保持未测（绝不写成失败）',
   eq(p.timeout, 0, 'deadline must not produce timeouts');
   let testing = 0;
   for (let i = 0; i < total; i++) {
-    if (LatencyController.stateFor('node-' + i) === LatencyState.TESTING) testing++;
+    if (LatencyLiveView.stateFor('node-' + i) === LatencyState.TESTING) testing++;
   }
   eq(testing, 0, 'deadline must not leave TESTING');
   ok(p.measured > 0 && p.measured < total,
@@ -717,8 +712,8 @@ await checkAsync('C：通道作废整批时，已盖章的逐节点「超时」�
   // 前 6 个探测是真实节点超时（内核 504），其余按通道不可用 -> 触发整批作废
   ClashApiService.handler = async () => {
     n++;
-    return n <= 6 ? probeResult(-1, LatencyFailKind.TIMEOUT, 504)
-      : probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0);
+    return n <= 6 ? probeResult(-1, LatencyProbeKind.TIMEOUT, 504)
+      : probeResult(-1, LatencyProbeKind.CORE_NOT_READY, 0);
   };
   const run = LatencyEngine.start(new ClashApiService(), nodes(30), URL_, opts());
   const p = await run.run();
@@ -730,7 +725,7 @@ await checkAsync('C：通道作废整批时，已盖章的逐节点「超时」�
   let keptTimeouts = 0;
   let rolledBack = 0;
   for (let i = 0; i < 30; i++) {
-    const st = LatencyController.stateFor('node-' + i);
+    const st = LatencyLiveView.stateFor('node-' + i);
     if (st === LatencyState.TIMEOUT) keptTimeouts++;
     if (st === LatencyState.UNTESTED) rolledBack++;
   }
@@ -752,7 +747,7 @@ await checkAsync('C：通道瞬时不可用会重试；重试成功则照常出�
     n++;
     const seen = seenCount.get(name) ?? 0;
     seenCount.set(name, seen + 1);
-    return seen === 0 ? probeResult(-1, LatencyFailKind.CORE_NOT_READY, 0) : probeResult(66);
+    return seen === 0 ? probeResult(-1, LatencyProbeKind.CORE_NOT_READY, 0) : probeResult(66);
   };
   const run = LatencyEngine.start(new ClashApiService(), nodes(6), URL_, opts());
   const p = await run.run();
@@ -763,7 +758,7 @@ await checkAsync('C：通道瞬时不可用会重试；重试成功则照常出�
   eq(p.measured, 6, `all 6 nodes should recover via retry (measured=${p.measured})`);
   ok(n > 6, `retry must actually re-probe (calls=${n} for 6 nodes)`);
   for (let i = 0; i < 6; i++) {
-    eq(LatencyController.stateFor('node-' + i), LatencyState.MEASURED, `node-${i} measured`);
+    eq(LatencyLiveView.stateFor('node-' + i), LatencyState.MEASURED, `node-${i} measured`);
   }
 });
 
@@ -777,7 +772,7 @@ await checkAsync('超时节点会丢弃其入口域名的 DoH pin（下一批交
   ClashApiService.handler = async (name) => {
     // 前两个节点超时，后两个正常 —— 只应丢掉超时那两个的域名
     return name === 'hn-0' || name === 'hn-1'
-      ? probeResult(-1, LatencyFailKind.TIMEOUT, 504)
+      ? probeResult(-1, LatencyProbeKind.TIMEOUT, 504)
       : probeResult(88);
   };
   const run = LatencyEngine.start(new ClashApiService(), ns, URL_, opts());
@@ -786,6 +781,119 @@ await checkAsync('超时节点会丢弃其入口域名的 DoH pin（下一批交
   eq(p.timeout, 2, `two nodes should be timeout (got ${p.timeout})`);
   eq(DoHResolver.dropped.slice().sort(), ['sg00.example.xyz', 'sg01.example.xyz'],
     'exactly the timed-out nodes\' server domains must have their pin dropped');
+});
+
+
+// ── D. DNS 预检接线（2026-10-20 真机根因：域名解析不出来 ≠ 网络不可达）────
+// 契约：
+//  ① 编排器的 DoH 快照**每批取一次**（口径一批之内一致）；
+//  ② attempted 里有、pins 里没有的域名 => **一次 /delay 都不发**，直接判 dns_unresolved；
+//  ③ pins 里有的域名 => 照常探测；
+//  ④ 不在 attempted 里的域名 => **没试过解析** => 照常探测（不得误报 unresolved）；
+//  ⑤ 引擎把 DNS 结论**传下去**（探针据此短路）；
+//  ⑥ 认不出来的响应（unknown）=> **非判定**：不落任何节点结论。
+await checkAsync('D1 DNS 快照每批只取一次（不是逐节点去问编排器）', async () => {
+  fresh();
+  ConnectionOrchestrator.snapshot = { pins: { 'ok.example.xyz': '1.2.3.4' }, attempted: ['ok.example.xyz'] };
+  ClashApiService.handler = async () => probeResult(70);
+  const run = LatencyEngine.start(new ClashApiService(), nodes(5), URL_, opts());
+  await run.run();
+  LatencyEngine.release(run);
+  eq(ConnectionOrchestrator.snapshotCalls, 1, `snapshot must be taken once per batch (got ${ConnectionOrchestrator.snapshotCalls})`);
+});
+
+await checkAsync('D2 域名解析不出来 => 一次 /delay 都不发，直接判 dns_unresolved', async () => {
+  fresh();
+  ConnectionOrchestrator.snapshot = {
+    pins: {},
+    attempted: ['dead.example.xyz'],
+  };
+  // ⚠ pins 为空 ⇒ 引擎按「快照无正例」保守降级（不判 unresolved）——
+  //   这一条断言的是**有正例时**的判定路径（下面 D2b 覆盖空快照的降级）。
+  ConnectionOrchestrator.snapshot = {
+    pins: { 'alive.example.xyz': '1.2.3.4' },
+    attempted: ['alive.example.xyz', 'dead.example.xyz'],
+  };
+  ClashApiService.handler = async () => probeResult(70);
+  const ns = [new ProxyNode('dead-node', 'dead.example.xyz'), new ProxyNode('alive-node', 'alive.example.xyz')];
+  const run = LatencyEngine.start(new ClashApiService(), ns, URL_, opts());
+  const p = await run.run();
+  LatencyEngine.release(run);
+  const called = ClashApiService.calls.map((c) => c.name);
+  ok(!called.includes('dead-node'), `unresolved node must NOT hit the kernel (called: ${called.join(',')})`);
+  ok(called.includes('alive-node'), 'resolved node must still be probed');
+  eq(ClashApiService.dnsShortCircuits.map((c) => c.name).join(','), 'dead-node',
+    'unresolved node must be short-circuited by the DNS verdict');
+  eq(LatencyLiveView.stateFor('dead-node'), LatencyState.FAILED, 'unresolved node is a node conclusion');
+  const rec = LatencyLiveView.recordFor('dead-node');
+  eq(rec.failKind, LatencyProbeKind.DNS_UNRESOLVED, 'failKind must be dns_unresolved');
+  eq(p.dnsUnresolved, 1, 'progress counts dns_unresolved');
+  eq(p.coreNotReady, 0, 'dns_unresolved is NOT a channel failure');
+});
+
+await checkAsync('D3 引擎把 DNS 结论传给探针（unresolved 由探针短路）', async () => {
+  fresh();
+  ConnectionOrchestrator.snapshot = {
+    pins: { 'alive.example.xyz': '1.2.3.4' },
+    attempted: ['alive.example.xyz', 'dead.example.xyz'],
+  };
+  ClashApiService.handler = async () => probeResult(70);
+  const ns = [new ProxyNode('dead-node', 'dead.example.xyz'), new ProxyNode('alive-node', 'alive.example.xyz')];
+  const run = LatencyEngine.start(new ClashApiService(), ns, URL_, opts());
+  await run.run();
+  LatencyEngine.release(run);
+  for (const c of ClashApiService.calls) {
+    ok(c.dns !== null && c.dns !== undefined, `dns verdict must be passed down (${c.name})`);
+    ok(typeof c.dns.status === 'string', 'dns verdict must carry a status');
+  }
+  const aliveCall = ClashApiService.calls.find((c) => c.name === 'alive-node');
+  eq(aliveCall.dns.status, 'resolved', 'alive domain => resolved');
+});
+
+await checkAsync('D4 没在 attempted 里的域名 => 没试过解析 => 照常探测（不得误报 unresolved）', async () => {
+  fresh();
+  ConnectionOrchestrator.snapshot = {
+    pins: { 'alive.example.xyz': '1.2.3.4' },
+    attempted: ['alive.example.xyz'],
+  };
+  ClashApiService.handler = async () => probeResult(70);
+  const ns = [new ProxyNode('untried-node', 'never-tried.example.xyz')];
+  const run = LatencyEngine.start(new ClashApiService(), ns, URL_, opts());
+  const p = await run.run();
+  LatencyEngine.release(run);
+  eq(ClashApiService.calls.length, 1, 'untried domain must still be probed');
+  eq(p.dnsUnresolved, 0, 'untried domain must NOT be judged unresolved');
+  eq(LatencyLiveView.stateFor('untried-node'), LatencyState.MEASURED, 'untried domain is probed normally');
+});
+
+await checkAsync('D5 认不出来的响应（unknown）=> 非判定，不落任何节点结论', async () => {
+  fresh();
+  ClashApiService.handler = async () => probeResult(-1, LatencyProbeKind.UNKNOWN, 503);
+  const run = LatencyEngine.start(new ClashApiService(), nodes(3), URL_, opts());
+  const p = await run.run();
+  LatencyEngine.release(run);
+  for (const n of ['node-0', 'node-1', 'node-2']) {
+    // 非判定失败 => 不产生节点结论：节点回到「未测(--)」，**绝不**是失败/延迟
+    eq(LatencyLiveView.stateFor(n), LatencyState.UNTESTED,
+      `${n} must have no verdict (unknown is not a conclusion)`);
+    const rec = LatencyLiveView.recordFor(n);
+    ok(rec === null || rec.failKind === '' || rec.failKind === LatencyProbeKind.UNTESTED,
+      `${n} must not carry a failure verdict (got ${rec === null ? 'null' : rec.failKind})`);
+  }
+  eq(p.failed, 0, 'unknown must not count as failed');
+  eq(p.measured, 0, 'unknown must not count as measured');
+});
+
+await checkAsync('D6 DNS 快照为空（无正例）=> 保守降级，不判 dns_unresolved', async () => {
+  fresh();
+  ConnectionOrchestrator.snapshot = { pins: {}, attempted: ['dead.example.xyz'] };
+  ClashApiService.handler = async () => probeResult(70);
+  const ns = [new ProxyNode('dead-node', 'dead.example.xyz')];
+  const run = LatencyEngine.start(new ClashApiService(), ns, URL_, opts());
+  const p = await run.run();
+  LatencyEngine.release(run);
+  eq(p.dnsUnresolved, 0, 'empty snapshot must not produce dns_unresolved (快照口径不可信时宁可少报)');
+  eq(ClashApiService.calls.length, 1, 'node must still be probed');
 });
 
 fs.rmSync(stage, { recursive: true, force: true });

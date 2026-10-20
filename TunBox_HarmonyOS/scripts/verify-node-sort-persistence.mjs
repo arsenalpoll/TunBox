@@ -6,8 +6,8 @@
  * 命中为 0）。它是纯逻辑，可以直接在 Node 里真实驱动 —— 比读源码断言强得多。
  *
  * 做法与 verify-latency-cache.mjs 一致：把 .ets 暂存成 .ts 后在 Node 里 import。
- * NodeSortPersistence 依赖 ProxyNode（模型）与 LatencyFailKind（ClashApiService，
- * 会拉进 @ohos.net.http，无法在 Node 里加载），所以为这两者生成**桩**；
+ * NodeSortPersistence 依赖 ProxyNode（模型）与失败分类表（现在住在零 import 的
+ * `commons/latency/LatencyKinds.ets`），所以为这两者生成**桩**；
  * 桩里的常量从真实源码里正则抽取，并断言抽取成功 —— 保证桩不会与真实值漂移。
  */
 import fs from 'node:fs';
@@ -18,6 +18,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..');
 const svc = path.join(root, 'entry/src/main/ets/commons/services/');
+const lat = path.join(root, 'entry/src/main/ets/commons/latency/');
 
 let passed = 0;
 let failed = 0;
@@ -42,12 +43,14 @@ function ok(cond, label) {
   if (!cond) throw new Error(label);
 }
 
-// ── 从真实源码抽取 LatencyFailKind 常量（桩不许与真实值漂移） ──────────────
-const apiSrc = fs.readFileSync(path.join(svc, 'ClashApiService.ets'), 'utf8');
-const kindBlock = apiSrc.slice(apiSrc.indexOf('export class LatencyFailKind'));
+// ── 从真实源码抽取失败分类常量（桩不许与真实值漂移） ──────────────────────
+// ⚠ 分类表的唯一真源已搬到**零 import** 的 `commons/latency/LatencyKinds.ets`
+//   （`LatencyProbeKind`）：`ClashApiService.LatencyFailKind` 那份副本已删。
+const kindsSrc = fs.readFileSync(path.join(lat, 'LatencyKinds.ets'), 'utf8');
+const kindBlock = kindsSrc.slice(kindsSrc.indexOf('export class LatencyProbeKind'));
 const kindPairs = [...kindBlock.matchAll(/static readonly (\w+): string = '([^']*)'/g)]
   .map((m) => [m[1], m[2]]);
-ok(kindPairs.length >= 7, `expected >=7 LatencyFailKind constants, got ${kindPairs.length}`);
+ok(kindPairs.length >= 7, `expected >=7 LatencyProbeKind constants, got ${kindPairs.length}`);
 const KIND = Object.fromEntries(kindPairs);
 
 // ── 暂存 ──────────────────────────────────────────────────────────────────
@@ -69,10 +72,15 @@ const kindsStub = `export class LatencyFailKind {\n${
 }\n}\n`;
 fs.writeFileSync(path.join(stage, 'ProxyNode.ts'), stub);
 fs.writeFileSync(path.join(stage, 'ClashApiService.ts'), kindsStub);
-// LatencyState 是纯模型文件（无 import）：真实暂存，供「非判定判定表唯一真源」
+// LatencyState 是纯模型文件：真实暂存，供「非判定判定表唯一真源」
+// ⚠ 它现在会值依赖 `../latency/LatencyKinds`（零 import 的分类表真源）：
+//   扁平沙箱里没有那一层目录 ⇒ 改写成同目录 './LatencyKinds.ts' 并一并暂存。
 // （LatencyPolicy.isNonVerdictKind）使用（2026-10-20：判定表收敛到一处）。
+fs.writeFileSync(path.join(stage, 'LatencyKinds.ts'),
+  fs.readFileSync(path.join(lat, 'LatencyKinds.ets'), 'utf8'));
 fs.writeFileSync(path.join(stage, 'LatencyState.ts'),
-  fs.readFileSync(path.join(svc, 'LatencyState.ets'), 'utf8'));
+  fs.readFileSync(path.join(svc, 'LatencyState.ets'), 'utf8')
+    .replace(/from '\.\.\/latency\/([A-Za-z0-9_]+)'/g, "from './$1.ts'"));
 
 let src = fs.readFileSync(path.join(svc, 'NodeSortPersistence.ets'), 'utf8');
 src = src

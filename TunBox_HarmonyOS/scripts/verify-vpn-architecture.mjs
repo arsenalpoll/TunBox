@@ -223,7 +223,7 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   has('gen.keepalive-interval', genSrc, 'keep-alive-interval:');
   has('gen.udp-timeout', genSrc, 'udp-timeout:');
   has('gen.tcp-concurrent', genSrc, 'tcp-concurrent: true');
-  has('gen.unified-delay', genSrc, 'unified-delay: true');
+  has('gen.unified-delay', genSrc, 'unified-delay: false');
   has('gen.dns.fallback', genSrc, "lines.push('  fallback:')");
   // 坑 40：fallback 非空会让内核在 config.Parse 阶段加载 MMDB（默认
   // fallback-filter.geoip=true），geoip.metadb 未就绪时启动被联网下载挂死。
@@ -284,6 +284,7 @@ const extSrc = readFileSync(join(etsRoot, 'vpnability', 'VpnExtensionAbility.ets
 }
 
 const orchSrc = readFileSync(join(svcDir, 'ConnectionOrchestrator.ets'), 'utf8');
+const builderSrc = readFileSync(join(etsRoot, 'commons', 'config', 'RuntimeConfigBuilder.ets'), 'utf8');
 const pageSrc = readFileSync(join(etsRoot, 'pages', 'NodeSelectionPage.ets'), 'utf8');
 const subsSrc = readFileSync(join(svcDir, 'SubscriptionService.ets'), 'utf8');
 const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings.ets'), 'utf8');
@@ -296,7 +297,9 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   has('orch.applyRulesChanged', orchSrc, 'async applyRulesChanged');
   has('orch.switchNodeHot', orchSrc, 'async switchNodeHot');
   has('orch.reloadFromPath', orchSrc, 'this.api.reloadFromPath');
-  has('orch.ipv4-only-pass', orchSrc, 'false, proxyHosts');
+  // IPv6 只出栈：生成器调用在唯一入口 RuntimeConfigBuilder 里，
+  // 「强制关 IPv6」这个标志在那里传 false（核心里是 ipv6: false 那一行）。
+  has('orch.ipv4-only-pass', builderSrc, 'options.useGeoip, false, hosts, tunEnabled');
   ok('orch.no-ipv6-detect-call', !orchSrc.includes('Ipv6Detector.hasIPv6'));
   // ── smart 组在编排层的接线 ──────────────────────────────────────────────
   has('orch.smart.model-ready-check', orchSrc, 'private isSmartModelReady()');
@@ -311,9 +314,12 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   // 模型准备必须与 autoSelectMode 解耦：默认就是 manual，只在 auto 下准备
   // 会让用户切到 auto 后还要再多等一轮连接
   has('orch.smart.prep-any-mode', orchSrc, 'if (!smartReady) {');
-  has('orch.smart.gated-by-auto', orchSrc,
-    'settings.autoSelectMode === AutoSelectModes.AUTO && smartReady');
-  has('orch.smart.reused-on-reload', orchSrc, 'this.lastUseSmart');
+  // smart 组只由 auto 模式启用 —— 决策已收口到唯一生成入口的 decideRuntimeOptions()。
+  has('orch.smart.gated-by-auto', builderSrc,
+    'settings.autoSelectMode === AutoSelectModes.AUTO && profile.smartModelReady');
+  // 热重载复用同一份事实位（模型是否就绪），由 builder 重新做同一处决策 ——
+  // 隧道与热重载不可能因为「决策点不同」而声明出不同的 smart 组。
+  has('orch.smart.reused-on-reload', orchSrc, 'this.lastSmartModelReady');
   // 关键：auto+smart 时不能把 PROXY 钉到具体节点，否则内核按连接选点被彻底架空
   has('orch.smart.pin-group', orchSrc, 'pinSmartGroup');
   has('orch.smart.select-group', orchSrc, 'ClashConfigGenerator.SMART_GROUP_NAME');
@@ -359,8 +365,13 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   has('gen.smart.exclude-filter-constant', genSrc, 'SMART_INFO_NODE_FILTER');
   has('gen.smart.exclude-filter-emitted', genSrc,
     'exclude-filter: "${ClashConfigGenerator.SMART_INFO_NODE_FILTER}"');
-  has('gen.smart.url-from-settings', genSrc,
-    'const smartUrl: string = (settings.testLatencyUrl ?? \'\').trim();');
+  // 2026-10-20（A12c / 审计 F12）：smart 组的测速地址改为**唯一真源**
+  // LatencyTestUrl.effective()；生成器不再自己读用户设置、不再自带 url 规则。
+  has('gen.smart.url-single-source', genSrc,
+    'const smartUrl: string = LatencyTestUrl.effective(smartTestUrl);');
+  has('gen.smart.url-imports-truth-source', genSrc,
+    "import { LatencyTestUrl } from '../latency/LatencyTestUrl';");
+  ok('gen.smart.url-not-read-from-settings', !genSrc.includes('settings.testLatencyUrl'));
   has('gen.smart.policy-priority-setting', settingsSrc, 'smartPolicyPriority: string = \'\';');
   has('gen.smart.policy-priority-emitted', genSrc, 'policy-priority:');
   has('settings.smart-policy-serialize', settingsSrc, 'j.smartPolicyPriority = this.smartPolicyPriority;');
@@ -569,11 +580,19 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
   // `this.state = ConnState.CONNECTED;`（另一处在热重连辅助路径），connect() 的是
   // 后者，故取 lastIndexOf；也不使用 startVpnExtensionAbility —— 该串在 headless
   // 测速核路径上更早出现，位置比较会被无关调用点带偏。
-  const refreshIdx = orchSrc.indexOf('DoHResolver.refreshStale()');
+  // 刷新调用点已移入唯一生成入口 RuntimeConfigBuilder（整仓只剩这一处）：
+  // buildRuntimeConfig() 内部刷新一次 —— 而 buildRuntimeConfig 的调用发生在隧道建立之前，
+  // 所以「隧道已起后再对 doh.pub 裸发查询」这个洞仍然被堵住。
+  const refreshIdx = builderSrc.indexOf('DoHResolver.refreshStale()');
+  const buildCallIdx = orchSrc.indexOf('RuntimeConfigBuilder.buildRuntimeConfig(');
   const connectedIdx = orchSrc.lastIndexOf('this.state = ConnState.CONNECTED;');
+  ok('dns.doh-refresh-pre-tunnel', refreshIdx > 0 && buildCallIdx > 0 && connectedIdx > 0
+    && buildCallIdx < connectedIdx);
+
   ok('dns.doh-refresh-pre-tunnel', refreshIdx > 0 && connectedIdx > 0 && refreshIdx < connectedIdx);
   // 只有一个调用点：多处刷新会把过期域名在隧道内外都查一遍，正是要避免的形态。
-  ok('dns.doh-refresh-single-call-site', orchSrc.split('DoHResolver.refreshStale()').length - 1 === 1);
+  const refreshHits = (orchSrc + builderSrc).split('DoHResolver.refreshStale()').length - 1;
+  ok('dns.doh-refresh-single-call-site', refreshHits === 1, `调用点 ${refreshHits} 处`);
   // DNS 自检必须问系统解析器（隧道在时被 any:53 劫持进内核），而不是再去 doh.pub。
   has('dns.selfcheck-tests-core', orchSrc, "connection.getAddressesByName('www.gstatic.com')");
 }

@@ -17,8 +17,56 @@ mkdirSync(outDir, { recursive: true });
 
 // 每个真实源文件 → 输出名 + 模块说明符重写表
 const FILES = [
-  { src: 'commons/models/ProxyNode.ets', out: 'ProxyNode.ts', map: { '@kit.ArkTS': './stubs.ts' } },
+  {
+    src: 'commons/models/ProxyNode.ets', out: 'ProxyNode.ts', map: {
+      '@kit.ArkTS': './stubs.ts',
+      // 2026-10-20（yaml-sub 的订阅解析内核化）：ProxyNode 已改走规范解析层
+      '../subscription/UriNodeParser': './UriNodeParser.ts',
+      '../subscription/ProxyNodeAdapter': './ProxyNodeAdapter.ts',
+    },
+  },
   { src: 'commons/models/ProxyGroup.ets', out: 'ProxyGroup.ts', map: {} },
+  // ── 订阅解析内核化（2026-10-20）：规范解析层是真源，不能打桩 ──
+  { src: 'commons/subscription/ProtocolParamTable.ets', out: 'ProtocolParamTable.ts', map: {} },
+  {
+    src: 'commons/subscription/NodeUsability.ets', out: 'NodeUsability.ts', map: {
+      './ProtocolParamTable': './ProtocolParamTable.ts',
+    },
+  },
+  {
+    src: 'commons/subscription/UnusableLedger.ets', out: 'UnusableLedger.ts', map: {
+      './NodeUsability': './NodeUsability.ts',
+    },
+  },
+  {
+    src: 'commons/subscription/UriNodeParser.ets', out: 'UriNodeParser.ts', map: {
+      './ProtocolParamTable': './ProtocolParamTable.ts',
+      './NodeUsability': './NodeUsability.ts',
+      './UnusableLedger': './UnusableLedger.ts',
+    },
+  },
+  {
+    // 2026-10-20：适配器已改为**纯映射**（不再 import ProxyNode）⇒ 无循环依赖
+    src: 'commons/subscription/ProxyNodeAdapter.ets', out: 'ProxyNodeAdapter.ts', map: {
+      './ProtocolParamTable': './ProtocolParamTable.ts',
+    },
+  },
+  {
+    src: 'commons/subscription/YamlNodeAdapter.ets', out: 'YamlNodeAdapter.ts', map: {
+      '../services/YamlMerger': './YamlMerger.ts',
+      './ProtocolParamTable': './ProtocolParamTable.ts',
+      './NodeUsability': './NodeUsability.ts',
+    },
+  },
+  {
+    src: 'commons/subscription/BodyDispatch.ets', out: 'BodyDispatch.ts', map: {
+      '../services/YamlMerger': './YamlMerger.ts',
+      './UriNodeParser': './UriNodeParser.ts',
+    },
+  },
+  // 测速地址唯一真源（零 import ⇒ 任何层都能安全引）
+  { src: 'commons/latency/LatencyTestUrl.ets', out: 'LatencyTestUrl.ts', map: {} },
+  { src: 'commons/latency/LatencyKinds.ets', out: 'LatencyKinds.ts', map: {} },
   {
     src: 'commons/services/YamlMerger.ets', out: 'YamlMerger.ts',
     map: { '@kit.ArkTS': './stubs.ts' },
@@ -29,6 +77,8 @@ const FILES = [
       '../models/ProxyGroup': './ProxyGroup.ts',
       './YamlMerger': './YamlMerger.ts',
       '../utils/AppLogger': './stubs.ts',
+      // 2026-10-20（B6 旧解析器退场）：链接列表改走规范解析层
+      '../subscription/UriNodeParser': './UriNodeParser.ts',
     },
   },
   {
@@ -37,7 +87,10 @@ const FILES = [
     },
   },
   {
-    src: 'commons/services/LatencyState.ets', out: 'LatencyState.ts', map: {},
+    src: 'commons/services/LatencyState.ets', out: 'LatencyState.ts', map: {
+      // 2026-10-20（latency-core 的测速分类真源）：LatencyState 引用了它
+      '../latency/LatencyKinds': './LatencyKinds.ts',
+    },
   },
   {
     src: 'commons/services/NodeSortPersistence.ets', out: 'NodeSortPersistence.ts', map: {
@@ -50,6 +103,8 @@ const FILES = [
     src: 'commons/models/AppSettings.ets', out: 'AppSettings.ts', map: {
       '../services/NodeSortPersistence': './NodeSortPersistence.ts',
       '../services/AppRoutingPolicy': './AppRoutingPolicy.ts',
+      // 2026-10-20（ND06 收口）：测速地址常量收口到零 import 的真源模块。
+      '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
       '../services/SettingsService': './stubs.ts',
       '../services/ProxyGroupStore': './stubs.ts',
       '../services/ManualNodeStore': './stubs.ts',
@@ -58,6 +113,8 @@ const FILES = [
       '../services/NodeSortModes': './NodeSortModes.ts',
       '../models/ProxyNode': './ProxyNode.ts',
       '../utils/AppLogger': './stubs.ts',
+      // 2026-10-20（latency-core 的测速地址唯一真源）：AppSettings 也引用了它
+      '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
     },
   },
   {
@@ -84,6 +141,13 @@ const FILES = [
       './CredentialStore': './stubs.ts',
       '../utils/AppLogger': './stubs.ts',
       './ConcurrentRefresh': './ConcurrentRefresh.ts',
+      // 2026-10-20（yaml-sub 的订阅解析内核化）
+      '../subscription/BodyDispatch': './BodyDispatch.ts',
+      '../subscription/YamlNodeAdapter': './YamlNodeAdapter.ts',
+      '../subscription/NodeUsability': './NodeUsability.ts',
+      '../subscription/UnusableLedger': './UnusableLedger.ts',
+      // 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退改走规范解析层
+      '../subscription/UriNodeParser': './UriNodeParser.ts',
     },
   },
   {
@@ -113,6 +177,8 @@ const FILES = [
       './YamlMerger': './YamlMerger.ts',
       '../utils/AppLogger': './stubs.ts',
       './RawSubscriptionStore': './stubs.ts',
+      // 2026-10-20（A12c）：测速地址唯一真源
+      '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
     },
   },
 ];

@@ -1,0 +1,11 @@
+## Hysteria2 订阅样本
+##
+## 形态：hysteria2://口令@host:port?sni=…&insecure=1&obfs=salamander&obfs-password=…#名称
+##  - 第 1/3 条用 hysteria2://，第 2 条用等价别名 hy2://（两个 scheme 都得认）
+##  - 第 3 条是**端口跳跃**：authority 的端口段是区间 20000-30000，
+##    原始端口段必须原样保留（历史上被 parseInt 截成 20000 属于「参数被改写」）
+##  - 凭据全假。
+
+hysteria2://fake-hy2-password@hk-hy2-01.example.test:8443?sni=hk-hy2-01.example.test&insecure=1&obfs=salamander&obfs-password=fake-obfs-password&up=50&down=200&alpn=h3&pinSHA256=8xK2mQ7pR3vN9wT5yB1cF4gH6jL0zD2eK1sV0bM#%E9%A6%99%E6%B8%AF%20HY2%2001
+hysteria2://fake-hy2-password@hk-hy2-hop.example.test:20000-30000?sni=hk-hy2-hop.example.test&insecure=1&obfs=salamander&obfs-password=fake-obfs-password&alpn=h3&ports=20000-30000#%E9%A6%99%E6%B8%AF%20HY2%20Hopping
+hy2://fake-hy2-password-2@sg-hy2-03.example.test:443?sni=sg-hy2-03.example.test&insecure=1&alpn=h3#%E6%96%B0%E5%8A%A0%E5%9D%A1%20HY2%2003

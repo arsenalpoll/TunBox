@@ -22,6 +22,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.join(here, '..');
 const svc = path.join(appRoot, 'entry/src/main/ets/commons/services/');
+const latency = path.join(appRoot, 'entry/src/main/ets/commons/latency/');
 
 let passed = 0;
 let failed = 0;
@@ -64,12 +65,25 @@ const w = (dir, name, s) => fs.writeFileSync(path.join(dir, name), s, 'utf8');
 
 // ── 公共依赖（真实现 + 桩） ───────────────────────────────────────────────
 function writeDeps(dir) {
-  // 真实实现（真跑）：LatencyState / LatencyController
-  for (const f of ['LatencyState', 'LatencyController']) {
+  // 真实实现（真跑）：LatencyState / LatencyLiveView（LP08：LatencyController 已删）
+  for (const f of ['LatencyState', 'LatencyLiveView']) {
     const src = fs.readFileSync(path.join(svc, f + '.ets'), 'utf8')
-      .replace(/from '(\.\/[A-Za-z0-9_]+)'/g, "from '$1.ts'");
+      .replace(/from '(\.\/[A-Za-z0-9_]+)'/g, "from '$1.ts'")
+      // ⚠ services 侧现在会值依赖 `../latency/LatencyKinds`（零 import 的分类表）：
+      //   扁平沙箱里没有那一层目录 ⇒ 必须改写成同目录 './LatencyKinds.ts'。
+      .replace(/from '\.\.\/latency\/([A-Za-z0-9_]+)'/g, "from './$1.ts'")
+      ;
     w(dir, f + '.ts', src);
   }
+  // 真实现：DNS 预检结论（**零 import** 的纯模块 ⇒ 扁平沙箱可直接暂存）
+  w(dir, 'LatencyDnsVerdict.ts',
+    fs.readFileSync(path.join(latency, 'LatencyDnsVerdict.ets'), 'utf8')
+      .replace(/from '(\.[A-Za-z0-9_/]+)'/g, "from '$1.ts'"));
+  // 真实现：失败分类表 + 探测结果类型（**零 import** 的纯模块 ⇒ 扁平沙箱可直接暂存）
+  // ⚠ 分类表住在零 import 的 LatencyKinds.ets：services 侧只值依赖零 import 模块，
+  //   扁平暂存才不会 ERR_MODULE_NOT_FOUND。
+  w(dir, 'LatencyKinds.ts',
+    fs.readFileSync(path.join(latency, 'LatencyKinds.ets'), 'utf8'));
   // 桩：AppLogger
   w(dir, 'AppLogger.ts', `
 export class AppLogger {
@@ -93,6 +107,10 @@ export class ProxyNode {
 `);
   // 桩：ConnectionOrchestrator（记录自愈/回收调用）
   w(dir, 'ConnectionOrchestrator.ts', `
+export class LatencyHostSnapshot {
+  pins: Record<string, string> = {};
+  attempted: string[] = [];
+}
 export class ConnectionOrchestrator {
   static recycles = [];
   static recoverCalls = 0;
@@ -103,17 +121,15 @@ export class ConnectionOrchestrator {
     ConnectionOrchestrator.recoverResult = true;
   }
   static instance(): ConnectionOrchestrator { return new ConnectionOrchestrator(); }
+  hostSnapshot(): LatencyHostSnapshot {
+    const s = new LatencyHostSnapshot();
+    return s;
+  }
   scheduleTestCoreRecycle(_ms: number): void { ConnectionOrchestrator.recycles.push(_ms); }
   async refreshLatencyEndpoint(_api: Object): Promise<boolean> {
     ConnectionOrchestrator.recoverCalls++;
     return ConnectionOrchestrator.recoverResult;
   }
-}
-`);
-  // 桩：DirectLatencyTester（离线通道，本文件用不到）
-  w(dir, 'DirectLatencyTester.ts', `
-export class DirectLatencyTester {
-  static async testNode(_node: Object, _timeoutMs: number): Promise<number> { return 30; }
 }
 `);
   // 桩：DoHResolver
@@ -130,24 +146,7 @@ export class DoHResolver {
  * 每次请求的发起/结束时刻（用来证明「排队期间没有请求在飞」）。
  */
 const API_STUB = `
-export class LatencyFailKind {
-  static readonly NONE: string = '';
-  static readonly CORE_NOT_READY: string = 'core_not_ready';
-  static readonly SWITCH_FAILED: string = 'switch_failed';
-  static readonly NETWORK_UNREACHABLE: string = 'network_unreachable';
-  static readonly TIMEOUT: string = 'timeout';
-  static readonly UNSUPPORTED: string = 'unsupported';
-  static readonly PORT_ONLY: string = 'port_reachable_only';
-  static readonly UNTESTED: string = 'untested';
-  static readonly CANCELLED: string = 'cancelled';
-  static readonly QUEUE_TIMEOUT: string = 'queue_timeout';
-}
-export class LatencyProbeResult {
-  delayMs: number = -1;
-  failKind: string = '';
-  httpCode: number = 0;
-  detail: string = '';
-}
+import { LatencyProbeKind, LatencyProbeResult } from './LatencyKinds.ts';
 export function probeResult(delayMs, failKind = '', httpCode = 0) {
   const r = new LatencyProbeResult();
   r.delayMs = delayMs; r.failKind = failKind; r.httpCode = httpCode;
@@ -194,10 +193,11 @@ function stageEngine(dir, queueWaitMs) {
     .replace(/from '\.\/ClashApiService'/g, "from './ClashApiService.ts'")
     .replace(/from '\.\/ConnectionOrchestrator'/g, "from './ConnectionOrchestrator.ts'")
     .replace(/from '\.\/LatencyState'/g, "from './LatencyState.ts'")
-    .replace(/from '\.\/LatencyController'/g, "from './LatencyController.ts'")
+    .replace(/from '\.\/LatencyLiveView'/g, "from './LatencyLiveView.ts'")
     .replace(/from '\.\.\/models\/ProxyNode'/g, "from './ProxyNode.ts'")
-    .replace(/from '\.\/DirectLatencyTester'/g, "from './DirectLatencyTester.ts'")
-    .replace(/from '\.\/DoHResolver'/g, "from './DoHResolver.ts'");
+    .replace(/from '\.\/DoHResolver'/g, "from './DoHResolver.ts'")
+    .replace(/from '\.\.\/latency\/LatencyDnsVerdict'/g, "from './LatencyDnsVerdict.ts'")
+    .replace(/from '\.\.\/latency\/LatencyKinds'/g, "from './LatencyKinds.ts'");
   if (queueWaitMs !== undefined) {
     // 排队上限改小，才能确定性地触发「排队超时」这条路径
     eng = eng.replace(/export const LATENCY_QUEUE_WAIT_MAX_MS = \d+;/,
@@ -215,11 +215,11 @@ stageEngine(dirB, 300);
 
 const A = await import(pathToFileURL(path.join(dirA, 'LatencyEngine.ts')).href);
 const AC = await import(pathToFileURL(path.join(dirA, 'ClashApiService.ts')).href);
-const ALC = await import(pathToFileURL(path.join(dirA, 'LatencyController.ts')).href);
+const ALC = await import(pathToFileURL(path.join(dirA, 'LatencyLiveView.ts')).href);
 const ALState = await import(pathToFileURL(path.join(dirA, 'LatencyState.ts')).href);
 const B = await import(pathToFileURL(path.join(dirB, 'LatencyEngine.ts')).href);
 const BC = await import(pathToFileURL(path.join(dirB, 'ClashApiService.ts')).href);
-const BLC = await import(pathToFileURL(path.join(dirB, 'LatencyController.ts')).href);
+const BLC = await import(pathToFileURL(path.join(dirB, 'LatencyLiveView.ts')).href);
 
 const { ProxyNode } = await import(pathToFileURL(path.join(dirA, 'ProxyNode.ts')).href);
 
@@ -251,7 +251,7 @@ check('常量契约：worker 并发=50、在途请求=8、排队上限=60s', () 
 // ── A2. lanes 语义：传给 testLatencyDetailed 的是「在途数」= 8 ───────────
 await checkAsync('lanes 语义：传下去的是同时在途的 HTTP 请求数（8），不是 worker 数', async () => {
   AC.ClashApiService.reset();
-  ALC.LatencyController.clearAll();
+  ALC.LatencyLiveView.clearAll();
   AC.ClashApiService.handler = async () => AC.probeResult(120, '', 200);
   const run = A.LatencyEngine.start(new AC.ClashApiService(), nodes(30), URL_, opts());
   await run.run();
@@ -265,7 +265,7 @@ await checkAsync('lanes 语义：传下去的是同时在途的 HTTP 请求数�
 // ── A3. 真跑一批：峰值在途 ≤ 8（且确实并行） ──────────────────────────────
 await checkAsync('在途上限：真跑 40 节点，峰值在途请求数 ≤ 8', async () => {
   AC.ClashApiService.reset();
-  ALC.LatencyController.clearAll();
+  ALC.LatencyLiveView.clearAll();
   const perRequest = 250;
   AC.ClashApiService.handler = async () => {
     await sleep(perRequest);
@@ -291,7 +291,7 @@ await checkAsync('在途上限：真跑 40 节点，峰值在途请求数 ≤ 8'
 // ── A4. 排队等待不计入单请求网络超时 ─────────────────────────────────────
 await checkAsync('排队等待不计入请求超时：排队后发起的请求仍拿到完整预算', async () => {
   AC.ClashApiService.reset();
-  ALC.LatencyController.clearAll();
+  ALC.LatencyLiveView.clearAll();
   const perRequest = 250;
   AC.ClashApiService.handler = async () => {
     await sleep(perRequest);
@@ -317,7 +317,7 @@ await checkAsync('排队等待不计入请求超时：排队后发起的请求�
 // ── A5. 排队超时 = 节点级「排队超时」，绝不是 CORE_NOT_READY ─────────────
 await checkAsync('排队超时：节点被标为排队超时（queue_timeout），不是内核不可用', async () => {
   BC.ClashApiService.reset();
-  BLC.LatencyController.clearAll();
+  BLC.LatencyLiveView.clearAll();
   // 8 个在途请求占满名额 1.2s，其余节点只能排队；排队上限 300ms → 必然超时
   BC.ClashApiService.handler = async () => {
     await sleep(1200);
@@ -333,19 +333,21 @@ await checkAsync('排队超时：节点被标为排队超时（queue_timeout）�
   eq(p.coreNotReady, 0, '排队超时绝不能计入「通道不可用」');
   eq(p.coreUnavailable, false, '排队超时绝不能作废整批');
   for (const n of nodes(20)) {
-    const rec = BLC.LatencyController.recordFor(n.name);
+    const rec = BLC.LatencyLiveView.recordFor(n.name);
     if (rec === null) continue;
     ok(rec.failKind !== 'core_not_ready', '不得出现 core_not_ready 的节点结论');
     if (rec.failKind === 'queue_timeout') {
       eq(rec.state, ALState.LatencyState.TIMEOUT, '排队超时的状态档位');
     }
   }
+  // ⚠ 排队超时是**非判定**分类（内核判定表 isVerdictKind）：这一轮根本没拨号，
+  //   与节点/出口无关 ⇒ **不落节点结论**（沿用该节点上一次的有效结论）。
   const qt = [];
   for (const n of nodes(20)) {
-    const rec = BLC.LatencyController.recordFor(n.name);
+    const rec = BLC.LatencyLiveView.recordFor(n.name);
     if (rec !== null && rec.failKind === 'queue_timeout') qt.push(n.name);
   }
-  ok(qt.length > 0, '必须有节点的 failKind 落成 queue_timeout');
+  eq(qt.length, 0, '排队超时不得落成节点结论（非判定）');
 });
 
 // ── B 组：真实 ClashApiService 的组测分类 ─────────────────────────────────
@@ -372,17 +374,48 @@ export const util = {
   }
 };
 `);
+// 真实 ClashApiService 现在把探测**委托给测速内核**（commons/latency/LatencyProbe.ets）
+// ⇒ 沙箱里必须一并暂存内核（+ 它的零 import 依赖 LatencyTestUrl + AppSettings 桩）
+w(dirC, 'LatencyTestUrl.ts',
+  fs.readFileSync(path.join(latency, 'LatencyTestUrl.ets'), 'utf8'));
+w(dirC, 'AppSettings.ts', `
+export class AppSettings {
+  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
+}
+`);
+w(dirC, 'LatencyDnsVerdict.ts',
+  fs.readFileSync(path.join(latency, 'LatencyDnsVerdict.ets'), 'utf8')
+    .replace(/from '(\.[A-Za-z0-9_/]+)'/g, "from '$1.ts'"));
+w(dirC, 'LatencyKinds.ts',
+  fs.readFileSync(path.join(latency, 'LatencyKinds.ets'), 'utf8'));
+w(dirC, 'LatencyProbe.ts',
+  fs.readFileSync(path.join(latency, 'LatencyProbe.ets'), 'utf8')
+    .replace(/from '@kit\.NetworkKit'/g, "from './fakeHttp.ts'")
+    .replace(/from '@kit\.ArkTS'/g, "from './fakeUtil.ts'")
+    .replace(/from '\.\.\/utils\/AppLogger'/g, "from './AppLogger.ts'")
+    .replace(/from '\.\.\/models\/AppSettings'/g, "from './AppSettings.ts'")
+    .replace(/from '\.\/LatencyTestUrl'/g, "from './LatencyTestUrl.ts'")
+    .replace(/from '\.\/LatencyDnsVerdict'/g, "from './LatencyDnsVerdict.ts'")
+    .replace(/from '\.\/LatencyKinds'/g, "from './LatencyKinds.ts'"));
 let apiSrc = fs.readFileSync(path.join(svc, 'ClashApiService.ets'), 'utf8');
 apiSrc = apiSrc
   .replace(/from '@kit\.NetworkKit'/g, "from './fakeHttp.ts'")
   .replace(/from '@kit\.ArkTS'/g, "from './fakeUtil.ts'")
   .replace(/from '\.\.\/utils\/AppLogger'/g, "from './AppLogger.ts'")
-  .replace(/from '\.\/LatencyState'/g, "from './LatencyState.ts'");
+  .replace(/from '\.\/LatencyState'/g, "from './LatencyState.ts'")
+  .replace(/from '\.\.\/latency\/LatencyProbe'/g, "from './LatencyProbe.ts'")
+  .replace(/from '\.\.\/latency\/LatencyDnsVerdict'/g, "from './LatencyDnsVerdict.ts'")
+  .replace(/from '\.\.\/latency\/LatencyKinds'/g, "from './LatencyKinds.ts'")
+  // `LatencyHttpTransport` 是 **interface**（纯类型）=> Node 的 type-stripping 会把它抹掉，
+  // 但 import 语句还在 => ESM 具名导入直接报错。暂存副本里去掉这个**纯类型**导入。
+  .replace(/\n\s*LatencyHttpTransport,?/, '');
 ok(!/@kit\./.test(apiSrc), 'staged ClashApiService 不得残留 @kit 导入');
 w(dirC, 'ClashApiService.ts', apiSrc);
 
 const C = await import(pathToFileURL(path.join(dirC, 'ClashApiService.ts')).href);
-const { ClashApiService: RealApi, LatencyFailKind: RealKind } = C;
+const { ClashApiService: RealApi } = C;
+const { LatencyProbeKind: RealKind } =
+  await import(pathToFileURL(path.join(dirC, 'LatencyKinds.ts')).href);
 let lastUrl = '';
 function fakeHttp(status, body) {
   globalThis.__fakeHttp__ = async (url) => {
@@ -452,16 +485,16 @@ await checkAsync('组测 200：ok=true，delays 只含 delay>0 的成员', async
   eq(res.delays.get('node-b'), undefined, 'node-b（delay=0）必须被过滤');
 });
 
-await checkAsync('兼容接口 testGroupDetailed 行为不变：非 200 一律 null', async () => {
-  fakeHttp(504, 'get delay: all proxies timeout');
-  const m504 = await new RealApi().testGroupDetailed('PROXY', URL_, 5000);
-  eq(m504, null, '504 → null（旧行为）');
-  fakeHttp(401, 'unauthorized');
-  const m401 = await new RealApi().testGroupDetailed('PROXY', URL_, 5000);
-  eq(m401, null, '401 → null（旧行为）');
-  fakeHttp(200, JSON.stringify({ 'node-a': 120, 'node-b': 0 }));
-  const m200 = await new RealApi().testGroupDetailed('PROXY', URL_, 5000);
-  ok(m200 !== null && m200.size === 1, '200 → 只含成功节点的 Map');
+// ⚠ 旧兼容口已删除（审计 LP02 / LP03）：`testGroupDetailed`（任何非 200 ⇒ null）
+//   与 `testLatency`（失败 ⇒ -1）会把「节点全不通（504）」和「内核不可用（401）」
+//   压成同一个 null/-1 ⇒ 调用方无法区分通道级与节点级故障。
+//   唯一入口是 `testGroupDetailedResult`（带分类）与 `testLatencyDetailed`（内核探针）。
+await checkAsync('旧兼容口已删除：testGroupDetailed / testLatency 不再存在', () => {
+  const api = new RealApi();
+  eq(typeof api.testGroupDetailed, 'undefined', 'testGroupDetailed 必须已删除（LP02）');
+  eq(typeof api.testLatency, 'undefined', 'testLatency 必须已删除（LP03）');
+  eq(typeof api.testGroupDetailedResult, 'function', '结构化组测入口必须保留');
+  eq(typeof api.testLatencyDetailed, 'function', '内核探针入口必须保留');
 });
 
 console.log('');

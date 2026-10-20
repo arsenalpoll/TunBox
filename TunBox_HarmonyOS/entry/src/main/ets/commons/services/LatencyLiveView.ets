@@ -1,4 +1,15 @@
 /**
+ * 测速**进程内实时视图**（原 LatencyController，审计 LP08 迁到这里）。
+ *
+ * ⚠ 这不是「结论真源」：结论的落盘真源是 `commons/latency/LatencyStore`（字段级
+ *   落盘仓），本文件只承载**瞬态**：测试中标记、通道、来源、以及 UI 的订阅通知。
+ *   页面层统一走 `LatencyStoreBridge`（它同时暴露本视图与落盘仓）✓。
+ *
+ * ⚠ **本文件必须保持「零跨目录 import」**：Node 侧四个行为闸门
+ *   （verify-latency-cache / -concurrency / -restore / -engine-runtime）把它
+ *   暂存成扁平沙箱再 import —— 一旦这里拖进 ../latency/*（那条链带 @kit.ArkData /
+ *   @kit.NetworkKit / AppSettings），沙箱就缺模块而红。
+ *
  * 延迟结果存储（重做版）
  *
  * 旧版是 `Map<string, number>`：只能放一个数字，于是超时写成 -1、未测写成 -2，
@@ -20,7 +31,7 @@ import { LatencyChannel, LatencyPolicy, LatencyRecord, LatencyState } from './La
 
 const NOTIFY_COALESCE_MS = 200;
 
-export class LatencyController {
+export class LatencyLiveView {
   private static map: Map<string, LatencyRecord> = new Map<string, LatencyRecord>();
   private static listeners: (() => void)[] = [];
   /** 待触发的合并通知定时器；-1 表示当前没有挂起的通知 */
@@ -28,13 +39,13 @@ export class LatencyController {
 
   /** 完整记录（新代码入口） */
   static recordFor(nodeName: string): LatencyRecord | null {
-    const v = LatencyController.map.get(nodeName);
+    const v = LatencyLiveView.map.get(nodeName);
     return v === undefined ? null : v;
   }
 
   /** 状态（缺省 = UNTESTED，绝不缺省成"超时"） */
   static stateFor(nodeName: string): number {
-    const v = LatencyController.map.get(nodeName);
+    const v = LatencyLiveView.map.get(nodeName);
     return v === undefined ? LatencyState.UNTESTED : v.state;
   }
 
@@ -45,7 +56,7 @@ export class LatencyController {
    * runId===0 表示调用方未参与代次管理（旧调用点），退回"只看状态"的宽松语义。
    */
   static isTestingOwnedBy(nodeName: string, runId: number): boolean {
-    const v = LatencyController.map.get(nodeName);
+    const v = LatencyLiveView.map.get(nodeName);
     if (v === undefined || v.state !== LatencyState.TESTING) {
       return false;
     }
@@ -57,7 +68,7 @@ export class LatencyController {
    * MEASURED/OFFLINE → 延迟；TIMEOUT/FAILED → -1；其余（未测/测试中/取消）→ null。
    */
   static latencyFor(nodeName: string): number | null {
-    const v = LatencyController.map.get(nodeName);
+    const v = LatencyLiveView.map.get(nodeName);
     if (v === undefined) {
       return null;
     }
@@ -72,8 +83,8 @@ export class LatencyController {
 
   /** 写入完整记录 */
   static setRecord(rec: LatencyRecord): void {
-    LatencyController.map.set(rec.name, rec);
-    LatencyController.scheduleNotify();
+    LatencyLiveView.map.set(rec.name, rec);
+    LatencyLiveView.scheduleNotify();
   }
 
   /**
@@ -84,7 +95,7 @@ export class LatencyController {
    * 用户看到"正在测速的行突然变成未测"。
    */
   static markTesting(nodeName: string, runId: number = 0): void {
-    const existing = LatencyController.map.get(nodeName);
+    const existing = LatencyLiveView.map.get(nodeName);
     const rec = new LatencyRecord();
     rec.name = nodeName;
     rec.runId = runId;
@@ -92,8 +103,8 @@ export class LatencyController {
     rec.delayMs = -1;
     rec.atMs = 0;
     rec.channel = existing === undefined ? LatencyChannel.CORE : existing.channel;
-    LatencyController.map.set(nodeName, rec);
-    LatencyController.scheduleNotify();
+    LatencyLiveView.map.set(nodeName, rec);
+    LatencyLiveView.scheduleNotify();
   }
 
   /**
@@ -121,7 +132,7 @@ export class LatencyController {
    */
   static restore(nodeName: string, latency: number, failKind: string, atMs: number): void {
     if (latency >= 1) {
-      LatencyController.setRecord(
+      LatencyLiveView.setRecord(
         LatencyRecord.measured(nodeName, latency, LatencyChannel.CORE, atMs));
       return;
     }
@@ -133,43 +144,43 @@ export class LatencyController {
         // 测速路径写进快照的失败**一定**带分类（见 NodeSelectionPage.toPersistRecord），
         // 所以这里把 '' 判成非结论是安全的（方向也是保守的：宁可显示「--」，
         // 也不显示假的「超时」）。
-        LatencyController.setRecord(LatencyRecord.untested(nodeName));
+        LatencyLiveView.setRecord(LatencyRecord.untested(nodeName));
         return;
       }
       // 真实失败结论：保留分类（switch_failed → 显示「未生效」，其余 → 超时/失败）
       const state: number = failKind === 'timeout' ? LatencyState.TIMEOUT : LatencyState.FAILED;
-      LatencyController.setRecord(
+      LatencyLiveView.setRecord(
         LatencyRecord.failed(nodeName, state, atMs, LatencyChannel.CORE, failKind));
       return;
     }
-    LatencyController.setRecord(LatencyRecord.untested(nodeName));
+    LatencyLiveView.setRecord(LatencyRecord.untested(nodeName));
   }
 
   /** 兼容入口：数字 → 记录 */
   static set(nodeName: string, latency: number): void {
     if (latency >= 1) {
-      LatencyController.setRecord(
+      LatencyLiveView.setRecord(
         LatencyRecord.measured(nodeName, latency, LatencyChannel.CORE, Date.now()));
       return;
     }
     if (latency === 0 || latency === -1) {
-      LatencyController.setRecord(
+      LatencyLiveView.setRecord(
         LatencyRecord.failed(nodeName, LatencyState.TIMEOUT, Date.now()));
       return;
     }
     // -2（旧"未测"）及其它：回到未测，不盖章成失败
-    LatencyController.setRecord(LatencyRecord.untested(nodeName));
+    LatencyLiveView.setRecord(LatencyRecord.untested(nodeName));
   }
 
   static clearAll(): void {
-    LatencyController.map.clear();
-    LatencyController.scheduleNotify();
+    LatencyLiveView.map.clear();
+    LatencyLiveView.scheduleNotify();
   }
 
   /** 全部记录快照（排序/持久化用） */
   static snapshot(): LatencyRecord[] {
     const out: LatencyRecord[] = [];
-    for (const rec of LatencyController.map.values()) {
+    for (const rec of LatencyLiveView.map.values()) {
       out.push(rec);
     }
     return out;
@@ -182,58 +193,59 @@ export class LatencyController {
   static retainOnly(nodeNames: string[]): void {
     const active = new Set<string>(nodeNames);
     let changed = false;
-    for (const name of LatencyController.map.keys()) {
+    for (const name of LatencyLiveView.map.keys()) {
       if (!active.has(name)) {
-        LatencyController.map.delete(name);
+        LatencyLiveView.map.delete(name);
         changed = true;
       }
     }
     if (changed) {
-      LatencyController.scheduleNotify();
+      LatencyLiveView.scheduleNotify();
     }
   }
 
   static addListener(listener: () => void): void {
-    if (LatencyController.listeners.indexOf(listener) < 0) {
-      LatencyController.listeners.push(listener);
+    if (LatencyLiveView.listeners.indexOf(listener) < 0) {
+      LatencyLiveView.listeners.push(listener);
     }
   }
 
   static removeListener(listener: () => void): void {
-    const index = LatencyController.listeners.indexOf(listener);
+    const index = LatencyLiveView.listeners.indexOf(listener);
     if (index >= 0) {
-      LatencyController.listeners.splice(index, 1);
+      LatencyLiveView.listeners.splice(index, 1);
     }
   }
 
   /** 合并窗口内的通知调度：已有挂起定时器则不再排新的（O(1) 合并） */
   private static scheduleNotify(): void {
-    if (LatencyController.notifyTimer >= 0) {
+    if (LatencyLiveView.notifyTimer >= 0) {
       return;
     }
-    LatencyController.notifyTimer = setTimeout((): void => {
-      LatencyController.notifyTimer = -1;
-      LatencyController.notify();
+    LatencyLiveView.notifyTimer = setTimeout((): void => {
+      LatencyLiveView.notifyTimer = -1;
+      LatencyLiveView.notify();
     }, NOTIFY_COALESCE_MS);
   }
 
   /** 立即刷新（批次结束/进入页面恢复快照后调用，避免最后一批结果延迟 200ms 才显示） */
   static flushNow(): void {
-    if (LatencyController.notifyTimer >= 0) {
-      clearTimeout(LatencyController.notifyTimer);
-      LatencyController.notifyTimer = -1;
+    if (LatencyLiveView.notifyTimer >= 0) {
+      clearTimeout(LatencyLiveView.notifyTimer);
+      LatencyLiveView.notifyTimer = -1;
     }
-    LatencyController.notify();
+    LatencyLiveView.notify();
   }
 
   /** 是否有挂起的合并通知（专项验证用） */
   static hasPendingNotify(): boolean {
-    return LatencyController.notifyTimer >= 0;
+    return LatencyLiveView.notifyTimer >= 0;
   }
 
   static notify(): void {
-    for (const l of LatencyController.listeners) {
+    for (const l of LatencyLiveView.listeners) {
       l();
     }
   }
+
 }

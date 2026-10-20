@@ -1,0 +1,10 @@
+## TUIC 订阅样本
+##
+## 形态：
+##  - v5：tuic://uuid:口令@host:port?congestion_control=…#名称
+##  - v4（token 形态，没有 uuid）：tuic://口令@host:port#名称
+## 两种都要认：v4 的 userinfo 整段是口令，不能当成 uuid 丢掉，也不能反过来。
+## 凭据全假。
+
+tuic://66666666-6666-4666-8666-666666666666:fake-tuic-password@hk-tuic-01.example.test:443?sni=hk-tuic-01.example.test&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1&reduce_rtt=1&udp_over_stream=1&max_udp_relay_packet_size=1024#%E9%A6%99%E6%B8%AF%20TUIC%2001
+tuic://fake-tuic-v4-token@sg-tuic-04.example.test:443?sni=sg-tuic-04.example.test&alpn=h3&congestion_control=cubic&disable_sni=1#%E6%96%B0%E5%8A%A0%E5%9D%A1%20TUIC%2004

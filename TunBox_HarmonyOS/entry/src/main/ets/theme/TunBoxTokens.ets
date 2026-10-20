@@ -13,6 +13,7 @@
  */
 import { ThemeService } from './ThemeService';
 import { LatencyRecord, LatencyPolicy, LatencyState } from '../commons/services/LatencyState';
+import { LatencyStore, LatencyViewLevel } from '../commons/latency/LatencyStore';
 
 /**
  * 页面级动效参数（2026-10-17 用户规格：水平滑动 + 淡入淡出，时长 220–300ms，
@@ -334,10 +335,25 @@ export class TunBoxPing {
     // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」：
     // 旧结论不能顶着一颗新鲜的红「超时」出现在列表里 → 标「·旧」并灰显，
     // 与「123ms·旧」的既有口径一致（过期 = 中性，不是当前结论）。
-    if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
-      return `${LatencyPolicy.stateText(rec.state, rec.failKind)}·旧`;
+    // 瞬态（测试中 / 已取消）不是结论 —— 用状态词，不查结论表。
+    if (rec.state === LatencyState.TESTING) {
+      return '测试中';
     }
-    return LatencyPolicy.stateText(rec.state, rec.failKind);
+    if (rec.state === LatencyState.CANCELLED) {
+      return '已取消';
+    }
+    // 结论文案**唯一真源** = LatencyStore.describe（live / 落盘 / 恢复三套渲染同表）。
+    // 旧实现在这里另有一份 stateText 包装（两份一模一样 ⇒ 审计 LP05），
+    // 现在只认内核那一张表：同一个 failKind 在任何来源都得到同一个文案与级别。
+    const view = LatencyStore.describe(rec.failKind, rec.delayMs, rec.atMs, nowMs);
+    // 失败结论也可能是**上一轮**的（冷启动从持久化快照恢复）。
+    // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」：
+    // 旧结论不能顶着一颗新鲜的红「超时」出现在列表里 → 标「·旧」并灰显，
+    // 与「123ms·旧」的既有口径一致（过期 = 中性，不是当前结论）。
+    if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
+      return `${view.text}·旧`;
+    }
+    return view.text;
   }
 
   /**
@@ -358,10 +374,14 @@ export class TunBoxPing {
       }
       return TunBoxPing.color(rec.delayMs);
     }
-    if (LatencyPolicy.isNotEffective(rec.failKind)) {
+    // 结论的**级别**（严重程度）同样归真源：describe().level
+    // WARN = 「未生效」（内核表里没有它 = 配置把它丢了，节点可能是好的）→ 警告色；
+    // BAD  = 真失败 → 红色。
+    const view = LatencyStore.describe(rec.failKind, rec.delayMs, rec.atMs, nowMs);
+    if (view.level === LatencyViewLevel.WARN) {
       return TunBoxColors.warning;
     }
-    if (rec.state === LatencyState.TIMEOUT || rec.state === LatencyState.FAILED) {
+    if (view.level === LatencyViewLevel.BAD) {
       // 陈旧的失败结论（上一轮的）→ 中性灰，不顶红字（与 recordText 同口径）
       if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
         return TunBoxColors.textSecondary;

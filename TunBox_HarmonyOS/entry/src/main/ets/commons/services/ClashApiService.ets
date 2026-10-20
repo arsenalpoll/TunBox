@@ -9,6 +9,16 @@ import { http } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
 import { AppLogger } from '../utils/AppLogger';
 import { LatencyPolicy } from './LatencyState';
+import {
+  LatencyProbe as CoreLatencyProbe,
+  LatencyKernelEndpoint,
+  LatencyHttpReply,
+  LatencyHttpTransport
+} from '../latency/LatencyProbe';
+import { LatencyDnsVerdict } from '../latency/LatencyDnsVerdict';
+// 失败分类表与结果类型住在**零 import** 的 LatencyKinds.ets（单一真源；
+// services 侧只值依赖零 import 模块 ⇒ Node 行为闸门的扁平暂存沙箱能跑）。
+import { LatencyProbeKind, LatencyProbeResult } from '../latency/LatencyKinds';
 
 const TAG = 'ClashApiService';
 
@@ -51,69 +61,49 @@ export class ConnectionEntry {
   rule: string = '';
 }
 
+
 /**
- * 延迟/探测失败分类。
+ * 测速传输层适配：把 ClashApiService 的**在途登记 / 取消**语义接到
+ * 测速内核的「一次 GET、给一个回复」抽象上。
  *
- * 审计背景：旧实现把所有非 200 响应与传输异常统一映射成 -1，调用方只能显示
- * 「超时」。真机上「测速内核还在跑但 secret 被别的路径覆盖」造成的 401、
- * 「内核里没有这个节点」造成的 404、以及真正 dial 超时（504）在 UI 上完全
- * 无法区分，只能靠猜。分类必须一路带到日志与快照。
+ * 为什么不直接用内核自带的 `ArkHttpTransport`：
+ * 那个实现不登记在途表 => 用户取消 / 新批次抢占时，客户端侧的 http 句柄
+ * 不会被 destroy => 旧批次继续占着 127.0.0.1 的连接（真机：同 host 连接池 ≈ 8，
+ * 旧批次不放手 => 新批次排队 => 假超时）。这里保留 `inflight` 登记语义。
  */
-export class LatencyFailKind {
-  /** 无失败（成功） */
-  static readonly NONE: string = '';
-  /** 测速内核/controller 不可用：进程已死、连接被拒，或 endpoint+secret 与内核不一致 */
-  static readonly CORE_NOT_READY: string = 'core_not_ready';
-  /** 内核代理表里找不到该节点（配置未生效 / 节点未下发）→ 切换节点失败 */
-  static readonly SWITCH_FAILED: string = 'switch_failed';
-  /** 网络不可达：内核能应答但出站拨号 / DNS 失败（不是超时） */
-  static readonly NETWORK_UNREACHABLE: string = 'network_unreachable';
-  /** 真正超时：内核按 timeout 判定失败（504），或请求在预算内无响应 */
-  static readonly TIMEOUT: string = 'timeout';
-  /** 无法离线探测（协议不支持）→ 保持「未测」，不是失败 */
-  static readonly UNSUPPORTED: string = 'unsupported';
-  /** 端口可达性降级结果：只证明 server:port 可达，绝不冒充代理延迟 */
-  static readonly PORT_ONLY: string = 'port_reachable_only';
-  /**
-   * 未测：本次批次未完成测量（整批硬截止到点、或候选 URL 列表为空）。
-   * 它不是节点的测速结论，绝不允许被呈现成「超时」，也不得让排序快照把它记成失败。
-   */
-  static readonly UNTESTED: string = 'untested';
-  /**
-   * **排队超时**（**节点级**）：该节点在应用层在途闸门上等了太久才轮到它，
-   * 这一轮**根本没发出请求**。
-   *
-   * ⚠ 与 CORE_NOT_READY 的区别（必须一路带到 UI / 持久化，二者绝不能混）：
-   *  · CORE_NOT_READY = **通道级**故障（内核不在 / 凭证错配）→ 整批结论无效，
-   *    引擎会连击作废整批；
-   *  · QUEUE_TIMEOUT  = **节点级**的「没排上队」→ 其它节点的结果完全有效，
-   *    只是这个节点这一轮没测到。
-   * 混了就会重现「排队久了 → 报内核不可用 → 整批作废 → 全部节点都不通」。
-   */
-  static readonly QUEUE_TIMEOUT: string = 'queue_timeout';
-  /**
-   * 客户端主动中止（用户取消 / 页面退出 / 网络切换）。
-   * **不是节点结论**：mihomo 的 /delay 用 context.Background()，abort 只影响客户端，
-   * 中途被打断的探测不能盖章成"节点失败"。
-   */
-  static readonly CANCELLED: string = 'cancelled';
-}
+class ClashApiDelayTransport implements LatencyHttpTransport {
+  private readonly owner: ClashApiService;
 
-/** 单次延迟探测结果（延迟值 + 失败分类 + 状态码） */
-export class LatencyProbeResult {
-  /** >=0 延迟毫秒；-1 失败；-2 无法离线探测 */
-  delayMs: number = -1;
-  /** LatencyFailKind.* */
-  failKind: string = LatencyFailKind.NONE;
-  /** HTTP 状态码（0 = 无响应 / 传输层失败） */
-  httpCode: number = 0;
-  /** 脱敏诊断信息（绝不包含 secret / 订阅地址 / 节点口令） */
-  detail: string = '';
+  constructor(owner: ClashApiService) {
+    this.owner = owner;
+  }
 
-  ok(): boolean {
-    return this.delayMs >= 0;
+  async get(url: string, headers: Record<string, string>, timeoutMs: number): Promise<LatencyHttpReply> {
+    const reply = new LatencyHttpReply();
+    const req = http.createHttp();
+    this.owner.trackInflight(req);
+    try {
+      const resp = await req.request(url, {
+        method: http.RequestMethod.GET,
+        header: headers,
+        connectTimeout: timeoutMs,
+        readTimeout: timeoutMs,
+        usingCache: false
+      });
+      reply.responseCode = resp.responseCode;
+      if (typeof resp.result === 'string') {
+        reply.body = resp.result as string;
+      } else if (resp.result instanceof ArrayBuffer) {
+        reply.body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
+      }
+      return reply;
+    } finally {
+      this.owner.untrackInflight(req);
+      req.destroy();
+    }
   }
 }
+
 
 /**
  * 组测速（`GET /group/{name}/delay`）的结构化结果。
@@ -146,7 +136,7 @@ export class GroupLatencyResult {
   delays: Map<string, number> = new Map<string, number>();
   /** HTTP 状态码（0 = 传输层失败，没有拿到响应） */
   httpCode: number = 0;
-  /** 失败分类（LatencyFailKind.*；空串 = 无失败） */
+  /** 失败分类（LatencyProbeKind.*；空串 = 无失败） */
   failKind: string = '';
   /** 脱敏诊断信息（绝不包含 secret / 订阅地址 / 节点口令） */
   detail: string = '';
@@ -188,6 +178,16 @@ export class ClashApiService {
    * 在途请求，通道立刻释放。
    */
   private inflight: Set<http.HttpRequest> = new Set<http.HttpRequest>();
+
+  /** 登记一个在途测速请求（取消时统一 destroy） */
+  trackInflight(req: http.HttpRequest): void {
+    this.inflight.add(req);
+  }
+
+  /** 注销一个已结束/已销毁的测速请求 */
+  untrackInflight(req: http.HttpRequest): void {
+    this.inflight.delete(req);
+  }
 
   /** 中断所有在途延迟测试请求，返回被中断的数量（其余业务请求不受影响）。 */
   cancelInflight(): number {
@@ -619,45 +619,6 @@ export class ClashApiService {
     return out;
   }
 
-  /** 由内核响应码判定失败分类（区分凭证错配 / 节点缺失 / 超时 / 网络不可达） */
-  private static classifyStatusCode(code: number): string {
-    if (code === 401 || code === 403) {
-      // secret 不一致：内核在跑，但用的不是我们这份凭证
-      return LatencyFailKind.CORE_NOT_READY;
-    }
-    if (code === 404) {
-      // 内核代理表里没有该节点 → 切换/下发失败
-      return LatencyFailKind.SWITCH_FAILED;
-    }
-    if (code === 408 || code === 504) {
-      // mihomo 按 timeout 参数判定失败
-      return LatencyFailKind.TIMEOUT;
-    }
-    return LatencyFailKind.NETWORK_UNREACHABLE;
-  }
-
-  /**
-   * 由传输层异常消息判定失败分类。
-   *
-   * **重要语义（真机实证后修正）**：本方法只处理「**本机 controller 没能给出 HTTP 响应**」
-   * 这一种情况。节点本身不通时，controller 是**活着**的，它会正常返回
-   * `503 {"message":"An error occurred in the delay test"}` 或 `504 Timeout` —— 也就是
-   * 说节点级失败永远走 classifyStatusCode，**不会**落到这里。
-   *
-   * 因此这里的结论只有一个：**通道不可用，不是节点结论**。
-   *
-   * 为什么必须这么改：真机实测跑 106 节点批测时，隧道内核在中途重启（secret 变更），
-   * 后续 49 个节点全部拿到连接类异常。旧口径把 `reset` 归入 network_unreachable，
-   * 于是这 49 个节点被**盖章成"失败"**并写进排序快照 —— 这正是本次重做要消灭的
-   * 「内核一抖，半张列表变红」。现在统一归 CORE_NOT_READY，由引擎在连续命中后
-   * 复查通道并作废整批，未测的节点保持「未测」。
-   *
-   * 唯一例外是**我们自己主动 abort**（用户取消 / 页面退出）：那是 CANCELLED，
-   * 由引擎按 isAborted 判定，不属于传输错误。
-   */
-  private static classifyTransportError(message: string): string {
-    return LatencyFailKind.CORE_NOT_READY;
-  }
 
   /**
    * 延迟测试（详细版，对应 clash_service_latency_support）：
@@ -668,112 +629,42 @@ export class ClashApiService {
    * fallback URL 依次调用时，每个 URL 各拿一份独立预算，不再把单节点总预算
    * 按剩余次数切碎（旧实现组测每次只剩 250~500ms → 大面积假超时）。
    *
-   * 失败分类随结果返回（LatencyFailKind），调用方不得再统一折叠成「超时」。
+   * 失败分类随结果返回（LatencyProbeKind），调用方不得再统一折叠成「超时」。
    *
    * ⚠ `lanes` 的语义（2026-10-20 修正，方案 C8/C9）：它是**同时在途的 HTTP
    * 请求数**，不是 worker 数、也不是队列深度。公式 `ceil(lanes/8)` 只有在
    * lanes = 实际在途数时才成立。
    */
   async testLatencyDetailed(nodeName: string, testUrl: string,
-    timeoutMs: number = 5000, lanes: number = 1): Promise<LatencyProbeResult> {
+    timeoutMs: number = 5000, lanes: number = 1,
+    dns: LatencyDnsVerdict | null = null): Promise<LatencyProbeResult> {
     const out = new LatencyProbeResult();
-    const req = http.createHttp();
-    this.inflight.add(req);
-    // 真实外层超时预算：catch 分支也要打它（旧日志硬编码 timeoutMs+1200，
-    // 与实际公式 batchCount*timeoutMs+1200 不符，会把排查引向错误方向）。
-    let outerTimeoutMs: number = 0;
-    try {
-      // API 位于本机，外层只需给 mihomo 返回结果留调度余量。
-      //
-      // 这个余量必须**明显大于**内核自己的 timeout，否则两者会撞在一起：内核在
-      // timeoutMs 到点后要先把 dial 上下文拆掉、再序列化 504 响应并回写 socket，
-      // 移动端弱网/高负载时这一步可能花掉上百毫秒。若客户端恰好也在同一时刻超时，
-      // 我们拿到的是**传输层错误**（kind=network_unreachable）而不是内核明确的
-      // `504 Timeout`，于是"真超时"会被误分类成"失败"，五态语义直接塌掉。
-      // 取 1200ms：足以覆盖收尾抖动，又远小于单节点 5s 预算，不会放大长尾。
-      // 外层余量 = 排队批次数 × 内核 timeout + 调度余量。
-      //
-      // ⚠ 前提（2026-10-20 修正，方案 C8/C9）：`lanes` 必须是**同时在途的
-      // HTTP 请求数**，不是 worker 数、也不是队列深度。调用方（LatencyEngine）
-      // 现在传 LATENCY_INFLIGHT(8)，队列化已由**应用层信号量**完成
-      // （排队等待不计入请求超时，见 LatencyInflightGate）→ batchCount 恒为 1
-      // → outerTimeout = timeoutMs + 1200（6.2s），每个在途请求都能拿到
-      // **真实判定**（200/504/503/404）。
-      //
-      // 旧实现传的是硬编码 16（与实际并发数毫无关系）→ batchCount=2 → 外层只有
-      // 11.2s，而排队最坏需要 11×5s=55s → 排队中的请求**客户端侧先超时** →
-      // 被 classifyTransportError 归为 CORE_NOT_READY → 连击作废整批 →
-      // 用户看到「测速全部失败」（根因 T2）。
-      // 真机实证（2026-09-23）：OHOS http 栈对同一 host 的并发连接数有上限
-      // （约 8 个）—— 超出即排队，且排队时间被算进请求预算。mihomo 本身毫无压力
-      // （问题在客户端栈）。
-      const batchCount = Math.max(1, Math.ceil(lanes / 8));
-      outerTimeoutMs = batchCount * timeoutMs + 1200;
-      const startedAt = Date.now();
-      const resp = await req.request(
-        `${this.baseUrl()}/proxies/${encodeURIComponent(nodeName)}/delay?url=${encodeURIComponent(testUrl)}&timeout=${timeoutMs}`, {
-        method: http.RequestMethod.GET,
-        header: this.authHeader(),
-        connectTimeout: outerTimeoutMs,
-        readTimeout: outerTimeoutMs,
-        usingCache: false
-      });
-      out.httpCode = resp.responseCode;
-      let body: string = '';
-      if (typeof resp.result === 'string') {
-        body = resp.result as string;
-      } else if (resp.result instanceof ArrayBuffer) {
-        body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
-      }
-      if (resp.responseCode !== 200) {
-        out.delayMs = -1;
-        out.failKind = ClashApiService.classifyStatusCode(resp.responseCode);
-        out.detail = `http=${resp.responseCode} bodyLen=${body.length} kind=${out.failKind}`;
-        AppLogger.warn(TAG, `latency non-200: code=${resp.responseCode} kind=${out.failKind} bodyLen=${body.length} `
-          + `innerTimeout=${timeoutMs} outerTimeout=${outerTimeoutMs} elapsed=${Date.now() - startedAt}ms`);
-        return out;
-      }
-      if (body.length === 0) {
-        out.delayMs = -1;
-        out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
-        out.detail = `http=200 empty body innerTimeout=${timeoutMs}`;
-        AppLogger.warn(TAG, `latency empty response: kind=${out.failKind} innerTimeout=${timeoutMs} `
-          + `outerTimeout=${outerTimeoutMs} elapsed=${Date.now() - startedAt}ms`);
-        return out;
-      }
-      try {
-        const json = JSON.parse(body) as Record<string, number>;
-        const delay = json['delay'];
-        if (delay !== undefined) {
-          out.delayMs = delay;
-          out.failKind = LatencyFailKind.NONE;
-          out.detail = `delay=${delay} kind=ok`;
-          return out;
-        }
-        out.delayMs = -1;
-        out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
-        out.detail = `http=200 missing delay bodyLen=${body.length}`;
-        AppLogger.warn(TAG, `latency response missing delay: kind=${out.failKind} bodyLen=${body.length} `
-          + `elapsed=${Date.now() - startedAt}ms`);
-      } catch (jsonError) {
-        out.delayMs = -1;
-        out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
-        out.detail = `http=200 bad json bodyLen=${body.length}`;
-        AppLogger.warn(TAG, `latency JSON error: kind=${out.failKind} bodyLen=${body.length} `
-          + `error=${this.errText(jsonError)} elapsed=${Date.now() - startedAt}ms`);
-      }
-      return out;
-    } catch (e) {
-      out.delayMs = -1;
-      out.failKind = ClashApiService.classifyTransportError(this.errText(e));
-      out.detail = `transport kind=${out.failKind}`;
-      AppLogger.warn(TAG, `latency request error: kind=${out.failKind} innerTimeout=${timeoutMs} `
-        + `outerTimeout=${outerTimeoutMs} lanes=${lanes} error=${this.errText(e)}`);
-      return out;
-    } finally {
-      this.inflight.delete(req);
-      req.destroy();
+    out.nodeName = nodeName;
+    const endpoint = new LatencyKernelEndpoint();
+    endpoint.baseUrl = this.baseUrl();
+    endpoint.secret = this.secret;
+    const transport = new ClashApiDelayTransport(this);
+    // => 测速内核（commons/latency/LatencyProbe.ets）：**一次请求**语义 +
+    //    单一失败分类表 + **完整失败响应体**进日志 + DNS 预检短路，
+    //    全部只在一处实现（这条路径就是「唯一测速路径」）。
+    //
+    // WARN 外层超时预算也归内核常量区（LatencyProbeLimits.outerTimeoutMs = inner + 1200）：
+    //    旧公式 `ceil(lanes/8) * timeoutMs + 1200` 只有在 lanes = 实际在途数时才成立，
+    //    而在途数已由引擎的应用层闸门（LATENCY_INFLIGHT = 8）保证 => batchCount 恒为 1。
+    //    `lanes` 保留只为兼容调用点（引擎传的是在途数），日志里留痕便于对照。
+    const core = await CoreLatencyProbe.probeOne(nodeName, testUrl, endpoint, transport, timeoutMs, dns);
+    out.httpCode = core.httpCode;
+    out.failKind = core.failKind;
+    out.detail = core.detail;
+    out.isVerdict = core.isVerdict;
+    out.bodyText = core.bodyText;
+    out.elapsedMs = core.elapsedMs;
+    out.delayMs = core.failKind === LatencyProbeKind.NONE ? core.delayMs : -1;
+    if (core.failKind !== LatencyProbeKind.NONE) {
+      AppLogger.warn(TAG, `latency probe result: node=${nodeName} kind=${out.failKind} `
+        + `http=${out.httpCode} lanes=${lanes} inner=${timeoutMs}ms detail=${out.detail}`);
     }
+    return out;
   }
 
   /**
@@ -829,7 +720,7 @@ export class ClashApiService {
           out.detail = `http=200 measured=${out.delays.size}`;
           AppLogger.info(TAG, `group latency done: group=${groupName} measured=${out.delays.size}/${body.length}`);
         } catch (jsonError) {
-          out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
+          out.failKind = LatencyProbeKind.NETWORK_UNREACHABLE;
           out.detail = `http=200 bad json bodyLen=${body.length} error=${this.errText(jsonError)}`;
           AppLogger.warn(TAG, `group latency JSON error: group=${groupName} ${out.detail}`);
         }
@@ -839,22 +730,22 @@ export class ClashApiService {
         // 全部成员超时 —— **通道正常**，只是节点全不通（绝不能报成「内核不可用」）
         out.ok = false;
         out.allTimedOut = true;
-        out.failKind = LatencyFailKind.TIMEOUT;
+        out.failKind = LatencyProbeKind.TIMEOUT;
         out.detail = `http=504 all proxies timeout bodyLen=${body.length}`;
         AppLogger.warn(TAG, `group latency all timed out (channel ok): group=${groupName}`);
         return out;
       }
       if (resp.responseCode === 401 || resp.responseCode === 403) {
         // secret 不一致：内核在跑，但用的不是我们这份凭证 → 通道不可用
-        out.failKind = LatencyFailKind.CORE_NOT_READY;
+        out.failKind = LatencyProbeKind.CORE_NOT_READY;
       } else if (resp.responseCode === 404) {
         // 内核代理表里没有这个组 → 切换/下发失败
-        out.failKind = LatencyFailKind.SWITCH_FAILED;
+        out.failKind = LatencyProbeKind.SWITCH_FAILED;
       } else if (resp.responseCode === 503) {
         // 单节点拨号失败语义
-        out.failKind = LatencyFailKind.TIMEOUT;
+        out.failKind = LatencyProbeKind.TIMEOUT;
       } else {
-        out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
+        out.failKind = LatencyProbeKind.NETWORK_UNREACHABLE;
       }
       out.detail = `http=${resp.responseCode} bodyLen=${body.length} kind=${out.failKind}`;
       AppLogger.warn(TAG, `group latency non-200: code=${resp.responseCode} group=${groupName} `
@@ -862,7 +753,7 @@ export class ClashApiService {
       return out;
     } catch (e) {
       // 传输层异常：本机没能拿到 HTTP 响应 → 通道不可用（不是节点结论）
-      out.failKind = LatencyFailKind.CORE_NOT_READY;
+      out.failKind = LatencyProbeKind.CORE_NOT_READY;
       out.detail = `transport kind=${out.failKind} error=${this.errText(e)}`;
       AppLogger.warn(TAG, `group latency request error: ${this.errText(e)}`);
       return out;
@@ -872,27 +763,6 @@ export class ClashApiService {
     }
   }
 
-  /**
-   * 兼容旧调用点：**返回成功节点的延迟表；任何非 200 / 传输异常都返回 null**
-   * （与整改前的行为**逐字一致** —— 旧调用方据此判定「通道不可用」）。
-   *
-   * 需要区分「节点全不通（504）」与「内核不可用」时，请改用
-   * {@link testGroupDetailedResult}。
-   */
-  async testGroupDetailed(groupName: string, testUrl: string,
-    timeoutMs: number): Promise<Map<string, number> | null> {
-    const result = await this.testGroupDetailedResult(groupName, testUrl, timeoutMs);
-    if (!result.ok || result.httpCode !== 200) {
-      return null;
-    }
-    return result.delays;
-  }
-
-  /** 兼容旧调用点：只取延迟数值（失败一律 -1）。需要失败分类请用 testLatencyDetailed。 */
-  async testLatency(nodeName: string, testUrl: string, timeoutMs: number = 5000): Promise<number> {
-    const probe = await this.testLatencyDetailed(nodeName, testUrl, timeoutMs);
-    return probe.delayMs;
-  }
 
   /** 流量快照：GET /connections。
    *  mihomo 的 Snapshot 只有 uploadTotal/downloadTotal(累计字节), 没有速率字段;

@@ -258,10 +258,13 @@ ok('import NodeProtocolPolicy',
 ok('代码中无 slice(0, 8) 硬截断', !/toUpperCase\(\)\.slice\(0, 8\)/.test(codeOnly));
 
 // ── 9. 延迟口径：TunBoxPing 五态文案/配色，不再走 NexusPing ─────────────
+// 2026-10-20（LP08 清退）：旧门面 LatencyController 已删 ⇒ 页面改走 LatencyStoreBridge
+// （= LatencyStore + LatencyLiveView 的唯一 UI 接缝）⇒ 断言跟着换源。
 ok('nodePingText 走 TunBoxPing.recordText',
-  /private nodePingText\(node: ProxyNode\): string \{\s*\n\s*return TunBoxPing\.recordText\(LatencyController\.recordFor\(node\.name\), this\.latencyTick\);/.test(src));
+  /private nodePingText\(node: ProxyNode\): string \{\s*\n\s*return TunBoxPing\.recordText\(LatencyStoreBridge\.recordFor\(node\.name\), this\.latencyTick\);/.test(src));
 ok('nodePingColor 走 TunBoxPing.recordColor',
-  /private nodePingColor\(node: ProxyNode\): ResourceColor \{\s*\n\s*return TunBoxPing\.recordColor\(LatencyController\.recordFor\(node\.name\), this\.latencyTick\);/.test(src));
+  /private nodePingColor\(node: ProxyNode\): ResourceColor \{\s*\n\s*return TunBoxPing\.recordColor\(LatencyStoreBridge\.recordFor\(node\.name\), this\.latencyTick\);/.test(src));
+ok('页面不再直接读旧 LatencyController', !/LatencyController/.test(codeOnly));
 ok('TunBoxPing 已从主题令牌导入', /import \{[^}]*TunBoxPing[^}]*\} from '\.\.\/theme\/TunBoxTokens';/.test(src));
 ok('旧 NexusPing 延迟路径已移除（代码区）', !/NexusPing/.test(codeOnly));
 ok('第二行延迟仍带配色（五态）', /fontColor\(this\.nodePingColor\(node\)\)/.test(row2Text));

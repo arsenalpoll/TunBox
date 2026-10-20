@@ -24,7 +24,7 @@ import { PublicIpService } from '../commons/services/PublicIpService';
 import { PublicIpInfo, AppDiagnostics } from '../commons/models/PublicIpInfo';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
-import { LatencyController } from '../commons/services/LatencyController';
+import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
 import { FormStateSync } from '../commons/services/FormStateSync';
 import { UiGuardian } from '../commons/services/UiGuardian';
 import { DiagnosticsSheet } from '../widgets/DiagnosticsSheet';
@@ -528,19 +528,35 @@ export struct HomePage {
     await SettingsService.init(ctx);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
-    const latencySnapshot = NodeSortSnapshot.fromJsonText(this.settings.nodeSortSnapshot);
-    if (latencySnapshot !== null) {
-      for (const rec of latencySnapshot.records) {
-        if (rec.latency !== -2) {
-          // 恢复**上一轮**的结论：必须带失败分类与真实时间戳。
-          // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」
-          // ——旧写法 `LatencyController.set(rec.name, rec.latency)` 丢掉分类、
-          // 并用 Date.now() 盖时间戳，把旧失败伪装成本次刚测出来的红「超时」。
-          LatencyController.restore(rec.name, rec.latency, rec.failKind, latencySnapshot.testedAt);
+    // ── 测速结论恢复：**新真源**（LatencyStore，字段级落盘）────────────
+    //
+    // 旧形态是「进程内 Map」+「落盘 nodeSortSnapshot」两份源，冷启动时旧快照能把
+    // 进程内更新的结论盖掉（用户：刚测出来是好的，重启后又变超时）。
+    // 现在落盘结论只认 LatencyStore，恢复遵守「无记录或更新才覆盖」。
+    //
+    // 旧快照降级为**一次性迁移源**：老装机升级后第一次启动时把里面的结论搬进
+    // 新仓（字段级），此后一律走新仓。
+    await LatencyStoreBridge.ensureStore(ctx);
+    const restored: string[] = await LatencyStoreBridge.restoreFromStore();
+    if (restored.length === 0) {
+      const latencySnapshot = NodeSortSnapshot.fromJsonText(this.settings.nodeSortSnapshot);
+      if (latencySnapshot !== null) {
+        const legacyNames: string[] = [];
+        for (const rec of latencySnapshot.records) {
+          if (rec.latency !== -2) {
+            // 恢复**上一轮**的结论：必须带失败分类与真实时间戳。
+            // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」
+            // ——旧写法 `LatencyStoreBridge.set(rec.name, rec.latency)` 丢掉分类、
+            // 并用 Date.now() 盖时间戳，把旧失败伪装成本次刚测出来的红「超时」。
+            LatencyStoreBridge.restore(rec.name, rec.latency, rec.failKind, latencySnapshot.testedAt);
+            legacyNames.push(rec.name);
+          }
         }
+        // 一次性迁移进新仓：迁移后旧快照不再是真源
+        await LatencyStoreBridge.persistConclusions(legacyNames);
       }
-      LatencyController.flushNow();
     }
+    LatencyStoreBridge.flushNow();
     const pm: string = this.settings.proxyMode;
     this.proxyMode = (pm === 'global' || pm === 'direct') ? pm : 'rule';
     const authority = await this.orchestrator.authorityState();
@@ -875,7 +891,11 @@ export struct HomePage {
     // rule/global；重启后由 AppSettings.fromJson 再兜一层（direct → rule）。
     // 需要直连时再点一次按钮，代价是一次点击，收益是不可能被粘死。
     if (mode !== 'direct') {
-      await SettingsService.save(this.settings);
+      // 字段级写入口（审计 F2）：整单 save 会把别的写者刚写进去的字段盖回旧值。
+      // 这里只改 proxyMode 一个字段，其余字段从盘上最新值原样带走。
+      await SettingsService.patchSettings((s: AppSettings): void => {
+        s.proxyMode = mode;
+      });
     }
     // 内存里保留 `settings.proxyMode = 'direct'`（上面已赋值），但要注意一个
     // **有意的行为**：自动重连（网络切换/故障切换）走的是

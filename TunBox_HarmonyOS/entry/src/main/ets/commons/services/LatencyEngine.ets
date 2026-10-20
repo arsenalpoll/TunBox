@@ -40,13 +40,17 @@
  *     服务器可达性，状态为 OFFLINE、UI 显示 `≈123ms`，**绝不冒充代理延迟**。
  */
 import { AppLogger } from '../utils/AppLogger';
-import { ClashApiService, LatencyFailKind, LatencyProbeResult } from './ClashApiService';
-import { ConnectionOrchestrator } from './ConnectionOrchestrator';
+import { ClashApiService } from './ClashApiService';
+// 失败分类表 + 探测结果类型来自**零 import** 的 `LatencyKinds.ets`（唯一真源）。
+// 引擎**不再自带**失败映射（旧的 `mapFailure` 已删）：分类与「算不算节点结论」
+// 全部由内核的判定表回答，引擎只负责批次调度（队列/在途/进度/取消/DNS 结论下发）。
+import { LatencyProbeKind, LatencyProbeResult } from '../latency/LatencyKinds';
+import { ConnectionOrchestrator, LatencyHostSnapshot } from './ConnectionOrchestrator';
 import { LatencyChannel, LatencyPolicy, LatencyRecord, LatencyState } from './LatencyState';
-import { LatencyController } from './LatencyController';
+import { LatencyLiveView } from './LatencyLiveView';
 import { ProxyNode } from '../models/ProxyNode';
-import { DirectLatencyTester } from './DirectLatencyTester';
 import { DoHResolver } from './DoHResolver';
+import { LatencyDnsVerdict, LatencyDnsStatus } from '../latency/LatencyDnsVerdict';
 
 const TAG = 'LatencyEngine';
 
@@ -88,7 +92,7 @@ export const LATENCY_INFLIGHT = 8;
 /**
  * 信号量排队等待上限（毫秒）。
  *
- * 等待超时的节点标为**排队超时**（独立失败分类 `LatencyFailKind.QUEUE_TIMEOUT`），
+ * 等待超时的节点标为**排队超时**（独立失败分类 `LatencyProbeKind.QUEUE_TIMEOUT`），
  * 绝不归入 CORE_NOT_READY —— 那是**通道级**故障（内核/凭证），与节点排队两回事。
  * 60s：59 节点的最坏排队约 ⌈59/8⌉×5s ≈ 37s，留足余量。
  */
@@ -300,6 +304,19 @@ export class LatencyInflightGate {
 }
 
 /** 进度快照（UI 直接绑定） */
+/**
+ * 是否信任「**0 命中**」的 DNS 快照（attempted 里有域名、pins 里一个都没有）。
+ *
+ * 两种解释在数据上分不开：
+ *  ① 整批域名真的都解析不出来（机场换域名了）—— 正是 2026-10-20 那批 mitce 节点；
+ *  ② 这份快照压根**不是被测通道**的解析结果（口径错位）—— 会把好节点冤枉成域名下线。
+ *
+ * 默认 **false（保守）**：宁可少报，也不误伤。
+ * 编排器侧把 `hostSnapshot().pins` 换成「被测通道实际生效的 hosts」、
+ * 且 attempted 换成「真正查过的域名」之后，可置 true。
+ */
+const DNS_TRUST_EMPTY_SNAPSHOT: boolean = false;
+
 export class LatencyProgress {
   total: number = 0;
   finished: number = 0;
@@ -318,6 +335,14 @@ export class LatencyProgress {
   queueTimeout: number = 0;
   /** 通道不可用（内核/凭证层面）的连续命中总数 */
   coreNotReady: number = 0;
+  /**
+   * **域名无法解析**的节点数（2026-10-20 真机根因）。
+   *
+   * 这批节点**一次 /delay 都没发**（我们自己的 DoH 预解析已经判了）⇒
+   * 它们不是「超时」也不是「网络不可达」，而是「域名可能已下线」。
+   * 单独计数是为了让 UI 能把它折成**一条**组级诊断条，而不是 N 条同色红条。
+   */
+  dnsUnresolved: number = 0;
   /** 整批因通道不可用而中止：此时**不能**把结果当节点结论 */
   coreUnavailable: boolean = false;
   /** 本批实际使用的通道：LatencyChannel.CORE / OFFLINE */
@@ -390,6 +415,15 @@ export class LatencyRun {
   private deadlineAt: number = 0;
   /** 本批是否已尝试过"重新解析通道凭证"（每批最多一次） */
   private channelRecoveryTried: boolean = false;
+  /**
+   * 本批的 **DNS 预解析快照**（批次开始时取一次，不逐节点去问编排器）。
+   *
+   * 来源：编排器侧的 `ConnectionOrchestrator.instance().hostSnapshot()`
+   * （pins = 域名→IP，attempted = 本批尝试解析过的域名）。
+   * 拿不到 / 口径不可信 = 没有 DNS 结论 => 全部按 unknown 处理（照常探测），
+   * **绝不**凭空判 dns_unresolved。
+   */
+  private dnsSnapshot: LatencyHostSnapshot | null = null;
   private cursor: number = 0;
 
   constructor(api: ClashApiService | null, nodes: ProxyNode[], url: string, timeoutMs: number,
@@ -405,6 +439,9 @@ export class LatencyRun {
     this.onProgress = onProgress;
     this.batchDeadlineMs = batchDeadlineMs;
     this.progress.total = nodes.length;
+    // ⚠ api === null ⇒ 没有内核通道 ⇒ 本批**不探测**（旧的离线直连兜底通道已下线：
+    //   它测的是「服务器可达」而不是代理延迟，混进延迟列会把「服务器近」冒充
+    //   「线路快」）。此时 channel 记为 OFFLINE，UI 显示「未测」而不是假延迟。
     this.progress.channel = api === null ? LatencyChannel.OFFLINE : LatencyChannel.CORE;
   }
 
@@ -468,8 +505,8 @@ export class LatencyRun {
     for (const node of this.nodes) {
       // 只收回**本批**打上的 TESTING：runId 是批次身份，抢占后的新批在
       // 同一节点上重新 markTesting(runId'≠runId)，旧批收尾不得清掉它。
-      if (LatencyController.isTestingOwnedBy(node.name, this.runId)) {
-        LatencyController.setRecord(LatencyRecord.untested(node.name));
+      if (LatencyLiveView.isTestingOwnedBy(node.name, this.runId)) {
+        LatencyLiveView.setRecord(LatencyRecord.untested(node.name));
         cleared = cleared + 1;
       }
     }
@@ -477,8 +514,8 @@ export class LatencyRun {
     //
     // 旧实现（coreUnavailable 时把本批 failure 章一并改回 untested）的理由是
     // 「通道故障批的章不可信」，但代码路径上根本不成立：通道级故障
-    // （failKind=CORE_NOT_READY）在 probeThroughCore 里走的是
-    // `ProbeOutcome.notPublishable()` —— **从不发布任何记录**。因此能被回滚的
+    // （failKind=CORE_NOT_READY）在 probeThroughCore 里走的是「通道级故障」分支
+    // —— **从不发布任何记录**（判定权在内核的 isVerdictKind）。因此能被回滚的
     // 失败章，100% 都是内核针对该节点给出的真实拨号结论（504 → TIMEOUT）。
     //
     // 真机取证 2026-10-18（飞鸟云 37 节点批）：内核已把 14 个节点盖成「超时」，
@@ -499,11 +536,11 @@ export class LatencyRun {
     let strandedStamped = 0;
     if (this.progress.coreUnavailable && !this.userCancelled) {
       for (const node of this.nodes) {
-        if (LatencyController.stateFor(node.name) === LatencyState.UNTESTED) {
+        if (LatencyLiveView.stateFor(node.name) === LatencyState.UNTESTED) {
           // 通道不可用 ≠ 节点失败：分类标 core_not_ready（NodeSortPersistence 把它
           // 列为「非节点判定」，持久化时沿用上次结论，不再把整批写成「全失败」）。
           this.publish(node.name, LatencyRecord.failed(node.name, LatencyState.TIMEOUT, Date.now(),
-            LatencyChannel.CORE, LatencyFailKind.CORE_NOT_READY));
+            LatencyChannel.CORE, LatencyProbeKind.CORE_NOT_READY));
           strandedStamped = strandedStamped + 1;
         }
       }
@@ -514,7 +551,7 @@ export class LatencyRun {
         + `${strandedStamped > 0 ? `, ${strandedStamped} stranded node(s) stamped TIMEOUT` : ''} `
         + `(cancelled=${this.cancelled} userCancelled=${this.userCancelled} `
         + `unavailable=${this.progress.coreUnavailable}); stamped node verdicts kept`);
-      LatencyController.notify();
+      LatencyLiveView.notify();
     }
   }
 
@@ -528,6 +565,25 @@ export class LatencyRun {
       + `concurrency=${LATENCY_CONCURRENCY} inflight=${LATENCY_INFLIGHT} `
       + `timeout=${this.timeoutMs}ms force=${this.force} `
       + `channel=${this.progress.channel} url=${this.url}`);
+
+    if (this.api === null) {
+      // 没有内核通道 ⇒ **本批不探测**。
+      // 旧的「离线直连兜底」通道已下线：它测的是**服务器可达**（TCP/TLS 握手），
+      // 不是代理延迟；混进延迟列会让「服务器近」冒充「线路快」（排序被带偏）。
+      // 现在节点保持「未测」，由 UI 如实显示「--」。
+      AppLogger.warn(TAG, `latency batch skipped: no core channel `
+        + `(离线直连兜底通道已下线；节点保持未测)`);
+      this.progress.finished = this.progress.total;
+      this.finished = true;
+      this.progress.running = false;
+      this.emitProgress();
+      return this.progress;
+    }
+
+    // DNS 预解析快照：**每批取一次**（口径一批之内一致，也避免逐节点跨模块调用）。
+    // 来源：编排器侧的 `hostSnapshot()`（pins = 域名→IP，attempted = 本次尝试过的域名）。
+    this.dnsSnapshot = ConnectionOrchestrator.instance().hostSnapshot();
+    this.logDnsSnapshot();
 
     // ⚠ `lanes` 是**并发 worker 数**（队列深度），不是同时在飞的 HTTP 请求数；
     // 在途数由 LatencyInflightGate（LATENCY_INFLIGHT=8）控制。两者语义不同，别混。
@@ -551,6 +607,7 @@ export class LatencyRun {
     this.emitProgress();
     AppLogger.info(TAG, `latency batch done nodes=${this.nodes.length} channel=${this.progress.channel} `
       + `measured=${this.progress.measured} timeout=${this.progress.timeout} failed=${this.progress.failed} `
+      + `dnsUnresolved=${this.progress.dnsUnresolved} `
       + `queueTimeout=${this.progress.queueTimeout} `
       + `cancelled=${this.progress.cancelled} skipped=${this.progress.skipped} `
       + `notReady=${this.progress.coreNotReady} unavailable=${this.progress.coreUnavailable} `
@@ -564,6 +621,70 @@ export class LatencyRun {
       ConnectionOrchestrator.instance().scheduleTestCoreRecycle(LATENCY_CORE_IDLE_MS);
     }
     return this.progress;
+  }
+
+  /**
+   * 打印本批 DNS 快照的规模（诊断用）。
+   *
+   * ⚠ `pins=0` 且 `attempted>0` 是**危险信号**：可能是「整批域名真的都解析不出来」
+   * （机场换域名了），也可能是「这份快照压根不是被测通道的解析结果」—— 两者的处置完全不同
+   * （见 `dnsVerdictFor` 与 `DNS_TRUST_EMPTY_SNAPSHOT`）。
+   */
+  private logDnsSnapshot(): void {
+    const snap = this.dnsSnapshot;
+    if (snap === null) {
+      AppLogger.info(TAG, `latency dns snapshot: none (编排器未暴露快照) `
+        + `=> DNS 结论全部按 unknown 处理`);
+      return;
+    }
+    const pins = Object.keys(snap.pins).length;
+    const attempted = snap.attempted.length;
+    AppLogger.info(TAG, `latency dns snapshot: pins=${pins} attempted=${attempted}`);
+    if (pins === 0 && attempted > 0) {
+      // ⚠ 危险信号：「整批域名都解析不出来」与「这份快照压根不是被测通道的解析结果」
+      //    在数据上**分不开**（pins/attempted 口径不同时两者都是 0 命中）。
+      //    在编排器把 pins 换成「被测通道实际生效的 hosts」之前，本批**不判**
+      //    dns_unresolved（宁可少报，也不把好节点冤枉成域名下线）。
+      AppLogger.warn(TAG, `latency dns snapshot: 0 pin / ${attempted} attempted `
+        + `=> 本批不判 ${LatencyProbeKind.DNS_UNRESOLVED}（快照无正例，口径待编排器侧修 pins）`);
+    }
+  }
+
+  /**
+   * 某节点的 DNS 预检结论（**每批口径一致**）。
+   *
+   * 铁律（2026-10-20 lead 裁定）：
+   *  - **没在 attempted 里 => unknown**（不是 unresolved）：「没试过解析」≠「解析不出来」；
+   *  - attempted 里有、pins 里查不到 => unresolved => 一次 /delay 都不发；
+   *  - 快照**没有正例**（pins 为空）=> 口径不可信 => 保守降级为 unknown（宁可少报不误伤）。
+   */
+  private dnsVerdictFor(node: ProxyNode): LatencyDnsVerdict | null {
+    const snap = this.dnsSnapshot;
+    if (snap === null) {
+      return null;
+    }
+    // 「0 命中」的快照不产生 DNS 结论（见 logDnsSnapshot 的说明）：
+    // 快照无正例时，「域名全下线」与「这份快照不是被测通道的解析结果」分不开 ⇒ 保守降级。
+    // 精确口径（编排器给了 failed/resolved）：「failed 非空」本身就是证据 ⇒
+    // 「整批域名都解析不出来」可以照实判，不必等 pins 里有正例。
+    const hasFailedSet: boolean = snap.failed !== undefined && snap.failed.length > 0;
+    if (Object.keys(snap.pins).length === 0 && snap.attempted.length > 0
+      && !DNS_TRUST_EMPTY_SNAPSHOT && !hasFailedSet) {
+      return null;
+    }
+    // failed/resolved 存在时用**精确口径**（查过才算失败）；
+    // 不存在时退回旧口径（attempted + pins）——兼容旧的合成快照。
+    const failedList: string[] = snap.failed === undefined ? [] : snap.failed;
+    const resolvedList: string[] = snap.resolved === undefined ? [] : snap.resolved;
+    const precise: boolean = snap.failed !== undefined && snap.resolved !== undefined;
+    const verdict = precise
+      ? LatencyDnsVerdict.fromPins(node.name, node.server, snap.pins, snap.attempted, failedList, resolvedList)
+      : LatencyDnsVerdict.fromPins(node.name, node.server, snap.pins, snap.attempted);
+    if (verdict.status === LatencyDnsStatus.UNRESOLVED) {
+      AppLogger.info(TAG, `latency dns verdict: node=${node.name} host=${node.server} `
+        + `status=unresolved => 本节点不发起 /delay，直接判 ${LatencyProbeKind.DNS_UNRESOLVED}`);
+    }
+    return verdict;
   }
 
   /** 领取下一个待测节点下标（单线程事件循环，无需锁） */
@@ -611,7 +732,7 @@ export class LatencyRun {
 
       // force=false：仍新鲜的实测结果直接跳过，不浪费一次拨号
       if (!this.force) {
-        const existing = LatencyController.recordFor(node.name);
+        const existing = LatencyLiveView.recordFor(node.name);
         if (existing !== null && existing.channel === LatencyChannel.CORE && existing.hasValue()
           && Date.now() - existing.atMs < FRESH_RESULT_MS) {
           this.progress.skipped = this.progress.skipped + 1;
@@ -621,7 +742,7 @@ export class LatencyRun {
         }
       }
 
-      LatencyController.markTesting(node.name, this.runId);
+      LatencyLiveView.markTesting(node.name, this.runId);
       if (this.isAborted(generation)) {
         return;
       }
@@ -630,11 +751,9 @@ export class LatencyRun {
       // 它们的结果却还在后面陆续落库 —— 用户看到的是"进度条跑完了，列表还在变"。
       // 真实 ClashApiService 自己吞异常返回 failKind，所以这条路径平时不触发；
       // 但引擎不能依赖调用方永不抛错。
-      let outcome: ProbeOutcome;
+      let probe: LatencyProbeResult;
       try {
-        outcome = this.api === null
-          ? await this.probeOffline(node, generation)
-          : await this.probeThroughCore(node, generation);
+        probe = await this.probeThroughCore(node, generation);
       } catch (e) {
         AppLogger.warn(TAG, `latency probe threw for one node; keeping it untested: `
           + `${AppLogger.errText(e)}`);
@@ -646,19 +765,24 @@ export class LatencyRun {
       if (this.isAborted(generation)) {
         return;
       }
-      if (!outcome.publishable) {
-        // 通道不可用：不是节点结论 → 保持「未测」，并在连续命中后中止整批
-        // ⚠ 但「整批硬截止到点」不是通道故障：那些节点**根本没发出请求**，
-        //   保持「未测」，且**不计入 finished**（finished 只统计拿到了结论的节点，
-        //   否则进度条会把「没测」算成「测完了」）。
-        if (!outcome.skipped) {
-          this.progress.finished = this.progress.finished + 1;
-        }
+      if (probe.failKind === LatencyProbeKind.CORE_NOT_READY) {
+        // 通道不可用：不是节点结论 → 保持「未测」（连击/自愈/作废整批已在
+        // probeThroughCore 里做完），但要计入进度，否则进度条永远到不了 total。
+        this.progress.finished = this.progress.finished + 1;
         this.emitProgress();
         continue;
       }
-      this.publish(node.name, outcome.record);
-      this.progress.finished = this.progress.finished + 1;
+      // 「要不要落结论」由**内核的判定表**回答（isVerdictKind），引擎不自带口径。
+      const record: LatencyRecord | null = this.recordFor(node, probe);
+      if (record !== null) {
+        this.publish(node.name, record);
+      }
+      // ⚠ 「整批硬截止到点」不是通道故障：那些节点**根本没发出请求**，
+      //   保持「未测」，且**不计入 finished**（finished 只统计拿到了结论的节点，
+      //   否则进度条会把「没测」算成「测完了」）。
+      if (probe.failKind !== LatencyProbeKind.UNTESTED) {
+        this.progress.finished = this.progress.finished + 1;
+      }
       this.emitProgress();
     }
   }
@@ -721,7 +845,7 @@ export class LatencyRun {
     if (!granted) {
       const queued: LatencyProbeResult = new LatencyProbeResult();
       queued.delayMs = -1;
-      queued.failKind = LatencyFailKind.QUEUE_TIMEOUT;
+      queued.failKind = LatencyProbeKind.QUEUE_TIMEOUT;
       queued.httpCode = 0;
       queued.detail = `queue wait exceeded ${LATENCY_QUEUE_WAIT_MAX_MS}ms`;
       AppLogger.warn(TAG, `latency queue timeout: node=${node.name} `
@@ -732,7 +856,7 @@ export class LatencyRun {
       if (this.isAborted(generation)) {
         const aborted: LatencyProbeResult = new LatencyProbeResult();
         aborted.delayMs = -1;
-        aborted.failKind = LatencyFailKind.CANCELLED;
+        aborted.failKind = LatencyProbeKind.CANCELLED;
         aborted.detail = 'aborted while queued for an in-flight slot';
         return aborted;
       }
@@ -740,7 +864,7 @@ export class LatencyRun {
         // 排队期间整批硬截止已到：保持「未测」，**不发请求**（发了也来不及算进结论）
         const skipped: LatencyProbeResult = new LatencyProbeResult();
         skipped.delayMs = -1;
-        skipped.failKind = LatencyFailKind.UNTESTED;
+        skipped.failKind = LatencyProbeKind.UNTESTED;
         skipped.detail = 'batch deadline reached while queued';
         return skipped;
       }
@@ -748,18 +872,26 @@ export class LatencyRun {
       // 也不是队列深度。ClashApiService 的外层超时按 ceil(lanes/8) 自适应：
       // 8 → 1 批 → outerTimeout = timeoutMs + 1200（6.2s），正好覆盖内核 5s 预算
       // + 收尾余量；而排队等待发生在拿到名额**之前**，不占这份预算。
-      return await api.testLatencyDetailed(node.name, this.url, this.timeoutMs, LATENCY_INFLIGHT);
+      // DNS 预检结论随探测一起下发：unresolved => **一次 /delay 都不发**，
+      // 直接判 dns_unresolved（内核的 503 是通用句，看不到 DNS 原因）。
+      return await api.testLatencyDetailed(node.name, this.url, this.timeoutMs, LATENCY_INFLIGHT,
+        this.dnsVerdictFor(node));
     } finally {
       gate.release();
     }
   }
 
-  /** 通道可用性判定的探测结果包装 */
-  private async probeThroughCore(node: ProxyNode, generation: number): Promise<ProbeOutcome> {
-    const api = this.api;
-    if (api === null) {
-      return ProbeOutcome.notPublishable();
-    }
+  /**
+   * 探测一个节点（**含通道级故障处理**），返回内核的探测结果。
+   *
+   * 引擎的职责边界：**批次调度**。分类、判定（算不算「节点结论」）全在内核
+   * （`LatencyKinds.ets` 的 `LatencyProbeKind`）；引擎只做三件事：
+   *  1. 调内核探针（`gatedProbe` → `ClashApiService.testLatencyDetailed` →
+   *     `LatencyProbe.probeOne`）；
+   *  2. 通道瞬时过载时的就地重试 / 退避（见下）；
+   *  3. 通道级故障的连击、自愈与整批作废（**不是节点结论**）。
+   */
+  private async probeThroughCore(node: ProxyNode, generation: number): Promise<LatencyProbeResult> {
     const firstProbe = await this.gatedProbe(node, generation);
     // ── 通道瞬时过载：先就地重试/退避，不要立刻把它算进「通道不可用」连击 ──
     // 死亡节点成批拨号会把 controller 打到 Operation timeout（2300028），这是过载
@@ -768,7 +900,7 @@ export class LatencyRun {
     // 这里最多再试 CORE_NOT_READY_RETRY_MAX 次（线性退避），任一成功即按正常流程
     // 发布结论；全部失败才交回下面的连击/中止逻辑。
     let probe = firstProbe;
-    if (firstProbe.failKind === LatencyFailKind.CORE_NOT_READY) {
+    if (firstProbe.failKind === LatencyProbeKind.CORE_NOT_READY) {
       for (let attempt = 1; attempt <= CORE_NOT_READY_RETRY_MAX; attempt += 1) {
         if (this.isAborted(generation)) {
           break;
@@ -780,15 +912,15 @@ export class LatencyRun {
           break;
         }
         probe = await this.gatedProbe(node, generation);
-        if (probe.failKind !== LatencyFailKind.CORE_NOT_READY) {
+        if (probe.failKind !== LatencyProbeKind.CORE_NOT_READY) {
           break;
         }
       }
     }
-    if (probe.failKind === LatencyFailKind.UNTESTED) {
+    if (probe.failKind === LatencyProbeKind.UNTESTED) {
       // 整批硬截止已到（排队期间耗尽）：本节点**根本没发出请求** → 保持「未测」，
-      // 不发布任何结论，也不计入 finished（见 ProbeOutcome.skipped）。
-      return ProbeOutcome.deadlineSkipped();
+      // 不发布任何结论，也不计入 finished（见 worker 里的 finished 记账）。
+      return probe;
     }
     if (this.isAborted(generation)) {
       // 用户取消 / 新批次抢占 / 通道作废：本批剩余工作全部作废。
@@ -802,12 +934,12 @@ export class LatencyRun {
       //
       // 注意：只有拿到结果后才计数（failKind !== NONE 说明这次探测确实被打断），
       // 取消瞬间刚好成功返回的探测不计入 cancelled。
-      if (probe.failKind !== LatencyFailKind.NONE) {
+      if (probe.failKind !== LatencyProbeKind.NONE) {
         this.progress.cancelled = this.progress.cancelled + 1;
       }
-      return ProbeOutcome.notPublishable();
+      return probe;
     }
-    if (probe.failKind === LatencyFailKind.CORE_NOT_READY) {
+    if (probe.failKind === LatencyProbeKind.CORE_NOT_READY) {
       // 通道问题，不是节点问题。两种成因必须分开处理：
       //  - 内核中途重启 / secret 被换掉（真机实测：106 节点批测进行中隧道重启，
       //    此后 49 个节点全部连接异常）→ 重新解析隧道 secret 还能救回来；
@@ -816,7 +948,7 @@ export class LatencyRun {
       this.progress.coreNotReady = this.progress.coreNotReady + 1;
       await this.tryRecoverChannel();
       if (this.isAborted(generation)) {
-        return ProbeOutcome.notPublishable();
+        return probe;
       }
       // 自愈已尝试过（或本轮不满足自愈条件）仍然连续失联 → 通道确实不可用。
       // 此时**作废整批**：剩余节点保持「未测」，页面提示"内核不可用，本轮未测"。
@@ -828,81 +960,94 @@ export class LatencyRun {
           + `recoveryTried=${this.channelRecoveryTried}`);
         this.invalidate();
       }
-      return ProbeOutcome.notPublishable();
+      return probe;
     }
     this.coreNotReadyStreak = 0;
-    if (probe.failKind === LatencyFailKind.NONE && LatencyPolicy.isValidDelay(probe.delayMs)) {
-      this.progress.measured = this.progress.measured + 1;
-      return ProbeOutcome.publishable(
-        LatencyRecord.measured(node.name, probe.delayMs, LatencyChannel.CORE, Date.now()));
+    return probe;
+  }
+
+  /**
+   * 把内核的探测结果落成**节点结论**（或判定「不落」）。
+   *
+   * ⚠ 判定权在**内核**：只有 `LatencyProbeKind.isVerdictKind()` 认可的分类才盖章；
+   * 其余（unknown / queue_timeout / cancelled / untested / core_not_ready …）
+   * 一律**不落结论** ⇒ 沿用该节点上一次的有效结论（「我们不知道」不能变成「失败」，
+   * 这正是本次重做要消灭的缺陷：旧口径一律压成 network_unreachable，
+   * 于是内核一抖就半张列表变红）。
+   *
+   * @return 要落库的记录；null = 不落任何结论。
+   */
+  private recordFor(node: ProxyNode, probe: LatencyProbeResult): LatencyRecord | null {
+    if (probe.failKind === LatencyProbeKind.UNTESTED) {
+      // 整批硬截止到点：这一轮**根本没发出请求** → 不是「跳过」，是「没轮到」。
+      // 不落结论、不计 skipped、不计 finished（进度条不能把「没测」算成「测完了」）。
+      return null;
     }
-    const state = LatencyEngine.mapFailure(probe.failKind, probe.httpCode);
+    if (probe.failKind === LatencyProbeKind.QUEUE_TIMEOUT) {
+      // 排队超时：这一轮**没拨号** → 与节点/出口无关 ⇒ 非判定：
+      // 不落节点结论，也不该动 DoH pin。
+      this.progress.queueTimeout = this.progress.queueTimeout + 1;
+      return null;
+    }
+    if (probe.failKind === LatencyProbeKind.CANCELLED) {
+      this.progress.cancelled = this.progress.cancelled + 1;
+      return null;
+    }
+    if (probe.failKind === LatencyProbeKind.NONE) {
+      if (LatencyPolicy.isValidDelay(probe.delayMs)) {
+        this.progress.measured = this.progress.measured + 1;
+        return LatencyRecord.measured(node.name, probe.delayMs, LatencyChannel.CORE, Date.now());
+      }
+      // 测通了但延迟非法（不该发生）⇒ 当作「认不出来」：不落结论。
+      this.progress.skipped = this.progress.skipped + 1;
+      AppLogger.info(TAG, `latency non-verdict response: node=${node.name} `
+        + `kind=${probe.failKind} http=${probe.httpCode} => 不落节点结论（保留上次结论）`);
+      return null;
+    }
+    if (probe.failKind === LatencyProbeKind.DNS_UNRESOLVED) {
+      // **域名解析不出来**（我们自己的 DoH 预解析判定）=> 这是**节点结论**：
+      // 该节点当前根本用不了（域名可能已下线），该换机场/换订阅，而不是换线路。
+      // 它与 network_unreachable（拨号失败）严格分开，也不计入 coreNotReady 连击
+      // —— 通道是好的，只是这个节点的域名死了。
+      this.progress.failed = this.progress.failed + 1;
+      this.progress.dnsUnresolved = this.progress.dnsUnresolved + 1;
+      AppLogger.warn(TAG, `latency dns unresolved: node=${node.name} host=${node.server} `
+        + `=> 判 ${LatencyProbeKind.DNS_UNRESOLVED}（域名可能已下线），不发起 /delay`);
+      return LatencyRecord.failed(node.name, LatencyState.FAILED, Date.now(),
+        LatencyChannel.CORE, LatencyProbeKind.DNS_UNRESOLVED);
+    }
+    if (!LatencyProbeKind.isVerdictKind(probe.failKind)) {
+      // 非判定（unknown / unsupported / port_reachable_only）⇒ 不产生节点结论。
+      this.progress.skipped = this.progress.skipped + 1;
+      AppLogger.info(TAG, `latency non-verdict response: node=${node.name} `
+        + `kind=${probe.failKind} http=${probe.httpCode} => 不落节点结论（保留上次结论）`);
+      return null;
+    }
+    // 结论类失败：timeout / switch_failed / network_unreachable。
+    // ⚠ 状态分档也由内核给口径（isTimeoutKind）—— 引擎不再自己拿 httpCode 猜。
+    const state: number = LatencyProbeKind.isTimeoutKind(probe.failKind)
+      ? LatencyState.TIMEOUT : LatencyState.FAILED;
     if (state === LatencyState.TIMEOUT) {
       this.progress.timeout = this.progress.timeout + 1;
-      if (probe.failKind === LatencyFailKind.QUEUE_TIMEOUT) {
-        // 排队超时：这一轮**没拨号** → 与节点/出口无关，也不该动 DoH pin
-        this.progress.queueTimeout = this.progress.queueTimeout + 1;
-      } else {
-        // 该节点入口域名若还挂着 DoH pin，却连握手都等不到应答，最可能是记录已轮换
-        // （机场短 TTL 换绑）而 hosts pin 把内核钉在旧 IP 上。丢掉这条 pin：下一个
-        // 批次重新生成配置时不再写 hosts，交由内核按 TTL 现解析。
-        DoHResolver.dropPin(node.server);
-      }
+      // 该节点入口域名若还挂着 DoH pin，却连握手都等不到应答，最可能是记录已轮换
+      // （机场短 TTL 换绑）而 hosts pin 把内核钉在旧 IP 上。丢掉这条 pin：下一个
+      // 批次重新生成配置时不再写 hosts，交由内核按 TTL 现解析。
+      DoHResolver.dropPin(node.server);
     } else {
       this.progress.failed = this.progress.failed + 1;
     }
     // 失败分类必须带进记录：switch_failed（内核里没这个节点）与 timeout（真超时）
     // 在 state 上都是「失败」这一档，只有靠 failKind 才能在 UI 上区分开。
-    return ProbeOutcome.publishable(
-      LatencyRecord.failed(node.name, state, Date.now(), LatencyChannel.CORE, probe.failKind));
+    return LatencyRecord.failed(node.name, state, Date.now(), LatencyChannel.CORE, probe.failKind);
   }
 
-  /**
-   * 离线粗略探测（无内核可用时的兜底通道）。
-   * 结果状态是 OFFLINE（UI 显示 `≈ms`），语义是"服务器可达"，不是代理延迟。
-   * `-2`（协议不支持离线探测）保持「未测」，绝不写成失败。
-   */
-  private async probeOffline(node: ProxyNode, generation: number): Promise<ProbeOutcome> {
-    // 本地/环回地址的"可达性"不是代理延迟，而是本机自己的握手开销。实测里这类节点
-    // 会以个位数毫秒的 `≈2ms` 排到列表最前，看起来"最快"其实毫无意义。保持未测。
-    if (LatencyPolicy.isLoopbackOrLocal(node.server)) {
-      this.progress.skipped = this.progress.skipped + 1;
-      return ProbeOutcome.notPublishable();
-    }
-    let delay = -1;
-    try {
-      delay = await DirectLatencyTester.testNode(node, this.timeoutMs);
-    } catch (e) {
-      delay = -1;
-    }
-    if (this.isAborted(generation)) {
-      return ProbeOutcome.notPublishable();
-    }
-    if (delay === -2) {
-      // 无法离线探测：保持未测（不污染排序快照）
-      this.progress.skipped = this.progress.skipped + 1;
-      return ProbeOutcome.notPublishable();
-    }
-    if (delay >= 0) {
-      this.progress.measured = this.progress.measured + 1;
-      return ProbeOutcome.publishable(
-        LatencyRecord.measured(node.name, delay, LatencyChannel.OFFLINE, Date.now()));
-    }
-    this.progress.failed = this.progress.failed + 1;
-    // 离线通道只能得出**端口级**结论（TCP 能不能连上），不是协议级失败。
-    // 标 PORT_ONLY（NodeSortPersistence 的「非节点判定」类）→ 持久化时沿用上次结论，
-    // 不会把"离线探测没通"当成"节点坏了"覆盖掉已有延迟。
-    return ProbeOutcome.publishable(
-      LatencyRecord.failed(node.name, LatencyState.FAILED, Date.now(), LatencyChannel.OFFLINE,
-        LatencyFailKind.PORT_ONLY));
-  }
 
   private publish(nodeName: string, rec: LatencyRecord): void {
     // runId 写进每条已落库记录：通道故障批收尾据此认出本批盖的失败章并收回。
     // source 随批落库：auto 来源的失败 UI 显示中性「未测」，manual 保持红。
     rec.runId = this.runId;
     rec.source = this.source;
-    LatencyController.setRecord(rec);
+    LatencyLiveView.setRecord(rec);
     if (this.onResult !== null) {
       this.onResult(rec);
     }
@@ -916,40 +1061,6 @@ export class LatencyRun {
   }
 }
 
-/** 单次探测的结果包装：区分「节点结论」与「通道不可用（无结论）」 */
-class ProbeOutcome {
-  publishable: boolean = false;
-  record: LatencyRecord = new LatencyRecord();
-  /**
-   * 是否是「整批硬截止到点、根本没发出请求」的跳过。
-   *
-   * 与「通道不可用」不同：通道不可用也是不发布结论，但它是一次**已发生的**
-   * 事件（要计入 finished 与 coreNotReady）；而 deadline 跳过是「没发生」，
-   * 节点保持「未测」，**不计入 finished**（否则进度条会把「没测」算成「测完」）。
-   */
-  skipped: boolean = false;
-
-  static publishable(rec: LatencyRecord): ProbeOutcome {
-    const o = new ProbeOutcome();
-    o.publishable = true;
-    o.record = rec;
-    return o;
-  }
-
-  static notPublishable(): ProbeOutcome {
-    const o = new ProbeOutcome();
-    o.publishable = false;
-    return o;
-  }
-
-  /** 整批硬截止到点：没发出请求 → 保持「未测」，不计入 finished */
-  static deadlineSkipped(): ProbeOutcome {
-    const o = new ProbeOutcome();
-    o.publishable = false;
-    o.skipped = true;
-    return o;
-  }
-}
 
 /**
  * 引擎：持有当前会话，保证同一时刻只有一批在跑。
@@ -957,32 +1068,6 @@ class ProbeOutcome {
 export class LatencyEngine {
   private static current: LatencyRun | null = null;
 
-  /**
-   * 把 ClashApiService 的失败分类映射到状态。
-   *
-   * 严格区分三件事：
-   *  - TIMEOUT：内核按预算判定超时（504）
-   *  - FAILED：拨号失败 / 状态码不符 / delay==0（503）、节点已不存在（404）
-   *  - CANCELLED：客户端主动中止
-   */
-  static mapFailure(failKind: string, httpCode: number): number {
-    if (failKind === LatencyFailKind.TIMEOUT) {
-      return LatencyState.TIMEOUT;
-    }
-    if (failKind === LatencyFailKind.CANCELLED) {
-      return LatencyState.CANCELLED;
-    }
-    if (failKind === LatencyFailKind.QUEUE_TIMEOUT) {
-      // 排队超时：这一轮**没排上队**，节点**没有**被判失败 —— 与真超时同档展示
-      // （都是「没测出延迟」），但分类是独立的，UI/持久化可以据此把
-      // 「节点不通」与「没排上队」分开（见 LatencyFailKind.QUEUE_TIMEOUT）。
-      return LatencyState.TIMEOUT;
-    }
-    if (httpCode === 504) {
-      return LatencyState.TIMEOUT;
-    }
-    return LatencyState.FAILED;
-  }
 
   /**
    * 启动一批测速。已有批次会被作废（其结果全部丢弃）。

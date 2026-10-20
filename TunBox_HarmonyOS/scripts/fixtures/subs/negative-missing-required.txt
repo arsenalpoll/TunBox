@@ -1,0 +1,19 @@
+## 负例：缺必填参数 ⇒ **整条 ParseError**（绝不能返回半条节点）
+##
+## 这一节是本文件存在的意义：
+##   旧实现里「缺参数 ⇒ 少写一个字段继续走」，节点照样进内核代理表，
+##   但握手参数不完整 → 拨号立刻失败 → 整片测速判失败（mihomo 503）。
+##   正确做法是**整条不可用 + 说清缺哪个参数**，让上层能提示、能跳过、能记账。
+##
+## 格式：出现 `## negative` 之后的所有 URI 行都按负例处理（必须返回 ParseError）。
+## 逐行一条 URI。
+
+## negative
+vless://@hk-broken-01.example.test:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=x8K2mQ7pR3vN9wT5yB1cF4gH6jL0zD2e&sid=a1b2c3d4&type=tcp#%E7%BC%BA%E5%B0%91-UUID
+vless://11111111-1111-4111-8111-111111111111@hk-broken-02.example.test:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&sid=a1b2c3d4&type=tcp#%E7%BC%BA%E5%B0%91-REALITY-PBK
+trojan://@hk-broken-03.example.test:443?sni=hk-broken-03.example.test#%E7%BC%BA%E5%B0%91-Trojan-%E5%8F%A3%E4%BB%A4
+anytls://@hk-broken-04.example.test:443?sni=hk-broken-04.example.test#%E7%BC%BA%E5%B0%91-AnyTLS-%E5%8F%A3%E4%BB%A4
+hysteria2://@hk-broken-05.example.test:8443?sni=hk-broken-05.example.test#%E7%BC%BA%E5%B0%91-HY2-%E5%8F%A3%E4%BB%A4
+tuic://@hk-broken-06.example.test:443?sni=hk-broken-06.example.test#%E7%BC%BA%E5%B0%91-TUIC-%E5%8F%A3%E4%BB%A4
+snell://@hk-broken-07.example.test:6160?version=4#%E7%BC%BA%E5%B0%91-Snell-PSK
+vmess://eyJ2IjoiMiIsInBzIjoi57y65bCRLVVVSUQiLCJhZGQiOiJoay1icm9rZW4tMDguZXhhbXBsZS50ZXN0IiwicG9ydCI6IjQ0MyIsImlkIjoiIiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJ3cyIsInR5cGUiOiJub25lIiwiaG9zdCI6ImhrLWJyb2tlbi0wOC5leGFtcGxlLnRlc3QiLCJwYXRoIjoiL3JheSIsInRscyI6InRscyJ9

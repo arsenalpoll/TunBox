@@ -20,7 +20,13 @@ import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { AppLogger } from '../commons/utils/AppLogger';
-import { LatencyController } from '../commons/services/LatencyController';
+import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
+
+
+import { UnusableRecord } from '../commons/subscription/UnusableLedger';
+// 台账里的**三类**条目要分开呈现：INCOMPLETE（缺参节点）/ DNS（域名类）/
+// INFO（订阅里混进来的流量/到期/官网等伪节点）⇒ 角标按 category 过滤。
+import { UnusableCategory } from '../commons/subscription/NodeUsability';
 import { NodeProtocolPolicy } from '../commons/services/NodeSortPersistence';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import {
@@ -421,7 +427,7 @@ export struct SubscriptionPage {
       this.shownBridge.setShowHandler(null);
     }
     if (this.latencyBound) {
-      LatencyController.removeListener(this.latencyListener);
+      LatencyStoreBridge.removeListener(this.latencyListener);
       this.latencyBound = false;
     }
   }
@@ -439,7 +445,7 @@ export struct SubscriptionPage {
     this.reload();
     if (!this.latencyBound) {
       this.latencyBound = true;
-      LatencyController.addListener(this.latencyListener);
+      LatencyStoreBridge.addListener(this.latencyListener);
     }
     // 预热测速通道（真机取证 2026-10-20）：「点了测速要等几秒才开始」的根因是
     // 测速通道的准备（未连接时要拉起 headless 测速内核）。进页面时后台把这段
@@ -548,6 +554,90 @@ export struct SubscriptionPage {
     return this.expandedIds.includes(id);
   }
 
+
+  /**
+   * 某订阅里**定义不完整**的节点数（订阅行的角标用）。
+   *
+   * ⚠ 与「域名无法解析」是**两件不同的事**，必须分开呈现（lead 2026-10-20 追加）：
+   *  - 定义不完整 = 这条订阅给过来的节点**字段就缺**（缺 uuid / reality 公钥 /
+   *    密码 / server / port）⇒ 是**订阅提供方（机场）**的数据问题，**不是 TunBox
+   *    的问题**；这类节点整条被排除，不进内核代理表、也不进测速集合。
+   *  - 域名无法解析 = 定义完整，但域名**真的下线了** ⇒ 来自测速内核的
+   *    `dns_unresolved` 结论（LatencyStore），是**机场线路**的问题。
+   * 两者来源不同（订阅侧台账 vs 测速结论），不许合成一句话，更不许都写成「失败」。
+   *
+   * ⚠⚠ **只数 INCOMPLETE 类**：`unusableDefinitions()` 返回的是台账里**所有被排除
+   * 的条目**（`excluded === true`），而台账里还有两类同样 excluded 的条目 ——
+   * **信息条目（INFO）**（订阅里的流量/到期/官网/群等伪节点）与 **DNS 类**
+   * （定义完整、只是这次域名没解析出来）。不按 category 过滤 ⇒ 用户会以为
+   * 「6 条信息条」是「6 条缺参的节点」⇒ 口径必须按 category 拆开
+   * （lead 2026-10-20 追加）。
+   */
+  private incompleteCount(subId: string): number {
+    const items: UnusableRecord[] = SubscriptionService.unusableDefinitions();
+    let count: number = 0;
+    for (const item of items) {
+      if (item.subscriptionId === subId && item.category === UnusableCategory.INCOMPLETE) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /** 「定义不完整」的一句话说明（空串 = 这条订阅没有这类问题） */
+  private incompleteHint(subId: string): string {
+    const count: number = this.incompleteCount(subId);
+    if (count === 0) {
+      return '';
+    }
+    return `${count} 条节点定义不完整：订阅里这些节点缺必填参数，已整条排除、未纳入测速。`
+      + '这是订阅提供方给的数据有问题，不是 TunBox 的问题；可以找机场补全或换一条线路。';
+  }
+
+  /**
+   * 某订阅里**信息条目**（INFO）的条数 —— 第三类，独立角标。
+   *
+   * 这是订阅里混进来的**伪节点**：流量/到期/官网/群链接之类（名字里含 http(s)
+   * URL 或这些关键词）⇒ 它们本来就不是节点，剔出代理表与测速集合是对的
+   * （yaml-sub 台账侧实现）。但**必须单独告诉用户「这 N 条是信息条目」** ——
+   * 混进「定义不完整」里，用户会以为机场给了一堆缺参的坏节点。
+   */
+  private infoCount(subId: string): number {
+    const items: UnusableRecord[] = SubscriptionService.unusableDefinitions();
+    let count: number = 0;
+    for (const item of items) {
+      if (item.subscriptionId === subId && item.category === UnusableCategory.INFO) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /** 「信息条目已跳过」的一句话说明（空串 = 这条订阅没有这类条目） */
+  private infoHint(subId: string): string {
+    const count: number = this.infoCount(subId);
+    if (count === 0) {
+      return '';
+    }
+    return `${count} 条信息条目已跳过：订阅里混进来的流量/到期/官网等说明行，本就不是节点，`
+      + '已剔出节点列表与测速，不影响可用节点。';
+  }
+
+  /**
+   * 订阅的**组级诊断**（空串 = 没有同因失败）。
+   *
+   * 聚合口径与结论文案都归测速内核（LatencyStore.summarize），
+   * 这里只取结论那一行；节点页与订阅页共用同一句文案。
+   */
+  private subDiagnosisText(subId: string): string {
+    const nodes: ProxyNode[] = this.service.nodesOf(subId);
+    const names: string[] = [];
+    for (const node of nodes) {
+      names.push(node.name);
+    }
+    return LatencyStoreBridge.groupDiagnosis(names);
+  }
+
   private toggleOpen(id: string): void {
     if (this.isOpen(id)) {
       this.expandedIds = this.expandedIds.filter((x) => x !== id);
@@ -589,12 +679,12 @@ export struct SubscriptionPage {
 
   /** 节点延迟文案（TunBoxPing.recordText：五态语义；第二参为页面既有延迟触发变量） */
   private nodePingText(node: ProxyNode): string {
-    return TunBoxPing.recordText(LatencyController.recordFor(node.name), this.latencyTick);
+    return TunBoxPing.recordText(LatencyStoreBridge.recordFor(node.name), this.latencyTick);
   }
 
   /** 节点延迟配色（TunBoxPing.recordColor：实测走阈值，过期/未测中性，手测失败红） */
   private nodePingColor(node: ProxyNode): ResourceColor {
-    return TunBoxPing.recordColor(LatencyController.recordFor(node.name), this.latencyTick);
+    return TunBoxPing.recordColor(LatencyStoreBridge.recordFor(node.name), this.latencyTick);
   }
 
   /**
@@ -605,7 +695,7 @@ export struct SubscriptionPage {
   private nodesSortedByLatency(subId: string): ProxyNode[] {
     const arr: ProxyNode[] = this.service.nodesOf(subId).slice();
     const key = (node: ProxyNode): number => {
-      const v = LatencyController.latencyFor(node.name);
+      const v = LatencyStoreBridge.latencyFor(node.name);
       return (v === null || v < 0) ? Number.MAX_SAFE_INTEGER : v;
     };
     // 稳定排序：ArkTS sort 对相同 key 保持插入序（ECMAScript 规范）
@@ -1235,6 +1325,28 @@ export struct SubscriptionPage {
                             // 徽标永不压缩/永不被挤出去：它是状态标识，宽度必须完整
                             .flexShrink(0)
                         }
+                        // 2026-10-20 用户要求：订阅卡片上**不再显示**「N 个域名无法解析」
+                        // —— 节点行已经逐条写着「域名无法解析（节点域名可能已下线）」，
+                        // 卡片再挂一个计数是**重复信息**（用户：「你在节点上显示了，
+                        // 这里就不允许显示了」）⇒ 卡片只保留与节点无关的统计。
+                        // 「定义不完整」单独一个角标（与上面的「域名无法解析」是两回事：
+                        // 这一条是订阅给的数据缺字段，不是线路问题、更不是网络问题）。
+                        if (this.incompleteCount(sub.id) > 0) {
+                          Text(`${this.incompleteCount(sub.id)} 条定义不完整`)
+                            .fontSize(10).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.warning)
+                            .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                            .borderRadius(TunBoxGeometry.pillRadius)
+                            .backgroundColor(TunBoxColors.surfaceSubtle)
+                            .flexShrink(0)
+                            .onClick(() => {
+                              if (!this.isOpen(sub.id)) {
+                                this.toggleOpen(sub.id);
+                              }
+                            })
+                        }
+                        // 2026-10-20 用户要求：订阅卡片上**不再显示**「N 条信息条目已跳过」
+                        // —— 与上面同一条理由：卡片不重复节点级结论；信息条目在展开区
+                        // 的说明里能看到（那里才是它的位置）。
                       }.width('100%')
                       Text(`${this.service.nodesOf(sub.id).length} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
                         .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
@@ -1273,6 +1385,66 @@ export struct SubscriptionPage {
                   // 展开节点区
                   if (this.isOpen(sub.id)) {
                     Column({ space: 6 }) {
+                      // 组级诊断条（订阅级）：整组同因全败时折叠成一条，
+                      // 别让用户逐个节点点开才发现是同一个原因
+                      // （文案与判定都归测速内核 LatencyStore.summarize）。
+                      if (this.subDiagnosisText(sub.id).length > 0) {
+                        Row({ space: 8 }) {
+                          Image($r('app.media.ic_warning'))
+                            .width(15).height(15)
+                            .fillColor(TunBoxColors.warning)
+                          Text(this.subDiagnosisText(sub.id))
+                            .fontSize(12)
+                            .fontColor(TunBoxColors.warning)
+                            .layoutWeight(1)
+                            .maxLines(3)
+                        }
+                        .width('100%')
+                        .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+                        .borderRadius(10)
+                        .backgroundColor(TunBoxColors.surfaceSubtle)
+                        .borderWidth(1)
+                        .borderColor(TunBoxColors.warning)
+                      }
+                      // 「定义不完整」单独一条（**不与域名无法解析合并**）：
+                      // 订阅给的数据缺字段 ⇒ 机场/线路提供方的问题，不是 TunBox 的问题。
+                      if (this.incompleteHint(sub.id).length > 0) {
+                        Row({ space: 8 }) {
+                          Image($r('app.media.ic_warning'))
+                            .width(15).height(15)
+                            .fillColor(TunBoxColors.textSecondary)
+                          Text(this.incompleteHint(sub.id))
+                            .fontSize(12)
+                            .fontColor(TunBoxColors.textSecondary)
+                            .layoutWeight(1)
+                            .maxLines(4)
+                        }
+                        .width('100%')
+                        .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+                        .borderRadius(10)
+                        .backgroundColor(TunBoxColors.surfaceSubtle)
+                        .borderWidth(1)
+                        .borderColor(TunBoxColors.cardBorder)
+                      }
+                      // 「信息条目已跳过」单独一条（第三类，既不是缺参节点、也不是域名问题）：
+                      if (this.infoHint(sub.id).length > 0) {
+                        Row({ space: 8 }) {
+                          Image($r('app.media.ic_warning'))
+                            .width(15).height(15)
+                            .fillColor(TunBoxColors.textMuted)
+                          Text(this.infoHint(sub.id))
+                            .fontSize(12)
+                            .fontColor(TunBoxColors.textMuted)
+                            .layoutWeight(1)
+                            .maxLines(4)
+                        }
+                        .width('100%')
+                        .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+                        .borderRadius(10)
+                        .backgroundColor(TunBoxColors.surfaceSubtle)
+                        .borderWidth(1)
+                        .borderColor(TunBoxColors.cardBorder)
+                      }
                       // 2026-10-19 用户要求：原「点击选用节点 · 长按可删除单个节点 ·
                       // 点行头闪电图标测速」提示行**去掉**，这一行改放操作按钮：
                       // 闪电测速 / 编辑 / 删除（闪电在编辑左边）。

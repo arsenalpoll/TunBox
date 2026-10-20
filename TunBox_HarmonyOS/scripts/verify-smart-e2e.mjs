@@ -77,6 +77,29 @@ for (const [file, out] of [
   if (!fs.existsSync(p)) { console.log(`缺模型 ${file}`); process.exit(1); }
   w(out, stripEnums(flatten(fs.readFileSync(p, 'utf8'))));
 }
+// 2026-10-20（yaml-sub 的订阅解析内核化）：ProxyNode.ets 现在 import 规范解析层
+// （../subscription/UriNodeParser、../subscription/ProxyNodeAdapter），
+// flatten() 会把它们改写成 './UriNodeParser.ts' / './ProxyNodeAdapter.ts' ⇒
+// 这几个模块也必须一并 stage，否则 ERR_MODULE_NOT_FOUND（staging 失败 ⇒ 整套件红）。
+const sub = path.join(ets, 'commons/subscription');
+for (const [file, out] of [
+  ['ProtocolParamTable.ets', 'ProtocolParamTable.ts'],
+  ['NodeUsability.ets', 'NodeUsability.ts'],
+  ['UnusableLedger.ets', 'UnusableLedger.ts'],
+  ['UriNodeParser.ets', 'UriNodeParser.ts'],
+  ['ProxyNodeAdapter.ets', 'ProxyNodeAdapter.ts'],
+]) {
+  const p = path.join(sub, file);
+  if (!fs.existsSync(p)) { console.log(`缺订阅解析模块 ${file}`); process.exit(1); }
+  w(out, stripEnums(flatten(fs.readFileSync(p, 'utf8'))));
+}
+// 2026-10-20（A12c）：生成器的测速地址改走唯一真源 LatencyTestUrl（零 import）
+// ⇒ 也必须 stage，否则 ClashConfigGenerator.ts import 不到。
+{
+  const p = path.join(ets, 'commons/latency/LatencyTestUrl.ets');
+  if (!fs.existsSync(p)) { console.log('缺 latency/LatencyTestUrl.ets'); process.exit(1); }
+  w('LatencyTestUrl.ts', stripEnums(flatten(fs.readFileSync(p, 'utf8'))));
+}
 // AppSettings 依赖 NodeSortPersistence / AppRoutingPolicy —— 用最小桩替掉
 w('NodeSortPersistence.ts', `export class NodeSortModes {
   static readonly DEFAULT: string = 'default';

@@ -5,6 +5,7 @@
  * 字段与 upstream 保持一致；鸿蒙端持久化由 SettingsService（@ohos.data.preferences）承担。
  */
 import { NodeSortModes } from './NodeSortPersistence.ts';
+import { LatencyTestUrl } from './LatencyTestUrl.ts';
 import { AppRoutingCustomApp, AppRoutingPolicy } from './AppRoutingPolicy.ts';
 
 /** 自动选点模式（第二阶段新增，语义同 NodeSortModes 风格） */
@@ -84,7 +85,7 @@ export class AppSettingsJson {
   preferredNodeSubscriptionId: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
-  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
+  testLatencyUrl: string = LatencyTestUrl.DEFAULT_URL;
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default' 订阅默认顺序 / 'auto' 按最近测速结果 / 'manual' 用户手动固定顺序 */
   nodeSortMode: string = 'default';
@@ -177,15 +178,15 @@ export class AppSettings {
    * ⚠ **只约束「出厂默认 / 历史默认值」**，绝不改写用户自填的 http 地址
    *   （见 `upgradeLegacyTestUrl`）。
    */
-  static readonly DEFAULT_TEST_URL: string = 'https://www.gstatic.com/generate_204';
+  static readonly DEFAULT_TEST_URL: string = LatencyTestUrl.DEFAULT_URL;
   /**
    * 本客户端历史上写过的两个 **http** 默认值（升级用）。
    *
    * 只有**恰好等于**这两个字符串的历史默认值才会被单向升级为 https；
    * 其余用户自填的 http 地址（带路径/参数/端口的）一律原样保留。
    */
-  static readonly LEGACY_TEST_URL_GSTATIC: string = 'http://www.gstatic.com/generate_204';
-  static readonly LEGACY_TEST_URL_CLOUDFLARE: string = 'http://cp.cloudflare.com/generate_204';
+  static readonly LEGACY_TEST_URL_GSTATIC: string = LatencyTestUrl.LEGACY_GSTATIC_HTTP;
+  static readonly LEGACY_TEST_URL_CLOUDFLARE: string = LatencyTestUrl.LEGACY_CLOUDFLARE_HTTP;
 
   /** 跟随系统 / 暗色 / 亮色 */
   themeMode: number = 0; // 0=system, 1=dark, 2=light
@@ -209,7 +210,7 @@ export class AppSettings {
   preferredNodeSubscriptionId: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
-  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
+  testLatencyUrl: string = LatencyTestUrl.DEFAULT_URL;
   /** 代理模式：rule = 规则 / global = 全局 / direct = 直连（对应 upstream settings.proxyMode） */
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default'=订阅默认顺序, 'auto'=按最近测速结果, 'manual'=手动固定顺序 */
@@ -349,10 +350,10 @@ export class AppSettings {
       return AppSettings.DEFAULT_TEST_URL;
     }
     if (raw === AppSettings.LEGACY_TEST_URL_GSTATIC) {
-      return 'https://www.gstatic.com/generate_204';
+      return LatencyTestUrl.DEFAULT_URL;
     }
     if (raw === AppSettings.LEGACY_TEST_URL_CLOUDFLARE) {
-      return 'https://cp.cloudflare.com/generate_204';
+      return LatencyTestUrl.ALT_URL;
     }
     if (!/^https?:\/\/\S+$/.test(raw)) {
       // 非法值（没有协议头 / 带空白）→ 默认 https

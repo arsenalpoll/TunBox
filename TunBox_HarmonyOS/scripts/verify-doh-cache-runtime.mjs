@@ -16,7 +16,11 @@ import vm from 'node:vm';
 const file = new URL('../entry/src/main/ets/commons/services/DoHResolver.ets', import.meta.url);
 const source = fs.readFileSync(file, 'utf8')
   .replace(/^import .*;\r?\n/gm, '')
-  .replace('export class DoHResolver', 'class DoHResolver')
+  // 这个闸门在 vm 里按**脚本**（非 ESM）跑 ⇒ 所有顶层 `export ` 必须去掉。
+  // 2026-10-20：DoHResolver.ets 新增了 `export class DoHResolveReport`（latency-core 的
+  // DNS 过程报告），只替换 `export class DoHResolver` 一处会让第二个 export 漏进脚本
+  // ⇒ vm.runInContext 报「SyntaxError: Unexpected token 'export'」。这里统一剥掉。
+  .replace(/^export /gm, '')
   + '\nglobalThis.Resolver = DoHResolver;';
 const js = stripTypeScriptTypes(source);
 

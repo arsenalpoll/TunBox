@@ -1,0 +1,12 @@
+## VMess 订阅样本（v2rayN 的 base64(JSON) 形态）
+##
+## 真实机场发的 vmess 链接就是「vmess:// + base64(v2rayN JSON)」，本文件照抄该形态：
+##   - 载荷里的 add/port/id/ aid/scy/net/host/path/tls/sni 都是 JSON 字段，不是 query
+##   - ps（显示名）、net（传输方式：ws/grpc/tcp）、type（伪装头类型，不是传输方式！）
+##   - 凭据全假：域名走 example.test，UUID 是占位串
+##
+## 逐行一条 URI。
+
+vmess://eyJ2IjoiMiIsInBzIjoi6aaZ5rivIFdTIDAxIiwiYWRkIjoiaGstd3MtMDEuZXhhbXBsZS50ZXN0IiwicG9ydCI6IjQ0MyIsImlkIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJ3cyIsInR5cGUiOiJub25lIiwiaG9zdCI6ImhrLXdzLTAxLmV4YW1wbGUudGVzdCIsInBhdGgiOiIvcmF5IiwidGxzIjoidGxzIiwic25pIjoiaGstd3MtMDEuZXhhbXBsZS50ZXN0IiwiYWxwbiI6ImgyLGh0dHAvMS4xIn0=
+vmess://eyJ2IjoiMiIsInBzIjoi5pel5pysIGdSUEMgMDIiLCJhZGQiOiJqcC1ncnBjLTAyLmV4YW1wbGUudGVzdCIsInBvcnQiOjg0NDMsImlkIjoiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzIiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJncnBjIiwidHlwZSI6Im5vbmUiLCJob3N0IjoiIiwicGF0aCI6ImdycGMtc2VydmljZS1uYW1lIiwidGxzIjoidGxzIiwic25pIjoianAtZ3JwYy0wMi5leGFtcGxlLnRlc3QifQ==
+vmess://eyJ2IjoiMiIsInBzIjoi5paw5Yqg5Z2hIFRDUCAwMyIsImFkZCI6InNnLXRjcC0wMy5leGFtcGxlLnRlc3QiLCJwb3J0IjoiMTAwODYiLCJpZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidHlwZSI6Im5vbmUiLCJob3N0IjoiIiwicGF0aCI6IiIsInRscyI6IiJ9

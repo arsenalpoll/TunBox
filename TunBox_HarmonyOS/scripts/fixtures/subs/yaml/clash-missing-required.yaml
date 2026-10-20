@@ -1,0 +1,34 @@
+# Clash YAML 样本：定义不完整（缺必填）—— 每条都必须是「整条不可用 + 带原因」
+# 缺什么就少什么，不得出现"半条节点"（有公钥没 uuid / 有 server 没 password …）。
+proxies:
+  # 缺 uuid（vless 必填）
+  - name: "Y-BAD-NO-UUID"
+    type: vless
+    server: bad1.example.test
+    port: 443
+    network: tcp
+    tls: true
+  # 缺 password（trojan 必填）
+  - name: "Y-BAD-NO-PASS"
+    type: trojan
+    server: bad2.example.test
+    port: 443
+    sni: bad2.example.test
+  # 缺 password（hysteria2 必填）
+  - name: "Y-BAD-HY2-NO-PASS"
+    type: hysteria2
+    server: bad3.example.test
+    port: 443
+    sni: bad3.example.test
+  # 声明了 reality-opts 却丢了 public-key —— 最典型的"半条节点"
+  # （内核拿到 short-id 没有公钥 ⇒ REALITY 握手必失败 ⇒ 整片 503）
+  - name: "Y-BAD-REALITY-NO-PBK"
+    type: vless
+    server: bad4.example.test
+    port: 443
+    uuid: 44444444-4444-4444-4444-444444444444
+    network: tcp
+    tls: true
+    servername: bad4.example.test
+    reality-opts:
+      short-id: 0123456789abcdef

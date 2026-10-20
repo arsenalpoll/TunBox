@@ -60,28 +60,35 @@ for (const t of targets) {
   ok(`${t.ns}.recordColor 不再按 source==='auto' 走中性色`,
     !/source\s*===\s*'auto'/.test(color));
 
-  // 必须仍然把失败落到 stateText（超时/失败），并且**必须带上 failKind**：
+  // 失败结论必须落到**唯一真源** LatencyStore.describe（审计 LP05：主题里那份
+  // stateText 包装删掉了，两份一模一样 ⇒ 收敛成一张表）。
   // 2026-10-19 起 state 只有「失败」一档，分不出「内核里没这个节点」(switch_failed)
-  // 与「真超时」(timeout)。不带 failKind 就会退回"404 和 504 在 UI 上完全一样"。
-  ok(`${t.ns}.recordText 失败走 LatencyPolicy.stateText`,
-    /LatencyPolicy\.stateText\(rec\.state,\s*rec\.failKind\)/.test(text));
+  // 与「真超时」(timeout)。describe 带 failKind ⇒ 不会退回"404 和 504 完全一样"。
+  ok(`${t.ns}.recordText 失败走 LatencyStore.describe`,
+    /LatencyStore\.describe\(rec\.failKind,\s*rec\.delayMs,\s*rec\.atMs,\s*nowMs\)/.test(text));
+  ok(`${t.ns}.recordText 不再自己调 LatencyPolicy.stateText`,
+    !/LatencyPolicy\.stateText\(/.test(text));
   // 必须仍然保留离线 ≈ 前缀与"没数据 = --"语义
   ok(`${t.ns}.recordText 保留离线 ≈ 前缀`,
     /`≈\$\{body\}`/.test(text) || /≈/.test(text));
   ok(`${t.ns}.recordText 无记录时仍为 --`, /return\s*'--'/.test(text));
-  // 失败配色必须是红色系（不再是中性）
-  ok(`${t.ns}.recordColor 失败走红色`,
-    /LatencyState\.TIMEOUT\s*\|\|\s*rec\.state\s*===\s*LatencyState\.FAILED/.test(color));
+  // 失败配色必须走真源的级别（BAD = 红）
+  ok(`${t.ns}.recordColor 失败走真源的 BAD 级别`,
+    /LatencyViewLevel\.BAD/.test(color) && /LatencyStore\.describe\(/.test(color));
   // 「节点未生效」（内核里没它）必须走警告色，不能和"节点坏了"一样红
   ok(`${t.ns}.recordColor 对未生效用警告色`,
-    /isNotEffective\(rec\.failKind\)[\s\S]{0,120}?warning/.test(color));
+    /LatencyViewLevel\.WARN[\s\S]{0,120}?warning/i.test(color));
 }
 
-// 反例守护：确保 stateText 真的把 TIMEOUT 映射成「超时」
+// 反例守护：**别又长出第二张渲染表**（审计 LP05）。
+// 渲染表（结论文案 + 级别）唯一真源 = commons/latency/LatencyStore.describe；
+// 行为级断言在 verify-latency-core-v2（那里能真正执行 describe）。
 const stateSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/services/LatencyState.ets'), 'utf8');
-ok('LatencyPolicy.stateText 中 TIMEOUT 映射为「超时」',
-  /TIMEOUT[\s\S]{0,120}?超时/.test(stateSrc));
+ok('LatencyState 不再自带第二张渲染表（stateText 已删）',
+  !/static\s+stateText\s*\(/.test(stateSrc));
+ok('LatencyState 不再自带 isNotEffective 分类表',
+  !/static\s+isNotEffective\s*\(/.test(stateSrc));
 
 // ── 失败分类必须一路带到 UI（2026-10-19 新增契约）────────────────────
 // 反例守护：分类若在运行时被丢掉，switch_failed（节点没进内核配置）与 timeout
@@ -89,12 +96,12 @@ ok('LatencyPolicy.stateText 中 TIMEOUT 映射为「超时」',
 // → UI 全红，用户以为节点坏了（实际节点可用、代理正常）。
 ok('LatencyRecord 带 failKind 字段',
   /class LatencyRecord[\s\S]{0,2000}?failKind\s*:\s*string\s*=\s*''/.test(stateSrc));
-ok('LatencyPolicy.stateText 接受 failKind 参数',
-  /static stateText\(state:\s*number,\s*failKind:\s*string\s*=\s*''\)/.test(stateSrc));
-ok('LatencyPolicy.stateText 对 switch_failed 显示「未生效」',
-  /isNotEffective\(failKind\)[\s\S]{0,200}?'未生效'/.test(stateSrc));
-ok('LatencyPolicy.isNotEffective 判定 switch_failed',
-  /isNotEffective[\s\S]{0,200}?'switch_failed'/.test(stateSrc));
+ok('渲染表在真源里（LatencyStore.describe 带 failKind + testedAt）',
+  /static\s+describe\(failKind:\s*string,\s*delayMs:\s*number,\s*testedAt:\s*number,\s*nowMs:\s*number\)/.test(
+    fs.readFileSync(path.join(root, 'entry/src/main/ets/commons/latency/LatencyStore.ets'), 'utf8')));
+ok('「节点未生效」的判定归真源（LatencyStore.describe 对 switch_failed 给「未生效」）',
+  /'未生效'/.test(
+    fs.readFileSync(path.join(root, 'entry/src/main/ets/commons/latency/LatencyStore.ets'), 'utf8')));
 
 const engineSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/services/LatencyEngine.ets'), 'utf8');
@@ -112,7 +119,7 @@ ok('持久化转换优先使用 rec.failKind（不再从 state 重新盖章）',
 ok('组测路径用内核代理表区分「未生效」',
   /proxyTableNames\(\)/.test(persistSrc));
 ok('组测路径把不在代理表的失败节点标为 switch_failed',
-  /notInCore[\s\S]{0,400}?LatencyFailKind\.SWITCH_FAILED/.test(persistSrc));
+  /notInCore[\s\S]{0,400}?LatencyProbeKind\.SWITCH_FAILED/.test(persistSrc));
 ok('测速完成提示单独报「未生效」计数',
   /未生效 \$\{progress\.failed\}/.test(persistSrc));
 
@@ -136,9 +143,15 @@ ok('在途并发上限为 8（C7 闸门：同 host 连接池容量）', /LATENCY
 ok('组测每节点预算与单节点一致（5000ms）', /GROUP_TEST_TIMEOUT_MS\s*=\s*5000/.test(engineSrc));
 ok('内核延迟探测默认超时同步为 5000ms',
   /testLatencyDetailed\(nodeName: string, testUrl: string,\s*\n?\s*timeoutMs: number = 5000/.test(apiSrc));
-ok('离线探测的阶段预算同步为 5s（不被 2.5s 截断）',
-  /QUIC_TIMEOUT_MS\s*=\s*5000/.test(fs.readFileSync(
-    path.join(root, 'entry/src/main/ets/commons/services/DirectLatencyTester.ets'), 'utf8')));
+// 离线探测器（DirectLatencyTester）已被测速内核（LP07）取代 —— 文件不在了就跳过这条，
+// 但**不许**因为文件缺失而整个闸门崩掉（那会让「文件已删」看起来像「契约破了」）。
+const directTesterPath = path.join(root, 'entry/src/main/ets/commons/services/DirectLatencyTester.ets');
+if (fs.existsSync(directTesterPath)) {
+  ok('离线探测的阶段预算同步为 5s（不被 2.5s 截断）',
+    /QUIC_TIMEOUT_MS\s*=\s*5000/.test(fs.readFileSync(directTesterPath, 'utf8')));
+} else {
+  ok('离线探测器已被测速内核取代（文件已删，跳过阶段预算断言）', true);
+}
 ok('批次硬截止可注入（回归测试不再依赖并发算术巧合）',
   /batchDeadlineMs:\s*number\s*=\s*BATCH_DEADLINE_MS/.test(engineSrc));
 

@@ -12,6 +12,9 @@
 import { ProxyNode, ProxyNodeType } from './ProxyNode.ts';
 import { ProxyGroup } from './ProxyGroup.ts';
 import { AppSettings, AutoSelectModes, CustomRuleSet } from './AppSettings.ts';
+// 测速地址的**单一真源**（零 import ⇒ 不会形成循环依赖）。
+// 生成器不再自己读用户配置、也不再自带任何 url 规则（审计 F12）。
+import { LatencyTestUrl } from './LatencyTestUrl.ts';
 import { YamlMerger } from './YamlMerger.ts';
 import { AppLogger } from './stubs.ts';
 import {
@@ -167,7 +170,8 @@ export class ClashConfigGenerator {
     ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
     tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = [],
     ruleProviderReady: boolean = true, useSmart: boolean = false,
-    subscriptionRules: string[] = [], subscriptionRuleProviders: string = ''): string {
+    subscriptionRules: string[] = [], subscriptionRuleProviders: string = '',
+    smartTestUrl: string = ''): string {
     const lines: string[] = [];
 
     lines.push('mixed-port: ' + mixedPort);
@@ -184,14 +188,24 @@ export class ClashConfigGenerator {
     // 配合 VpnExtensionAbility 的 IPv4-only TUN，消除 IPv6 绕过及泄漏通道。
     lines.push('ipv6: false');
     lines.push('disable-ipv6: true');
-    lines.push('unified-delay: true');
+    // 【FlClash 对齐 · 2026-10-20】mihomo 的 UnifiedDelay **默认就是 false**
+    // （adapter.go: `var UnifiedDelay = atomic.NewBool(false)`），FlClash 从不打开它。
+    // 打开后 mihomo 的 URLTest 会**连发两次 HEAD**（adapter.go 的 unifiedDelay 分支）：
+    // 第二次的结果才作数，上报的延迟只算**第二次**请求的耗时。
+    // 于是「出口不欢迎第二次 HEAD」（第二次被劫持/超时/连接被关）时，
+    // **整批可用节点会被判失败** —— 真机 2026-10-20：mitce.io 34 个节点秒失败 503，
+    // 同批其它订阅正常、隧道用同一个节点也能连通（节点本身完全没问题）。
+    // 与 FlClash 对齐 = 关掉：单次请求，延迟 = 连接建立 + 响应，语义与 FlClash 一致。
+    lines.push('unified-delay: false');
     lines.push('tcp-concurrent: true');
     // 长连接与会话复用参数：降低频繁握手、弱网切换后的僵尸连接和后台功耗。
     lines.push('keep-alive-idle: 30');
     lines.push('keep-alive-interval: 15');
     lines.push('udp-timeout: 300');
-    // 【C18】该字段是 string（mihomo process.FindProcessMode），但裸 off 在
-    // YAML 1.1 语境下有歧义 → 加引号消除歧义。
+    // 【C22】该字段是 string（mihomo process.FindProcessMode）。裸写 off 在
+    // YAML 1.1 语境下会被解析成 bool（内核用的是 YAML 1.2 解析器，裸 off 目前
+    // 是 !!str，实测能过；加引号是为了消除语义歧义，与真实内核实测结论一致：
+    // `find-process-mode: off` 与 `find-process-mode: "off"` 内核都接受）。
     lines.push('find-process-mode: "off"');
     lines.push('');
     lines.push('dns:');
@@ -574,15 +588,18 @@ export class ClashConfigGenerator {
       //     ASN.mmdb，实测 **90s 阻塞**（同 MMDB 坑），而设备上并没有 ASN.mmdb。
       //   url 用用户配置的测速地址，而不是内核默认的 gstatic —— 否则「测速设置」
       //     对自动选点不生效，两处延迟口径不一致（真机发现的遗漏）。
+      //   ⚠ 2026-10-20（A12c / 审计 F12）：测速地址**只有一个真源** ——
+      //     调用方把用户填的原始值传进来（smartTestUrl），规则（空/非法 → 默认 https、
+      //     历史 http 默认值 → https、用户自填 http 保持原样）全部由
+      //     LatencyTestUrl.effective() 决定。生成器**不再自己读用户配置**，
+      //     也不再自带任何 url 规则 —— 避免「两份实现、两套话术」。
       lines.push(`  - name: "${SMART_GROUP_NAME}"`);
       lines.push('    type: smart');
       lines.push('    uselightgbm: true');
       lines.push('    collectdata: false');
       lines.push('    prefer-asn: false');
-      const smartUrl: string = (settings.testLatencyUrl ?? '').trim();
-      if (smartUrl.length > 0) {
-        lines.push(`    url: "${ClashConfigGenerator.escapeYaml(smartUrl)}"`);
-      }
+      const smartUrl: string = LatencyTestUrl.effective(smartTestUrl);
+      lines.push(`    url: "${ClashConfigGenerator.escapeYaml(smartUrl)}"`);
       // 机场常把「剩余流量/套餐到期」这类**信息条**塞进 proxies 列表，它们和真实节点
       // 共用同一个 server/uuid（真机实证：4 条信息条与 🇯🇵日本•移联01 端点完全相同），
       // 纯属重复噪音。不排除的话内核会把它们当真节点参与评分，甚至选成出口 ——
@@ -1233,16 +1250,18 @@ export class ClashConfigGenerator {
   ]);
 
   /**
-   * 覆盖层布尔字段白名单（C18）：只有这些**路径**上的 yes/no/on/off 才会被改写成
-   * true/false。路径 = 缩进栈推导出的「顶层键 → 子键」链（如 dns.enable）。
+   * 覆盖层布尔字段白名单（C18）：只有这些**路径**上的布尔字面量才会被改写成
+   * 裸 true/false。路径 = 缩进栈推导出的「顶层键 → 子键」链（如 dns.enable）。
    *
-   * 为什么需要：mihomo 用 YAML 1.2 core schema（go.yaml.in/yaml/v3），
-   * `yes`/`no`/`on`/`off` 解析为 **!!str**（不是 bool）→ 落进 RawConfig 的 bool
-   * 字段（allow-lan / dns.enable / tun.enable …）就是
-   * `cannot unmarshal !!str 'yes' into bool` → 整份配置拒载（R3）。
+   * ⚠ **口径以真实内核实测为准**（Mihomo Meta 1.10.0，2026-10-20 逐写法实测，
+   *   详见 normalizeOverrideBooleans 的实测表）：
+   *   - 裸写 `yes/no/on/off` 内核**接受**（yaml.v3 对 bool 目标有 YAML 1.1 兼容分支）
+   *     → 改写它们只是「规范化」，**不是**救火；
+   *   - 真正会整份拒载的是**带引号的** `"true"/"false"/"1"/"0"`（!!str into bool）
+   *     与**裸写的** `1/0`（!!int into bool）→ 这两类必须改写。
    *
-   * 刻意**保守**：只列 RawConfig 里确定是 bool 的字段；未知路径上的 yes/no
-   * **原样保留**（内核对不认识的字段宽容，我们不擅自改写用户原文）。
+   * 刻意**保守**：只列 RawConfig 里确定是 bool 的字段；未知路径上的值
+   * **一律原样保留**（内核对不认识的字段宽容，我们不擅自改写用户原文）。
    */
   private static readonly OVERRIDE_BOOL_PATHS: Set<string> = new Set<string>([
     'allow-lan', 'ipv6', 'unified-delay', 'tcp-concurrent', 'disable-keep-alive',
@@ -1353,11 +1372,34 @@ export class ClashConfigGenerator {
   }
 
   /**
-   * 覆盖层布尔值归一（C18）：**路径感知**，只改白名单路径上的 yes/no/on/off。
+   * 覆盖层布尔值归一（C18）：**路径感知**，只改白名单路径上的布尔字面量。
    *
-   * 用缩进栈推导「顶层键 → 子键」路径；值是 yes/no/on/off（任意大小写）时改写成
-   * true/false。**不做全局文本替换** —— 未知路径上的 yes/no 原样保留。
-   * 引号包裹的值（"yes"）同样按布尔处理并去掉引号（内核只认裸 true/false）。
+   * ── 真实内核实测口径（Mihomo Meta 1.10.0，`mihomo.exe -t -d <dir> -f <cfg>`，
+   *    2026-10-20 逐个写法实测，不是推测）──────────────────────────────
+   *  | 写法                              | 真实内核                          |
+   *  |-----------------------------------|-----------------------------------|
+   *  | `allow-lan: yes` / `on` / `no`    | **通过**（裸写）                  |
+   *  | `allow-lan: "yes"` / `"on"` / `"no"` / `"OFF"` | **通过**（带引号也在兼容表内）|
+   *  | `allow-lan: true` / `false`       | 通过（裸写，本就是 bool）         |
+   *  | `allow-lan: "true"` / `"True"` / `"TRUE"` / `"false"` / `"1"` / `"0"` | **整份拒载** |
+   *  | `allow-lan: 1` / `0`              | **整份拒载**（!!int into bool）   |
+   *
+   *  原因（yaml.v3 decode 层）：resolve 表只认 true/false → 带引号的字面量是
+   *  !!str；但对 **bool 目标**另有一层 YAML 1.1 兼容分支，把
+   *  y/Y/yes/Yes/YES/on/On/ON、n/N/no/No/NO/off/Off/OFF 转成 bool。
+   *  **该兼容表里没有 true/True/TRUE/false/False/FALSE/1/0** → 带引号的
+   *  "true"/"1" 是 !!str 落进 bool 字段 = `cannot unmarshal !!str 'true' into bool`
+   *  = 整份拒载（unmarshal errors 是全有全无）。
+   *
+   * 所以本函数的**真正职责**是：把「会炸的写法」改成内核必吃的裸 true/false ——
+   *  ① 带引号的 `"true"/"false"/"True"/"TRUE"/"1"/"0"` → 去引号写成 true/false；
+   *  ② 裸写的 `1`/`0`（!!int into bool，同样会炸）→ true/false；
+   *  ③ 裸写/带引号的 `yes/no/on/off` → 统一成裸 true/false（**语义相同**，
+   *     内核本来也吃，属于规范化而非救火）。
+   *  带引号的 `"yes"/"on"/"no"/"off"` 内核能吃，**保持原样不改**（不擅自改写用户原文）。
+   *
+   * **路径感知**：用缩进栈推导「顶层键 → 子键」路径，只有白名单路径才改写；
+   * 未知路径上的值一律**原样保留**（绝不全局文本替换）。
    */
   static normalizeOverrideBooleans(lines: string[]): string[] {
     const out: string[] = [];
@@ -1389,17 +1431,16 @@ export class ClashConfigGenerator {
       }
       const path = stackKeys.length > 0 ? `${stackKeys.join('.')}.${key}` : key;
       const valueRaw = parts[1];
-      const value = ClashConfigGenerator.stripYamlComment(valueRaw);
-      const unquoted = ClashConfigGenerator.unquoteKey(value);
-      const lower = unquoted.toLowerCase();
+      const split = ClashConfigGenerator.splitValueAndComment(valueRaw);
+      const value = split[0];
+      const comment = split[1];
       let rewritten = raw;
-      if (ClashConfigGenerator.OVERRIDE_BOOL_PATHS.has(path)
-        && (lower === 'yes' || lower === 'no' || lower === 'on' || lower === 'off')) {
-        const boolText = (lower === 'yes' || lower === 'on') ? 'true' : 'false';
-        const prefix = line.substring(0, indent);
-        const commentIdx = valueRaw.indexOf(' #');
-        const comment = commentIdx >= 0 ? valueRaw.substring(commentIdx) : '';
-        rewritten = `${prefix}${rawKey.trim()}: ${boolText}${comment}`;
+      if (ClashConfigGenerator.OVERRIDE_BOOL_PATHS.has(path)) {
+        const boolText = ClashConfigGenerator.boolLiteralToCanonical(value);
+        if (boolText.length > 0) {
+          const prefix = line.substring(0, indent);
+          rewritten = `${prefix}${rawKey.trim()}: ${boolText}${comment}`;
+        }
       }
       out.push(rewritten);
       if (value.length === 0) {
@@ -1409,6 +1450,84 @@ export class ClashConfigGenerator {
       }
     }
     return out;
+  }
+
+  /**
+   * 把一个值文本归一成内核必吃的**裸** true/false；不需要改写时返回空串。
+   *
+   * 口径见 normalizeOverrideBooleans 的实测表：
+   *  - 带引号的 "true"/"false"/"True"/"TRUE"/"1"/"0" → true/false（**会炸的写法**）
+   *  - 裸写的 1/0 → true/false（!!int into bool，同样会炸）
+   *  - 裸写的 yes/no/on/off（任意大小写）→ true/false（语义相同，规范化）
+   *  - 带引号的 "yes"/"on"/"no"/"off" → **保持原样**（内核能吃）
+   *  - 其它（true/false 裸写、非布尔值）→ 保持原样
+   */
+  private static boolLiteralToCanonical(value: string): string {
+    const text = value.trim();
+    if (text.length === 0) {
+      return '';
+    }
+    const quoted = text.length >= 2
+      && ((text.startsWith('"') && text.endsWith('"'))
+        || (text.startsWith("'") && text.endsWith("'")));
+    if (quoted) {
+      const inner = text.substring(1, text.length - 1).trim();
+      const lower = inner.toLowerCase();
+      if (lower === 'true') {
+        return 'true';
+      }
+      if (lower === 'false') {
+        return 'false';
+      }
+      if (inner === '1') {
+        return 'true';
+      }
+      if (inner === '0') {
+        return 'false';
+      }
+      // "yes"/"on"/"no"/"off" 在 yaml.v3 的 bool 兼容表内 → 内核能吃，原样保留
+      return '';
+    }
+    const lower = text.toLowerCase();
+    if (lower === 'yes' || lower === 'on') {
+      return 'true';
+    }
+    if (lower === 'no' || lower === 'off') {
+      return 'false';
+    }
+    if (text === '1') {
+      return 'true';
+    }
+    if (text === '0') {
+      return 'false';
+    }
+    return '';
+  }
+
+  /**
+   * 拆出「值」与「尾部注释」（引号感知）：只有引号外、且前面是空白的 '#' 才是注释起点；
+   * 引号内的 '#' 不算。返回 [值, 注释（含前导空白）]。
+   */
+  private static splitValueAndComment(valueRaw: string): string[] {
+    let quote = '';
+    for (let i = 0; i < valueRaw.length; i++) {
+      const ch = valueRaw.charAt(i);
+      if (quote.length > 0) {
+        if (ch === quote) {
+          quote = '';
+        }
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === '#' && (i === 0 || valueRaw.charAt(i - 1) === ' ')) {
+        const comment = i > 0 ? valueRaw.substring(i - 1) : valueRaw.substring(i);
+        return [valueRaw.substring(0, i).trim(), comment];
+      }
+    }
+    return [valueRaw.trim(), ''];
   }
 
   /** 与节点页持久化键保持一致：订阅 ID + NUL + 原始组名。 */
@@ -1515,20 +1634,25 @@ export class ClashConfigGenerator {
   }
 
   /**
-   * 组测速 URL 安全化：仅接受 http(s) 明文链接且不含 YAML 破坏字符；
-   * 非法/未声明回退内核默认口径 gstatic generate_204。
+   * 组测速 URL 安全化：只保留 YAML 安全检查，**url 规则一律交给真源**。
    *
-   * 【C4】兜底值改为 **https**：mihomo 官方点名 `group.url` 应使用 HTTPS
+   * 2026-10-20（A12c / 审计 F12）：本方法原先自带一整套 url 规则
+   * （http(s) 前缀判定 + 2048 长度上限 + gstatic 兜底），
+   * 与 LatencyTestUrl.effective() 是**两份实现** —— 同一件事两种话术，
+   * 改一处、别处还是旧口径。现在：
+   *   · 合法性/默认值 → LatencyTestUrl.effective()（唯一真源）；
+   *   · 这里只保留 **YAML 安全**（不含破坏字符）与转义 —— 那是写盘安全，不是 url 规则。
+   * 【C4】兜底值仍是 **https**：mihomo 官方点名 `group.url` 应使用 HTTPS
    * （明文地址会被出口劫持，测速结果不可信）。**用户/订阅自己声明的 url
    * 保持原样不动**（个别出口掐 gstatic 的 TLS SNI 是真机实证过的合法用法）。
    */
   static safeGroupUrl(raw: string): string {
     const url = raw.trim();
-    if (url.length === 0 || url.length > 2048 || !ClashConfigGenerator.isSafeText(url)
-      || !(url.startsWith('http://') || url.startsWith('https://'))) {
-      return 'https://www.gstatic.com/generate_204';
+    if (url.length === 0 || url.length > LatencyTestUrl.MAX_LENGTH
+      || !ClashConfigGenerator.isSafeText(url)) {
+      return LatencyTestUrl.DEFAULT_URL;
     }
-    return ClashConfigGenerator.escapeYaml(url);
+    return ClashConfigGenerator.escapeYaml(LatencyTestUrl.effective(url));
   }
 
   /** 组测速间隔夹取：30..86400 秒；未声明（0/负数）回退 300（旧版硬编码值）。 */

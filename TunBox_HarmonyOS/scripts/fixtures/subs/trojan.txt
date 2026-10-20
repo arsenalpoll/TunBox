@@ -1,0 +1,10 @@
+## Trojan 订阅样本
+##
+## 形态：trojan://口令@host:port?sni=…&type=…#名称
+## 第 2 条的口令含百分号编码（fake%40pass%2Fword → fake@pass/word），
+## 用来证明**敏感值只做一次百分号解码、绝不被改写或截断**（闸门用 sha256 摘要比对）。
+## 凭据全假。
+
+trojan://fake-trojan-password@hk-trojan-01.example.test:443?sni=hk-trojan-01.example.test&type=tcp&fp=chrome&alpn=h2%2Chttp%2F1.1#%E9%A6%99%E6%B8%AF%20Trojan%2001
+trojan://fake%40pass%2Fword@sg-trojan-ws.example.test:443?sni=sg-trojan-ws.example.test&type=ws&host=sg-trojan-ws.example.test&path=%2Ftr-trojan-ws#%E6%96%B0%E5%8A%A0%E5%9D%A1%20Trojan%20WS
+trojan://another-fake-trojan-password@jp-trojan-grpc.example.test:443?sni=jp-trojan-grpc.example.test&type=grpc&serviceName=trojan-grpc-svc&mode=gun#%E6%97%A5%E6%9C%AC%20Trojan%20gRPC

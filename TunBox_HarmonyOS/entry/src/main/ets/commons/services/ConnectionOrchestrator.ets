@@ -18,6 +18,7 @@ import { util } from '@kit.ArkTS';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { coreBridge } from '../../core/CoreBridge';
 import { ClashApiService, TrafficSnapshot } from './ClashApiService';
+import { RuntimeConfigBuilder, RuntimeConfigMode, RuntimeConfigProfile } from '../config/RuntimeConfigBuilder';
 import { ClashConfigGenerator } from './ClashConfigGenerator';
 import { ConfigValidator } from './ConfigValidator';
 import { DoHResolver } from './DoHResolver';
@@ -282,6 +283,35 @@ const RECONNECT_MAX_MS: number = 8000;
 /** 网络切换触发的最大重连尝试次数 */
 const RECONNECT_MAX_ATTEMPTS: number = 3;
 
+/**
+ * 一次内核会话的端口三元组。
+ *
+ * 刻意做成**不可变输入**而不是共享可变字段：测速核与隧道核各自持有一份，
+ * 互不写回（审计 F1：旧实现里测速核的端口探测会改写隧道核正在用的端口）。
+ */
+export class RuntimePorts {
+  apiPort: number = 0;
+  mixedPort: number = 0;
+  dnsPort: number = 0;
+}
+
+/**
+ * DoH 快照（节点域名 → 固定 IP + 本次尝试解析过的域名名单）。
+ *
+ * 测速侧靠它区分「域名无法解析」（在名单里、却没解析出 IP）与「没试过解析」（不在名单里）——
+ * 后者必须记 unknown，不能误报成解析失败。
+ */
+export class LatencyHostSnapshot {
+  /** 小写域名 → 固定 IP（没解析出来的域名不在表里）。 */
+  pins: Record<string, string> = {};
+  /** 本次**实际尝试过**解析的域名（小写）。 */
+  attempted: string[] = [];
+  /** 预解析**查到了地址**的域名（小写；含被丢弃的 ⇒ 不能误报失败）。 */
+  resolved: string[] = [];
+  /** 预解析**查了但没查到地址**的域名（小写）⇒ 真·解析失败。 */
+  failed: string[] = [];
+}
+
 export class ConnectionOrchestrator implements NetworkStateListener, OrchestratorHealthView {
   /**
    * 进程级单例: 每个页面必须共享同一个 orchestrator 实例。
@@ -339,9 +369,40 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private zeroNodeAutoRefreshDone: boolean = false;
   /** 上次连接写入配置的 DoH pin 结果 + GEOIP 判定，供热重载复用（避免重建隧道）。 */
   private lastProxyHosts: Record<string, string> = {};
-  private lastUseGeoip: boolean = false;
+  /**
+   * 本次 DoH 预解析**实际尝试过**的域名名单（小写）。
+   *
+   * 测速侧要靠它区分「解析失败」与「根本没试过」：只有**在名单里**且没解析出 IP 的
+   * 域名才算「域名无法解析」；不在名单里的一律记 unknown（不能误报）。
+   */
+  private lastProxyHostAttempted: string[] = [];
+  /**
+   * 本次预解析**查到了地址**的域名（小写）。
+   *
+   * 为什么单独存：`pins` 只含**被 pin 住**（写进 hosts）的域名；
+   * 「查到了但因易变/劫持嫌疑被丢弃」的域名不在 pins 里，却**确实解析成功** ⇒
+   * 只看 pins 会把它误判成「解析失败」。
+   */
+  private lastProxyHostResolved: string[] = [];
+  /**
+   * 本次预解析**查了但没查到地址**的域名（小写）⇒ 真·解析失败。
+   *
+   * 这是「域名下线」的唯一可靠判据：只有**真的查过**且失败才算；
+   * 「没查过」（短 TTL 故意不 pin）绝不能算失败。
+   */
+  private lastProxyHostFailed: string[] = [];
+  private lastGeoipReady: boolean = false;
   /** 上次连接是否启用了内核 smart 组（热重载复用同一决策，避免两次生成不一致） */
-  private lastUseSmart: boolean = false;
+  private lastSmartModelReady: boolean = false;
+  /** 去广告规则集文件是否已就绪（事实位；是否声明由 builder 统一决策）。 */
+  private lastRuleProviderFileReady: boolean = false;
+  /**
+   * 真实隧道当前配置所对应的**节点集指纹**（'' = 未登记）。
+   * 隧道配置同样只在连接那一刻生成一次；订阅集合变了之后隧道里就缺新节点，
+   * 新节点不在内核代理表 → 测速 404 → UI「未生效」。测速取通道前用它判断
+   * 隧道配置是否过期（过期就热重载，不拆隧道）。
+   */
+  private tunnelConfigFingerprint: string = '';
   /** 本次会话实际启用的 mihomo 端口（reservePorts 探测后更新；热重载必须复用，禁止重选）。 */
   private apiPort: number = API_PORT;
   private mixedPort: number = MIXED_PORT;
@@ -406,6 +467,35 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.invalidateStateProbeCache();
     // 第二阶段集成点①：进程级启动网络状态监听（幂等，失败静默降级）
     this.startNetworkWatch();
+    // 节点集变化 → 作废测速核（幂等注册：同一回调只入队一次）
+    SubscriptionService.onNodeSetChanged((reason: string): void => {
+      this.onSubscriptionNodeSetChanged(reason);
+    });
+  }
+
+  /**
+   * 订阅集合变化后的测速核处置。
+   *
+   * 内核里的 mihomo 配置**只在启动那一刻**按当时的节点集生成一次；订阅导入/
+   * 刷新/增删之后它就与当前节点集脱节 —— 新节点不在内核代理表里，/delay 404，
+   * UI 整屏显示「未生效」（真机 2026-10-20：用户导入新订阅后测速全屏未生效，
+   * 而 /version 探活照样通过 —— 「活着的内核」不等于「配置是新的」）。
+   *
+   * 这里做两件事：作废（下次取通道按新节点集重建）+ 后台预热（用户下一次点
+   * 测速时内核既热又新，不必等一次冷启动）。真实隧道在场时一律不动：测速核
+   * 与真实隧道共用同一个扩展进程，停它等于停用户的 VPN。
+   */
+  private onSubscriptionNodeSetChanged(reason: string): void {
+    if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING) {
+      // 真实隧道在场：测速复用隧道 controller，隧道配置的新鲜度由
+      // ensureTunnelConfigFresh() 在取通道时判定（必要时热重载，不拆隧道）。
+      return;
+    }
+    this.invalidateTestCoreForSubscriptionChange(reason)
+      .then((): void => {
+        this.prewarmLatencyChannel().catch((): void => {});
+      })
+      .catch((): void => {});
   }
 
   requestDisconnect(): void {
@@ -764,10 +854,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.reloading = true;
     try {
       const settings: AppSettings = await SettingsService.load();
-      const yaml = ClashConfigGenerator.generate(node, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
-        this.apiSecret, this.lastUseGeoip, false, this.lastProxyHosts, true, subs.proxyGroups,
-        this.isRuleProviderReady(), this.lastUseSmart,
-        subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
+      // 凭据回填收敛在 hydrateAndBuildProfile（生成配置的唯一入口）。
+      // 唯一配置生成入口：热重载与隧道/测速核走同一条生成路径（决策一处、事实同源）。
+      const hotPorts = new RuntimePorts();
+      hotPorts.apiPort = this.apiPort;
+      hotPorts.mixedPort = this.mixedPort;
+      hotPorts.dnsPort = this.dnsPort;
+      const hotProfile = await this.hydrateAndBuildProfile(subs, settings, node.name, hotPorts, this.apiSecret,
+        this.lastProxyHosts, this.lastSmartModelReady, this.lastGeoipReady, this.lastRuleProviderFileReady);
+      const hotBuilt = await RuntimeConfigBuilder.buildRuntimeConfig(hotProfile, RuntimeConfigMode.TUNNEL);
+      const yaml = hotBuilt.yaml;
       // 写盘前闸门：坏配置绝不落盘（内核对重复键是整份拒载）
       const safeYaml = this.prepareConfigYaml(yaml, 'hot-reload');
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
@@ -778,6 +874,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `[hot-reload] controller reload failed; caller will fallback (${reason})`);
         return false;
       }
+      // 隧道配置已按当前节点集重写 → 登记新指纹（测速前的过期判定用）
+      this.tunnelConfigFingerprint = SubscriptionService.nodeSetFingerprint(subs.nodes);
       // 热重载会把代理组重置为默认首节点，恢复用户当前选择。
       await this.api.selectNode(this.lastNodeName);
       this.applyProxyModeSilent(settings.proxyMode);
@@ -1398,7 +1496,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     try {
       const settings = await SettingsService.load();
-      let snap = NodeSortSnapshot.fromJsonText(settings.nodeSortSnapshot);
+      // 读也走分片视图（不再直接读整单里的旧字段 —— 那又是一份真源，审计 F2 / ND07）。
+      let snap = NodeSortSnapshot.fromJsonText(await SettingsService.loadNodeSortSnapshot());
       if (snap === null) {
         snap = new NodeSortSnapshot();
       }
@@ -1430,8 +1529,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         // 失败记账走 failCount / lastOk（选点评分照旧，见 candidateFromRecord），
         // 测速结论只由测速批次写。
       }
-      settings.nodeSortSnapshot = snap.toJsonText();
-      await SettingsService.save(settings);
+      // 字段级写入（F2 根因修复 + ND07 写者唯一）：
+      // 连接记账（failCount / lastOk）只写**记账分片**，
+      // 测速结论（latency / failKind / testedAt）由测速批次写**测速分片** ——
+      // 两者互不覆盖；整单 save() 会把对方刚写的结论盖回旧值（审计 F2）。
+      await SettingsService.saveNodeSortStats(snap.toJsonText());
       AppLogger.info(TAG, `[failover] node stat ${name}: ok=${ok} consecutiveFailures=${rec.failCount}`);
       return rec.failCount;
     } catch (e) {
@@ -1512,7 +1614,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       AppLogger.info(TAG, `[failover] cooldown active ${now - this.lastFailoverAt}ms < ${cooldownMs}ms; skip (${trigger})`);
       return false;
     }
-    const snap = NodeSortSnapshot.fromJsonText(settings.nodeSortSnapshot);
+    const snap = NodeSortSnapshot.fromJsonText(await SettingsService.loadNodeSortSnapshot());
     const opts = new SelectorOptions();
     opts.failThreshold = settings.failoverFailureThreshold;
     opts.cooldownMs = cooldownMs;
@@ -1866,6 +1968,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   testCoreActive: boolean = false;
   private testCoreSecret: string = '';
   /**
+   * 测速核**实际**使用的 api 端口（可能与隧道核不同 —— 测速核用自己探测的端口，
+   * 不写回共享字段，审计 F1）。客户端 setEndpoint 必须用这个端口。
+   */
+  private testCoreApiPort: number = 0;
+  /**
    * 测速内核「预计变热」的时间戳（ms）。0 = 无预热窗口（不是测速核）。
    * 内核刚就绪时设成 now + TEST_CORE_WARMUP_MS；复用时窗口早已过去 → 不等待。
    */
@@ -1878,6 +1985,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * false，页面按既有约定降级成「端口可达」，绝不冒充代理延迟。
    */
   private testCoreNegativeUntil: number = 0;
+  /**
+   * 测速核当前配置所对应的**节点集指纹**（'' = 未登记 / 无有效配置）。
+   * 复用测速核前必须比对：探活只能证明 controller 活着，证明不了「配置里含有
+   * 当前这些节点」（真机 2026-10-20：导入新订阅后 /version 200，但 /delay 全
+   * 404 → UI 整屏「未生效」）。指纹口径见 SubscriptionService.nodeSetFingerprint。
+   */
+  private testCoreNodeFingerprint: string = '';
 
   /** 懒建状态机（依赖 this.context，调用前须已 init） */
   private getTestCoreFlight(): SingleFlightTestCore {
@@ -1907,7 +2021,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /**
    * 测速内核通道真实可用判据（四者一致才算就绪）：
    *   1) 本进程持有本班次的测速 secret；
-   *   2) endpoint 端口 = API_PORT；
+   *   2) endpoint 端口 = 测速核自己的 api 端口（不与隧道核共用）；
    *   3) endpoint secret = 本班次 secret；
    *   4) 真实探测 GET /version 返回 200（进程存活 + secret 被内核接受）。
    */
@@ -1915,7 +2029,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (this.testCoreSecret.length === 0) {
       return false;
     }
-    if (this.api.currentPort() !== this.apiPort || !this.api.hasSecret(this.testCoreSecret)) {
+    if (this.testCoreApiPort <= 0 || this.api.currentPort() !== this.testCoreApiPort
+      || !this.api.hasSecret(this.testCoreSecret)) {
       AppLogger.warn(TAG, 'test core channel verify failed: endpoint port/secret mismatch');
       return false;
     }
@@ -1960,6 +2075,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 1) 真实隧道优先：它已经带着完整节点表，且是唯一权威的运行时配置
     if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING) {
       if (await this.api.healthProbe()) {
+        // 隧道配置新鲜度（2026-10-20）：订阅集合变了以后隧道配置里缺新节点，
+        // 新节点不在内核代理表 → 测速 /delay 404 → UI「未生效」。热重载把当前
+        // 节点集重新写进内核（不拆隧道、不掉线）。
+        await this.ensureTunnelConfigFresh();
         AppLogger.info(TAG, 'latency channel: reusing connected tunnel controller');
         return this.api;
       }
@@ -2091,7 +2210,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (!applied) {
         // 测速内核正在服务（未连接场景）：那它用的就是本进程持有的测速 secret
         if (this.testCoreSecret.length > 0) {
-          api.setEndpoint(this.apiPort, this.testCoreSecret);
+          // 测速核的端口**不与隧道核共用**（审计 F1 / F9）：这里下发的是测速核
+          // 自己的端口，否则会对着隧道端口发测速 secret ⇒ 整批「内核未就绪」。
+          const corePort = this.testCoreApiPort > 0 ? this.testCoreApiPort : this.apiPort;
+          api.setEndpoint(corePort, this.testCoreSecret);
         } else {
           return false;
         }
@@ -2161,25 +2283,38 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     const flight = this.getTestCoreFlight();
     if (flight.isActive()) {
-      // 就绪判据 = controller 实际可用（端口 + secret + 真实 /version 探测），
-      // 不能只看进程内状态机 ACTIVE：内核已死或 secret 被别的路径覆盖时，
-      // 旧实现直接 return true，导致整批 /delay 非 200（真机 143 节点全超时）。
-      if (await this.verifyTestCoreChannel()) {
-        this.testCoreNegativeUntil = 0;
-        return true;
-      }
-      // 通道可能只是被覆盖了 secret：先用本班次 secret 重新下发并复探一次
-      if (this.testCoreSecret.length > 0) {
-        this.api.setEndpoint(this.apiPort, this.testCoreSecret);
+      // 配置新鲜度闸门（2026-10-20 整改）：内核代理表必须与当前节点集一致。
+      // **探活证明不了配置是新的**：/version 照样 200，但配置里没有新节点时
+      // /delay 全 404 → UI「未生效」（真机：导入新订阅后测速整屏未生效）。
+      // 不一致就重建（配置按当前节点集重新生成），再谈探活。
+      const staleConfig: boolean = this.testCoreNodeFingerprint.length > 0
+        && this.testCoreNodeFingerprint !== SubscriptionService.nodeSetFingerprint(subs.nodes);
+      if (staleConfig) {
+        AppLogger.info(TAG, 'test core config is stale (node set changed); rebuilding test core');
+        await this.stopTestCore();
+      } else {
+        // 就绪判据 = controller 实际可用（端口 + secret + 真实 /version 探测），
+        // 不能只看进程内状态机 ACTIVE：内核已死或 secret 被别的路径覆盖时，
+        // 旧实现直接 return true，导致整批 /delay 非 200（真机 143 节点全超时）。
         if (await this.verifyTestCoreChannel()) {
-          AppLogger.info(TAG, 'test core channel recovered by re-issuing endpoint secret');
           this.testCoreNegativeUntil = 0;
           return true;
         }
+        // 通道可能只是被覆盖了 secret：先用本班次 secret 重新下发并复探一次
+        if (this.testCoreSecret.length > 0) {
+          // 测速核的端口不与隧道核共用：优先用本班次记录的测速核端口 ✓
+          const corePort = this.testCoreApiPort > 0 ? this.testCoreApiPort : this.apiPort;
+          this.api.setEndpoint(corePort, this.testCoreSecret);
+          if (await this.verifyTestCoreChannel()) {
+            AppLogger.info(TAG, 'test core channel recovered by re-issuing endpoint secret');
+            this.testCoreNegativeUntil = 0;
+            return true;
+          }
+        }
+        AppLogger.warn(TAG,
+          'test core marked ACTIVE but controller unusable; tearing down and relaunching');
+        await this.stopTestCore();
       }
-      AppLogger.warn(TAG,
-        'test core marked ACTIVE but controller unusable; tearing down and relaunching');
-      await this.stopTestCore();
     }
     // 安全门禁（防「互相 stop」）：headless 测速内核的启动流程第一步就是
     // stopVpnExtensionAbility —— 若此刻真实隧道正在建立/已连接/恢复中，那一步
@@ -2281,6 +2416,38 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
+  /**
+   * DoH 快照（只读）：节点域名 → 固定 IP，以及本次**尝试过**的域名名单。
+   *
+   * 测速侧据此判定「域名无法解析」（dns_unresolved）与「没试过解析」（unknown）的区别：
+   * 只有在 attempted 里、且 pins 里查不到的域名才算解析失败。
+   */
+  hostSnapshot(): LatencyHostSnapshot {
+    const snap = new LatencyHostSnapshot();
+    snap.pins = this.lastProxyHosts;
+    snap.attempted = this.lastProxyHostAttempted;
+    snap.resolved = this.lastProxyHostResolved;
+    snap.failed = this.lastProxyHostFailed;
+    return snap;
+  }
+  /**
+   * 生成配置前把节点凭据回填到内存。
+   *
+   * 导入/刷新订阅后，凭据会被封存进加密层并**清掉内存明文**
+   * （SubscriptionService.sealPlaintext），而回填（initNodes）只在 App 启动
+   * 与备份恢复时做。同一会话里紧接着生成配置时，那些节点会因「缺凭据」被
+   * 生成器整条跳过 → 节点不在内核代理表 → 测速显示「未生效」、连接也找不到
+   * 该节点（真机 2026-10-20）。
+   */
+  private async hydrateNodeCredentials(subs: SubscriptionService): Promise<void> {
+    try {
+      await subs.initNodes(subs.nodes);
+    } catch (e) {
+      AppLogger.warn(TAG, `node credential hydrate failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+
   /** 真正的启动动作（由状态机单次调用） */
   private async launchTestCore(): Promise<boolean> {
     const subs = this.testCoreSubs;
@@ -2289,33 +2456,54 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return false;
     }
     try {
-      const domains: string[] = [];
-      for (const n of subs.nodes) {
-        const s = n.server;
-        if (s.length === 0 || s.includes(':') || /^\d+\.\d+\.\d+\.\d+$/.test(s)) {
-          continue;
-        }
-        domains.push(s);
-      }
+
       let hosts: Record<string, string> = {};
       try {
-        hosts = await DoHResolver.resolveMany(domains, 4000);
+        // hosts 的**唯一来源**是 RuntimeConfigBuilder.resolveSharedHosts（审计 F10 / ND11）：
+        // 隧道与测速核共用同一次 DoH 解析 ⇒ 同一域名在两份 YAML 里钉到同一个 IP，
+        // 不会再出现「同一节点隧道里能用、测速核里 pin 不上」。
+        const testPriority: string[] = subs.nodes.length > 0 && subs.nodes[0].server.length > 0
+          ? [subs.nodes[0].server] : [];
+        hosts = await RuntimeConfigBuilder.resolveSharedHosts(subs.nodes, testPriority);
       } catch (e) {
         AppLogger.warn(TAG, `test-core DoH pre-resolve failed: ${AppLogger.errText(e)}`);
       }
+      // 与隧道**共用同一份「节点域名 → 固定 IP」状态**：隧道建立时已经解析成功的
+      // 域名直接复用（lastProxyHosts）。隧道里能连上的节点，测速核必须也能连上 ——
+      // 两边各自解析 = 同一节点在两条路径上表现不同（真机 2026-10-20：DoH 在当前
+      // 网络不通时测速核 pin 不到 → 运行期回退明文 DNS → 全部 503 失败）。
+      const sharedHostKeys: string[] = Object.keys(this.lastProxyHosts);
+      for (const k of sharedHostKeys) {
+        if (hosts[k] === undefined) {
+          hosts[k] = this.lastProxyHosts[k];
+        }
+      }
+      // ⚠ 这两个集合**必须来自 DoH 的过程报告**，不能用「入参域名表」：
+      //   attempted = **真的查过**的域名（查了没查到 ⇒ 真·解析失败）；
+      //   resolved = 查到了地址的域名（含后来被丢弃的 ⇒ 不能误报失败）。
+      // 用入参域名表会把「故意不查的短 TTL 域名」算成解析失败（假 dns_unresolved）。
+      const dohReport = DoHResolver.lastReport;
+      this.lastProxyHostAttempted = dohReport.queried.concat(dohReport.failed);
+      this.lastProxyHostResolved = dohReport.resolved.slice(0);
+      this.lastProxyHostFailed = dohReport.failed.slice(0);
+      const testDomainCount = RuntimeConfigBuilder.proxyServerDomains(subs.nodes).length;
+      AppLogger.info(TAG, `test-core proxy hosts: ${Object.keys(hosts).length}/${testDomainCount} `
+        + `(shared from tunnel: ${sharedHostKeys.length})`);
       this.testCoreSecret = `ssr-test-${Date.now().toString(36)}-${Math.floor(Math.random() * 0x7FFFFFFF).toString(36)}`;
       // 端口探测：其他 mihomo 系应用（NekoBox 等）可能占用默认 9090/7890/1053
-      await this.reservePorts();
-      // geoip 缺失/损坏时不生成 GEOIP 规则与 dns.fallback(同 connect),
-      // 否则内核启动会联网下载/重下 MMDB 卡死
-      const testGeoip = this.isGeoipReady();
-      // 规则集同理：测速核复用同一生成器，缺文件同样会把内核启动卡在联网下载上
-      const testRuleProviderReady = this.isRuleProviderReady();
+      // 测速核用**自己探测的**端口，且**不写回**共享端口字段（审计 F1）：
+      // 写回会让隧道 YAML 里的端口与客户端 setEndpoint 用的端口对不上。
+      const testPorts = await this.pickPorts(this.apiPort);
       // 测速核不启用 smart 组：它只做延迟探测，多一层内核选点会让测速结果失真
-      const yaml = ClashConfigGenerator.generate(subs.nodes[0], subs.nodes, settings,
-        this.mixedPort, this.apiPort, this.dnsPort, this.testCoreSecret, testGeoip, false, hosts, false,
-        subs.proxyGroups, testRuleProviderReady, false,
-        subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
+      // 凭据回填收敛在 hydrateAndBuildProfile（生成配置的唯一入口）。
+      // 唯一配置生成入口：测速核与隧道共用同一份事实与同一处决策，
+      // 选中的节点也一致（审计 F6：旧实现测速核写死 subs.nodes[0]）。
+      const testProfile = await this.hydrateAndBuildProfile(subs, settings, this.lastNodeName, testPorts,
+        this.testCoreSecret, hosts, this.isSmartModelReady(), this.isGeoipReady(), this.isRuleProviderReady());
+      const testBuilt = await RuntimeConfigBuilder.buildRuntimeConfig(testProfile, RuntimeConfigMode.TEST);
+      const yaml = testBuilt.yaml;
+      // 登记「这份配置对应哪个节点集」：复用测速核前要比对，不一致就重建。
+      this.testCoreNodeFingerprint = SubscriptionService.nodeSetFingerprint(subs.nodes);
       const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
@@ -2352,7 +2540,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       };
       await vpnExtension.startVpnExtensionAbility(want);
       this.invalidateStateProbeCache();
-      this.api.setEndpoint(this.apiPort, this.testCoreSecret);
+      this.testCoreApiPort = testPorts.apiPort;
+      this.api.setEndpoint(this.testCoreApiPort, this.testCoreSecret);
       const deadline = Date.now() + 20000;
       let readinessDelayMs = 0;
       while (Date.now() < deadline) {
@@ -2440,6 +2629,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.testCoreActive = false;
     this.testCoreNegativeUntil = 0;
     this.testCoreWarmAt = 0;
+    this.testCoreNodeFingerprint = '';
     this.invalidateStateProbeCache();
     this.clearTestCoreArtifacts();
     if (this.testCoreFlight !== null) {
@@ -2476,9 +2666,60 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.testCoreNegativeUntil = 0;
     this.testCoreSecret = '';
     this.testCoreActive = false;
+    this.testCoreNodeFingerprint = '';
     if (this.testCoreFlight !== null) {
       this.testCoreFlight.resetIdle();
     }
+  }
+
+  /**
+   * 真实隧道的配置新鲜度：订阅集合变了以后，隧道配置里缺新节点。
+   *
+   * 热重载（PUT /configs?path=）按当前节点集重写内核配置，不拆隧道、不掉线；
+   * 失败**不重连**（连接是用户资产），只记日志：此时新节点会显示「未生效」，
+   * 下一次热重载或用户重连后恢复。
+   */
+  private async ensureTunnelConfigFresh(): Promise<void> {
+    if (this.state !== ConnState.CONNECTED) {
+      return;
+    }
+    const subs: SubscriptionService = this.lastSubs !== null
+      ? this.lastSubs : SubscriptionService.instance();
+    if (subs.nodes.length === 0 || this.tunnelConfigFingerprint.length === 0) {
+      return;
+    }
+    if (this.tunnelConfigFingerprint === SubscriptionService.nodeSetFingerprint(subs.nodes)) {
+      return;
+    }
+    AppLogger.info(TAG, 'tunnel config is stale (node set changed); hot reloading');
+    const ok = await this.reloadRulesHot('node-set-changed');
+    if (ok) {
+      AppLogger.info(TAG, 'tunnel config refreshed with current node set');
+    } else {
+      AppLogger.warn(TAG, 'tunnel config refresh failed; new nodes may show as not effective');
+    }
+  }
+
+  /**
+   * 订阅增删/刷新后作废测速核。
+   *
+   * 内核里的配置与新节点集不再对应时，继续复用会让新节点全部「未生效」
+   * （真机 2026-10-20：导入新订阅后测速整屏未生效，/version 探活却通过）。
+   * 作废后下一次取通道会按当前节点集重建；调用方可紧接着预热一次，让用户
+   * 下一次点测速时内核既是热的、配置也是新的。
+   *
+   * 真实隧道在场时不动：测速核与真实隧道共用同一个扩展进程，停它等于停 VPN。
+   */
+  async invalidateTestCoreForSubscriptionChange(reason: string): Promise<void> {
+    if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING) {
+      return;
+    }
+    if (this.testCoreFlight === null || !this.testCoreFlight.isActive()) {
+      this.testCoreNodeFingerprint = '';
+      return;
+    }
+    AppLogger.info(TAG, `test core invalidated by subscription change (${reason})`);
+    await this.stopTestCore();
   }
 
   /** 单独抽出便于验证：删除测速配置 + 隧道状态文件，逐文件独立容错 */
@@ -2499,6 +2740,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 状态机只负责状态位；secret / endpoint / 负缓存 / 单飞复位统一在这里显式清零
     this.testCoreActive = false;
     this.testCoreNegativeUntil = 0;
+    this.testCoreNodeFingerprint = '';
     if (this.testCoreFlight.isActive()) {
       AppLogger.warn(TAG, 'stopTestCore: flight still ACTIVE after stop(); forcing idle');
       this.testCoreFlight.resetIdle();
@@ -2563,13 +2805,69 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /**
-   * 为即将启动的内核选定端口三元组（API/混合代理/DNS 监听）。
-   * 依次尝试候选组，三端口全部空闲才采用；全部被占则保持默认（行为与旧版一致，
-   * 由 API 就绪检查给出明确错误）。必须在停止测速核之后、写配置之前调用；
-   * 热重载严禁调用（必须复用运行中内核的端口）。
+   * 构造运行配置输入（IR）。
+   *
+   * 隧道与测速核**共用同一份事实**（节点集 / 设置 / 代理组 / 订阅规则 / DoH 快照 /
+   * 三个就绪标志），差异只有 mode 决定的 tun.enable、端口与 secret。
+   * 决策（useSmart / ruleProviderReady / selectedNode / useGeoip）全部在
+   * RuntimeConfigBuilder.decideRuntimeOptions 一处做（审计 F5 / F6 / F11）。
    */
-  private async reservePorts(): Promise<void> {
+  /**
+   * 生成配置前的**唯一入口**：先回填凭据，再建事实（profile）。
+   *
+   * 为什么必须是唯一入口：凭据封存/回填散在多处时，某条路径漏了回填 ⇒
+   * 生成器按「缺凭据」把节点整条跳过 ⇒ 节点不在内核代理表 ⇒
+   * 测速/连接都找不到节点（真机 2026-10-20：34/34 秒败）。
+   * 收敛到一处之后，「配置里没有节点」这件事只可能来自这一处。
+   */
+  private async hydrateAndBuildProfile(subs: SubscriptionService, settings: AppSettings,
+    selectedNodeName: string, ports: RuntimePorts, secret: string,
+    proxyHosts: Record<string, string>, smartModelReady: boolean,
+    geoipReady: boolean, ruleProviderFileReady: boolean): Promise<RuntimeConfigProfile> {
+    await this.hydrateNodeCredentials(subs);
+    return this.buildRuntimeProfile(subs, settings, selectedNodeName, ports, secret,
+      proxyHosts, smartModelReady, geoipReady, ruleProviderFileReady);
+  }
+  private buildRuntimeProfile(subs: SubscriptionService, settings: AppSettings,
+    selectedNodeName: string, ports: RuntimePorts, secret: string,
+    proxyHosts: Record<string, string>, smartModelReady: boolean,
+    geoipReady: boolean, ruleProviderFileReady: boolean): RuntimeConfigProfile {
+    const profile = new RuntimeConfigProfile();
+    profile.nodes = subs.nodes;
+    profile.settings = settings;
+    profile.proxyGroups = subs.proxyGroups;
+    profile.subscriptionRules = subs.subscriptionRulesLines();
+    profile.subscriptionRuleProviders = subs.subscriptionRuleProvidersBlock();
+    profile.selectedNodeName = selectedNodeName;
+    profile.mixedPort = ports.mixedPort;
+    profile.apiPort = ports.apiPort;
+    profile.dnsPort = ports.dnsPort;
+    profile.apiSecret = secret;
+    profile.smartModelReady = smartModelReady;
+    profile.geoipReady = geoipReady;
+    profile.ruleProviderFileReady = ruleProviderFileReady;
+    profile.proxyHosts = proxyHosts;
+    return profile;
+  }
+
+  /**
+   * 为一次内核会话选端口三元组：**不写任何共享字段**。
+   *
+   * 测速核必须用自己的一套端口：旧实现里测速核的端口探测会写回共享的
+   * this.apiPort / this.mixedPort / this.dnsPort，导致测速核换了端口后，
+   * 隧道那份 YAML 里的端口与客户端 setEndpoint 用的端口对不上（审计 F1）。
+   *
+   * @param excludeApiPort 需要避开的 api 端口（正在运行的隧道核）；-1 = 不避让。
+   */
+  private async pickPorts(excludeApiPort: number): Promise<RuntimePorts> {
+    const picked = new RuntimePorts();
+    picked.apiPort = this.apiPort;
+    picked.mixedPort = this.mixedPort;
+    picked.dnsPort = this.dnsPort;
     for (const candidate of PORT_CANDIDATE_SETS) {
+      if (excludeApiPort > 0 && candidate[0] === excludeApiPort) {
+        continue;
+      }
       let allFree = true;
       for (const port of candidate) {
         if (!(await ConnectionOrchestrator.portIsFree(port))) {
@@ -2578,16 +2876,30 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         }
       }
       if (allFree) {
-        this.apiPort = candidate[0];
-        this.mixedPort = candidate[1];
-        this.dnsPort = candidate[2];
-        if (candidate[0] !== API_PORT) {
-          AppLogger.warn(TAG, `default ports busy; shifted to api=${this.apiPort} mixed=${this.mixedPort} dns=${this.dnsPort}`);
-        }
-        return;
+        picked.apiPort = candidate[0];
+        picked.mixedPort = candidate[1];
+        picked.dnsPort = candidate[2];
+        return picked;
       }
     }
-    AppLogger.warn(TAG, `all port candidate sets busy; keeping defaults api=${this.apiPort}`);
+    AppLogger.warn(TAG, 'all port candidate sets busy; keeping current ports');
+    return picked;
+  }
+
+  /**
+   * 为即将启动的内核选定端口三元组（API/混合代理/DNS 监听）。
+   * 依次尝试候选组，三端口全部空闲才采用；全部被占则保持默认（行为与旧版一致，
+   * 由 API 就绪检查给出明确错误）。必须在停止测速核之后、写配置之前调用；
+   * 热重载严禁调用（必须复用运行中内核的端口）。
+   */
+  private async reservePorts(): Promise<void> {
+    const picked = await this.pickPorts(-1);
+    this.apiPort = picked.apiPort;
+    this.mixedPort = picked.mixedPort;
+    this.dnsPort = picked.dnsPort;
+    if (picked.apiPort !== API_PORT) {
+      AppLogger.warn(TAG, `default ports busy; shifted to api=${this.apiPort} mixed=${this.mixedPort} dns=${this.dnsPort}`);
+    }
   }
 
   /**
@@ -2799,8 +3111,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // geoip.metadb 缺失/损坏时降级生成（不含 GEOIP 规则、不含 dns.fallback）,
       // 避免内核在 config.Parse 阶段联网下载 MMDB 失败导致启动卡死;
       // 连接成功后后台补齐, 下次连接生效。
-      const useGeoip = this.isGeoipReady();
-      if (!useGeoip) {
+      const geoipReady = this.isGeoipReady();
+      if (!geoipReady) {
         AppLogger.info(TAG, 'geoip.metadb missing/invalid; generate config without GEOIP rule or dns.fallback');
       }
 
@@ -2810,8 +3122,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 去广告开关默认关闭（见 AppSettings.hyperAdRulesEnabled）——关着时连后台下载
       // 都省掉：既不占启动后的带宽，也不产生无意义的 GitHub 访问。
       const adRulesOn = settings.rulesEnabled && settings.hyperAdRulesEnabled;
-      const ruleProviderReady = adRulesOn && this.isRuleProviderReady();
-      if (adRulesOn && !ruleProviderReady) {
+      const ruleProviderFileReady = this.isRuleProviderReady();
+      if (adRulesOn && !ruleProviderFileReady) {
         AppLogger.info(TAG, 'ruleset/hyper_adrules_ads.mrs missing; generate config without RULE-SET');
         // 与本次连接并行补齐（不阻塞连接路径）；落地后下次连接即启用去广告规则
         this.downloadRuleProviderInBackground(settings.assetSource);
@@ -2828,14 +3140,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 全部命中缓存，这一步直接归零；真正要联网的只有新增/过期的域名。
       // 并且把**本次要连的节点**排在最前解析，预算再紧也先把它 pin 住 ——
       // 连不上当前节点的代价远高于漏 pin 几个备用节点。
-      const serverDomains: string[] = [];
-      for (const n of subs.nodes) {
-        const s = n.server;
-        if (s.length === 0 || s.includes(':') || /^\d+\.\d+\.\d+\.\d+$/.test(s)) {
-          continue; // 跳过空/IPv6/裸 IPv4
-        }
-        serverDomains.push(s);
-      }
+
       // 项目规格统一为 IPv4-only：不再探测/启用 IPv6 入站，Extension 与 YAML
       // 均强制关闭 IPv6，杜绝 IPv6 泄漏通道。仅保留代理服务器域名的 DoH 防投毒预解析。
       this.ipv6Active = false;
@@ -2851,9 +3156,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 放到连接后就是"隧道已起、UI 进程却还在对 doh.pub / alidns 裸发查询"，
       // 等于在刚建好的防泄露链路上又开一个明文的洞。放这里既保持网络干净，
       // 又与 resolveMany 并行推进，不额外占用启动时间。
-      DoHResolver.refreshStale().catch((e: Error): void => {
-        AppLogger.info(TAG, `doh stale refresh skipped: ${AppLogger.errText(e)}`);
-      });
       let proxyHosts: Record<string, string> = {};
       // 2026-10-19 稳定性回退：预算恢复为固定 6000ms（0.3.3 口径）。
       //
@@ -2863,11 +3165,19 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 稳定性优先：所有节点域名一律给足 6s，宁可首连慢一点，也不留"某些节点不通"的坑。
       // （注意：DoHResolver 内部对短 TTL 域名不再 pin，那部分见该文件头注释。）
       try {
-        proxyHosts = await DoHResolver.resolveMany(serverDomains, 6000, priorityDomains);
+        // 同上：hosts 唯一来源 = RuntimeConfigBuilder.resolveSharedHosts（ND11）。
+        proxyHosts = await RuntimeConfigBuilder.resolveSharedHosts(subs.nodes, priorityDomains);
+        const tunnelReport = DoHResolver.lastReport;
+        this.lastProxyHostAttempted = tunnelReport.queried.concat(tunnelReport.failed);
+        this.lastProxyHostResolved = tunnelReport.resolved.slice(0);
+        this.lastProxyHostFailed = tunnelReport.failed.slice(0);
       } catch (e) {
         proxyHosts = {};
         AppLogger.warn(TAG, `proxy-server DoH pre-resolution failed: ${AppLogger.errText(e)}`);
       }
+      // 域名清单来自唯一实现（RuntimeConfigBuilder.proxyServerDomains）——
+      // 隧道与测速核用的是同一份清单，不能各算各的。
+      const serverDomains: string[] = RuntimeConfigBuilder.proxyServerDomains(subs.nodes);
       AppLogger.info(TAG, `DoH pinned ${Object.keys(proxyHosts).length}/${serverDomains.length} proxy servers`);
       const unpinnedDomains: string[] = [];
       for (const d of serverDomains) {
@@ -2908,20 +3218,33 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 保持字面量表达：架构自检（scripts/verify-vpn-architecture.mjs 的
       // orch.smart.gated-by-auto）就是靠这段文本锁定"smart 组只由 auto 模式启用"，
       // 换成中间变量会让这道闸门失效。
-      const useSmart = settings.autoSelectMode === AutoSelectModes.AUTO && smartReady;
-      if (settings.autoSelectMode === AutoSelectModes.AUTO && !useSmart) {
+      const configGenT0 = Date.now();
+      // 凭据回填收敛在 hydrateAndBuildProfile（生成配置的唯一入口）。
+      // 唯一配置生成入口：隧道与测速核共用同一份事实与同一处决策。
+      const tunnelPorts = new RuntimePorts();
+      tunnelPorts.apiPort = this.apiPort;
+      tunnelPorts.mixedPort = this.mixedPort;
+      tunnelPorts.dnsPort = this.dnsPort;
+      const tunnelProfile = await this.hydrateAndBuildProfile(subs, settings, target.name, tunnelPorts, this.apiSecret,
+        proxyHosts, smartReady, geoipReady, ruleProviderFileReady);
+      const built = await RuntimeConfigBuilder.buildRuntimeConfig(tunnelProfile, RuntimeConfigMode.TUNNEL);
+      const yaml = built.yaml;
+      if (settings.autoSelectMode === AutoSelectModes.AUTO && !built.options.useSmart) {
         AppLogger.info(TAG, 'auto mode but Model.bin not ready; using app-side selection '
           + '(smart group disabled this session; downloading in background)');
       }
-      const configGenT0 = Date.now();
-      const yaml = ClashConfigGenerator.generate(target, subs.nodes, settings, this.mixedPort, this.apiPort, this.dnsPort,
-        this.apiSecret, useGeoip, false, proxyHosts, true, subs.proxyGroups, ruleProviderReady, useSmart,
-        subs.subscriptionRulesLines(), subs.subscriptionRuleProvidersBlock());
       AppLogger.info(TAG, `config generated: ${Date.now() - configGenT0}ms (${yaml.length} bytes)`);
+      // 登记「隧道配置对应哪个节点集」：测速取通道前用它判断隧道配置是否过期
+      // （订阅集合变了 → 隧道配置缺新节点 → 测速 404「未生效」）。
+      this.tunnelConfigFingerprint = SubscriptionService.nodeSetFingerprint(subs.nodes);
       // 缓存本次连接的配置输入，供规则/站点热重载复用（不重跑 DoH、不重建隧道）。
       this.lastProxyHosts = proxyHosts;
-      this.lastUseGeoip = useGeoip;
-      this.lastUseSmart = useSmart;
+      // 注意：lastProxyHostAttempted / Resolved / Failed 在上面由 DoH 过程报告赋值，
+      // 这里**不再**用入参域名表覆盖 —— 用域名表会把「故意没查的短 TTL 域名」
+      // 误报成解析失败（假 dns_unresolved）。
+      this.lastGeoipReady = geoipReady;
+      this.lastSmartModelReady = smartReady;
+      this.lastRuleProviderFileReady = ruleProviderFileReady;
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       // 含 API secret 与节点口令：最小权限目录(0700) + 文件(0600)，fd 由 writePrivate 兜底关闭
       ensurePrivateDir(this.context.cacheDir);
@@ -3103,7 +3426,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       //   用户的要求是「任何场景都不能出现启动代理不可用」，所以宁可保留 0.3.3 的
       //   宽松语义：钉选失败 = 内核按配置里 PROXY 组首个成员（=本次目标节点）走，
       //   这正是我们生成 YAML 时 unshift 保证的顺序。读回日志用于事后定位。
-      const pinSmartGroup = useSmart && settings.autoSelectMode === AutoSelectModes.AUTO;
+      const pinSmartGroup = built.options.useSmart && settings.autoSelectMode === AutoSelectModes.AUTO;
       const pinTargetName: string = pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name;
       const pinned = await this.api.selectNode(pinTargetName);
       if (!pinned) {
@@ -3178,7 +3501,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 把此前网络性拉取失败（被阻断面板）的订阅自动补拉一次。只记日志不弹 UI：
       // 这是无感修复，失败也不影响本次连接结果（advice 已在原失败时提示过用户）。
       this.retryPendingSubscriptionFetches(subs);
-      if (!useGeoip) {
+      if (!geoipReady) {
         // 后台补齐 geoip.metadb（多镜像）, 下次连接即可启用 GEOIP 直连规则
         this.downloadGeoipInBackground(settings.assetSource);
       }

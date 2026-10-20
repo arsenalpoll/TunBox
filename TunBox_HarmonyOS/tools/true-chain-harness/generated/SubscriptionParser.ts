@@ -13,6 +13,8 @@ import { ProxyNode, ProxyNodeType, SsrCodec } from './ProxyNode.ts';
 import { ProxyGroup } from './ProxyGroup.ts';
 import { MergedProxy, YamlMergeError, YamlMerger, YamlNodeError } from './YamlMerger.ts';
 import { AppLogger } from './stubs.ts';
+// 2026-10-20（B6 旧解析器退场）：链接列表走**规范解析层**，不再走 ProxyNode.fromUri
+import { parse as parseUriNode, ParseError, ParsedNode } from './UriNodeParser.ts';
 
 const TAG = 'SubscriptionParser';
 
@@ -122,16 +124,24 @@ export class SubscriptionParser {
 
     const normalized = text.replace(/^\uFEFF/, '');
     result.groups = SubscriptionParser.parseProxyGroups(normalized, subscriptionId);
-    // scheme 注册表分发：有解析器 → fromUri + add（去重/originalName 冻结），未识别 scheme → unsupported
+    // scheme 注册表分发：有解析器 → 规范解析层 + add（去重/originalName 冻结），未识别 scheme → unsupported
+    // 2026-10-20（B6）：不再调 ProxyNode.fromUri —— 订阅链路统一走规范解析层
     const addFromUri = (trimmed: string): void => {
       diagnostics.inputCount = diagnostics.inputCount + 1;
       const scheme = SubscriptionParser.uriScheme(trimmed);
       if (ProxyNode.hasUriCodec(scheme)) {
-        try {
-          add(ProxyNode.fromUri(trimmed, subscriptionId, `${subscriptionId}-${counter++}`));
-        } catch (e) {
+        const parsed: ParsedNode | ParseError = parseUriNode(trimmed, subscriptionId);
+        if (parsed instanceof ParseError) {
+          // 缺必填参数等 → 整条不可用（原因已进 UnusableLedger，UI 可见）
           diagnostics.invalidCount = diagnostics.invalidCount + 1;
+          return;
         }
+        const built = ProxyNode.fromCanonical(parsed, subscriptionId, `${subscriptionId}-${counter++}`);
+        if (built === null) {
+          diagnostics.invalidCount = diagnostics.invalidCount + 1;
+          return;
+        }
+        add(built);
         return;
       }
       diagnostics.unsupportedCount = diagnostics.unsupportedCount + 1;

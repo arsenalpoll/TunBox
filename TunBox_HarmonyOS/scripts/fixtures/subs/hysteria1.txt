@@ -1,0 +1,17 @@
+## Hysteria v1 订阅样本
+##
+## 形态：hysteria://口令@host:port?peer=…&insecure=1&up=…&down=…&alpn=…#名称
+##
+## 2026-10-20（B6 旧解析器退场）：旧实现里的 ModernUriCodec.parseHysteria 被
+## **整体删除**，hysteria v1 改由规范解析层（参数表 + UriNodeParser）承接 ——
+## 这份样本就是「不许悄悄丢掉这个协议」的证据。
+##  - 第 1 条：口令在 userinfo（hysteria://口令@host:port）
+##  - 第 2 条：口令在 query 的 auth（机场面板的另一种写法）
+##  - 第 3 条：缺口令 ⇒ 必须整条 ParseError（负例，绝不能半条）
+## 凭据全假。
+
+hysteria://fake-hy1-password@hk-hy1-01.example.test:8443?peer=hk-hy1-01.example.test&insecure=1&up=50&down=200&alpn=h3&obfs=xplus&protocol=udp#%E9%A6%99%E6%B8%AF%20HY1%2001
+hysteria://hk-hy1-02.example.test:443?auth=fake-hy1-password-2&peer=hk-hy1-02.example.test&insecure=1&upmbps=100&downmbps=300&fp=chrome#%E6%97%A5%E6%9C%AC%20HY1%2002
+
+## negative
+hysteria://hk-hy1-03.example.test:443?peer=hk-hy1-03.example.test#%E7%BC%BA%E5%B0%91-HY1-%E5%8F%A3%E4%BB%A4

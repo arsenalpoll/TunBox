@@ -2,7 +2,7 @@
 /**
  * 延迟结果存储回归（运行时，非源码断言）。
  *
- * 把 `LatencyState.ets` / `LatencyController.ets` 按 .ts 暂存到临时目录后直接 import，
+ * 把 `LatencyState.ets` / `LatencyLiveView.ets` 按 .ts 暂存到临时目录后直接 import，
  * 真实驱动状态机与存储（Node 24 的 type-stripping 只接受可擦除语法，所以这两个文件
  * 必须避免 `enum`；LatencyState 因此用 class + static readonly）。
  *
@@ -31,12 +31,78 @@ writeFileSync(join(sandbox, 'package.json'), JSON.stringify({ type: 'module' }),
 /** 暂存一个 .ets 为 .ts，并把无扩展名的相对 import 补成 .ts（Node ESM 要求显式扩展名） */
 function stage(fileName) {
   const src = readFileSync(join(services, fileName + '.ets'), 'utf8')
-    .replace(/from '(\.\/[A-Za-z0-9_]+)'/g, "from '$1.ts'");
+    .replace(/from '(\.\/[A-Za-z0-9_]+)'/g, "from '$1.ts'")
+    // 本闸门的沙箱是**扁平**的：跨目录的零 import 分类常量模块（LP04 新口径）
+    // 要改指到沙箱根 —— LatencyKinds 已在 stageLatencyCore() 里暂存在根目录。
+    .replace(/from '\.\.\/latency\/LatencyKinds'/g, "from './LatencyKinds.ts'");
   writeFileSync(join(sandbox, fileName + '.ts'), src, 'utf8');
 }
 
 stage('LatencyState');
-stage('LatencyController');
+stage('LatencyLiveView');
+
+/**
+ * 暂存测速内核（LatencyStore 及其依赖）+ @kit 桩。
+ *
+ * 为什么需要：主题的渲染表现在**唯一真源 = LatencyStore.describe**（审计 LP05），
+ * 主题文件因此 import 了 commons/latency/LatencyStore —— 那条链带 @kit.ArkData /
+ * @kit.NetworkKit / @kit.ArkTS 与 AppLogger/AppSettings，Node 下要桩掉。
+ * （同一套桩见 verify-latency-core-v2 / verify-latency-restore。）
+ */
+function stageLatencyCore() {
+  const latencyDir = join(appRoot, 'entry', 'src', 'main', 'ets', 'commons', 'latency');
+  const core = ['LatencyStore', 'LatencyProbe', 'LatencyTestUrl', 'LatencyDnsVerdict', 'LatencyKinds'];
+  for (const name of core) {
+    const src = readFileSync(join(latencyDir, name + '.ets'), 'utf8')
+      .replace(/from '@kit\.NetworkKit'/g, "from './fakeNetworkKit.ts'")
+      .replace(/from '@kit\.ArkTS'/g, "from './fakeArkTS.ts'")
+      .replace(/from '@kit\.ArkData'/g, "from './fakeArkData.ts'")
+      .replace(/from '\.\.\/utils\/AppLogger'/g, "from './AppLogger.ts'")
+      .replace(/from '\.\.\/models\/AppSettings'/g, "from './AppSettings.ts'")
+      .replace(/from '\.\/(LatencyProbe|LatencyTestUrl|LatencyDnsVerdict|LatencyKinds)'/g, "from './$1.ts'");
+    writeFileSync(join(sandbox, name + '.ts'), src, 'utf8');
+  }
+  writeFileSync(join(sandbox, 'AppLogger.ts'), `
+export class AppLogger {
+  static info(_tag: string, _msg: string): void {}
+  static warn(_tag: string, _msg: string): void {}
+  static error(_tag: string, _msg: string): void {}
+  static errText(e: Object): string { return e === null || e === undefined ? String(e) : String(e); }
+}
+`, 'utf8');
+  writeFileSync(join(sandbox, 'AppSettings.ts'), `
+export class AppSettings {
+  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
+}
+`, 'utf8');
+  writeFileSync(join(sandbox, 'fakeNetworkKit.ts'), `
+export const http = {
+  RequestMethod: { GET: 0, POST: 1 },
+  createHttp(): Object { return { request: async (): Promise<Object> => ({}), destroy: (): void => {} }; }
+};
+`, 'utf8');
+  writeFileSync(join(sandbox, 'fakeArkTS.ts'), `
+export const util = {
+  TextDecoder: {
+    create(_enc: string): Object {
+      return { decodeToString: (a: Uint8Array): string => Buffer.from(a).toString('utf8') };
+    }
+  }
+};
+`, 'utf8');
+  writeFileSync(join(sandbox, 'fakeArkData.ts'), `
+export const preferences = {
+  getPreferences: async (_ctx: Object, _name: string): Promise<Object> => ({
+    get: async (_k: string, d: Object): Promise<Object> => d,
+    put: async (_k: string, _v: Object): Promise<void> => {},
+    flush: async (): Promise<void> => {},
+    getAll: async (): Promise<Object> => ({})
+  })
+};
+`, 'utf8');
+}
+
+stageLatencyCore();
 
 const checks = [];
 function check(label, ok) {
@@ -44,32 +110,53 @@ function check(label, ok) {
 }
 
 try {
-  const { LatencyController } = await import(pathToFileURL(join(sandbox, 'LatencyController.ts')).href);
+  const { LatencyLiveView } = await import(pathToFileURL(join(sandbox, 'LatencyLiveView.ts')).href);
+  const { LatencyProbe } = await import(pathToFileURL(join(sandbox, 'LatencyProbe.ts')).href);
   const { LatencyState, LatencyPolicy, LatencyRecord, LatencyChannel } =
     await import(pathToFileURL(join(sandbox, 'LatencyState.ts')).href);
 
   // ---- 1/2/3 兼容入口与五态 ----
-  LatencyController.clearAll();
-  LatencyController.set('active-a', 31);
-  LatencyController.set('stale-b', 92);
-  LatencyController.set('active-c', -1);
-  LatencyController.set('untested-d', -2);
-  check('set(>=1) 记为实测', LatencyController.latencyFor('active-a') === 31);
-  check('set(-1) 记为超时', LatencyController.latencyFor('active-c') === -1);
-  check('set(-1) 状态是 TIMEOUT', LatencyController.stateFor('active-c') === LatencyState.TIMEOUT);
+  LatencyLiveView.clearAll();
+  LatencyLiveView.set('active-a', 31);
+  LatencyLiveView.set('stale-b', 92);
+  LatencyLiveView.set('active-c', -1);
+  LatencyLiveView.set('untested-d', -2);
+  check('set(>=1) 记为实测', LatencyLiveView.latencyFor('active-a') === 31);
+  check('set(-1) 记为超时', LatencyLiveView.latencyFor('active-c') === -1);
+  check('set(-1) 状态是 TIMEOUT', LatencyLiveView.stateFor('active-c') === LatencyState.TIMEOUT);
   check('set(-2) 状态是 UNTESTED（不是超时）',
-    LatencyController.stateFor('untested-d') === LatencyState.UNTESTED);
+    LatencyLiveView.stateFor('untested-d') === LatencyState.UNTESTED);
   check('未测节点的 latencyFor 是 null（UI 显示 --）',
-    LatencyController.latencyFor('untested-d') === null);
-  check('未测节点不产生"超时"文案', LatencyPolicy.stateText(LatencyState.UNTESTED) === '--');
-  check('超时文案是「超时」', LatencyPolicy.stateText(LatencyState.TIMEOUT) === '超时');
-  check('失败文案是「失败」（不与超时合并）', LatencyPolicy.stateText(LatencyState.FAILED) === '失败');
+    LatencyLiveView.latencyFor('untested-d') === null);
+  // 渲染表（结论文案 + 级别）**唯一真源 = LatencyStore.describe**（审计 LP05）：
+  // LatencyState 里那份 stateText 包装已删 —— 行为级断言在 verify-latency-core-v2
+  // （那里能真正执行 LatencyStore.describe），这里只守「别又长出第二张表」。
+  const stateSrcForTable = readFileSync(
+    join(appRoot, 'entry/src/main/ets/commons/services/LatencyState.ets'), 'utf8');
+  check('LatencyState 不再自带第二张渲染表（stateText 已删）',
+    !/static\s+stateText\s*\(/.test(stateSrcForTable));
+  check('LatencyState 不再自带 isNotEffective 分类表',
+    !/static\s+isNotEffective\s*\(/.test(stateSrcForTable));
+  // 陈旧判定（ND14）与「算不算结论」（ND13）：判定表**只有一份**，都在零 import 的
+  // 内核分类表 LatencyKinds 里；LatencyState 这三个入口只做转调/别名。
+  // 注释里的字面量不算「第二份阈值」⇒ 断言只看代码部分。
+  const stateCodeOnly = stateSrcForTable
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+  check('LatencyState 不再自带陈旧阈值字面量（阈值只一份，在内核分类表）',
+    !/10\s*\*\s*60\s*\*\s*1000/.test(stateCodeOnly));
+  check('LatencyPolicy.isStale 转调内核判定表（不自己判）',
+    /static\s+isStale\s*\([^)]*\)\s*:\s*boolean\s*\{[\s\S]*?LatencyProbeKind\.isStale\(/.test(stateSrcForTable));
+  check('LatencyPolicy.isStaleConclusion 转调内核判定表（年龄未知的失败仍算陈旧）',
+    /static\s+isStaleConclusion\s*\([^)]*\)\s*:\s*boolean\s*\{[\s\S]*?LatencyProbeKind\.isStale\(/.test(stateSrcForTable));
+  check('LatencyPolicy.isNonVerdictKind 转调内核唯一判定表（不自带第二份清单）',
+    /static\s+isNonVerdictKind\s*\([^)]*\)\s*:\s*boolean\s*\{\s*return\s+LatencyProbeKind\.isNonVerdictKind\(/.test(stateSrcForTable));
 
   // markTesting 不产生数值结论
-  LatencyController.markTesting('testing-e');
-  check('markTesting → TESTING 状态', LatencyController.stateFor('testing-e') === LatencyState.TESTING);
+  LatencyLiveView.markTesting('testing-e');
+  check('markTesting → TESTING 状态', LatencyLiveView.stateFor('testing-e') === LatencyState.TESTING);
   check('markTesting 期间 latencyFor 为 null（不显示旧数字）',
-    LatencyController.latencyFor('testing-e') === null);
+    LatencyLiveView.latencyFor('testing-e') === null);
 
   // ---- 4 过期判定 ----
   const fresh = LatencyRecord.measured('n1', 50, LatencyChannel.CORE, Date.now());
@@ -80,9 +167,9 @@ try {
     LatencyPolicy.isStale(LatencyRecord.untested('n3'), Date.now()) === false);
 
   // ---- 5 retainOnly ----
-  LatencyController.retainOnly(['active-a', 'active-c', 'untested-d', 'testing-e']);
-  check('已消失节点被回收', LatencyController.latencyFor('stale-b') === null);
-  check('保留节点数值不变', LatencyController.latencyFor('active-a') === 31);
+  LatencyLiveView.retainOnly(['active-a', 'active-c', 'untested-d', 'testing-e']);
+  check('已消失节点被回收', LatencyLiveView.latencyFor('stale-b') === null);
+  check('保留节点数值不变', LatencyLiveView.latencyFor('active-a') === 31);
 
   // ---- 6 delay==0 不是有效延迟 ----
   check('0ms 不是有效延迟（mihomo 用 0 表示失败）', LatencyPolicy.isValidDelay(0) === false);
@@ -92,15 +179,25 @@ try {
     LatencyPolicy.isValidDelay(65535) === false);
 
   // ---- 7 分类与排序 ----
-  check('200+delay 归为实测',
-    LatencyPolicy.classify(200, 88, false) === LatencyState.MEASURED);
-  check('200+delay=0 归为失败（不能当 0ms 很快）',
-    LatencyPolicy.classify(200, 0, false) === LatencyState.FAILED);
-  check('504 归为超时', LatencyPolicy.classify(504, -1, false) === LatencyState.TIMEOUT);
-  check('503 归为失败', LatencyPolicy.classify(503, -1, false) === LatencyState.FAILED);
-  check('404（节点已不存在）归为失败', LatencyPolicy.classify(404, -1, false) === LatencyState.FAILED);
-  check('客户端中止归为已取消（不是节点结论）',
-    LatencyPolicy.classify(0, -1, true) === LatencyState.CANCELLED);
+  // 失败分类**唯一真源 = 测速内核**（LatencyProbe.classify，审计 LP06：
+  // LatencyState 里的旧数值状态机 classify 已删）。这里直接打内核那张表；
+  // 行为级完整覆盖在 verify-latency-core-v2（C 组 10 例）。
+  check('200 + 合法 delay → 成功结论（判定）',
+    LatencyProbe.classify(200, '{"delay":87}', '').kind === ''
+    && LatencyProbe.classify(200, '{"delay":87}', '').isVerdict === true);
+  check('200 + delay=0 不是「0ms 很快」→ 认不出来（非判定）',
+    LatencyProbe.classify(200, '{"delay":0}', '').kind === 'unknown'
+    && LatencyProbe.classify(200, '{"delay":0}', '').isVerdict === false);
+  check('504 归为超时（判定）',
+    LatencyProbe.classify(504, '{"message":"timeout"}', '').kind === 'timeout');
+  check('503 + dial 错误归为「拨号失败」（判定，不是超时）',
+    LatencyProbe.classify(503, '{"message":"dial tcp 1.2.3.4:443: i/o timeout"}', '').kind
+      === 'network_unreachable');
+  check('404（节点已不存在）归为「未生效」（配置类判定）',
+    LatencyProbe.classify(404, '{"message":"proxy not found"}', '').kind === 'switch_failed');
+  check('传输层异常归为通道未就绪（非判定，不是节点结论）',
+    LatencyProbe.classify(0, '', 'connect refused').kind === 'core_not_ready'
+    && LatencyProbe.classify(0, '', 'connect refused').isVerdict === false);
 
   const measured = LatencyRecord.measured('m', 80, LatencyChannel.CORE, Date.now());
   const slow = LatencyRecord.measured('s', 400, LatencyChannel.CORE, Date.now());
@@ -144,7 +241,10 @@ try {
     // 注入最小桩：$r 返回"资源名字符串"（桩里正好当成颜色标签用），并让 Ui.* 变成
     // 可比较的独立标签，从而 recordColor 的相等/不等断言有意义。
     uiSrc = uiSrc
-      .replace(/from '(\.\.\/[A-Za-z0-9_\/]+)'/g, "from './LatencyState.ts'")
+      // 只把 LatencyState 指向沙箱；LatencyStore 是内核真源（已暂存在沙箱里），
+      // 指向它自己 —— 不能一股脑重写成 LatencyState（那会让主题拿不到 describe）。
+      .replace(/from '\.\.\/commons\/services\/LatencyState'/g, "from './LatencyState.ts'")
+      .replace(/from '\.\.\/commons\/latency\/LatencyStore'/g, "from './LatencyStore.ts'")
       .replace(/^import .*@ohos.*$/gm, '');
     const prelude = [
       'type ResourceColor = string;',
@@ -163,6 +263,11 @@ try {
     const cancelled = LatencyRecord.failed('cancelled', LatencyState.CANCELLED, now);
     const to = LatencyRecord.failed('to', LatencyState.TIMEOUT, now);
     const bad = LatencyRecord.failed('bad', LatencyState.FAILED, now);
+    // 新口径（审计 F13/LP05）：**没有失败分类 = 没有结论** ⇒ 渲染成「未测(--)」，
+    // 不许渲染成一颗红「超时」。真正有分类的失败才带结论与红色。
+    to.failKind = 'timeout';
+    bad.failKind = 'network_unreachable';
+    const legacyNoKind = LatencyRecord.failed('legacy-no-kind', LatencyState.FAILED, now);
 
     // 五态文案两两不同 —— 这就是"可区分"的可执行定义
     const texts = [fresh, old, off, unt, testing, cancelled, to, bad]
@@ -171,6 +276,8 @@ try {
       LatencyStyle.recordText(unt, now) === '--');
     check('未测与超时文案不同',
       LatencyStyle.recordText(unt, now) !== LatencyStyle.recordText(to, now));
+    check('无分类的失败不渲染成红「超时」（新口径：没有分类 = 没有结论）',
+      LatencyStyle.recordText(legacyNoKind, now) === '--');
     check('取消与失败/超时文案都不同（取消不是结论）',
       LatencyStyle.recordText(cancelled, now) !== LatencyStyle.recordText(bad, now)
       && LatencyStyle.recordText(cancelled, now) !== LatencyStyle.recordText(to, now));

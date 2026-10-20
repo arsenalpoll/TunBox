@@ -22,8 +22,76 @@ import {
   LinkHealthItem, LinkHealthReport, summarize, runLinkHealthCheck,
   repairSteps, HealthStatus, HealthOverall
 } from '../commons/services/LinkHealthChecker';
-import { OrchestratorHealthProbes } from '../commons/services/OrchestratorHealthProbes';
+import { OrchestratorHealthProbes, OrchestratorHealthView } from '../commons/services/OrchestratorHealthProbes';
 import { CoreLogStream, CoreLogLine } from '../commons/services/CoreLogStream';
+
+/**
+ * 编排器只读运行态的**名义类型适配器**。
+ *
+ * ArkTS 不支持结构化类型（`arkts-no-structural-typing`）：把
+ * `ConnectionOrchestrator` 直接当 `OrchestratorHealthView`（interface）传是不允许的
+ * —— 只有**显式 `implements`** 的 class 才是名义类型。
+ * 这里做一层薄适配：只读转发，不改任何状态（探针契约：只读 + 无副作用）。
+ */
+class OrchestratorHealthViewAdapter implements OrchestratorHealthView {
+  private orch: ConnectionOrchestrator;
+
+  constructor(orch: ConnectionOrchestrator) {
+    this.orch = orch;
+  }
+
+  hasSubscriptions(): boolean {
+    return this.orch.hasSubscriptions();
+  }
+
+  subsNodeCount(): number {
+    return this.orch.subsNodeCount();
+  }
+
+  currentNodeName(): string {
+    return this.orch.currentNodeName();
+  }
+
+  isCurrentNodeValid(): boolean {
+    return this.orch.isCurrentNodeValid();
+  }
+
+  isHeartbeatAlive(): boolean {
+    return this.orch.isHeartbeatAlive();
+  }
+
+  isTunnelMarkerPresent(): boolean {
+    return this.orch.isTunnelMarkerPresent();
+  }
+
+  isDesiredConnected(): Promise<boolean> {
+    return this.orch.isDesiredConnected();
+  }
+
+  isIntentConsistent(): Promise<boolean> {
+    return this.orch.isIntentConsistent();
+  }
+
+  startErrorText(): string {
+    return this.orch.startErrorText();
+  }
+
+  isIpv6Enabled(): boolean {
+    return this.orch.isIpv6Enabled();
+  }
+
+  checkClashApiReachable(): Promise<boolean> {
+    return this.orch.checkClashApiReachable();
+  }
+
+  checkDnsResolvable(): Promise<boolean> {
+    return this.orch.checkDnsResolvable();
+  }
+
+  checkEgressReachable(): Promise<boolean> {
+    return this.orch.checkEgressReachable();
+  }
+}
 
 /** 日志区 tab：应用运行日志 / 内核实时日志流 */
 class LogTab {
@@ -204,7 +272,8 @@ export struct DiagnosticsSheet {
     }
     this.running = true;
     try {
-      const report = await runLinkHealthCheck(new OrchestratorHealthProbes(this.orchestrator));
+      const report = await runLinkHealthCheck(new OrchestratorHealthProbes(
+        new OrchestratorHealthViewAdapter(this.orchestrator)));
       this.applyReport(report);
       let maxSteps = 2;
       try {

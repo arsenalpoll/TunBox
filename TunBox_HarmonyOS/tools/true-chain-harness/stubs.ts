@@ -105,6 +105,7 @@ export class AppLogger {
   static info(tag: string, msg: string): void { AppLogger.lines.push(`INFO ${tag} ${msg}`); }
   static warn(tag: string, msg: string): void { AppLogger.lines.push(`WARN ${tag} ${msg}`); }
   static error(tag: string, msg: string): void { AppLogger.lines.push(`ERROR ${tag} ${msg}`); }
+  static errText(e: Object): string { return String(e); }
   static addListener(_l: (line: string) => void): void {}
   static removeListener(_l: (line: string) => void): void {}
 }

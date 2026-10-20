@@ -11,6 +11,9 @@
 import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
 import { ProxyGroup } from '../models/ProxyGroup';
 import { AppSettings, AutoSelectModes, CustomRuleSet } from '../models/AppSettings';
+// 测速地址的**单一真源**（零 import ⇒ 不会形成循环依赖）。
+// 生成器不再自己读用户配置、也不再自带任何 url 规则（审计 F12）。
+import { LatencyTestUrl } from '../latency/LatencyTestUrl';
 import { YamlMerger } from './YamlMerger';
 import { AppLogger } from '../utils/AppLogger';
 import {
@@ -166,7 +169,8 @@ export class ClashConfigGenerator {
     ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
     tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = [],
     ruleProviderReady: boolean = true, useSmart: boolean = false,
-    subscriptionRules: string[] = [], subscriptionRuleProviders: string = ''): string {
+    subscriptionRules: string[] = [], subscriptionRuleProviders: string = '',
+    smartTestUrl: string = ''): string {
     const lines: string[] = [];
 
     lines.push('mixed-port: ' + mixedPort);
@@ -183,7 +187,15 @@ export class ClashConfigGenerator {
     // 配合 VpnExtensionAbility 的 IPv4-only TUN，消除 IPv6 绕过及泄漏通道。
     lines.push('ipv6: false');
     lines.push('disable-ipv6: true');
-    lines.push('unified-delay: true');
+    // 【FlClash 对齐 · 2026-10-20】mihomo 的 UnifiedDelay **默认就是 false**
+    // （adapter.go: `var UnifiedDelay = atomic.NewBool(false)`），FlClash 从不打开它。
+    // 打开后 mihomo 的 URLTest 会**连发两次 HEAD**（adapter.go 的 unifiedDelay 分支）：
+    // 第二次的结果才作数，上报的延迟只算**第二次**请求的耗时。
+    // 于是「出口不欢迎第二次 HEAD」（第二次被劫持/超时/连接被关）时，
+    // **整批可用节点会被判失败** —— 真机 2026-10-20：mitce.io 34 个节点秒失败 503，
+    // 同批其它订阅正常、隧道用同一个节点也能连通（节点本身完全没问题）。
+    // 与 FlClash 对齐 = 关掉：单次请求，延迟 = 连接建立 + 响应，语义与 FlClash 一致。
+    lines.push('unified-delay: false');
     lines.push('tcp-concurrent: true');
     // 长连接与会话复用参数：降低频繁握手、弱网切换后的僵尸连接和后台功耗。
     lines.push('keep-alive-idle: 30');
@@ -575,15 +587,18 @@ export class ClashConfigGenerator {
       //     ASN.mmdb，实测 **90s 阻塞**（同 MMDB 坑），而设备上并没有 ASN.mmdb。
       //   url 用用户配置的测速地址，而不是内核默认的 gstatic —— 否则「测速设置」
       //     对自动选点不生效，两处延迟口径不一致（真机发现的遗漏）。
+      //   ⚠ 2026-10-20（A12c / 审计 F12）：测速地址**只有一个真源** ——
+      //     调用方把用户填的原始值传进来（smartTestUrl），规则（空/非法 → 默认 https、
+      //     历史 http 默认值 → https、用户自填 http 保持原样）全部由
+      //     LatencyTestUrl.effective() 决定。生成器**不再自己读用户配置**，
+      //     也不再自带任何 url 规则 —— 避免「两份实现、两套话术」。
       lines.push(`  - name: "${SMART_GROUP_NAME}"`);
       lines.push('    type: smart');
       lines.push('    uselightgbm: true');
       lines.push('    collectdata: false');
       lines.push('    prefer-asn: false');
-      const smartUrl: string = (settings.testLatencyUrl ?? '').trim();
-      if (smartUrl.length > 0) {
-        lines.push(`    url: "${ClashConfigGenerator.escapeYaml(smartUrl)}"`);
-      }
+      const smartUrl: string = LatencyTestUrl.effective(smartTestUrl);
+      lines.push(`    url: "${ClashConfigGenerator.escapeYaml(smartUrl)}"`);
       // 机场常把「剩余流量/套餐到期」这类**信息条**塞进 proxies 列表，它们和真实节点
       // 共用同一个 server/uuid（真机实证：4 条信息条与 🇯🇵日本•移联01 端点完全相同），
       // 纯属重复噪音。不排除的话内核会把它们当真节点参与评分，甚至选成出口 ——
@@ -1618,20 +1633,25 @@ export class ClashConfigGenerator {
   }
 
   /**
-   * 组测速 URL 安全化：仅接受 http(s) 明文链接且不含 YAML 破坏字符；
-   * 非法/未声明回退内核默认口径 gstatic generate_204。
+   * 组测速 URL 安全化：只保留 YAML 安全检查，**url 规则一律交给真源**。
    *
-   * 【C4】兜底值改为 **https**：mihomo 官方点名 `group.url` 应使用 HTTPS
+   * 2026-10-20（A12c / 审计 F12）：本方法原先自带一整套 url 规则
+   * （http(s) 前缀判定 + 2048 长度上限 + gstatic 兜底），
+   * 与 LatencyTestUrl.effective() 是**两份实现** —— 同一件事两种话术，
+   * 改一处、别处还是旧口径。现在：
+   *   · 合法性/默认值 → LatencyTestUrl.effective()（唯一真源）；
+   *   · 这里只保留 **YAML 安全**（不含破坏字符）与转义 —— 那是写盘安全，不是 url 规则。
+   * 【C4】兜底值仍是 **https**：mihomo 官方点名 `group.url` 应使用 HTTPS
    * （明文地址会被出口劫持，测速结果不可信）。**用户/订阅自己声明的 url
    * 保持原样不动**（个别出口掐 gstatic 的 TLS SNI 是真机实证过的合法用法）。
    */
   static safeGroupUrl(raw: string): string {
     const url = raw.trim();
-    if (url.length === 0 || url.length > 2048 || !ClashConfigGenerator.isSafeText(url)
-      || !(url.startsWith('http://') || url.startsWith('https://'))) {
-      return 'https://www.gstatic.com/generate_204';
+    if (url.length === 0 || url.length > LatencyTestUrl.MAX_LENGTH
+      || !ClashConfigGenerator.isSafeText(url)) {
+      return LatencyTestUrl.DEFAULT_URL;
     }
-    return ClashConfigGenerator.escapeYaml(url);
+    return ClashConfigGenerator.escapeYaml(LatencyTestUrl.effective(url));
   }
 
   /** 组测速间隔夹取：30..86400 秒；未声明（0/负数）回退 300（旧版硬编码值）。 */
