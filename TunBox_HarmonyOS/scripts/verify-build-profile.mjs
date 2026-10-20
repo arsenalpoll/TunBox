@@ -186,6 +186,13 @@ if (fails.length > 0) {
   console.log('     提交前必须恢复为空数组（本脚本就是提交前的闸门）');
   console.log('  5) 签名一律走仓库根 sign-nexus-package.ps1，');
   console.log('     材料在 AGC通用证书 目录（不入库）');
+  console.log('');
+  console.log('  ⚠ 如果你现在是**本地 debug 模式**（想在 DevEco 里 Run 装真机），');
+  console.log('    那这个失败是**预期行为**，不是故障：');
+  console.log('      开： & C:\\Worker\\TunBox\\switch-signing.ps1 -Mode debug   （本地调试用，勿提交）');
+  console.log('      关： & C:\\Worker\\TunBox\\switch-signing.ps1 -Mode release （提交前必须切回来）');
+  console.log('    补充：DevEco 里 Run 只会打包 **unsigned** HAP 时，安装必然报');
+  console.log('    "error: no signature file. (code:9568320)" —— unsigned 包装不上，必须先切 debug 模式。');
   console.log('RESULT: BUILD PROFILE CHECKS FAILED');
   process.exit(1);
 }
