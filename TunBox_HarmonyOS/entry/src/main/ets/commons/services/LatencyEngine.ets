@@ -51,21 +51,48 @@ import { DoHResolver } from './DoHResolver';
 const TAG = 'LatencyEngine';
 
 /**
- * 并发探测数（2026-10-19 用户要求：50 → 88）。
+ * 并发探测数（2026-10-20 复核定为 50）= **并发 worker 数**（批次队列深度）。
+ *
+ * ⚠ 语义澄清（这一层长期被混淆 —— 方案 C8b）：
+ *  · `LATENCY_CONCURRENCY`（本常量，50）= **同时处于探测中的任务数**（worker 数），
+ *    即批次队列深度。它**不是**同时发出的 HTTP 请求数。
+ *  · `LATENCY_INFLIGHT`（另一个常量，8）= **同时在飞的 HTTP 请求数** ——
+ *    OHOS http 栈对同一 host 的连接池容量（真机实测约 8，超出即排队）。
+ *  · 50 个 worker 里**只有 8 个在飞**，其余阻塞在应用层信号量（LatencyInflightGate）上。
+ *
+ * 为什么是 50：与 FlClash 的 `maxConcurrentDelayTests = 50` **数值对齐**（口径一致，
+ * 便于日后做同口径对比）。⚠ 但**数值对齐 ≠ 机制对齐**：FlClash 的 50 是内核
+ * mBatch 限流（IPC 通道），本项目的 50 是客户端 REST 侧的队列深度 ——
+ * 真正同时拨号的数量仍由连接池（8）决定（根因 T3：REST 通道拿不到核内并发）。
+ *
+ * 最坏墙钟：⌈50/8⌉ × 5s ≈ 35s < BATCH_DEADLINE_MS(90s) → deadline 不会砍掉队尾。
  *
  * ⚠ 历史真机取证（2026-10-17）：冷内核 44 节点**全并发**把 controller API
  * 拖到 Operation timeout；OHOS http 单 host 约 8 并发上限，超过即排队。
- * 原值 16 是当时验证过的安全值。50 → 88 的变化：
- *   · 88 = 客户端 8 并发上限的 11 批。`testLatencyDetailed` 的外层超时按
- *     `ceil(lanes/8) * timeoutMs + 1200` 自适应（见 ClashApiService 注释），
- *     所以排队中的请求等得起内核的 504，**不会**被误报成"内核不可用"。
- *   · 单批硬上限 BATCH_DEADLINE_MS（90s）与错峰抖动仍生效：88 并发 × 5s 的
- *     最坏排队约 11×5s=55s，仍在 90s 内；真超时则剩余节点保持「未测」
- *     （不会被盖章为失败），不会整批挂死。
- *   · 单节点超时同步改为 5s（LatencyPolicy.DEFAULT_TIMEOUT_MS），两边尺子一致。
  * 若真机复现「测速卡住/大量假超时」，优先回退到 24 或 32。
  */
-export const LATENCY_CONCURRENCY = 88;
+export const LATENCY_CONCURRENCY = 50;
+/**
+ * 同时在飞的 HTTP 请求数（= OHOS 同 host 连接池容量，真机实测约 8）。
+ *
+ * 这个数**不是** worker 数：worker 数是 `LATENCY_CONCURRENCY`（50，队列深度）。
+ * 两者必须分开，因为「同时在飞的请求数」决定每个请求能否在 `timeoutMs + 1200`
+ * 内拿到**真实判定**（200/504/503/404）—— 超出连接池容量的请求会在 HTTP 栈
+ * 内部排队，而排队时间被算进请求预算后，排队中的请求必然先在客户端侧超时 →
+ * 被误判成通道故障（根因 T2）→ 连击作废整批 → 用户看到「测速全部失败」。
+ *
+ * 因此：应用层用信号量把在途数压到 8，**排队等待不计入请求超时**
+ * （见 `LatencyInflightGate` 与 `LatencyRun.gatedProbe`）。
+ */
+export const LATENCY_INFLIGHT = 8;
+/**
+ * 信号量排队等待上限（毫秒）。
+ *
+ * 等待超时的节点标为**排队超时**（独立失败分类 `LatencyFailKind.QUEUE_TIMEOUT`），
+ * 绝不归入 CORE_NOT_READY —— 那是**通道级**故障（内核/凭证），与节点排队两回事。
+ * 60s：59 节点的最坏排队约 ⌈59/8⌉×5s ≈ 37s，留足余量。
+ */
+export const LATENCY_QUEUE_WAIT_MAX_MS = 60000;
 /** 单节点探测超时（mihomo 内部默认 5000ms）。 */
 export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
 /** 组测速（GET /group/{name}/delay）的整组预算。真机实测（2026-09-23）：内核的
@@ -83,8 +110,23 @@ const STAGGER_MAX_MS = 200;
  * 见 scripts/verify-latency-engine-runtime.mjs。
  */
 export const BATCH_DEADLINE_MS = 90000;
-/** 连续「通道不可用」达到该次数即中止本批（内核不在/凭证错配，整批结论无效）。 */
-const CORE_NOT_READY_ABORT_STREAK = 3;
+/**
+ * 连续「通道不可用」达到该次数即**中止本批**（内核不在/凭证错配，整批结论无效）。
+ *
+ * ⚠ 这是**全批共享**计数器：任何一个节点命中都会 +1（不是每个节点各算一份）。
+ * 因此阈值不能太小 —— **个别节点的传输异常**（弱网抖动、内核瞬时过载）不该让
+ * 整批结论作废。3 → 6：连击 6 次才作废整批。
+ */
+const CORE_NOT_READY_ABORT_STREAK = 6;
+/**
+ * 连续「通道不可用」达到该次数即尝试一次**通道自愈**（重解析 endpoint/secret）。
+ *
+ * 为什么比「作废阈值」低：自愈是**廉价且每批只做一次**的动作（读一次配置、
+ * 换一次凭证），早点尝试能救回「内核中途重启换了 secret」这类可恢复故障；
+ * 而作废整批是**破坏性**动作（整批结论作废、剩余节点停在「未测」），
+ * 必须更谨慎才敢做。
+ */
+const CORE_NOT_READY_RECOVER_STREAK = 3;
 /**
  * 通道报「不可用」时的**就地重试**次数与线性退避基数。
  *
@@ -94,9 +136,13 @@ const CORE_NOT_READY_ABORT_STREAK = 3;
  * 旧实现每命中一次就 `coreNotReadyStreak++`，连续 3 次即作废整批：37 节点中
  * 14 个已经被内核盖成「超时」的真实结论被回滚，其余 20 个永远停在「未测」——
  * 用户看到的就是「一半超时、一半 --」。先重试再判死，可让批次真正跑完。
+ *
+ * ⚠ 2 → 1 次、退避 350 → 500ms（方案 C12）：**过载时重试会把压力再放大一倍**
+ * （真机 37 个死节点打爆 controller 的教训）。过载的正确解法是**限流**
+ * （C7 的在途信号量），不是多打几遍 —— 每多一轮重试，连接池就更挤。
  */
-const CORE_NOT_READY_RETRY_MAX = 2;
-const CORE_NOT_READY_RETRY_BACKOFF_MS = 350;
+const CORE_NOT_READY_RETRY_MAX = 1;
+const CORE_NOT_READY_RETRY_BACKOFF_MS = 500;
 /** `force=false` 时，多久以内的实测结果视为新鲜、可跳过重测。 */
 export const FRESH_RESULT_MS = 5 * 60 * 1000;
 /**
@@ -106,12 +152,152 @@ export const FRESH_RESULT_MS = 5 * 60 * 1000;
 export const LATENCY_CORE_IDLE_MS = 90000;
 
 /**
- * 默认测速 URL：**http** 的 generate_204 —— 对齐主流 Clash 客户端（CFW/CMFA/v2rayN）
- * 的出厂默认；过节点对 gstatic 的 TLS 握手在受限出口会挂起，导致「正常节点测出超时」。
- * 捆绑内核对 unified-delay 的第二次 HEAD 失败是非致命回退（adapter.go），测试不会失败。
+ * 默认测速 URL：**HTTPS** 的 generate_204。
+ *
+ * 依据（2026-10-20 复核，方案 C1）：
+ *  · FlClash 出厂默认即 `https://www.gstatic.com/generate_204`（数值口径对齐）；
+ *  · mihomo 官方告警点名 `provider.health-check.url` 与 `group.url` 应使用 HTTPS ——
+ *    明文测速地址会被机场/落地劫持（第一次 HEAD 就被劫成非 204 → 该节点判失败）；
+ *  · 5.6.0 真机基线：https + 并发 8，59 节点 13.14s 跑通、`unavailable=false`。
+ *
+ * ⚠ 但**不得**把用户自填的 http URL 强行改写：部分出口会掐 gstatic 的 TLS SNI
+ * （真机 commit `a3fe45d` 实证：YF 新加坡 https=Timeout / http=1158ms）。
+ * 「用户自填 http 属合法用法」由 AppSettings 侧的**精确匹配 + 单向升级**策略保证
+ * （`AppSettings.upgradeLegacyTestUrl`），本引擎只负责自己的默认值。
  */
-export const LATENCY_TEST_URL = 'http://www.gstatic.com/generate_204';
-export const LATENCY_TEST_URL_ALT = 'http://cp.cloudflare.com/generate_204';
+export const LATENCY_TEST_URL = 'https://www.gstatic.com/generate_204';
+/**
+ * 备用测速源（**HTTPS**）。
+ *
+ * ⚠ **当前引擎不会自动回退到它**（方案 C14b）：自动回退会与 C7 的在途信号量 /
+ * 超时预算打架 —— 回退 = 再发一次请求 = 再占一个在途名额 + 再等一份超时预算，
+ * 会把「排队」放大成「过载」，正是本轮要消灭的现象。
+ * 它只作为**显式选择**的备用源，供设置页与调用方使用。
+ *
+ * ⚠ 用户自填的 http 测速 URL 是**合法用法**（部分出口掐 gstatic 的 TLS SNI），
+ * 任何地方都**不得**擅自把它改写成 https 或本常量。
+ */
+export const LATENCY_TEST_URL_ALT = 'https://cp.cloudflare.com/generate_204';
+
+/** 一次在途名额的排队票据（见 LatencyInflightGate）。 */
+class GateTicket {
+  /** 是否拿到名额（false = 排队等待超时） */
+  granted: boolean = false;
+  /** 是否已结算（放号或超时，二者只生效一次） */
+  settled: boolean = false;
+  /** 结算回调：闸门在放号 / 超时时调用 */
+  wake: (granted: boolean) => void = noopGateWake;
+}
+
+/** 空结算回调（票据在被唤醒前的占位实现） */
+function noopGateWake(granted: boolean): void {
+  if (granted) {
+    return;
+  }
+}
+
+/**
+ * 应用层在途闸门（信号量）。
+ *
+ * ArkTS 没有原生 Semaphore，这里用**纯计数 + 等待队列**实现：
+ *  · `active` = 当前占用的在途名额数（严格 ≤ `LATENCY_INFLIGHT`）；
+ *  · 等待者排成 FIFO 队列，释放时按先进先出把名额**直接移交**给队首。
+ *
+ * 为什么必须放在应用层（根因 T2 / T3）：OHOS http 栈对同一 host 只有约 8 个并发
+ * 连接，超出的请求在 **HTTP 栈内部**排队，而那段时间被算进请求的超时预算 →
+ * 排队中的请求必然先在客户端侧超时 → 被归类成通道故障 → 连击作废整批 →
+ * 用户看到「测速全部失败」。把排队从 HTTP 栈挪进应用层、且**让等待不计入请求
+ * 超时**，每个在途请求才能拿到**真实判定**（200/504/503/404）。
+ */
+export class LatencyInflightGate {
+  private static gate: LatencyInflightGate | null = null;
+  /** 当前占用的名额数 */
+  private active: number = 0;
+  /** 名额上限（= OHOS 同 host 连接池容量） */
+  private limit: number = LATENCY_INFLIGHT;
+  /** 等待队列（FIFO） */
+  private waiters: GateTicket[] = [];
+
+  /**
+   * 全局唯一实例。
+   *
+   * 跨批次**共享**是刻意的：新批次接管时，旧批次的在途请求还没真正结束，
+   * 若每个批次各有一把闸门就会出现「短暂的 16 在途」，把连接池再次打爆。
+   */
+  static shared(): LatencyInflightGate {
+    if (LatencyInflightGate.gate === null) {
+      LatencyInflightGate.gate = new LatencyInflightGate();
+    }
+    return LatencyInflightGate.gate;
+  }
+
+  /** 当前在途数（诊断用） */
+  inflightCount(): number {
+    return this.active;
+  }
+
+  /**
+   * 申请一个在途名额。
+   *
+   * @param waitBudgetMs 排队等待上限（毫秒）
+   * @returns true = 拿到名额；false = **排队等待超时**（调用方按节点级排队超时处理，
+   *          不得归入 CORE_NOT_READY）
+   */
+  async acquire(waitBudgetMs: number): Promise<boolean> {
+    if (this.active < this.limit) {
+      this.active = this.active + 1;
+      return true;
+    }
+    const ticket: GateTicket = new GateTicket();
+    const waiting: Promise<void> = new Promise<void>((resolve) => {
+      ticket.wake = (granted: boolean): void => {
+        if (ticket.settled) {
+          return;
+        }
+        ticket.settled = true;
+        ticket.granted = granted;
+        resolve();
+      };
+    });
+    this.waiters.push(ticket);
+    let timerId: number = -1;
+    timerId = setTimeout(() => {
+      // 排队超时：把自己从队列里摘掉（若已被放号，settled 保护会挡住重复结算）
+      const idx: number = this.waiters.indexOf(ticket);
+      if (idx >= 0) {
+        this.waiters.splice(idx, 1);
+        ticket.wake(false);
+      }
+    }, waitBudgetMs);
+    await waiting;
+    if (timerId !== -1) {
+      clearTimeout(timerId);
+    }
+    return ticket.granted;
+  }
+
+  /**
+   * 释放一个名额，并把名额按 FIFO **直接移交**给队首等待者。
+   *
+   * 移交时 `active` 保持不变（名额没被浪费），等待者被唤醒后即可发请求。
+   */
+  release(): void {
+    if (this.active > 0) {
+      this.active = this.active - 1;
+    }
+    while (this.waiters.length > 0) {
+      const next: GateTicket = this.waiters[0];
+      this.waiters.shift();
+      if (next.settled) {
+        // 已超时结算的票据：名额继续往下传
+        continue;
+      }
+      this.active = this.active + 1;
+      next.wake(true);
+      return;
+    }
+  }
+}
 
 /** 进度快照（UI 直接绑定） */
 export class LatencyProgress {
@@ -123,6 +309,13 @@ export class LatencyProgress {
   cancelled: number = 0;
   /** 因结果仍新鲜而跳过的节点数（force=false 时） */
   skipped: number = 0;
+  /**
+   * **排队超时**的节点数（在途闸门上等太久才轮到它，这一轮没发出请求）。
+   *
+   * 它是 `timeout` 的**子集**（state 同为 TIMEOUT），单独计数是为了在日志里
+   * 把「节点不通」与「没排上队」分开看 —— 后者是队列问题，不是节点问题。
+   */
+  queueTimeout: number = 0;
   /** 通道不可用（内核/凭证层面）的连续命中总数 */
   coreNotReady: number = 0;
   /** 整批因通道不可用而中止：此时**不能**把结果当节点结论 */
@@ -188,6 +381,13 @@ export class LatencyRun {
   private cancelled: boolean = false;
   private finished: boolean = false;
   private coreNotReadyStreak: number = 0;
+  /**
+   * 本批的整批硬截止时刻（run() 开始时确定）。
+   *
+   * gatedProbe 在**拿到在途名额之后**再检查它：排队期间可能已经到点，
+   * 这时就不该再发请求（发了也算不进结论，只会拖慢整批）。
+   */
+  private deadlineAt: number = 0;
   /** 本批是否已尝试过"重新解析通道凭证"（每批最多一次） */
   private channelRecoveryTried: boolean = false;
   private cursor: number = 0;
@@ -323,10 +523,14 @@ export class LatencyRun {
     const generation = this.generation;
     const startedAt = Date.now();
     const deadlineAt = startedAt + this.batchDeadlineMs;
+    this.deadlineAt = deadlineAt;
     AppLogger.info(TAG, `latency batch start nodes=${this.nodes.length} `
-      + `concurrency=${LATENCY_CONCURRENCY} timeout=${this.timeoutMs}ms force=${this.force} `
+      + `concurrency=${LATENCY_CONCURRENCY} inflight=${LATENCY_INFLIGHT} `
+      + `timeout=${this.timeoutMs}ms force=${this.force} `
       + `channel=${this.progress.channel} url=${this.url}`);
 
+    // ⚠ `lanes` 是**并发 worker 数**（队列深度），不是同时在飞的 HTTP 请求数；
+    // 在途数由 LatencyInflightGate（LATENCY_INFLIGHT=8）控制。两者语义不同，别混。
     const lanes = Math.min(LATENCY_CONCURRENCY, Math.max(1, this.nodes.length));
     const workers: Promise<void>[] = [];
     for (let w = 0; w < lanes; w++) {
@@ -347,6 +551,7 @@ export class LatencyRun {
     this.emitProgress();
     AppLogger.info(TAG, `latency batch done nodes=${this.nodes.length} channel=${this.progress.channel} `
       + `measured=${this.progress.measured} timeout=${this.progress.timeout} failed=${this.progress.failed} `
+      + `queueTimeout=${this.progress.queueTimeout} `
       + `cancelled=${this.progress.cancelled} skipped=${this.progress.skipped} `
       + `notReady=${this.progress.coreNotReady} unavailable=${this.progress.coreUnavailable} `
       + `elapsed=${Date.now() - startedAt}ms`);
@@ -378,6 +583,11 @@ export class LatencyRun {
    * 队列等待与探测计时**分离**：testLatencyDetailed 的超时只覆盖这一次 HTTP，
    * worker 在两次探测之间不累积 deadline 压力，故排在后面的节点不会被前面的
    * 节点耗尽预算（旧实现共用一份 deadline，队尾节点大面积假超时）。
+   *
+   * ⚠ 另有一层**在途闸门**（LatencyInflightGate）：真正同时发出的 HTTP 请求
+   * 恒定 ≤ LATENCY_INFLIGHT(8)，其余 worker 阻塞在闸门上；这段等待**不计入**
+   * 请求超时（详见 gatedProbe）。worker 数（LATENCY_CONCURRENCY=50）与在途数
+   * （8）是两回事，别再混用。
    */
   private async worker(lane: number, generation: number, deadlineAt: number): Promise<void> {
     // 首批错峰：0~200ms，避免整批同时打内核
@@ -438,7 +648,12 @@ export class LatencyRun {
       }
       if (!outcome.publishable) {
         // 通道不可用：不是节点结论 → 保持「未测」，并在连续命中后中止整批
-        this.progress.finished = this.progress.finished + 1;
+        // ⚠ 但「整批硬截止到点」不是通道故障：那些节点**根本没发出请求**，
+        //   保持「未测」，且**不计入 finished**（finished 只统计拿到了结论的节点，
+        //   否则进度条会把「没测」算成「测完了」）。
+        if (!outcome.skipped) {
+          this.progress.finished = this.progress.finished + 1;
+        }
         this.emitProgress();
         continue;
       }
@@ -461,7 +676,7 @@ export class LatencyRun {
     if (this.channelRecoveryTried) {
       return;
     }
-    if (this.coreNotReadyStreak < CORE_NOT_READY_ABORT_STREAK) {
+    if (this.coreNotReadyStreak < CORE_NOT_READY_RECOVER_STREAK) {
       return;
     }
     this.channelRecoveryTried = true;
@@ -482,13 +697,70 @@ export class LatencyRun {
     }
   }
 
+  /**
+   * 在途闸门内的**单次**探测（修 T2 的根治点，方案 C7）。
+   *
+   * 三条硬约束：
+   *  1. **先拿名额再发请求**：名额由应用层信号量给出（= OHOS 同 host 连接池容量
+   *     LATENCY_INFLIGHT=8），超出的部分在**应用层**排队，而不是在 HTTP 栈里
+   *     偷偷排队（旧实现把排队算进请求预算 → 排队请求必然客户端侧先超时 →
+   *     被误判 CORE_NOT_READY → 连击作废整批 → 用户看到「测速全部失败」）。
+   *  2. **排队等待不计入请求超时**：底层 connectTimeout/readTimeout 是在
+   *     `req.request()` 调用时才生效的，只要拿到名额之后才发请求，等待就不在
+   *     单请求预算里。
+   *  3. **排队等待有上限**：超时 = 节点级**排队超时**（独立分类 QUEUE_TIMEOUT），
+   *     绝不归入 CORE_NOT_READY（那是通道级故障：内核/凭证问题）。
+   */
+  private async gatedProbe(node: ProxyNode, generation: number): Promise<LatencyProbeResult> {
+    const api = this.api;
+    if (api === null) {
+      return new LatencyProbeResult();
+    }
+    const gate: LatencyInflightGate = LatencyInflightGate.shared();
+    const granted: boolean = await gate.acquire(LATENCY_QUEUE_WAIT_MAX_MS);
+    if (!granted) {
+      const queued: LatencyProbeResult = new LatencyProbeResult();
+      queued.delayMs = -1;
+      queued.failKind = LatencyFailKind.QUEUE_TIMEOUT;
+      queued.httpCode = 0;
+      queued.detail = `queue wait exceeded ${LATENCY_QUEUE_WAIT_MAX_MS}ms`;
+      AppLogger.warn(TAG, `latency queue timeout: node=${node.name} `
+        + `waitLimit=${LATENCY_QUEUE_WAIT_MAX_MS}ms inflight=${gate.inflightCount()}`);
+      return queued;
+    }
+    try {
+      if (this.isAborted(generation)) {
+        const aborted: LatencyProbeResult = new LatencyProbeResult();
+        aborted.delayMs = -1;
+        aborted.failKind = LatencyFailKind.CANCELLED;
+        aborted.detail = 'aborted while queued for an in-flight slot';
+        return aborted;
+      }
+      if (Date.now() >= this.deadlineAt) {
+        // 排队期间整批硬截止已到：保持「未测」，**不发请求**（发了也来不及算进结论）
+        const skipped: LatencyProbeResult = new LatencyProbeResult();
+        skipped.delayMs = -1;
+        skipped.failKind = LatencyFailKind.UNTESTED;
+        skipped.detail = 'batch deadline reached while queued';
+        return skipped;
+      }
+      // lanes = **同时在途的 HTTP 请求数**（LATENCY_INFLIGHT=8）—— 不是 worker 数、
+      // 也不是队列深度。ClashApiService 的外层超时按 ceil(lanes/8) 自适应：
+      // 8 → 1 批 → outerTimeout = timeoutMs + 1200（6.2s），正好覆盖内核 5s 预算
+      // + 收尾余量；而排队等待发生在拿到名额**之前**，不占这份预算。
+      return await api.testLatencyDetailed(node.name, this.url, this.timeoutMs, LATENCY_INFLIGHT);
+    } finally {
+      gate.release();
+    }
+  }
+
   /** 通道可用性判定的探测结果包装 */
   private async probeThroughCore(node: ProxyNode, generation: number): Promise<ProbeOutcome> {
     const api = this.api;
     if (api === null) {
       return ProbeOutcome.notPublishable();
     }
-    const firstProbe = await api.testLatencyDetailed(node.name, this.url, this.timeoutMs, 16);
+    const firstProbe = await this.gatedProbe(node, generation);
     // ── 通道瞬时过载：先就地重试/退避，不要立刻把它算进「通道不可用」连击 ──
     // 死亡节点成批拨号会把 controller 打到 Operation timeout（2300028），这是过载
     // 而不是内核死亡；实测同一内核稍后仍能正常出结果。旧实现每命中一次就累加连击，
@@ -507,11 +779,16 @@ export class LatencyRun {
         if (this.isAborted(generation)) {
           break;
         }
-        probe = await api.testLatencyDetailed(node.name, this.url, this.timeoutMs, 16);
+        probe = await this.gatedProbe(node, generation);
         if (probe.failKind !== LatencyFailKind.CORE_NOT_READY) {
           break;
         }
       }
+    }
+    if (probe.failKind === LatencyFailKind.UNTESTED) {
+      // 整批硬截止已到（排队期间耗尽）：本节点**根本没发出请求** → 保持「未测」，
+      // 不发布任何结论，也不计入 finished（见 ProbeOutcome.skipped）。
+      return ProbeOutcome.deadlineSkipped();
     }
     if (this.isAborted(generation)) {
       // 用户取消 / 新批次抢占 / 通道作废：本批剩余工作全部作废。
@@ -562,10 +839,15 @@ export class LatencyRun {
     const state = LatencyEngine.mapFailure(probe.failKind, probe.httpCode);
     if (state === LatencyState.TIMEOUT) {
       this.progress.timeout = this.progress.timeout + 1;
-      // 该节点入口域名若还挂着 DoH pin，却连握手都等不到应答，最可能是记录已轮换
-      // （机场短 TTL 换绑）而 hosts pin 把内核钉在旧 IP 上。丢掉这条 pin：下一个
-      // 批次重新生成配置时不再写 hosts，交由内核按 TTL 现解析。
-      DoHResolver.dropPin(node.server);
+      if (probe.failKind === LatencyFailKind.QUEUE_TIMEOUT) {
+        // 排队超时：这一轮**没拨号** → 与节点/出口无关，也不该动 DoH pin
+        this.progress.queueTimeout = this.progress.queueTimeout + 1;
+      } else {
+        // 该节点入口域名若还挂着 DoH pin，却连握手都等不到应答，最可能是记录已轮换
+        // （机场短 TTL 换绑）而 hosts pin 把内核钉在旧 IP 上。丢掉这条 pin：下一个
+        // 批次重新生成配置时不再写 hosts，交由内核按 TTL 现解析。
+        DoHResolver.dropPin(node.server);
+      }
     } else {
       this.progress.failed = this.progress.failed + 1;
     }
@@ -638,6 +920,14 @@ export class LatencyRun {
 class ProbeOutcome {
   publishable: boolean = false;
   record: LatencyRecord = new LatencyRecord();
+  /**
+   * 是否是「整批硬截止到点、根本没发出请求」的跳过。
+   *
+   * 与「通道不可用」不同：通道不可用也是不发布结论，但它是一次**已发生的**
+   * 事件（要计入 finished 与 coreNotReady）；而 deadline 跳过是「没发生」，
+   * 节点保持「未测」，**不计入 finished**（否则进度条会把「没测」算成「测完」）。
+   */
+  skipped: boolean = false;
 
   static publishable(rec: LatencyRecord): ProbeOutcome {
     const o = new ProbeOutcome();
@@ -649,6 +939,14 @@ class ProbeOutcome {
   static notPublishable(): ProbeOutcome {
     const o = new ProbeOutcome();
     o.publishable = false;
+    return o;
+  }
+
+  /** 整批硬截止到点：没发出请求 → 保持「未测」，不计入 finished */
+  static deadlineSkipped(): ProbeOutcome {
+    const o = new ProbeOutcome();
+    o.publishable = false;
+    o.skipped = true;
     return o;
   }
 }
@@ -673,6 +971,12 @@ export class LatencyEngine {
     }
     if (failKind === LatencyFailKind.CANCELLED) {
       return LatencyState.CANCELLED;
+    }
+    if (failKind === LatencyFailKind.QUEUE_TIMEOUT) {
+      // 排队超时：这一轮**没排上队**，节点**没有**被判失败 —— 与真超时同档展示
+      // （都是「没测出延迟」），但分类是独立的，UI/持久化可以据此把
+      // 「节点不通」与「没排上队」分开（见 LatencyFailKind.QUEUE_TIMEOUT）。
+      return LatencyState.TIMEOUT;
     }
     if (httpCode === 504) {
       return LatencyState.TIMEOUT;

@@ -19,11 +19,11 @@ import { ProxyNode, ProxyNodeType } from '../commons/models/ProxyNode';
 import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ProxyGroup } from '../commons/models/ProxyGroup';
 import { LatencyController } from '../commons/services/LatencyController';
-import { ClashApiService, LatencyFailKind } from '../commons/services/ClashApiService';
+import { ClashApiService, GroupLatencyResult, LatencyFailKind } from '../commons/services/ClashApiService';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
 import { LatencyChannel, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
 import {
-  LATENCY_TEST_URL, LATENCY_TIMEOUT_MS, LatencyEngine, LatencyProgress, LatencyRun,
+  LATENCY_TIMEOUT_MS, LatencyEngine, LatencyProgress, LatencyRun,
   LatencyRunOptions, GROUP_TEST_TIMEOUT_MS
 } from '../commons/services/LatencyEngine';
 import { NodeCountryPolicy } from '../commons/services/PublicIpService';
@@ -165,6 +165,16 @@ struct NodeSelectionPage {
   @State latencyChannelLabel: string = '';
   /** 本轮因通道（内核/凭证）不可用而中止：结果不能当节点结论，也不能落盘 */
   @State latencyCoreUnavailable: boolean = false;
+  /**
+   * 本轮组测返回 **504（all proxies timeout）** = **所有节点都不通**，但**通道正常**。
+   *
+   * 必须与 `latencyCoreUnavailable` 区分开：
+   *  - 「内核不可用，本轮未测」= 本轮**根本没测出任何结论**（secret 错配 / 组不存在 / 传输异常）；
+   *  - 「全部节点超时」= 测了，**结论就是节点全不通**（可落库、可排序）。
+   * 早期实现把两者混为一谈（组测 504 → `resultMap === null` → coreUnavailable），
+   * 于是用户报「测速全部失败」时根本分不清是节点坏了还是内核挂了。
+   */
+  @State latencyAllTimedOut: boolean = false;
   /**
    * 本轮是否被取消（用户点取消 / 页面退出）。
    * 引擎的 LatencyProgress 只统计「取消时正好在探测的节点」，无法回答"这一批是否
@@ -906,21 +916,29 @@ struct NodeSelectionPage {
   /**
    * 本批使用的测速 URL。
    *
-   * 尊重用户在设置里的 `testLatencyUrl`（旧实现也是这么做的，只是同时挂着 3 个
-   * fallback 和整批级降级机制 —— 那套机制已删除，因为主流客户端**没有一个**做 URL
-   * 轮换，失败通常意味着节点本身不通，而不是 URL 被针对）。
-   * 但**强制 HTTPS**：`unified-delay` 开启时 mihomo 会发两次 HEAD，官方明确警告
-   * `http://` 这类 URL 在劫持型代理下会失败；用户若填了 http 就回落到默认 HTTPS。
+   * 口径（与 `BackgroundLatencyService` 完全一致）：
+   *  - **兜底目标**（用户没填 / 填了非法值）→ 默认 **HTTPS** 测速地址
+   *    （`AppSettings.DEFAULT_TEST_URL`）。理由：mihomo 官方明确告警
+   *    `provider.health-check.url` 与 `group.url` 应使用 HTTPS —— 明文测速地址
+   *    会被机场/落地劫持，导致整批测速红；5.6.0 真机基线也是 https。
+   *  - **用户自填的 URL**（http 或 https 都算）→ **原样使用**，这里不做任何改写。
+   *
+   * ⚠ 为什么**不**把用户自填的 http 强制改成 https：
+   *   真机 commit `a3fe45d` 实证 —— 个别出口掐 gstatic 的 TLS SNI，
+   *   同一个出口 https Timeout 而 http 1158ms。用户自填 http 是**有意为之**，
+   *   客户端无权替他改（旧实现在这里「非 https 一律回落」，注释与代码长期相反，
+   *   且会静默改掉用户的合法配置）。
    */
   private testUrlForLatency(): string {
     const configured: string = this.settings.testLatencyUrl.trim();
-    if (configured.startsWith('https://')) {
+    if (configured.length > 0 && /^https?:\/\/\S+$/.test(configured)) {
       return configured;
     }
     if (configured.length > 0) {
-      AppLogger.warn(TAG, `test url "${configured}" is not https; falling back to ${LATENCY_TEST_URL}`);
+      AppLogger.warn(TAG, `test url "${configured}" is invalid; `
+        + `falling back to default ${AppSettings.DEFAULT_TEST_URL}`);
     }
-    return LATENCY_TEST_URL;
+    return AppSettings.DEFAULT_TEST_URL;
   }
 
   /**
@@ -940,6 +958,8 @@ struct NodeSelectionPage {
       return null;
     }
     this.batchCancelled = false;
+    // 逐节点路径不涉及组测的 504 语义：每轮重置，避免上一轮的「全部超时」残留。
+    this.latencyAllTimedOut = false;
     if (driveHeader) {
       // 立刻进入「进度 + 取消」态：取通道本身可能要等（未连接时要拉起进程内无头内核），
       // 这段等待必须有可见反馈，否则用户会以为点了没反应。
@@ -1200,6 +1220,16 @@ struct NodeSelectionPage {
     await this.persistSortState();
     AppLogger.info(TAG, `group latency batch done: total=${progress.total} measured=${progress.measured} `
       + `timeout=${progress.timeout} failed=${progress.failed} channel=${progress.channel}`);
+    if (this.latencyAllTimedOut) {
+      // 504 = all proxies timeout：**通道正常，是所有节点都不通**。
+      // 与「内核不可用，本轮未测」严格区分：这一轮有结论（节点全超时），可落盘可排序。
+      if (this.pageActive) {
+        promptAction.showToast({
+          message: `全部节点超时：可用 0 / ${progress.total}（通道正常，请检查节点或换订阅）`
+        });
+      }
+      return;
+    }
     if (this.pageActive) {
       // 「未生效」必须单独报出来：它不是节点连不上，而是**节点根本没进内核配置**
       // （订阅解析/配置生成阶段丢了它）—— 指向配置/解析问题，不是节点质量。
@@ -1214,11 +1244,17 @@ struct NodeSelectionPage {
   }
 
   /**
-   * 组测速执行：markTesting 全部 → 一次组测请求 → 按 map 逐节点落库。
-   * map 里有的节点 = 内核实测成功（MEASURED）；map 里没有的 = 内核侧超时/失败
-   * （TIMEOUT，内核源码 URLTest：err != nil 的节点不进 map）——按用户要求
-   * 「要么超时要么延迟」，不留未测。请求失败（连接失败/全超时）= 通道不可用，
-   * 保持未测 + 由 testAll 提示。
+   * 组测速执行：markTesting 全部 → 一次组测请求 → 按结果逐节点落库。
+   *
+   * 结果里有的节点 = 内核实测成功（MEASURED）；没有的 = 内核侧超时/失败
+   * （内核源码 URLTest：err != nil 的节点不进结果集）——按用户要求
+   * 「要么超时要么延迟」，不留未测。
+   *
+   * ⚠ **失败分类不得丢失**（C10 / C10b，对应 §9.2 T5）：
+   *  - 内核返回 **504（all proxies timeout）** = **所有成员都超时**，但**通道是好的**
+   *    → 结论是「**全部节点超时**」，**不是**「内核不可用，本轮未测」；
+   *  - 只有真正的通道故障（401/403 secret 错配、404 组不存在、传输异常）
+   *    → 才标 `coreUnavailable`（本轮没有任何节点结论，保持未测）。
    */
   private async runGroupLatency(list: ProxyNode[], driveHeader: boolean,
     source: string): Promise<LatencyProgress | null> {
@@ -1226,6 +1262,8 @@ struct NodeSelectionPage {
       return null;
     }
     this.batchCancelled = false;
+    // 504 标记只属于本轮组测：每轮重置。
+    this.latencyAllTimedOut = false;
     if (driveHeader) {
       this.batchTesting = true;
       this.latencyTotal = list.length;
@@ -1255,8 +1293,18 @@ struct NodeSelectionPage {
       LatencyController.markTesting(n.name);
     }
     this.groupTestApi = api;
-    const resultMap = await api.testGroupDetailed('PROXY', this.testUrlForLatency(),
-      GROUP_TEST_TIMEOUT_MS);
+    // 组测用**带分类**的接口：只有它能区分 504（全部成员超时，通道正常）与
+    // 真正的通道故障（401/403 secret 错配、404 组不存在、传输异常）。
+    // 旧的 testGroupDetailed() 任何非 200 一律返回 null → 两者被混为一谈（T5）。
+    let groupRes: GroupLatencyResult = new GroupLatencyResult();
+    try {
+      groupRes = await api.testGroupDetailedResult('PROXY', this.testUrlForLatency(),
+        GROUP_TEST_TIMEOUT_MS);
+    } catch (e) {
+      // 抛异常 = 传输层故障；groupRes 保持默认（ok=false / allTimedOut=false）
+      // → 落到下面的「通道故障」分支。
+      AppLogger.warn(TAG, `group latency request error: ${AppLogger.errText(e)}`);
+    }
     this.groupTestApi = null;
     if (this.batchCancelled) {
       // 用户取消：被中断的节点收回「未测」
@@ -1271,9 +1319,12 @@ struct NodeSelectionPage {
       }
       return null;
     }
-    if (resultMap === null) {
-      // 组测请求失败 = 通道不可用：保持未测（TESTING 收回），不写成节点结论
+    if (!groupRes.ok && !groupRes.allTimedOut) {
+      // 真正的**通道故障**（401/403 secret 错配、404 组不存在、传输异常）：
+      // 本轮没有任何节点结论 → 保持未测（TESTING 收回），不写成节点结论。
       progress.coreUnavailable = true;
+      AppLogger.warn(TAG, `group latency channel failure: code=${groupRes.httpCode} `
+        + `kind=${groupRes.failKind} detail=${groupRes.detail}`);
       for (const n of list) {
         if (LatencyController.stateFor(n.name) === LatencyState.TESTING) {
           LatencyController.setRecord(LatencyRecord.untested(n.name));
@@ -1285,19 +1336,33 @@ struct NodeSelectionPage {
       }
       return progress;
     }
-    // 逐节点落库：map 有 → 实测；map 无 → 内核侧未成功。
+    if (groupRes.allTimedOut) {
+      // 504 = all proxies timeout：**通道正常，是「所有节点都不通」**。
+      // 绝不能标 coreUnavailable —— 那会把「节点全不通」说成「内核挂了，本轮未测」，
+      // 这正是用户报「测速全部失败」时无法定位的根因（§9.2 T5）。
+      this.latencyAllTimedOut = true;
+      AppLogger.warn(TAG, `group latency: all proxies timeout (504) nodes=${list.length} `
+        + `— channel ok, every node timed out`);
+    }
+    // 逐节点落库：结果里有 → 实测；结果里没有 → 内核侧未成功。
     // 每条落库立即 flushNow：组测是一次请求拿到全部结果，落库循环毫秒级完成，
     // 若只靠 200ms 合并通知会全部落完才排一次（表现为"边测边排序没生效"）。
     // 逐条 flush 让 UI 逐节点看到排序冒泡（每次 O(N log N)，百节点可忽略）。
     //
-    // 组测接口（/group/PROXY/delay）**不返回失败状态码** —— 内核只给"成功的节点"。
-    // 但内核代理表能回答「这个节点在不在内核里」：不在 = 节点根本没进配置
+    // 组测接口（/group/PROXY/delay）**只返回成功节点** —— 失败节点无法从响应里
+    // 区分原因。但内核代理表能回答「这个节点在不在内核里」：不在 = 节点根本没进配置
     // （订阅解析/配置生成把它丢了），与「节点连不上」是两回事，必须分开落库，
     // 否则用户看到的是"全红"，会以为节点坏了（真机 2026-10-19：36 个 anytls
     // 被丢弃 → 内核 404 → 测速全红，节点实际可用、代理正常）。
+    // ⚠ 二者**不得**混为一谈（C10b）：
+    //   · 不在内核代理表 → LatencyFailKind.SWITCH_FAILED（节点没进内核 = 未生效）
+    //   · 在内核表但本轮没测到 → LatencyFailKind.TIMEOUT（真超时）
+    // 504（全部成员超时）时结果集为空，全部走失败分支：这些节点在内核表里
+    // （组存在才谈得上 504），因此判 TIMEOUT —— 结论与逐节点路径一致。
+    const delays: Map<string, number> = groupRes.delays;
     const failedNames: string[] = [];
     for (const n of list) {
-      if (resultMap.get(n.name) === undefined) {
+      if (delays.get(n.name) === undefined) {
         failedNames.push(n.name);
       }
     }
@@ -1307,7 +1372,7 @@ struct NodeSelectionPage {
       coreTable = names === null ? null : new Set<string>(names);
     }
     for (const n of list) {
-      const delay = resultMap.get(n.name);
+      const delay = delays.get(n.name);
       if (delay !== undefined && delay > 0) {
         LatencyController.setRecord(
           LatencyRecord.measured(n.name, delay, LatencyChannel.CORE, Date.now()));
@@ -1546,6 +1611,11 @@ struct NodeSelectionPage {
             Row({ space: 8 }) {
               if (this.latencyCoreUnavailable) {
                 Text('内核不可用，本轮未测')
+                  .fontSize(11)
+                  .fontColor(Ui.warning)
+              } else if (this.latencyAllTimedOut) {
+                // 504：通道正常，只是所有节点都不通 —— 与「内核不可用」是两件事
+                Text('全部节点超时（通道正常）')
                   .fontSize(11)
                   .fontColor(Ui.warning)
               }

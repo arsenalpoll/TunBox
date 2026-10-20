@@ -79,9 +79,14 @@ check('页面不再持有自己的 lane / 代次 / URL 降级状态', () => {
 });
 check('页面不再自己解析 /delay 响应（不碰 HTTP 状态码/响应体）', () => {
   // 页面允许把记录状态翻译成持久化用的 failKind（那是数据映射，不是分类），
-  // 但绝不能自己发请求、自己读状态码 —— 那是引擎与 ClashApiService 的职责。
+  // 但绝不能自己发请求、自己读**原始** HTTP 响应 —— 那是引擎与 ClashApiService 的职责。
+  //
+  // ⚠ 2026-10-20 放宽 `httpCode`：C10 之后组测返回**已分类**的
+  // GroupLatencyResult，页面读 `groupRes.httpCode` 是读「分类结果」而不是
+  // 「原始响应」—— 正是为了把 504（通道正常、节点全不通）与 401/404
+  // （真通道故障）区分开。`responseCode`（原始响应字段）仍然禁止。
   for (const forbidden of ['testLatencyDetailed', 'classifyStatusCode', 'classifyTransportError',
-    'httpCode', 'responseCode']) {
+    'responseCode']) {
     assert.ok(!new RegExp('\\b' + forbidden + '\\b').test(pageCode),
       `page must not handle raw HTTP (${forbidden})`);
   }
@@ -129,18 +134,33 @@ check('后台静默测速也走同一引擎（不再是第二套实现）', () =
     'background must not keep its own parallel pipeline');
 });
 
-// ── 4. 测速 URL 用 HTTP（受限出口对 gstatic 的 TLS 握手会挂起 → 误标超时） ──
-check('默认测速 URL 是 HTTP 的 generate_204（对齐主流 Clash 出厂默认）', () => {
-  assert.ok(/LATENCY_TEST_URL\s*=\s*'http:\/\/www\.gstatic\.com\/generate_204'/.test(engine),
-    'primary test url must be http://www.gstatic.com/generate_204');
-  assert.ok(/LATENCY_TEST_URL_ALT\s*=\s*'http:\/\//.test(engine), 'alt test url must be http');
+// ── 4. 测速 URL 用 HTTPS（mihomo 官方要求 provider.health-check.url / group.url
+//     走 HTTPS；明文测速地址会被机场/落地劫持，把正常节点判成失败） ─────────
+//     ⚠ 注意：「用户自填 http 属合法用法」（部分出口掐 gstatic 的 TLS SNI，真机
+//     commit a3fe45d 实证 https=Timeout / http=1158ms）—— 客户端只做
+//     「历史默认值的单向升级」，绝不改写用户自己填的 http。
+check('默认测速 URL 是 HTTPS 的 generate_204（对齐 FlClash 出厂默认）', () => {
+  assert.ok(/LATENCY_TEST_URL\s*=\s*'https:\/\/www\.gstatic\.com\/generate_204'/.test(engine),
+    'primary test url must be https://www.gstatic.com/generate_204');
+  assert.ok(/LATENCY_TEST_URL_ALT\s*=\s*'https:\/\//.test(engine), 'alt test url must be https');
 });
-check('AppSettings 默认测速 URL 是 HTTP，且旧默认 https 会被加载迁移为 http', () => {
+check('备用测速源是 HTTPS，且引擎不自动回退（回退会与在途闸门打架）', () => {
+  assert.ok(/LATENCY_TEST_URL_ALT\s*=\s*'https:\/\/cp\.cloudflare\.com\/generate_204'/.test(engine),
+    'alt test url must be the https cloudflare generate_204');
+  assert.ok(!/LATENCY_TEST_URL_ALT\s*[),]/.test(engineCode.replace(/LATENCY_TEST_URL_ALT[^;]*;/g, '')),
+    'engine must not auto-fallback to the alt url (it would fight the in-flight gate)');
+});
+check('AppSettings 默认测速 URL 是 HTTPS，历史 http 默认值单向升级为 https', () => {
   const settings = fs.readFileSync(rel('entry/src/main/ets/commons/models/AppSettings.ets'), 'utf8');
-  assert.ok(!/testLatencyUrl[^=]*=\s*'https:\/\//.test(settings),
-    'AppSettings default test url must not be https (restricted exits hang on gstatic TLS)');
-  assert.ok(/'https:\/\/www\.gstatic\.com\/generate_204'\s*\n?\s*\?\s*'http:\/\/www\.gstatic\.com\/generate_204'/.test(settings),
-    'legacy persisted https default must be migrated to http on load');
+  assert.ok(/DEFAULT_TEST_URL\s*:\s*string\s*=\s*'https:\/\/www\.gstatic\.com\/generate_204'/.test(settings),
+    'AppSettings DEFAULT_TEST_URL must be https');
+  assert.ok(/LEGACY_TEST_URL_GSTATIC\s*:\s*string\s*=\s*'http:\/\/www\.gstatic\.com\/generate_204'/.test(settings),
+    'the legacy http default must be kept as an explicit legacy constant (one-way upgrade source)');
+  assert.ok(/upgradeLegacyTestUrl/.test(settings),
+    'AppSettings must migrate the legacy http default to https on load');
+  // ⚠ 绝不能再有「https → http 强制降级」的旧写法（那是罪魁祸首）
+  assert.ok(!/'https:\/\/www\.gstatic\.com\/generate_204'\s*\n?\s*\?\s*'http:\/\//.test(settings),
+    'AppSettings must not downgrade https to http any more');
 });
 
 // ── 5. 并发上限 ───────────────────────────────────────────────────────────

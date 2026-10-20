@@ -80,6 +80,18 @@ export class LatencyFailKind {
    */
   static readonly UNTESTED: string = 'untested';
   /**
+   * **排队超时**（**节点级**）：该节点在应用层在途闸门上等了太久才轮到它，
+   * 这一轮**根本没发出请求**。
+   *
+   * ⚠ 与 CORE_NOT_READY 的区别（必须一路带到 UI / 持久化，二者绝不能混）：
+   *  · CORE_NOT_READY = **通道级**故障（内核不在 / 凭证错配）→ 整批结论无效，
+   *    引擎会连击作废整批；
+   *  · QUEUE_TIMEOUT  = **节点级**的「没排上队」→ 其它节点的结果完全有效，
+   *    只是这个节点这一轮没测到。
+   * 混了就会重现「排队久了 → 报内核不可用 → 整批作废 → 全部节点都不通」。
+   */
+  static readonly QUEUE_TIMEOUT: string = 'queue_timeout';
+  /**
    * 客户端主动中止（用户取消 / 页面退出 / 网络切换）。
    * **不是节点结论**：mihomo 的 /delay 用 context.Background()，abort 只影响客户端，
    * 中途被打断的探测不能盖章成"节点失败"。
@@ -101,6 +113,45 @@ export class LatencyProbeResult {
   ok(): boolean {
     return this.delayMs >= 0;
   }
+}
+
+/**
+ * 组测速（`GET /group/{name}/delay`）的结构化结果。
+ *
+ * 为什么需要它（根因 T5，方案 C10）：内核在**全部成员失败**时返回 **504**
+ * （body `get delay: all proxies timeout`）—— 那是「节点全不通、**通道正常**」。
+ * 旧接口对**任何非 200 一律 return null**，调用方只能判定「内核不可用」，
+ * 于是「所有节点都不通」与「内核挂了」在 UI 上完全无法区分
+ * （用户报障原文：要么测速全部失败，要么启动代理失败）。
+ *
+ * ## 对外契约（供 UI 侧接入）
+ *
+ * | 情况 | ok | allTimedOut | failKind | 说明 |
+ * |---|---|---|---|---|
+ * | 200 且有成功节点 | true | false | '' | `delays` 只含 delay>0 的成员 |
+ * | 200 但无一成员成功 | true | false | '' | `delays` 为空 = 本轮没测到任何节点 |
+ * | **504**（全部成员超时） | **false** | **true** | TIMEOUT | **通道正常**，只是节点全不通 |
+ * | 401 / 403 | false | false | CORE_NOT_READY | secret 错配 = 通道不可用 |
+ * | 404 | false | false | SWITCH_FAILED | 内核里没有这个组 |
+ * | 503 | false | false | TIMEOUT | 单节点拨号失败语义 |
+ * | 其它非 200 | false | false | NETWORK_UNREACHABLE | |
+ * | 传输异常 | false | false | CORE_NOT_READY | 本机没拿到 HTTP 响应 = 通道不可用 |
+ *
+ * ⚠ **本方法不抛异常**：所有失败都用返回值表达（`failKind` + `detail`）。
+ */
+export class GroupLatencyResult {
+  /** 是否拿到**可用**响应（= 有成功节点）。注意：504 是「不可用但通道正常」→ false。 */
+  ok: boolean = false;
+  /** 成功节点的延迟（只含 delay > 0 的成员） */
+  delays: Map<string, number> = new Map<string, number>();
+  /** HTTP 状态码（0 = 传输层失败，没有拿到响应） */
+  httpCode: number = 0;
+  /** 失败分类（LatencyFailKind.*；空串 = 无失败） */
+  failKind: string = '';
+  /** 脱敏诊断信息（绝不包含 secret / 订阅地址 / 节点口令） */
+  detail: string = '';
+  /** 504 = 全部成员超时（**通道正常**，节点全不通） */
+  allTimedOut: boolean = false;
 }
 
 /**
@@ -618,12 +669,19 @@ export class ClashApiService {
    * 按剩余次数切碎（旧实现组测每次只剩 250~500ms → 大面积假超时）。
    *
    * 失败分类随结果返回（LatencyFailKind），调用方不得再统一折叠成「超时」。
+   *
+   * ⚠ `lanes` 的语义（2026-10-20 修正，方案 C8/C9）：它是**同时在途的 HTTP
+   * 请求数**，不是 worker 数、也不是队列深度。公式 `ceil(lanes/8)` 只有在
+   * lanes = 实际在途数时才成立。
    */
   async testLatencyDetailed(nodeName: string, testUrl: string,
     timeoutMs: number = 5000, lanes: number = 1): Promise<LatencyProbeResult> {
     const out = new LatencyProbeResult();
     const req = http.createHttp();
     this.inflight.add(req);
+    // 真实外层超时预算：catch 分支也要打它（旧日志硬编码 timeoutMs+1200，
+    // 与实际公式 batchCount*timeoutMs+1200 不符，会把排查引向错误方向）。
+    let outerTimeoutMs: number = 0;
     try {
       // API 位于本机，外层只需给 mihomo 返回结果留调度余量。
       //
@@ -634,14 +692,23 @@ export class ClashApiService {
       // `504 Timeout`，于是"真超时"会被误分类成"失败"，五态语义直接塌掉。
       // 取 1200ms：足以覆盖收尾抖动，又远小于单节点 5s 预算，不会放大长尾。
       // 外层余量 = 排队批次数 × 内核 timeout + 调度余量。
+      //
+      // ⚠ 前提（2026-10-20 修正，方案 C8/C9）：`lanes` 必须是**同时在途的
+      // HTTP 请求数**，不是 worker 数、也不是队列深度。调用方（LatencyEngine）
+      // 现在传 LATENCY_INFLIGHT(8)，队列化已由**应用层信号量**完成
+      // （排队等待不计入请求超时，见 LatencyInflightGate）→ batchCount 恒为 1
+      // → outerTimeout = timeoutMs + 1200（6.2s），每个在途请求都能拿到
+      // **真实判定**（200/504/503/404）。
+      //
+      // 旧实现传的是硬编码 16（与实际并发数毫无关系）→ batchCount=2 → 外层只有
+      // 11.2s，而排队最坏需要 11×5s=55s → 排队中的请求**客户端侧先超时** →
+      // 被 classifyTransportError 归为 CORE_NOT_READY → 连击作废整批 →
+      // 用户看到「测速全部失败」（根因 T2）。
       // 真机实证（2026-09-23）：OHOS http 栈对同一 host 的并发连接数有上限
-      // （约 8 个），并发 16 时一半请求在连接池排队——排队 5s + 内核拨号 5s
-      // 会超过固定的 +1200 余量 → 排队的请求客户端侧超时 → 被误分类为
-      // CORE_NOT_READY → 连续命中 → 「内核不可用，本轮未测」（8 并发没事、
-      // 16/24/32 出问题的完整解释）。外层超时按并发批次数自适应后，排队的
-      // 请求等得起内核的 504，不再误报。mihomo 本身毫无压力（问题在客户端栈）。
+      // （约 8 个）—— 超出即排队，且排队时间被算进请求预算。mihomo 本身毫无压力
+      // （问题在客户端栈）。
       const batchCount = Math.max(1, Math.ceil(lanes / 8));
-      const outerTimeoutMs = batchCount * timeoutMs + 1200;
+      outerTimeoutMs = batchCount * timeoutMs + 1200;
       const startedAt = Date.now();
       const resp = await req.request(
         `${this.baseUrl()}/proxies/${encodeURIComponent(nodeName)}/delay?url=${encodeURIComponent(testUrl)}&timeout=${timeoutMs}`, {
@@ -701,7 +768,7 @@ export class ClashApiService {
       out.failKind = ClashApiService.classifyTransportError(this.errText(e));
       out.detail = `transport kind=${out.failKind}`;
       AppLogger.warn(TAG, `latency request error: kind=${out.failKind} innerTimeout=${timeoutMs} `
-        + `outerTimeout=${timeoutMs + 1200} error=${this.errText(e)}`);
+        + `outerTimeout=${outerTimeoutMs} lanes=${lanes} error=${this.errText(e)}`);
       return out;
     } finally {
       this.inflight.delete(req);
@@ -710,7 +777,7 @@ export class ClashApiService {
   }
 
   /**
-   * **组测速（对齐主流客户端）**：`GET /group/{name}/delay` —— 一次请求让内核
+   * **组测速（带失败分类）**：`GET /group/{name}/delay` —— 一次请求让内核
    * 对组内**全部节点并发测试**（Go goroutine，无客户端 http 栈的同 host 并发
    * 连接限制）。内核源码实证（mihomo-smart hub/route/groups.go）：
    *  - 传入的 url 参数**会被使用**（`group.URLTest(ctx, url, expected)`）；
@@ -718,10 +785,17 @@ export class ClashApiService {
    *    不受影响）；
    *  - 返回 `map[节点名]延迟ms`——**成功的节点才有**，失败的（超时/拨号失败）
    *    不在 map 里，由调用方按「超时」落库（内核源码 URLTest：err!=nil 跳过）。
-   * 返回 Map<节点名, 延迟>；请求失败/组测全超时返回 null（调用方按通道不可用处理）。
+   *
+   * ⚠ **为什么必须有分类**（根因 T5，方案 C10）：内核在**全部成员失败**时返回
+   * **504**（body `get delay: all proxies timeout`）—— 那是「节点全不通、
+   * **通道正常**」。旧实现对任何非 200 一律 return null → 调用方判定
+   * 「内核不可用」→ 用户看到的「所有节点都不通」与「内核挂了」无法区分。
+   *
+   * 分类口径见 {@link GroupLatencyResult} 的契约表。**本方法不抛异常**。
    */
-  async testGroupDetailed(groupName: string, testUrl: string,
-    timeoutMs: number): Promise<Map<string, number> | null> {
+  async testGroupDetailedResult(groupName: string, testUrl: string,
+    timeoutMs: number): Promise<GroupLatencyResult> {
+    const out: GroupLatencyResult = new GroupLatencyResult();
     const req = http.createHttp();
     this.inflight.add(req);
     try {
@@ -735,33 +809,83 @@ export class ClashApiService {
         readTimeout: outerTimeoutMs,
         usingCache: false
       });
-      if (resp.responseCode !== 200) {
-        AppLogger.warn(TAG, `group latency non-200: code=${resp.responseCode} group=${groupName}`);
-        return null;
-      }
+      out.httpCode = resp.responseCode;
       let body: string = '';
       if (typeof resp.result === 'string') {
         body = resp.result as string;
       } else if (resp.result instanceof ArrayBuffer) {
         body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
       }
-      const parsed = JSON.parse(body) as Record<string, number>;
-      const result = new Map<string, number>();
-      for (const key of Object.keys(parsed)) {
-        const delay = parsed[key];
-        if (typeof delay === 'number' && delay > 0) {
-          result.set(key, delay);
+      if (resp.responseCode === 200) {
+        try {
+          const parsed = JSON.parse(body) as Record<string, number>;
+          for (const key of Object.keys(parsed)) {
+            const delay = parsed[key];
+            if (typeof delay === 'number' && delay > 0) {
+              out.delays.set(key, delay);
+            }
+          }
+          out.ok = true;
+          out.detail = `http=200 measured=${out.delays.size}`;
+          AppLogger.info(TAG, `group latency done: group=${groupName} measured=${out.delays.size}/${body.length}`);
+        } catch (jsonError) {
+          out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
+          out.detail = `http=200 bad json bodyLen=${body.length} error=${this.errText(jsonError)}`;
+          AppLogger.warn(TAG, `group latency JSON error: group=${groupName} ${out.detail}`);
         }
+        return out;
       }
-      AppLogger.info(TAG, `group latency done: group=${groupName} measured=${result.size}/${body.length}`);
-      return result;
+      if (resp.responseCode === 504) {
+        // 全部成员超时 —— **通道正常**，只是节点全不通（绝不能报成「内核不可用」）
+        out.ok = false;
+        out.allTimedOut = true;
+        out.failKind = LatencyFailKind.TIMEOUT;
+        out.detail = `http=504 all proxies timeout bodyLen=${body.length}`;
+        AppLogger.warn(TAG, `group latency all timed out (channel ok): group=${groupName}`);
+        return out;
+      }
+      if (resp.responseCode === 401 || resp.responseCode === 403) {
+        // secret 不一致：内核在跑，但用的不是我们这份凭证 → 通道不可用
+        out.failKind = LatencyFailKind.CORE_NOT_READY;
+      } else if (resp.responseCode === 404) {
+        // 内核代理表里没有这个组 → 切换/下发失败
+        out.failKind = LatencyFailKind.SWITCH_FAILED;
+      } else if (resp.responseCode === 503) {
+        // 单节点拨号失败语义
+        out.failKind = LatencyFailKind.TIMEOUT;
+      } else {
+        out.failKind = LatencyFailKind.NETWORK_UNREACHABLE;
+      }
+      out.detail = `http=${resp.responseCode} bodyLen=${body.length} kind=${out.failKind}`;
+      AppLogger.warn(TAG, `group latency non-200: code=${resp.responseCode} group=${groupName} `
+        + `kind=${out.failKind}`);
+      return out;
     } catch (e) {
+      // 传输层异常：本机没能拿到 HTTP 响应 → 通道不可用（不是节点结论）
+      out.failKind = LatencyFailKind.CORE_NOT_READY;
+      out.detail = `transport kind=${out.failKind} error=${this.errText(e)}`;
       AppLogger.warn(TAG, `group latency request error: ${this.errText(e)}`);
-      return null;
+      return out;
     } finally {
       this.inflight.delete(req);
       req.destroy();
     }
+  }
+
+  /**
+   * 兼容旧调用点：**返回成功节点的延迟表；任何非 200 / 传输异常都返回 null**
+   * （与整改前的行为**逐字一致** —— 旧调用方据此判定「通道不可用」）。
+   *
+   * 需要区分「节点全不通（504）」与「内核不可用」时，请改用
+   * {@link testGroupDetailedResult}。
+   */
+  async testGroupDetailed(groupName: string, testUrl: string,
+    timeoutMs: number): Promise<Map<string, number> | null> {
+    const result = await this.testGroupDetailedResult(groupName, testUrl, timeoutMs);
+    if (!result.ok || result.httpCode !== 200) {
+      return null;
+    }
+    return result.delays;
   }
 
   /** 兼容旧调用点：只取延迟数值（失败一律 -1）。需要失败分类请用 testLatencyDetailed。 */

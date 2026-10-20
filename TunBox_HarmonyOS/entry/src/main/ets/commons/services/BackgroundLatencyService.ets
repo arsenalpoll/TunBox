@@ -27,7 +27,8 @@
 import { AppLogger } from '../utils/AppLogger';
 import { ConnectionOrchestrator } from './ConnectionOrchestrator';
 import { LatencyController } from './LatencyController';
-import { LatencyEngine, LatencyRunOptions, LATENCY_TIMEOUT_MS, LATENCY_TEST_URL } from './LatencyEngine';
+import { LatencyEngine, LatencyRunOptions, LATENCY_TIMEOUT_MS } from './LatencyEngine';
+import { AppSettings } from '../models/AppSettings';
 import { ProxyNode } from '../models/ProxyNode';
 import { SettingsService } from './SettingsService';
 import { SubscriptionService } from './SubscriptionService';
@@ -88,6 +89,29 @@ export class BackgroundLatencyService {
   }
 
   /**
+   * 本批使用的测速 URL（**与 `NodeSelectionPage.testUrlForLatency` 同一口径**）。
+   *
+   *  - **兜底目标**（用户没填 / 填了非法值）→ 默认 **HTTPS** 测速地址。
+   *    理由：明文测速地址会被机场/落地劫持（mihomo 官方点名
+   *    `provider.health-check.url` / `group.url` 应使用 HTTPS），5.6.0 真机基线
+   *    也是 https。
+   *  - **用户自填的 URL**（http 或 https 都算）→ **原样保留**，这里不做任何改写。
+   *    真机 commit `a3fe45d` 实证：个别出口掐 gstatic 的 TLS SNI，
+   *    同一个出口 https Timeout 而 http 1158ms —— 用户自填 http 是有意为之。
+   */
+  static resolveTestUrl(settings: AppSettings): string {
+    const configured: string = settings.testLatencyUrl.trim();
+    if (configured.length > 0 && /^https?:\/\/\S+$/.test(configured)) {
+      return configured;
+    }
+    if (configured.length > 0) {
+      AppLogger.warn(TAG, `silent batch test url "${configured}" is invalid; `
+        + `falling back to default ${AppSettings.DEFAULT_TEST_URL}`);
+    }
+    return AppSettings.DEFAULT_TEST_URL;
+  }
+
+  /**
    * 执行一次静默批次。
    * @param subscriptionId null = 全部节点
    */
@@ -119,8 +143,8 @@ export class BackgroundLatencyService {
       // → 引擎走离线粗略通道（状态 OFFLINE，绝不冒充代理延迟）
       const api = await orchestrator.ensureLatencyApi();
       const settings = await SettingsService.load();
-      const url = settings.testLatencyUrl.trim().length > 0
-        ? settings.testLatencyUrl.trim() : LATENCY_TEST_URL;
+      // 测速 URL：兜底 → 默认 https；用户自填值 → 原样保留（口径与页面一致）。
+      const url: string = BackgroundLatencyService.resolveTestUrl(settings);
 
       const opts = new LatencyRunOptions();
       opts.force = false;              // 静默批次只补缺失/过期结果

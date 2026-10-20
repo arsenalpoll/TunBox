@@ -83,7 +83,7 @@ export class AppSettingsJson {
   preferredNodeSubscriptionId: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
-  testLatencyUrl: string = 'http://www.gstatic.com/generate_204';
+  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default' 订阅默认顺序 / 'auto' 按最近测速结果 / 'manual' 用户手动固定顺序 */
   nodeSortMode: string = 'default';
@@ -163,6 +163,29 @@ export class AppSettingsJson {
 }
 
 export class AppSettings {
+  /**
+   * 出厂默认测速地址（**HTTPS**）。
+   *
+   * 为什么默认 https（2026-10-20 定案）：
+   *  - 5.6.0 真机基线就是 https（59 节点 13.14s 跑通，`unavailable=false`），
+   *    后来版本改回 http 属于**退化**；
+   *  - mihomo 官方明确告警：`provider.health-check.url` 与 `group.url` 应使用 HTTPS
+   *    （明文测速地址会被机场/落地劫持 → 测速整批红）；
+   *  - FlClash 的默认值同样是 https。
+   *
+   * ⚠ **只约束「出厂默认 / 历史默认值」**，绝不改写用户自填的 http 地址
+   *   （见 `upgradeLegacyTestUrl`）。
+   */
+  static readonly DEFAULT_TEST_URL: string = 'https://www.gstatic.com/generate_204';
+  /**
+   * 本客户端历史上写过的两个 **http** 默认值（升级用）。
+   *
+   * 只有**恰好等于**这两个字符串的历史默认值才会被单向升级为 https；
+   * 其余用户自填的 http 地址（带路径/参数/端口的）一律原样保留。
+   */
+  static readonly LEGACY_TEST_URL_GSTATIC: string = 'http://www.gstatic.com/generate_204';
+  static readonly LEGACY_TEST_URL_CLOUDFLARE: string = 'http://cp.cloudflare.com/generate_204';
+
   /** 跟随系统 / 暗色 / 亮色 */
   themeMode: number = 0; // 0=system, 1=dark, 2=light
   autoConnectOnBoot: boolean = true;
@@ -185,7 +208,7 @@ export class AppSettings {
   preferredNodeSubscriptionId: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
-  testLatencyUrl: string = 'http://www.gstatic.com/generate_204';
+  testLatencyUrl: string = 'https://www.gstatic.com/generate_204';
   /** 代理模式：rule = 规则 / global = 全局 / direct = 直连（对应 upstream settings.proxyMode） */
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default'=订阅默认顺序, 'auto'=按最近测速结果, 'manual'=手动固定顺序 */
@@ -300,6 +323,43 @@ export class AppSettings {
     return j;
   }
 
+  /**
+   * 测速 URL 规范化：**只把本客户端自己写过的历史 http 默认值**单向升级为 https。
+   *
+   * ## 为什么不是「把所有 http 都改成 https」
+   *
+   * 明文测速地址确实有真实风险（机场/落地劫持 + mihomo 官方点名
+   * `provider.health-check.url` / `group.url` 应使用 HTTPS），但**一刀切会改坏用户的
+   * 合法配置**：真机 commit `a3fe45d` 实证 —— 个别出口会掐 gstatic 的 TLS SNI，
+   * 同一个出口 **https Timeout 而 http 1158ms**。用户自填 http 是**有意为之**，
+   * 客户端无权替他改。
+   *
+   * 所以规则是**精确匹配 + 单向**：
+   *  - 恰好等于本客户端历史上写过的两个 http 默认值 → 升级为对应 https
+   *    （存量用户落盘的旧默认值在**本次加载**时被迁移，用户不需要手动改）；
+   *  - 其余任何值（用户自填的 http、https、带路径/参数/端口的地址）→ **原样保留**；
+   *  - 空串 / 非法值（不是 `http(s)://` 开头的地址）→ 回落默认 https。
+   *
+   * ⚠ 本方法**绝不**把 https 降级回 http：用户手填 https 是明确意图。
+   */
+  static upgradeLegacyTestUrl(value: string): string {
+    const raw: string = typeof value === 'string' ? value.trim() : '';
+    if (raw.length === 0) {
+      return AppSettings.DEFAULT_TEST_URL;
+    }
+    if (raw === AppSettings.LEGACY_TEST_URL_GSTATIC) {
+      return 'https://www.gstatic.com/generate_204';
+    }
+    if (raw === AppSettings.LEGACY_TEST_URL_CLOUDFLARE) {
+      return 'https://cp.cloudflare.com/generate_204';
+    }
+    if (!/^https?:\/\/\S+$/.test(raw)) {
+      // 非法值（没有协议头 / 带空白）→ 默认 https
+      return AppSettings.DEFAULT_TEST_URL;
+    }
+    return raw;
+  }
+
   static fromJson(j: AppSettingsJson): AppSettings {
     const s = new AppSettings();
     s.themeMode = j.themeMode === 1 || j.themeMode === 2 ? j.themeMode : 0;
@@ -347,10 +407,11 @@ export class AppSettings {
       ? j.preferredNodeSubscriptionId : '';
     s.autoUpdateSubscription = typeof j.autoUpdateSubscription === 'boolean' ? j.autoUpdateSubscription : true;
     s.selectedSubscriptionId = typeof j.selectedSubscriptionId === 'string' ? j.selectedSubscriptionId : '';
-    s.testLatencyUrl = typeof j.testLatencyUrl === 'string' && j.testLatencyUrl.length > 0
-      ? (j.testLatencyUrl === 'https://www.gstatic.com/generate_204'
-        ? 'http://www.gstatic.com/generate_204' : j.testLatencyUrl)
-      : 'http://www.gstatic.com/generate_204';
+    // 测速地址：**只做「历史 http 默认值 → https」的单向升级**（C3）。
+    // 早期版本在这里做过**反向降级**（把用户手填的 https 改回 http）—— 那是罪魁祸首：
+    // 用户明确填 https 也会被悄悄改掉。现在不再有任何降级路径。
+    s.testLatencyUrl = AppSettings.upgradeLegacyTestUrl(
+      typeof j.testLatencyUrl === 'string' ? j.testLatencyUrl : '');
     // ── 代理模式恢复：`direct` **不跨重启持久化**（2026-10-19 稳定性裁定）──
     //
     // `direct` 是 0.4.0 新增的第三态（首页「直连」按钮）。它的语义是「所有流量

@@ -121,11 +121,18 @@ const apiSrc = fs.readFileSync(
 ok('ClashApiService 提供 proxyTableNames（内核代理表全名）',
   /async proxyTableNames\(\): Promise<string\[\] \| null>/.test(apiSrc));
 
-// ── 测速超时与并发度（2026-10-19 用户要求：超时 5s、并发 88）──────────────
+// ── 测速超时与并发度（2026-10-19 用户要求：超时 5s、并发 88 → 2026-10-20 整改为 50）──
 // 契约：单节点超时、组测预算、并发度三者必须一致 —— 同一节点在「测全部」
 // 和「单节点测速」里用不同尺子，结论会相反。
+//
+// 2026-10-20（订阅解析内核化整改 C8b）：并发度由 88 收敛为 50。
+//   88 是「并发 worker 数」口径下的旧值，与 FlClash 的核内批量限流数值对齐但机制不同；
+//   50 = worker 数（队列深度），**在途请求数**由 C7 的闸门单独限制为 LATENCY_INFLIGHT=8
+//   （= OHOS 同 host 连接池容量；5.6.0 真机基线：https + 并发 8 → 59 节点 13.14s、unavailable=false）。
+//   另注：C7 之后「排队等待」不再计入单请求超时预算，故并发度不再是超时算术的前提。
 ok('单节点测速超时为 5000ms', /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*5000/.test(stateSrc));
-ok('并发测速数为 88', /LATENCY_CONCURRENCY\s*=\s*88/.test(engineSrc));
+ok('并发测速数为 50（C8b：由 88 收敛，worker 口径）', /LATENCY_CONCURRENCY\s*=\s*50/.test(engineSrc));
+ok('在途并发上限为 8（C7 闸门：同 host 连接池容量）', /LATENCY_INFLIGHT\s*=\s*8/.test(engineSrc));
 ok('组测每节点预算与单节点一致（5000ms）', /GROUP_TEST_TIMEOUT_MS\s*=\s*5000/.test(engineSrc));
 ok('内核延迟探测默认超时同步为 5000ms',
   /testLatencyDetailed\(nodeName: string, testUrl: string,\s*\n?\s*timeoutMs: number = 5000/.test(apiSrc));

@@ -8,11 +8,16 @@
  *
  * 状态语义（必须一路带到 UI / 日志 / 持久化，禁止把 FAILED 折叠成 TIMEOUT）：
  *  - MEASURED  实测延迟，ms >= 1（mihomo 成功响应里 delay 恒 >= 1，0 被内核当失败）
- *  - TIMEOUT   内核侧超时（HTTP 504 {"message":"Timeout"}）
+ *  - TIMEOUT   内核侧超时（HTTP 504 {"message":"Timeout"}）；**也包括「排队超时」**
+ *               （在途闸门上等太久才轮到该节点，这一轮根本没拨号 —— 分类是
+ *               `failKind = queue_timeout`，用来把「节点不通」与「没排上队」分开）
  *  - FAILED    探测失败（HTTP 503：拨号失败 / 状态码不符 / delay==0）
  *  - OFFLINE   离线粗略探测（未连接内核时的 TCP/TLS/QUIC 探活，绝不冒充代理延迟）
  *  - CANCELLED 用户取消 / 网络切换中断，**不是节点结论**
  *  - UNTESTED  从未测过
+ *
+ * ⚠ 状态词表**保持不变**（新增状态会波及 UI 配色/排序/持久化三处），
+ * 「排队超时」靠 `failKind` 表达而不是新状态 —— 见 `LatencyRecord.failKind`。
  *
  * 纯数据 + 纯函数，无副作用，可在 ohosTest 直接驱动验证。
  */
@@ -89,6 +94,14 @@ export class LatencyRecord {
    * 内核 404，UI 全红，用户以为节点坏了（节点实际可用，代理正常）。
    *
    * 现在分类一路带到 UI（stateText/recordColor）与持久化快照。
+   *
+   * ⚠ 2026-10-20 新增一个分类：`queue_timeout`（**节点级**「没排上队」，
+   * 见 `ClashApiService.LatencyFailKind.QUEUE_TIMEOUT`）。它的 state 同为 TIMEOUT，
+   * 但含义与「内核 504 的真超时」不同 —— 那一轮**根本没拨号**。
+   * ✅ 已按**非判定**处理：`NodeSortPersistence.isNonVerdict` 已把 `queue_timeout`
+   * 列入白名单（与 core_not_ready 同源：都只说明「测速通道/客户端侧」的事），
+   * 所以排序快照会**沿用上一次有效结论**，不会把「我们自己的排队」写成节点失败
+   * 把节点沉底。
    */
   failKind: string = '';
 
@@ -161,7 +174,14 @@ export class LatencyPolicy {
    * 用户无法判断是节点问题还是客户端问题。
    *
    * 这个值同时是发给内核 `/delay` 的 `timeout` 参数；外层 http 超时按它推导
-   * （`timeout + 1200`），所以整批耗时也随之变化。
+   * （在途并发 ≤ 8 时 `batchCount=1` → 外层 = `timeout + 1200`），所以整批耗时
+   * 也随之变化。
+   *
+   * ⚠ 2026-10-20 修正：旧注释写的是「外层恒为 timeout+1200」。那只是 lanes ≤ 8
+   * 时才成立的特例 —— 旧实现硬编码 lanes=16 → batchCount=2 → 外层其实是
+   * `2*timeout+1200`，而排队最坏要 11×5s，外层根本兜不住（根因 T2）。
+   * 现在队列化已由应用层信号量负责，lanes 恒为 8（= 在途数），外层回到
+   * `timeout + 1200`。
    */
   static readonly DEFAULT_TIMEOUT_MS: number = 5000;
   /** mihomo 的 timeout 用 16 位整数解析，> 32767 直接 400。 */
@@ -325,6 +345,11 @@ export class LatencyPolicy {
       return '测试中';
     }
     if (state === LatencyState.TIMEOUT) {
+      if (failKind === 'queue_timeout') {
+        // 排队超时：这一轮**没排上队**（根本没拨号）—— 必须与「节点真的不通」分开，
+        // 否则用户会以为节点坏了（字面量，避免与 ClashApiService 循环依赖）。
+        return '排队超时';
+      }
       return '超时';
     }
     if (state === LatencyState.FAILED) {

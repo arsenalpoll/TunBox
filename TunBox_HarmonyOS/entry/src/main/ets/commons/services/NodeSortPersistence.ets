@@ -62,11 +62,17 @@ export class NodeLatencyRecord {
     //  - port_reachable_only 只证明端口可达（直连降级）
     //  - untested            整批硬截止，本次没测出来
     //  - unsupported         协议无法离线探测
+    //  - queue_timeout       **根本没拨号**（C7 闸门排队超时），与节点通不通无关
     // 它们必须沿用上一次有效结论，绝不能把「整批未测」写成「全失败」。
+    //
+    // queue_timeout（C7 起）：排队超时 = 这一轮因为应用侧在途名额耗尽而**没有发起请求**，
+    // 对节点健康度零信息量。若当成节点结论落盘 → 节点沉底、排序被「我们自己的排队」污染，
+    // 与 core_not_ready 的处理同源，故归入非判定。
     return failKind === LatencyFailKind.CORE_NOT_READY
       || failKind === LatencyFailKind.PORT_ONLY
       || failKind === LatencyFailKind.UNTESTED
-      || failKind === LatencyFailKind.UNSUPPORTED;
+      || failKind === LatencyFailKind.UNSUPPORTED
+      || failKind === LatencyFailKind.QUEUE_TIMEOUT;
   }
 
   /** 近期成功率: 从未测过为 -1，否则按失败次数估算（0 失败=1.0） */
