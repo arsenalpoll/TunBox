@@ -98,3 +98,6 @@ SSRVPN_HarmonyOS/tools/true-parser-harness/*.ts
 
 # 例外：应用源码（不含任何凭据材料），Windows core.ignorecase 下被 *credential* 误捕而从未入库
 !TunBox_HarmonyOS/entry/src/main/ets/commons/services/CredentialStore.ets
+
+# Windows client: standalone FlClash-based repo (own .git, not tracked by this repo)
+TunBox-Windows/

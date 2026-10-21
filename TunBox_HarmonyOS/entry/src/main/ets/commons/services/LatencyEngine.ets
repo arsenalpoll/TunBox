@@ -78,20 +78,26 @@ const TAG = 'LatencyEngine';
  */
 export const LATENCY_CONCURRENCY = 50;
 /**
- * 同时在飞的 HTTP 请求数（2026-10-20 用户拍板：改为 **50 路**，与 worker 数同宽）。
+ * 同时在飞的 HTTP 请求数（**2026-10-21 真机回退：50 → 8**）。
  *
- * 历史：这个值原为 8，依据是「OHOS http 栈对同一 host 的连接池约 8，超出即排队，
- * 排队时间被算进请求预算 → 假超时（2026-09-23 真机实证）」。
- * 现在按用户要求放开到 50：worker 数与在途数一致，**不再有应用层排队**，
- * 每个节点的 `elapsed` 就是它自己那次 /delay 的真实耗时（口径更干净）。
+ * 为什么退回 8（真机取证 192.168.10.5:39933，飞鸟云 31 节点批，14:32:46–14:35:10）：
+ *  · 50 路在途 = 50 个 `/delay` 同时打 `127.0.0.1:9090`，而 OHOS http 栈对同一 host
+ *    只有约 8 条连接（2026-09-23 已实测）⇒ 其余 42 个请求在 **HTTP 栈内部**排队，
+ *    排队时间被算进 4.2s 外层预算 ⇒ 一到点就抛 `code=2300028 Operation timeout`；
+ *  · 这些客户端超时被 `LatencyProbe.classify` 归为 `core_not_ready`（没拿到 HTTP 响应
+ *    = 通道问题）⇒ 6 连击撞上 `CORE_NOT_READY_ABORT_STREAK` ⇒ **整批作废**，剩下 24 个
+ *    节点一次 `/delay` 都没发（日志 `notReady=6 unavailable=true`）—— 用户看到的就是
+ *    「测出一部分超时节点后，剩下的就不测了」。
  *
- * ⚠ 代价与验证要求（改这一行的人必须重跑真机验收）：
- *  - 若真机复现「测速卡住 / 大量假超时 / queueTimeout>0」，说明连接池确实压不住 50 路，
- *    应回退到 24 或 32（**不要直接退回 8**，那是性能问题）。
- *  - 判定看 `latency batch done ... timeout= queueTimeout=` 两个计数：
- *    timeout 高 = 节点真慢；queueTimeout 高 = 连接池排队。
+ * 8 = OHOS 同 host 连接池容量 ⇒ 排队改在**应用层闸门**（LatencyInflightGate）里发生，
+ * 而闸门等待**不计入**单请求预算（见 gatedProbe 的三条硬约束）⇒ 读数仍是干净的 RTT。
+ * 历史基线同样支持这个值：5.6.0 真机 59 节点 13.14s 跑通、`unavailable=false`。
+ *
+ * ⚠ 想再放大必须先解决「栈内排队被算进超时」这个前提（自建连接池或换传输层），
+ *   否则只是把「测速跑到一半整批作废」重新引入。判定看
+ *   `latency batch done ... timeout= queueTimeout= notReady= unavailable=` 四个计数。
  */
-export const LATENCY_INFLIGHT = 50;
+export const LATENCY_INFLIGHT = 8;
 /**
  * 信号量排队等待上限（毫秒）。
  *
@@ -150,6 +156,17 @@ const CORE_NOT_READY_RECOVER_STREAK = 3;
  */
 const CORE_NOT_READY_RETRY_MAX = 1;
 const CORE_NOT_READY_RETRY_BACKOFF_MS = 500;
+/**
+ * 「controller 还活着吗」的探测预算与缓存窗口（见 `LatencyRun.controllerAnswers`）。
+ *
+ * 为什么需要它（2026-10-21 真机根因）：客户端侧 `2300028 Operation timeout` 有两种
+ * 完全相反的成因 ——（a）控制器被瞬时打满（并发拨号太多）；（b）内核真的没了 /
+ * secret 被换掉。只看错误文案分不开，旧实现一律按（b）累加连击 ⇒ 6 次就把整批作废。
+ * 800ms 是 `/version` 这种本地 GET 的宽松预算；缓存窗口同值，避免 8 个 worker
+ * 同时命中时打出 8 次健康检查（过载时再加负载只会更糟）。
+ */
+const CONTROLLER_PROBE_TIMEOUT_MS = 800;
+const CONTROLLER_ALIVE_CACHE_MS = 800;
 /** `force=false` 时，多久以内的实测结果视为新鲜、可跳过重测。 */
 export const FRESH_RESULT_MS = 5 * 60 * 1000;
 /**
@@ -339,6 +356,14 @@ export class LatencyProgress {
   /** 通道不可用（内核/凭证层面）的连续命中总数 */
   coreNotReady: number = 0;
   /**
+   * **过载**次数：controller 仍能答 `/version`，但这一发 `/delay` 在客户端侧超时
+   * （典型是 `2300028 Operation timeout`）。
+   *
+   * 与 `coreNotReady` 分开计：过载不是节点结论、也不是通道故障，**不参与连击/作废**；
+   * 但必须留痕，否则「整批跑完却一堆未测」在日志里看不出原因（2026-10-21 真机）。
+   */
+  coreOverloaded: number = 0;
+  /**
    * **域名无法解析**的节点数（2026-10-20 真机根因）。
    *
    * 这批节点**一次 /delay 都没发**（我们自己的 DoH 预解析已经判了）⇒
@@ -418,6 +443,12 @@ export class LatencyRun {
   private deadlineAt: number = 0;
   /** 本批是否已尝试过"重新解析通道凭证"（每批最多一次） */
   private channelRecoveryTried: boolean = false;
+  /**
+   * controller 存活探测的缓存（见 `controllerAnswers`）：
+   * `channelAliveAtMs = 0` 表示本批还没探过。
+   */
+  private channelAliveAtMs: number = 0;
+  private channelAlive: boolean = false;
   /**
    * 本批的 **DNS 预解析快照**（批次开始时取一次，不逐节点去问编排器）。
    *
@@ -613,7 +644,8 @@ export class LatencyRun {
       + `dnsUnresolved=${this.progress.dnsUnresolved} `
       + `queueTimeout=${this.progress.queueTimeout} `
       + `cancelled=${this.progress.cancelled} skipped=${this.progress.skipped} `
-      + `notReady=${this.progress.coreNotReady} unavailable=${this.progress.coreUnavailable} `
+      + `notReady=${this.progress.coreNotReady} overloaded=${this.progress.coreOverloaded} `
+      + `unavailable=${this.progress.coreUnavailable} `
       + `elapsed=${Date.now() - startedAt}ms`);
     // 内核回收归引擎管：批次结束后挂一个**宽限**回收（而不是立刻停）。测速内核重建
     // 要经历 DoH + 停旧扩展 + 600ms 等待 + 启新扩展 + 健康轮询（秒级），用户来回切
@@ -799,6 +831,43 @@ export class LatencyRun {
    * 在**连续失联并且本批已经有实测结果**时触发一次，且同批最多救一次，避免
    * 内核真死时把时间浪费在反复读盘上。
    */
+  /**
+   * 「controller 还活着吗」—— 把**瞬时过载**与**通道真的没了**分开（2026-10-21 真机根因）。
+   *
+   * 真机取证（飞鸟云 31 节点批）：50 路在途把 `127.0.0.1:9090` 打满，客户端连续拿到
+   * `code=2300028 Operation timeout`，被 `LatencyProbe.classify` 归为 `core_not_ready`；
+   * 6 连击直接作废整批，剩下 24 个节点一次 `/delay` 都没发。可内核其实一直活着
+   * （同一批里前 5 个节点还正常回了 504），只是忙不过来。
+   *
+   * ⇒ 在把这次失败计入「通道故障连击」之前，先打一次 `GET /version`（本地、廉价）：
+   *   · 200 且 secret 通过 ⇒ 通道是好的 ⇒ 这次只是**过载**：不计连击、不中止，
+   *     本节点保持「未测」（非判定，绝不写成超时）；
+   *   · 连不上 / 非 200 ⇒ 才是通道故障，走原有的自愈 + 连击 + 作废路径。
+   *
+   * 结论缓存 `CONTROLLER_ALIVE_CACHE_MS`：多个 worker 同时命中时只探一次，
+   * 避免在已经过载的 controller 上再加一层健康检查流量。
+   */
+  private async controllerAnswers(): Promise<boolean> {
+    const now: number = Date.now();
+    if (this.channelAliveAtMs > 0 && now - this.channelAliveAtMs < CONTROLLER_ALIVE_CACHE_MS) {
+      return this.channelAlive;
+    }
+    let alive: boolean = false;
+    const api = this.api;
+    if (api !== null) {
+      try {
+        const probe = await api.probeController(CONTROLLER_PROBE_TIMEOUT_MS);
+        alive = probe.reachable && probe.secretAccepted;
+      } catch (e) {
+        AppLogger.warn(TAG, `latency controller probe error: ${AppLogger.errText(e)}`);
+        alive = false;
+      }
+    }
+    this.channelAliveAtMs = now;
+    this.channelAlive = alive;
+    return alive;
+  }
+
   private async tryRecoverChannel(): Promise<void> {
     if (this.channelRecoveryTried) {
       return;
@@ -943,6 +1012,17 @@ export class LatencyRun {
       return probe;
     }
     if (probe.failKind === LatencyProbeKind.CORE_NOT_READY) {
+      // ① 先鉴别「控制器过载」与「通道真的没了」（2026-10-21 真机根因）。
+      //    真机取证：飞鸟云 31 节点批，50 路在途把 controller 打满 → 一批 2300028 →
+      //    6 连击作废整批，后 24 个节点一次都没拨号（`notReady=6 unavailable=true`）。
+      //    能答 /version ⇒ 只是过载：**不计连击、不自愈、不中止**，本节点保持「未测」
+      //    （非判定，绝不写成超时）。只有健康检查也失败，才进下面的通道故障路径。
+      if (await this.controllerAnswers()) {
+        this.progress.coreOverloaded = this.progress.coreOverloaded + 1;
+        AppLogger.warn(TAG, `latency probe overloaded (controller alive): node=${node.name} `
+          + `http=${probe.httpCode} elapsed=${probe.elapsedMs}ms => 不计连击、不作废整批`);
+        return probe;
+      }
       // 通道问题，不是节点问题。两种成因必须分开处理：
       //  - 内核中途重启 / secret 被换掉（真机实测：106 节点批测进行中隧道重启，
       //    此后 49 个节点全部连接异常）→ 重新解析隧道 secret 还能救回来；

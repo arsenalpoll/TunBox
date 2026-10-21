@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.tunbox.client",
     "vendor": "TunBox",
-    "versionCode": 403,
-    "versionName": "0.4.3",
+    "versionCode": 404,
+    "versionName": "0.4.4",
     "icon": "$media:layered_image",
     "label": "$string:app_name"
   }

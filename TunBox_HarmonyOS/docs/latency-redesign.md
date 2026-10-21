@@ -329,4 +329,109 @@ ipv6 开时额外下发 `fake-ip-range6: fdfe:dcba:9876::/64`；`dns.enable` 与
 - `node scripts/verify-vpn-architecture.mjs`（267 项；新增 `gen.dns.redir-host` / `ext.dns-always-sentinel` / `orch.no-dns-override-flag` 等反向断言）
 - `node scripts/verify-config-generation-integrity.mjs`（70 项，含**真实内核** `mihomo -t` 接受新配置）
 - `node scripts/verify-arkts-compile.mjs`（DevEco `assembleHap` 3/3）
-- `node scripts/verify-config-single-source.mjs`（42） / `verify-connect-stability.mjs`（38） / `verify-logic-pure.mjs`（228）
+## 十三、2026-10-21 指纹变更说明（测速并发 50 → 8 + 过载鉴别：修「测出一部分超时后就不测了」）
+
+> 本节**不改配置指纹**（只动 App 侧测速引擎与闸门），单独记在这里是因为它推翻了
+> `LATENCY_UNEFFECTIVE_FIX_2026-10-20.md` §8.3「8 → 50」的决定。
+
+### 现象（用户报障）
+
+飞鸟云（31 节点）「测全部」只测出**少数几个超时节点就不动了**，其余节点永远停在 `--`。
+
+### 真机取证（192.168.10.5:39933，`com.tunbox.client`，hilog）
+
+```
+latency batch done nodes=31 measured=0 timeout=5 failed=0 ... notReady=6 unavailable=true
+latency cleanup: 24 stranded stamped TIMEOUT
+```
+
+- 一次 `/delay` 都没成功：5 个节点得到内核回的真实 504（= 节点真的不通）；
+- 紧接 6 次客户端侧 `code=2300028 Operation timeout`，被 `LatencyProbe.classify` 归为
+  `core_not_ready`（没拿到 HTTP 响应 = 通道问题）→ 连续 6 次撞上
+  `CORE_NOT_READY_ABORT_STREAK` → `invalidate()` **作废整批**；
+- 剩余 24 个节点**一次请求都没发**，收尾还给它们补了「超时」章
+  （`clearOwnTestingMarks` 的 coreUnavailable 兜底盖章）—— 于是用户看到
+  「一批假超时 + 后面全是不动的 --」，与报障完全一致。
+
+### 根因（两条，缺一不可）
+
+1. **在途 50 路 = 主动制造栈内排队**。`LATENCY_INFLIGHT` 2026-10-20 被放开成 50，
+   而 OHOS http 栈对**同一 host**（这里恒为 `127.0.0.1:9090`）只有约 8 条连接
+   （2026-09-23 已实测）⇒ 其余请求在 **HTTP 栈内部**排队，排队时间被算进单请求预算
+   ⇒ 到点抛客户端侧 `2300028`。这不是节点慢，是**我们**把 controller 打满了。
+2. **过载被误判为通道死亡**。`classify` 只能看到「transport error」，分不清
+   「controller 忙不过来」与「内核没了 / secret 被换掉」；旧实现一律 `streak++`，
+   6 次就作废整批 —— 而这一步是**破坏性**的（剩余节点不再被测、还被补超时章）。
+
+### 修复（`LatencyEngine.ets`，两条各自独立生效）
+
+| # | 改动 | 为什么 |
+|---|---|---|
+| 1 | `LATENCY_INFLIGHT` 50 → **8** | 8 = OHOS 同 host 连接池容量 ⇒ 排队回到**应用层闸门**里发生，而闸门等待**不计入**单请求预算（C7 三条硬约束），读数仍是干净 RTT。历史基线同样支持：5.6.0 真机 59 节点 13.14s 跑通、`unavailable=false` |
+| 2 | 新增 `controllerAnswers()` 过载鉴别 | 命中 `core_not_ready` 时先打一次廉价 `GET /version`（`ClashApiService.probeController`，800ms 预算、结论缓存 800ms）：能答 ⇒ **过载**，不计连击、不自愈、不中止，本节点保持「未测」（非判定）；连不上 ⇒ 才走原有的自愈 + 连击 + 作废路径 |
+
+新增诊断计数 `LatencyProgress.coreOverloaded`：过载不再伪装成通道故障，但必须留痕
+（`latency batch done ... notReady= overloaded= unavailable=`），否则「整批跑完却一堆未测」
+在日志里仍然看不出原因。
+
+### 真机验收（2026-10-21 15:13，设备 192.168.10.5:39933，MLR-AL00）
+
+装法（复用既有配方，见 `docs/latency-ondevice-evidence.md` §0 与 `C:\Worker\TunBox\switch-signing.ps1`）：
+
+```powershell
+C:\Worker\TunBox\switch-signing.ps1 -Mode debug      # 切到本机 DevEco 托管调试证书
+node hvigorw.js --mode module -p module=entry@default -p product=default -p buildMode=release assembleHap
+hdc install -r entry/build/default/outputs/default/entry-default-signed.hap   # install bundle successfully
+```
+
+飞鸟云（31 节点）「测全部」hilog 原文（**修后**）：
+
+```
+LatencyProbe: latency probe transport error node=美国01aws kind=core_not_ready verdict=false
+              elapsed=4902ms inner=3000 outer=4200 error=code=2300028 Operation timeout
+LatencyEngine: latency probe overloaded (controller alive): node=美国01aws http=0 elapsed=4902ms
+              => 不计连击、不作废整批
+LatencyEngine: latency cleanup: 3 node(s) left TESTING -> untested (cancelled=false
+              userCancelled=false unavailable=false); stamped node verdicts kept
+LatencyEngine: latency batch done nodes=31 channel=core measured=0 timeout=27 failed=1
+              dnsUnresolved=0 queueTimeout=0 cancelled=0 skipped=0 notReady=0 overloaded=3
+              unavailable=false elapsed=21196ms
+```
+
+| | 修前（本轮报障） | 修后（同一订阅、同一设备） |
+|---|---|---|
+| 批次收尾 | `notReady=6 unavailable=true`（整批作废） | `notReady=0 overloaded=3 unavailable=false`（跑完） |
+| 未测节点 | 24 个**一次 `/delay` 都没发**，收尾还被补「超时」章 | 只有 3 个收尾保持「未测」，且**不补章**（`stamped node verdicts kept`） |
+| 每一轮 | 测到第 7 个节点就停 | 31/31 全部拿到内核结论（`timeout=27 failed=1`），21.2s 走完 |
+
+- `overloaded=3` 正是新计数：三次 `2300028` 都被 `controllerAnswers()` 判为**控制器过载**，
+  于是不计连击、不作废整批 —— 这正是用户报障的那条路径，现在被截断了。
+- 本批 `measured=0`：这 31 个节点在当前网络下**自身**全部拨号失败（内核直接回 504，
+  `verdict=true`，属节点结论），与本缺陷无关；判定口径可以从 `timeout=27`（节点真慢/不通）
+  与 `overloaded=3`（controller 忙）两个计数分开读出来 —— 这正是新增诊断计数的意义。
+- ⚠ 验证完记得切回 `switch-signing.ps1 -Mode release`（`build-profile.json5` 的
+  `signingConfigs` 必须保持为空，见 `scripts/verify-build-profile.mjs`）。
+
+### 闸门同步（同一提交）
+
+- `scripts/verify-latency-concurrency.mjs`：A1 常量（8 / 50 / 60s）、A2 `lanes=8`、
+  A3 峰值在途 ≤ 8（40 节点 → 5 波 <3s）、A4 排队仍不计预算；**新增**
+  A6「controller 仍能应答 ⇒ 过载不得作废整批、`finished==total`、不得补超时章」与
+  A7「controller 不答 ⇒ 连击仍作废整批（`coreUnavailable`、`cancelled>0`、`finished<total`、
+  不写 FAILED、不留 TESTING）」。
+- `scripts/verify-latency-engine-runtime.mjs`：ClashApiService 桩显式提供
+  `probeController`（默认不答 = 通道真的没了），原「作废整批 / 自愈」用例语义不变。
+- `scripts/verify-latency-display.mjs`：在途并发断言改判 8。
+
+### 复现门禁
+
+- `node scripts/verify-latency-concurrency.mjs`（14）
+- `node scripts/verify-latency-engine-runtime.mjs`（27）
+- `node scripts/verify-latency-display.mjs`（41）
+
+### 若日后仍要放开并发
+
+前提是先把「栈内排队被算进超时」这条解决掉（自建连接池 / 换传输层 / 装**不同 host**
+的独立 localhost 端口），否则放大在途数只会重新引入同一个缺陷。判定看四个计数：
+`timeout=`（节点真慢）、`queueTimeout=`（应用层排队超限）、`overloaded=`（controller 忙）、
+`unavailable=`（通道真的不可用）。

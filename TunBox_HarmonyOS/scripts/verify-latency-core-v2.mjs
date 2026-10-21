@@ -756,7 +756,11 @@ check('G1 参数常量区的取值', () => {
   eq(LatencyProbeLimits.NODE_TIMEOUT_MS, 3000, 'NODE_TIMEOUT_MS');
   eq(LatencyProbeLimits.OUTER_EXTRA_MS, 1200, 'OUTER_EXTRA_MS');
   eq(LatencyProbeLimits.WORKERS, 50, 'WORKERS');
-  eq(LatencyProbeLimits.MAX_INFLIGHT, 50, 'MAX_INFLIGHT');
+  // 2026-10-21 真机回退：在途请求数 50 → 8（= OHOS 同 host 连接池容量）。
+  // 50 路在途会让超出连接池的请求在 http 栈内部排队，排队时间被算进单请求预算 ⇒
+  // 客户端侧 2300028 ⇒ 被归成 core_not_ready ⇒ 6 连击作废整批（飞鸟云 31 节点批：
+  // 后 24 个节点一次 /delay 都没发）。必须与引擎闸门 LATENCY_INFLIGHT 同值。
+  eq(LatencyProbeLimits.MAX_INFLIGHT, 8, 'MAX_INFLIGHT（= 引擎在途闸门 LATENCY_INFLIGHT）');
   eq(LatencyProbeLimits.QUEUE_WAIT_MAX_MS, 60000, 'QUEUE_WAIT_MAX_MS');
 });
 check('G2 源码断言：超时/并发魔数只出现在 LatencyProbeLimits 类里', () => {

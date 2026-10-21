@@ -140,6 +140,9 @@ ok('ClashApiService 提供 proxyTableNames（内核代理表全名）',
 // 2026-10-20（lead 拍板迁移）：超时数值真源搬到零 import 的
 // commons/latency/LatencyKinds.ets 的 LatencyTimeout；LatencyState.LatencyPolicy
 // 只剩转调 getter ⇒ 断言改判**真源**，并额外要求转调关系存在（不许留第二份字面量）。
+// 2026-10-21（真机回退）：在途并发由 50 收敛为 8 —— 50 路在途会把 controller 打满，
+//   客户端侧 2300028 被归成 core_not_ready ⇒ 6 连击作废整批（飞鸟云 31 节点批只测了 7 个）。
+//   8 = OHOS http 栈对同一 host 的连接池容量 ⇒ 排队改在应用层闸门里发生，不污染读数。
 const kindsSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/latency/LatencyKinds.ets'), 'utf8');
 ok('单节点测速超时为 3000ms（2026-10-20 用户要求 5s→3s；真源 LatencyTimeout.DEFAULT_TIMEOUT_MS）',
@@ -148,8 +151,8 @@ ok('LatencyPolicy 的超时是转调真源（不留第二份字面量）',
   /return\s+LatencyTimeout\.DEFAULT_TIMEOUT_MS;/.test(stateSrc)
   && !/DEFAULT_TIMEOUT_MS:\s*number\s*=\s*\d+/.test(stateSrc));
 ok('并发测速数为 50（C8b：由 88 收敛，worker 口径）', /LATENCY_CONCURRENCY\s*=\s*50/.test(engineSrc));
-ok('在途并发上限为 50（2026-10-20 放开：与 worker 数同宽，无应用层排队）',
-  /LATENCY_INFLIGHT\s*=\s*50/.test(engineSrc));
+ok('在途并发上限为 8（2026-10-21 真机回退：= OHOS 同 host 连接池容量）',
+  /LATENCY_INFLIGHT\s*=\s*8/.test(engineSrc));
 ok('组测每节点预算与单节点一致（3000ms）', /GROUP_TEST_TIMEOUT_MS\s*=\s*3000/.test(engineSrc));
 ok('内核延迟探测默认超时同步为 3000ms',
   /testLatencyDetailed\(nodeName: string, testUrl: string,\s*\n?\s*(?:\/\/[^\n]*\n\s*)?timeoutMs: number = 3000/.test(apiSrc));

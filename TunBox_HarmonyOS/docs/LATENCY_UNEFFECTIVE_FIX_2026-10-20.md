@@ -400,4 +400,40 @@ proxies:                      # 77 个节点，含凭据 ✓（回填生效）
 - 内核每个节点多打**一次 HEAD**（unified-delay 的语义），整批墙钟略增；
   实测 oc2 组 `elapsed=2269ms`（7 节点）、ikuuu `elapsed=5998ms`（46 节点），可接受。
 - 50 路并发对内核/连接池压力更大。**判定标准**：若真机出现 `queueTimeout>0` 或大量假超时，
-  说明连接池压不住，回退到 24/32（**不要退回 8**，那是性能问题）。
+  说明连接池压不住，回退到 24/32（~~**不要退回 8**，那是性能问题~~ ⇒ **已被 2026-10-21 真机推翻，见 §九**）。
+
+---
+
+## 九、2026-10-21 回归更正：`LATENCY_INFLIGHT` 50 → 8（推翻 §8.3 / §8.6 的结论）
+
+### 为什么推翻
+
+飞鸟云 31 节点批「测出一部分超时节点后就不测了」，真机 hilog 定案：
+
+```
+latency batch done nodes=31 measured=0 timeout=5 failed=0 ... notReady=6 unavailable=true
+latency cleanup: 24 stranded stamped TIMEOUT
+```
+
+50 路在途把 `127.0.0.1:9090` 打满 ⇒ 超出 OHOS 同 host 连接池（≈8）的请求在 **HTTP 栈内部**
+排队，排队时间被算进单请求预算 ⇒ 客户端侧 `code=2300028 Operation timeout` ⇒ 被
+`classify` 归为 `core_not_ready` ⇒ 6 连击作废整批，剩余 24 个节点**一次 `/delay` 都没发**。
+
+§8.6 写的「回退到 24/32（不要退回 8）」判断错在：把「在途请求数」当成了纯性能旋钮。
+它不是 —— 在途数**超过同 host 连接池容量**本身就是缺陷源（栈内排队污染读数），
+8 是**容量事实**，不是保守取值。
+
+### 现在的事实
+
+- `LATENCY_INFLIGHT = 8`（= OHOS 同 host 连接池容量）；worker 数仍是 `LATENCY_CONCURRENCY = 50`；
+  排队由应用层闸门承担，闸门等待**不计入**单请求预算；
+- 过载不再等于通道故障：命中 `core_not_ready` 时先做一次 `GET /version` 健康鉴别
+  （`LatencyEngine.controllerAnswers`），controller 仍应答 ⇒ 只记 `coreOverloaded`，
+  不计连击、不中止，节点保持「未测」。
+
+### 闸门
+
+- `node scripts/verify-latency-concurrency.mjs`（14，含新增 A6/A7 过载鉴别用例）
+- `node scripts/verify-latency-engine-runtime.mjs`（27）
+- `node scripts/verify-latency-display.mjs`（41）
+
