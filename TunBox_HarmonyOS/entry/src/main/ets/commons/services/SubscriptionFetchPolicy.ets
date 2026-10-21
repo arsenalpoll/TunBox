@@ -39,10 +39,25 @@ const TRANSPORT_RETRY_BACKOFF_MS = 700;
  * UA 顺序：优先 Clash 系 UA 让面板直接返回 Clash YAML（vmess/vless/trojan 字段最完整），
  * 其余 UA 依次兜底；解析层同时支持 vless/vmess/trojan 链接格式。
  * SSRVPN 自家 UA 携带实时版本（AppInfo 单一来源, 不再硬编码）。
+ *
+ * 【2026-10-20 版本上调：1.7.7 → 2.4.2】面板普遍按 UA **版本号**做内容协商，
+ * 且 fetch() 命中第一个 200+非空 body 就返回（见本文件 fetch），后面的兜底 UA
+ * 永远不会被用到 —— 所以**第一个 UA 的版本号就是实际生效的客户端版本**。
+ * 实测（同一订阅 URL、同一时刻，仅换 UA）：
+ *   clash-verge/v1.7.7  → 20 条（0 anytls，另塞 4 条「客户端太老」假 ss 广告）
+ *   clash-verge/v2.4.2  → 36 条（20 anytls + 13 hy2 + 3 tuic）
+ *   clash.meta/v1.19.32 → 36 条；  mihomo/1.19.32 → 36 条
+ *   TunBox/<version>    → HTTP 400（面板不认）
+ * 用户报「FlClash 解析 36 个、TunBox 只剩 20 个」的根因就在这里（不是解析层丢节点：
+ * 解析层 36 进 36 出、mihomo -t 通过）。
+ *
+ * 选 v2.4.2 而不是 `mihomo/*`：两者都返回 36 条，但 mihomo UA 会让**部分**机场
+ * 改成返回 base64 链接列表（多一条解析分支的差异），而 clash-verge 语义与解析层
+ * 的 YAML 主路径完全一致。
  */
 export const UA_CHAIN: string[] = [
-  'clash-verge/v1.7.7',
-  'clash.meta/v1.18.8',
+  'clash-verge/v2.4.2',
+  'clash.meta/v1.19.32',
   'TunBox/' + AppInfo.version(),
   'v2rayN/6.23',
   'Shadowrocket/2077'
@@ -446,11 +461,12 @@ export class SubscriptionFetchPolicy {
       if (SubscriptionFetchPolicy.isPublicIpAddress(address.address)) {
         continue;
       }
-      // Mihomo fake-ip DNS（本应用隧道开启时接管系统解析）会把所有域名解析到
-      // 198.18.0.0/15（IPv6 fc00::/18）。该网段不可能承载真实服务：
-      // 无隧道时连它必然失败（无 SSRF 风险），有隧道时连接会被本应用 TUN 截获
-      // 并按域名回源 —— 属预期路径。此前该场景被误判为「私网/保留地址」拦截，
-      // 导致「VPN 开启后刷新订阅」必然失败，这里无条件放行 fake-ip 网段。
+      // 兼容路径：mihomo 的 fake-ip 把域名解析到 198.18.0.0/15（IPv6 fc00::/18）。
+      // 本应用默认已改 redir-host（2026-10-21，见 ClashConfigGenerator.pushDnsSection），
+      // 正常不会出现这些地址；但用户可以在 YAML 覆盖层里自己写回 fake-ip，所以这条
+      // 放行必须保留。该网段不可能承载真实服务：无隧道时连它必然失败（无 SSRF 风险），
+      // 有隧道时连接会被本应用 TUN 截获并按域名回源 —— 属预期路径。此前该场景被误判为
+      // 「私网/保留地址」拦截，导致「VPN 开启后刷新订阅」必然失败，这里无条件放行。
       if (SubscriptionFetchPolicy.isFakeIp(address.address)) {
         continue;
       }
@@ -628,7 +644,8 @@ export class SubscriptionFetchPolicy {
 
   /**
    * Mihomo fake-ip 默认网段：IPv4 198.18.0.0/15（198.18/198.19，RFC 2544 基准测试保留段），
-   * IPv6 为 fc00::/18。仅当本应用隧道开启时这些地址才是「预期路径」。
+   * IPv6 为 fc00::/18。本应用默认用 redir-host（不发假地址），此判定只为兼容用户
+   * 在 YAML 覆盖层里自行写回 fake-ip 的场景。
    */
   static isFakeIp(address: string): boolean {
     const value = address.trim().toLowerCase();

@@ -236,10 +236,19 @@ ok('卡片 borderRadius(16)', /\.borderRadius\(16\)/.test(cardTail));
 ok('卡片 backgroundColor(surfaceCard)', /backgroundColor\(TunBoxColors\.surfaceCard\)/.test(cardTail));
 ok('选中卡片描边加粗（1.5 vs 1）',
   /border\(\{\s*width: node\.id === this\.activeNodeId \? 1\.5 : 1,/.test(cardTail));
-ok('选中态圆圈填充 primary', /\.fill\(node\.id === this\.activeNodeId \? TunBoxColors\.primary : Color\.Transparent\)/.test(card));
-ok('选中点击仍绑 selectNode', /\.onClick\(\(\) => this\.selectNode\(node\)\)/.test(cardTail));
-ok('长按删除手势保留',
-  /LongPressGesture\(\)\.onAction/.test(cardTail) && /this\.deleteNodeTargetId = node\.id;/.test(cardTail));
+// 2026-10-20 批量多选改造后：圆圈要同时表达「当前出口」（平时）与「已勾选」（选择态），
+// 点击走 onNodeCardTap（选择态=勾选 / 平时=选中出口），长按改为进入批量选择态。
+ok('选中态圆圈填充 primary（含批量勾选态）',
+  /\.fill\(this\.nodeSelectMode\s*\n?\s*\? \(this\.isNodeSelected\(node\.id\) \? TunBoxColors\.primary : Color\.Transparent\)/
+    .test(card) || /\.fill\(this\.nodeSelectMode/.test(card));
+ok('点击走 onNodeCardTap（选择态切勾选）',
+  /\.onClick\(\(\) => this\.onNodeCardTap\(node\)\)/.test(cardTail));
+ok('onNodeCardTap 内部仍调用 selectNode（平时选中出口）',
+  /private onNodeCardTap\(node: ProxyNode\): void \{[\s\S]*?this\.selectNode\(node\);/.test(src));
+ok('长按进入批量多选（替换单节点删除框）',
+  /LongPressGesture\(\)\.onAction/.test(cardTail) && /this\.enterNodeSelectMode\(node\.id\)/.test(cardTail));
+ok('批量删除复用 removeNode（本地屏蔽台账）',
+  /private async doDeleteSelectedNodes\(\): Promise<void> \{[\s\S]*?this\.service\.removeNode\(id\)/.test(src));
 
 // ── 7. 单列 / 双列排布（GridRow 控宽，卡片自身 100%）────────────────────
 ok('nodeColumns 状态存在且默认单列', /@State nodeColumns: number = 1;/.test(src));

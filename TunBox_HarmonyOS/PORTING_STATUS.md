@@ -3,7 +3,8 @@
 > 本文件是移植工作的进度账本（2026-09-17 更新，见文末「架构与性能改造」一节）。
 > **当前状态：HAP 已可完整编译（BUILD SUCCESSFUL，含原生 NAPI）；网络监听、恢复编排与
 > 权威状态已下沉到 VpnExtensionAbility，规则/节点/模式支持不重建隧道的热更新，
-> 全链路统一 IPv4-only，3s 定周期心跳已改为事件驱动 + 低频存活租约。**
+> 全链路 IPv6 双栈 + DNS 覆写改为设置页开关（默认都开，§4），3s 定周期心跳已改为事件驱动 +
+> 低频存活租约。**
 > 继续开发前必须通读本文件和 `SPEC.md`（规格书 §1.4 功能 / §1.5 UI / §4 验收）。
 
 ## 构建方法（本机已验证）
@@ -46,7 +47,7 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 > - **强制代理站点对话框**：节点选择页顶栏「站点」入口，逐行域名输入 → settings.forceProxySites →
 >   下次连接的配置生成生效（DOMAIN-SUFFIX,site,PROXY）。
 > - **hypium 单测** `entry/src/ohosTest/ets/test/LogicTest.ets`（12 个用例）：SSR/SS/SIP002/Base64 订阅
->   解析、Clash YAML 提取、配置生成器（IPv4-only/mode/external-controller/GEOIP/MATCH/强制站点）、
+>   解析、Clash YAML 提取、配置生成器（IPv6 双栈/DNS 覆写/mode/external-controller/GEOIP/MATCH/强制站点）、
 >   国家识别、日志脱敏、节点名规整、延迟配色阈值、YAML 合并（去重+名称保留）、URL 校验与脱敏。
 >   DevEco 中右键 ohosTest → Run 'LogicTest' 即可执行（本地单测引擎）。
 > - **THIRD_PARTY_NOTICES**：补齐 libgojni.so OHOS 构建来源（方式/产物/SHA-256/包装层 ABI/与
@@ -86,7 +87,7 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 | `ets/commons/models/Subscription.ets` / `AppSettings.ets` / `PublicIpInfo.ets` | 对应 models | ✅ |
 | `ets/commons/services/SubscriptionParser.ets` | subscription_parser*.dart | ✅ |
 | `ets/commons/services/SubscriptionFetchPolicy.ets`（UA 链，url.URL 校验） | subscription_fetch_policy.dart | ✅ |
-| `ets/commons/services/ClashConfigGenerator.ets`（IPv4-only/规则） | clash_config_generator.dart | ✅ |
+| `ets/commons/services/ClashConfigGenerator.ets`（IPv6/DNS 覆写/规则） | clash_config_generator.dart | ✅ |
 | `ets/commons/services/ClashApiService.ets`（waitReady/selectNode/testLatency/traffic） | clash_service_* | ✅ |
 | `ets/commons/services/SettingsService.ets` / `SubscriptionService.ets`（含撤销 + ManualNodeStore） | 对应 services | ✅ |
 | `ets/commons/services/PublicIpService.ets`（含国家策略/旗帜） | public_ip_info_service + node_country_policy | ✅ |
@@ -185,16 +186,56 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
   `ConnectionOrchestrator.extensionStatus()` 供冷启动/回收后还原真实状态。
 - 断开时 `clearStartError()` 一并清除状态文件，防止读到上一会话的陈旧 `running`。
 
-### 4. IPv4-only 统一
+### 4. IPv6 双栈（2026-10-20 由「统一 IPv4-only」改为设置页开关，默认开）
 
-删除 `Ipv6Detector.ets`；Extension 侧 `isIPv6Accepted: false` + 仅 IPv4 地址与默认路由；
-YAML 侧 `ipv6: false` / `disable-ipv6: true` / `dns.ipv6: false`，移除 `fake-ip-range6`、
-`inet6-address`；want 不再下发 `ipv6Inbound`；诊断面板改为如实显示「统一 IPv4-only」。
+背景：旧策略在 4 层硬关 IPv6（YAML `ipv6: false` + `dns.ipv6: false`、运行时 `/configs`
+`"ipv6": false`、Extension `isIPv6Accepted: false` + 无 `::/0`、`ipv6Active=false` + 诊断恒 `skip`），
+却从未真正拦住 v6 —— 真机实测隧道在线时 `ping6 2001:4860:4860::8888` 仍直连成功、`vpn-tun`
+上 `::/0` 为 0 条（只挂在 wlan0），即 **v6 一直从物理网卡绕过代理**；同时 `dns.ipv6: false`
+让隧道 DNS 对 AAAA 一律回 `ancount=0`，v6-only 站点必然打不开。
+
+现状（2026-10-21 起）：设置页「网络」只有**一个开关** `IPv6 双栈`（默认开）。
+「DNS 覆写」开关已删除：DNS **恒接管**（生成器恒写 `dns.enable: true` + `tun.dns-hijack: any:53`，
+Extension 恒下发 `VpnConfig.dnsAddresses = ['172.19.0.2']`），与 FlClash 同构（它也没有这个开关）。
+
+| UI 项 | 设置字段 | 落点 |
+|---|---|---|
+| IPv6 双栈 | `ipv6Enabled` | YAML 顶层 `ipv6:` + `dns.ipv6:`；Extension 据此装 v6 地址 + `::/0` + `isIPv6Accepted` |
+| ~~DNS 覆写~~ | ~~`dnsOverrideEnabled`~~ | 已删除；DNS 恒接管（`dns.enable` / `dns-hijack` / `dnsAddresses` 三处无条件） |
+
+`fake-ip-range6` **永不产出**，且 2026-10-21 起整个 fake-ip 退场：`enhanced-mode: redir-host`
+（`fake-ip-range` / `fake-ip-filter` / `store-fake-ip` 全部删除）。原因见 §5 与 `docs/latency-redesign.md` §十二：
+`withFakeIP` 只在 fake-ip 模式挂载、`fakePool6 == nil` 时 AAAA 恒回空，而平台不装任何 v6 路由
+⇒ 「fake-ip + 无 range6」v6-only 站点必然打不开，「fake-ip + 有 range6」假 v6 必然无路可达。
+`redir-host` 下 AAAA 由 `withResolver` 返回真实地址（只受 `dns.ipv6` 控制），v6-only 站点可用
+（v6 流量直连物理网卡 —— 平台不装 v6 路由这一事实未变）。
+
+Extension 读**同一份 YAML** 决定 TUN 的 v6 地址（`fdfe:dcba:9876::1/126`）、`::/0` 与
+`isIPv6Accepted` —— 不新增 want 参数，避免 TUN 与内核两处不一致；`ipv6Active` 仅作诊断展示
+（真实 AAAA 探针：AAAA 拿不到 = 真故障，不再有「已知限制 skip」）。
+另删除从未生效的伪键 `disable-ipv6: true`（非 mihomo 顶层键，非 strict unmarshal 静默忽略）。
+`inet6-address` 仍不声明：v6 地址经 `VpnConfig.addresses` 注入已有 fd 的 TUN。
+
+真机验收（2026-10-20 21:52–22:20，华为真机 / 隧道在线；**当时还是 fake-ip + 双开关**，留作对照）：
+- `vpn config: dual-stack, dnsOverride=true, routes=2`；关/开两个开关后各自重连，状态位随之变化
+  （`ipv4-only` / `dnsOverride=false`），开关 → YAML → Extension 闭环成立。
+- 隧道 DNS（`127.0.0.1:1053`）对 `ipv6.google.com` 的 A 返回 fake-ip `198.18.1.206`，
+  对 AAAA 返回 `ancount=0`（fake-ip 无 v6 池）—— 这正是本次改 redir-host 的直接动因。
+- **v6 不进隧道（平台限制，非配置问题）**：`/proc/net/ipv6_route` 里 `vpn-tun` 有 7 条 v6 路由，
+  全部是地址派生（`/126`、`fe80::/64`、`/128`、`ff00::/8`），**没有 `::/0`**；v4 默认路由
+  （`/proc/net/route` mask `FCFFFFFF`）正常存在。⇒ v6 出站走物理网卡直连。
+
+待真机复验（2026-10-21 改动后）：
+- `enhanced-mode` 为 `redir-host` 时 A 应答是真实地址（不再是 `198.18.x`），`ipv6.google.com`
+  的 AAAA 应返回真实 v6 地址；
+- `getDnsServers()` 恒返回 `172.19.0.2`（开关已不存在，只有这一种形态）；
+- 探针 IPv6 项在双栈开、网络有 v6 时为 pass；网络无 v6 时为 fail（给出关闭双栈的建议）。
 
 ### 5. DNS 分流 / fallback / 缓存 与 链路参数
 
 `dns.nameserver-policy` 分流 + `fallback` DoT（`1.1.1.1:853` / `8.8.8.8:853#DIRECT`）+
-`cache-algorithm: arc` / `disable-cache: false` / `strategy: prefer_ipv4` + `fake-ip-filter`；
+`cache-algorithm: arc` / `disable-cache: false` / `strategy: prefer_ipv4` + `enhanced-mode: redir-host`
+（2026-10-21 起；fake-ip 已退场，`fake-ip-filter` 随之删除）；
 `tcp-concurrent` / `unified-delay` / `keep-alive-idle` / `keep-alive-interval` / `udp-timeout` /
 `find-process-mode: off` / `log-level: warning` / `profile.store-*`。
 `strict-route` 明确不启用（gvisor 栈无 iptables，OHOS 上不可用）。

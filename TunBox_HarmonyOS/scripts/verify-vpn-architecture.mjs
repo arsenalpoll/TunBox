@@ -214,11 +214,36 @@ function inp(o) {
 // ══════════════════════════════════════════════════════════════════════
 const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
 {
-  has('gen.ipv6-false', genSrc, "lines.push('ipv6: false')");
-  has('gen.disable-ipv6', genSrc, "lines.push('disable-ipv6: true')");
-  has('gen.dns.ipv6-false', genSrc, "lines.push('  ipv6: false')");
-  notHas('gen.no.fake-ip-range6', genSrc, 'fake-ip-range6');
+  // ── IPv6 双栈（设置页单开关，默认开）──
+  // 2026-10-21 二次定案：v6 必须走代理 ⇒ DNS 回 fake-ip，ipv6 开时同时下发
+  // fake-ip-range6 = TUN 自己的 fdfe:dcba:9876::/64。真机 /proc/net/ipv6_route 取证：
+  // 平台只装 LinkAddress 前缀派生的 on-link 路由（/126 → /126，/64 → /64），所以 range6
+  // 与 TUN 前缀必须成对：只写 range6（旧 /126）= 假 v6 无路由的黑洞；只放大前缀不写
+  // range6 = AAAA 恒空。两者都由同一个 ipv6Enabled 驱动，没有第二个开关。
+  has('gen.fake-ip-mode', genSrc, "lines.push('  enhanced-mode: fake-ip')");
+  has('gen.fake-ip-range', genSrc, "lines.push('  fake-ip-range: 198.18.0.1/16')");
+  has('gen.fake-ip-range6', genSrc, "lines.push('  fake-ip-range6: fdfe:dcba:9876::/64')");
+  has('gen.fake-ip-filter', genSrc, "lines.push('  fake-ip-filter:')");
+  notHas('gen.no.store-fake-ip', genSrc, 'store-fake-ip:');
+  notHas('gen.no.redir-host-line', genSrc, 'enhanced-mode: redir-host');
+  const extVpnSrc = readFileSync(join(appRoot, 'entry', 'src', 'main', 'ets',
+    'vpnability', 'VpnExtensionAbility.ets'), 'utf8');
+  has('ext.tun-v6-address-is-pool-gateway', extVpnSrc,
+    "const TUN_ADDRESS_V6 = 'fdfe:dcba:9876::1';");
+  has('ext.tun-v6-prefix-64', extVpnSrc, 'const TUN_PREFIX_V6 = 64;');
+  has('gen.ipv6-from-flag', genSrc, "lines.push('ipv6: ' + (ipv6Enabled ? 'true' : 'false'))");
+  has('gen.dns.ipv6-from-flag', genSrc, "lines.push('  ipv6: ' + (ipv6Enabled ? 'true' : 'false'))");
+  notHas('gen.no.hardcoded-ipv6-false', genSrc, "lines.push('ipv6: false')");
+  // `disable-ipv6` 不是 mihomo 的顶层键（非 strict unmarshal ⇒ 静默忽略的伪键）：必须彻底不再产出。
+  notHas('gen.no.disable-ipv6', genSrc, "lines.push('disable-ipv6: true')");
+  // tun.inet6-address 仍不声明：v6 地址是通过 VpnConfig.addresses 注入已有 fd 的 TUN，
+  // 不是让内核自建 TUN，声明了反而会与注入 fd 冲突。
   notHas('gen.no.inet6-address', genSrc, 'inet6-address');
+  // DNS 恒接管（2026-10-21 产品定案：设置页开关删除）：整段 dns 无条件产出。
+  has('gen.dns.always-emitted', genSrc,
+    'ClashConfigGenerator.pushDnsSection(lines, settings, dnsPort, useGeoip, ipv6Enabled, blockSites,');
+  notHas('gen.dns.no-enable-false-branch', genSrc, "lines.push('  enable: false')");
+  ok('gen.dns.no-override-setting', !genSrc.includes('dnsOverrideEnabled'));
   has('gen.keepalive-idle', genSrc, 'keep-alive-idle:');
   has('gen.keepalive-interval', genSrc, 'keep-alive-interval:');
   has('gen.udp-timeout', genSrc, 'udp-timeout:');
@@ -244,8 +269,10 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   has('gen.dns.cache-arc', genSrc, 'cache-algorithm: arc');
   has('gen.dns.disable-cache-false', genSrc, 'disable-cache: false');
   has('gen.dns.strategy', genSrc, 'strategy: prefer_ipv4');
-  has('gen.dns.fake-ip-filter', genSrc, 'fake-ip-filter:');
   has('gen.dns.proxy-server-nameserver', genSrc, 'proxy-server-nameserver:');
+  // dns-hijack 必须恒开（内核 DNS 恒启用）：任何条件包裹都会重现「设备指过来但内核没接管」。
+  has('gen.dns.hijack-any53', genSrc, "lines.push('    - any:53')");
+  notHas('gen.dns.no-hijack-gate', genSrc, 'dnsOverrideEnabled');
   // C22：mihomo RawConfig.Profile 的正确键名是 `store-selected`
   // （`store-selections` 是错的 —— 内核不认这个键，配置里的「记住选中节点」不生效）
   has('gen.profile.store-selected', genSrc, 'store-selected: true');
@@ -259,8 +286,31 @@ has('gen.log-warning', genSrc, "'warning'));");
 
 const extSrc = readFileSync(join(etsRoot, 'vpnability', 'VpnExtensionAbility.ets'), 'utf8');
 {
+  // 双栈 TUN：::/0 与 isIPv6Accepted:true 必须同时出现 —— 缺前者 v6 不进隧道（泄漏），
+  // 缺后者平台不接受 v6 地址。两条分支都要在（开关关闭时仍是纯 IPv4）。
+  has('ext.ipv6Accepted-true', extSrc, 'isIPv6Accepted: true');
   has('ext.ipv6Accepted-false', extSrc, 'isIPv6Accepted: false');
-  notHas('ext.no-ipv6-route', extSrc, "'::'");
+  // v6 默认路由写法与 NekoBox4Harmony 一致：不写 family、gateway 用 v4 占位。
+  // 写 `family: 2` 时真机平台会静默丢弃这条路由（v6 继续从 wlan0 泄漏）。
+  has('ext.ipv6-route', extSrc, "destination: { address: { address: '::' }, prefixLength: 0 }");
+  has('ext.ipv6-address-const', extSrc, "TUN_ADDRESS_V6 = 'fdfe:dcba:9876::1'");
+  // 开关必须从**生成的 YAML** 读回，不能在 want/设置里另存一份 ——
+  // 否则 TUN 与内核会分叉（v6 黑洞或泄漏）。
+  has('ext.tun-flags-from-yaml', extSrc, 'readTunFlagsFromConfig(configPath)');
+  // DNS 恒接管：dnsAddresses 恒为 sentinel，不能再有条件表达式（那是旧开关的残留）。
+  has('ext.dns-always-sentinel', extSrc, 'const dnsAddresses: string[] = DNS_SERVERS;');
+  ok('ext.no-dns-override-setting', !extSrc.includes('dnsOverride'));
+  ok('ext.no-readNestedBool', !extSrc.includes('readNestedBool'));
+  // DNS 必须指向 TUN 内 sentinel（对齐 FlClash VpnService.kt:300 `DNS = "198.18.0.2"`），
+  // 不能是公共 DNS：后者能否被 `dns-hijack: any:53` 截住取决于默认路由，
+  // 一旦失效就是明文直连 + QNAME 外泄。
+  has('ext.dns-servers-tun-sentinel', extSrc, "DNS_SERVERS = ['172.19.0.2']");
+  notHas('ext.dns-servers-no-public-dns', extSrc, "DNS_SERVERS = ['223.5.5.5'");
+  // 2026-10-21：ipv6 的读取不再用「整行字面量」正则。覆盖层经 C17 结构化合并后
+  // 可能出现 `ipv6: "true"` / `ipv6: yes`；旧正则对它们一律返回 false ⇒ TUN 静默
+  // 退回「IPv4-only」，而内核仍按 YAML 开着双栈 —— 正是本文件头部警告的
+  // 「TUN 与内核不一致」。
+  has('ext.tun-flags-ipv6-tolerant', extSrc, "readTopLevelBool(text, 'ipv6')");
   has('ext.mtu-from-active', extSrc, 'mtu: this.activeMtu');
   has('ext.attachTun-activeMtu', extSrc, 'attachTun(tunFd, this.activeMtu)');
   has('ext.uses-policy', extSrc, "from '../commons/services/VpnRecoveryPolicy'");
@@ -297,10 +347,23 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   has('orch.applyRulesChanged', orchSrc, 'async applyRulesChanged');
   has('orch.switchNodeHot', orchSrc, 'async switchNodeHot');
   has('orch.reloadFromPath', orchSrc, 'this.api.reloadFromPath');
-  // IPv6 只出栈：生成器调用在唯一入口 RuntimeConfigBuilder 里，
-  // 「强制关 IPv6」这个标志在那里传 false（核心里是 ipv6: false 那一行）。
-  has('orch.ipv4-only-pass', builderSrc, 'options.useGeoip, false, hosts, tunEnabled');
+  // IPv6 双栈（默认开）：生成器调用的那一个参数由 settings.ipv6Enabled 决定，
+  // 唯一入口仍是 RuntimeConfigBuilder（下面断言参数形状，防止有人改回硬编码 false）。
+  has('orch.ipv6-from-settings', builderSrc, 'profile.settings.ipv6Enabled !== false');
+  has('orch.ipv6-param-passed', builderSrc, 'options.useGeoip, ipv6Enabled, hosts, tunEnabled');
+  // 仍然不允许「把 IPv6 再探测一遍」的老入口：开关是唯一决策源，不做运行时二次判定。
   ok('orch.no-ipv6-detect-call', !orchSrc.includes('Ipv6Detector.hasIPv6'));
+  // DNS 恒接管后不再有「本次连接是否覆写 DNS」的快照位：残留即两份真源。
+  ok('orch.no-dns-override-flag', !orchSrc.includes('dnsOverride'));
+  // IPv6 探针：redir-host 下 AAAA 来自真实上游 ⇒ 「拿不到」就是真故障，
+  // 只保留 pass / fail 两条分支，不再按旧开关把已知限制记成 skip。
+  const probeSrc = readFileSync(join(svcDir, 'OrchestratorHealthProbes.ets'), 'utf8');
+  has('probe.ipv6-pass-real-aaaa', probeSrc, "'IPv6 双栈生效（AAAA 解析正常）'");
+  ok('probe.ipv6-no-override-branch', !probeSrc.includes('isDnsOverrideEnabled'));
+  ok('probe.ipv6-no-known-limitation-skip', !probeSrc.includes('这是已知限制，不是故障'));
+  has('probe.ipv6-no-restart-repair', probeSrc, "'当前网络/运营商未提供 IPv6");
+  notHas('probe.ipv6-no-restart-tunnel-repair', probeSrc,
+    "'请重启隧道；仍失败则检查上游 DNS 是否屏蔽 AAAA', 'restart-clash-api'");
   // ── smart 组在编排层的接线 ──────────────────────────────────────────────
   has('orch.smart.model-ready-check', orchSrc, 'private isSmartModelReady()');
   has('orch.smart.magic-tree', orchSrc, '0x74 && b[1] === 0x72');
@@ -417,8 +480,10 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   ok('orch.smart.no-dead-jsdelivr-mirror', !mirrorBlock.includes('@LightGBM-Model/Model.bin'));
   ok('orch.smart.no-dead-ghfast', !mirrorBlock.includes('ghfast.top'));
   ok('orch.smart.has-usable-mirror', mirrorBlock.includes('gh-proxy.com'));
+  // 双栈开关**不**走 want：扩展进程读的是落盘 YAML（readTunFlagsFromConfig），
+  // 多一条参数通道就多一个 TUN/内核分叉的机会。这里守住「不要把它加回来」。
   ok('orch.no-ipv6-inbound-param', !orchSrc.includes('ipv6Inbound'));
-  // IPv4-only 统一：IPv6 探测模块已整体移除，杜绝任何双栈回开通道。
+  // 运行时探测模块仍然移除：开关是唯一决策源，不做「有 v6 才开」的二次判定。
   ok('ipv4only.detector-removed', !existsSync(join(svcDir, 'Ipv6Detector.ets')));
 }
 
@@ -512,6 +577,13 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
   has('dns.direct-follow-policy-off', cfgSrc, "lines.push('  direct-nameserver-follow-policy: false')");
   // proxy-server-nameserver 是防死锁的关键，绝不能因为"改加密"顺手删掉。
   has('dns.proxy-server-nameserver-kept', cfgSrc, "lines.push('  proxy-server-nameserver:')");
+  // 订阅自带 DNS 上游必须真的接上（2026-10-20「测速全部超时」定案）：
+  // 上面那条只锁「DoT 字面量还在源码里」，会奖励把订阅分支写死成 DoT ——
+  // 这里补上「三分支形状 + 入参接线」的断言，改错了会红。
+  has('dns.subscription-upstream-branch', cfgSrc, 'if (subDnsServers.length > 0)');
+  has('dns.subscription-policy-branch', cfgSrc, '} else if (subDnsPolicies.length > 0)');
+  has('dns.subscription-upstream-wired', cfgSrc, 'normalizeNameservers(subscriptionDnsProxyServers)');
+  has('dns.subscription-policy-wired', cfgSrc, 'normalizeDnsPolicies(subscriptionDnsPolicies, allNodes)');
 
   // ── 5.8.0 线上回归的闸门：华为应用商店在全局模式下加载失败 ──
   // 根因是 primary 设成海外解析器 + 开了 respect-rules，导致国内服务的域名
@@ -569,10 +641,13 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
   ok('dns.no-plaintext-nameserver', plaintextUpstream.length === 0,
     '业务解析出现明文 UDP 上游: ' + plaintextUpstream.join(', '));
 
-  // STUN/NTP/反向解析必须给真实地址，否则会退化成无意义的明文查询 + 破坏探测。
-  has('dns.fakeip-filter-stun', cfgSrc, 'lines.push(\'    - "stun.*.*"\')');
-  has('dns.fakeip-filter-ntp', cfgSrc, 'lines.push(\'    - "+.pool.ntp.org"\')');
-  has('dns.fakeip-filter-localhost', cfgSrc, 'lines.push(\'    - "localhost"\')');
+  // fake-ip（2026-10-21 二次定案）：v6 也必须走代理，所以假池回来了 —— 但必须
+  // **同时**有 range6（假 v6 落在 TUN 的 /64 里才有路由）。STUN/NTP/门户探活仍靠
+  // fake-ip-filter 拿真实地址，不能删。
+  has('dns.fake-ip-mode', cfgSrc, "lines.push('  enhanced-mode: fake-ip')");
+  has('dns.fake-ip-range', cfgSrc, "lines.push('  fake-ip-range: 198.18.0.1/16')");
+  has('dns.fake-ip-range6', cfgSrc, "lines.push('  fake-ip-range6: fdfe:dcba:9876::/64')");
+  has('dns.fake-ip-filter', cfgSrc, "lines.push('  fake-ip-filter:')");
 
   // DoH 预解析/刷新必须发生在隧道建立之前：隧道已起时再对 doh.pub 裸发查询，
   // 等于在刚建好的防泄露链路上又开一个明文的洞。

@@ -142,17 +142,17 @@ ok('ClashApiService 提供 proxyTableNames（内核代理表全名）',
 // 只剩转调 getter ⇒ 断言改判**真源**，并额外要求转调关系存在（不许留第二份字面量）。
 const kindsSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/latency/LatencyKinds.ets'), 'utf8');
-ok('单节点测速超时为 5000ms（真源 LatencyTimeout.DEFAULT_TIMEOUT_MS）',
-  /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*5000/.test(kindsSrc));
+ok('单节点测速超时为 3000ms（2026-10-20 用户要求 5s→3s；真源 LatencyTimeout.DEFAULT_TIMEOUT_MS）',
+  /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*3000/.test(kindsSrc));
 ok('LatencyPolicy 的超时是转调真源（不留第二份字面量）',
   /return\s+LatencyTimeout\.DEFAULT_TIMEOUT_MS;/.test(stateSrc)
   && !/DEFAULT_TIMEOUT_MS:\s*number\s*=\s*\d+/.test(stateSrc));
 ok('并发测速数为 50（C8b：由 88 收敛，worker 口径）', /LATENCY_CONCURRENCY\s*=\s*50/.test(engineSrc));
 ok('在途并发上限为 50（2026-10-20 放开：与 worker 数同宽，无应用层排队）',
   /LATENCY_INFLIGHT\s*=\s*50/.test(engineSrc));
-ok('组测每节点预算与单节点一致（5000ms）', /GROUP_TEST_TIMEOUT_MS\s*=\s*5000/.test(engineSrc));
-ok('内核延迟探测默认超时同步为 5000ms',
-  /testLatencyDetailed\(nodeName: string, testUrl: string,\s*\n?\s*timeoutMs: number = 5000/.test(apiSrc));
+ok('组测每节点预算与单节点一致（3000ms）', /GROUP_TEST_TIMEOUT_MS\s*=\s*3000/.test(engineSrc));
+ok('内核延迟探测默认超时同步为 3000ms',
+  /testLatencyDetailed\(nodeName: string, testUrl: string,\s*\n?\s*(?:\/\/[^\n]*\n\s*)?timeoutMs: number = 3000/.test(apiSrc));
 // 离线探测器（DirectLatencyTester）已被测速内核（LP07）取代 —— 文件不在了就跳过这条，
 // 但**不许**因为文件缺失而整个闸门崩掉（那会让「文件已删」看起来像「契约破了」）。
 const directTesterPath = path.join(root, 'entry/src/main/ets/commons/services/DirectLatencyTester.ets');

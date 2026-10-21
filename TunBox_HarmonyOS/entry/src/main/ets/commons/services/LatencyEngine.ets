@@ -100,15 +100,15 @@ export const LATENCY_INFLIGHT = 50;
  * 60s：59 节点的最坏排队约 ⌈59/8⌉×5s ≈ 37s，留足余量。
  */
 export const LATENCY_QUEUE_WAIT_MAX_MS = 60000;
-/** 单节点探测超时（mihomo 内部默认 5000ms）。 */
+/** 单节点探测超时（2026-10-20 晚用户要求 5s → 3s）。 */
 export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
 /** 组测速（GET /group/{name}/delay）的整组预算。真机实测（2026-09-23）：内核的
  * 单节点拨号/HTTP 请求都用整组 context——死节点和连得上但响应慢的节点会等满
  * 预算才放弃，把整组拖长。3000ms：健康节点真机最高实测 ~522ms，5.7 倍余量，
  * 整组约 3 秒完成（用户要求）。
- * 2026-10-19 随单节点超时统一为 5s：组测里这个值是**每个节点**的拨号预算，
+ * 2026-10-20 晚随单节点超时一起从 5s 改回 3s：组测里这个值是**每个节点**的拨号预算，
  * 与逐节点探测必须同尺，否则同一节点在「测全部」和「单节点测速」里结论相反。 */
-export const GROUP_TEST_TIMEOUT_MS = 5000;
+export const GROUP_TEST_TIMEOUT_MS = 3000;
 /** 首批请求错峰抖动上限，避免整批同时撞内核（Clash Verge Rev 同款做法）。 */
 const STAGGER_MAX_MS = 200;
 /**

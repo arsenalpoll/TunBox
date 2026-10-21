@@ -636,7 +636,8 @@ export class ClashApiService {
    * lanes = 实际在途数时才成立。
    */
   async testLatencyDetailed(nodeName: string, testUrl: string,
-    timeoutMs: number = 5000, lanes: number = 1,
+    // 2026-10-20 晚用户要求：单节点超时 5s → 3s（与 LatencyTimeout.DEFAULT_TIMEOUT_MS 同值）
+    timeoutMs: number = 3000, lanes: number = 1,
     dns: LatencyDnsVerdict | null = null): Promise<LatencyProbeResult> {
     const out = new LatencyProbeResult();
     out.nodeName = nodeName;

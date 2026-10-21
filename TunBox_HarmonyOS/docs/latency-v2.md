@@ -159,7 +159,7 @@ entry/src/main/ets/commons/latency/
 
 ### 4.1 LatencyProbe
 
-- `LatencyProbeLimits`：**所有**并发/超时/取消数字的集中区（`NODE_TIMEOUT_MS=5000`、
+- `LatencyProbeLimits`：**所有**并发/超时/取消数字的集中区（`NODE_TIMEOUT_MS=3000`、
   `OUTER_EXTRA_MS=1200`、`WORKERS=50`、`MAX_INFLIGHT=8`、`QUEUE_WAIT_MAX_MS=60000`、
   `CANCEL_GRACE_MS=500`、`FAILURE_BODY_LOG_MAX=4096`）—— 外部不得散落魔数。
 - `LatencyTestUrl.effective(raw)`：URL 规则唯一真源（住在**零 import** 的 `LatencyTestUrl.ets`
@@ -260,7 +260,7 @@ LatencyEngine.run()                     ← 每批开始：取 DNS 快照（一�
   | worker 数（队列深度） | `LATENCY_CONCURRENCY = 50` | `LatencyEngine` 常量区 |
   | 同时在途 HTTP | `LATENCY_INFLIGHT = 8` | `LatencyInflightGate`（**排队等待不计入请求超时**） |
   | 排队上限 | `LATENCY_QUEUE_WAIT_MAX_MS = 60000` | 超出 = `queue_timeout`（非判定） |
-  | 节点超时 | `timeoutMs`（默认 5000） | 引擎 → API → 内核（内核再加 `OUTER_EXTRA_MS=1200` 外层预算） |
+  | 节点超时 | `timeoutMs`（默认 3000） | 引擎 → API → 内核（内核再加 `OUTER_EXTRA_MS=1200` 外层预算） |
   | 整批硬截止 | `this.deadlineAt` | 批开始时定；到点后剩余节点保持「未测」 |
   | 取消 | `ClashApiService.cancelInflight()` | destroy 已登记的 `http.HttpRequest` |
   | DNS 结论 | `dnsVerdictFor(node)` | 编排器 `hostSnapshot()`（每批一次）→ 每节点现算 |
@@ -437,7 +437,7 @@ LatencyEngine
 ### 为什么超时要留两个常量
 
 `LatencyProbeLimits.NODE_TIMEOUT_MS`（探针自身预算）与
-`LatencyTimeout.DEFAULT_TIMEOUT_MS`（调用方可见的超时契约）数值必须相同（都是 5000），
+`LatencyTimeout.DEFAULT_TIMEOUT_MS`（调用方可见的超时契约）数值必须相同（都是 3000），
 但 `LatencyProbe.ets` 会 import `models/AppSettings`，而 `LatencyEngine` 只引
 `ClashApiService` —— 为免把 probe 整条依赖链拖进引擎，两边保留独立常量，
 由 `verify-latency-core-v2` 断言**数值相等**。
@@ -446,5 +446,5 @@ LatencyEngine
 
 - `LatencyKinds.ets` 仍然**零 import**（`verify-latency-core-v2` 的 I11 断言）。
 - 所有策略/判定只有**一份实现**（`verify-no-divergence` 14/14）。
-- `LatencyPolicy` 里**不许再出现** `DEFAULT_TIMEOUT_MS: number = 5000` 这类字面量
+- `LatencyPolicy` 里**不许再出现** `DEFAULT_TIMEOUT_MS: number = 3000` 这类字面量
   （`verify-latency-display` 新增反例断言）。

@@ -15,9 +15,25 @@
  *    之前误用 onStart/onStop，系统回调命中基类空实现，TUN/内核从未启动，
  *    表现为 UI 侧 30s 超时报「9090 端口跨进程不可达」。
  *
- * 统一 IPv4-only（项目规格，不提供双栈入口）：isIPv6Accepted=false，TUN 仅安装
- * IPv4 地址与默认路由；内核侧 dns.ipv6=false + disable-ipv6=true 同步关闭，
- * IPv6 是否由平台丢弃仍需真机验证；此配置不能证明 IPv6 无绕行。
+ * IPv6 双栈（设置页开关，默认开）：TUN 的 v6 地址 / isIPv6Accepted 由**生成的那份 YAML**
+ * 决定（readTunFlagsFromConfig 解析 `ipv6:`）。与内核同源，因此不会出现
+ * 「TUN 装了 v6、内核 ipv6:false」的黑洞；want 丢失或进程重启后也不需要另存开关。
+ *
+ * DNS 接管（2026-10-21 起无开关）：生成器恒写 `dns.enable: true` + `tun.dns-hijack: any:53`，
+ * 本层恒把 VpnConfig.dnsAddresses 指向 TUN sentinel（DNS_SERVERS）。设置页的
+ * 「DNS 覆写」开关已删除 —— 只留一个恒真的事实，没有可漂移的第二决策点。
+ *
+ * ⚠ 2026-10-21 真机取证（改前缀后重测 /proc/net/ipv6_route）：
+ *   · `VpnConfig.routes` 里的 v6 条目仍被平台静默丢弃（`::/0` 的三种写法、`fc00::/71`
+ *     具体前缀，v4 默认路由正常）；
+ *   · 但平台**会**按 LinkAddress 的前缀派生 on-link 路由：地址写 /126 时 vpn-tun 只有
+ *     `fdfe:dcba:9876::/126`，地址写 /64 时立刻出现 `fdfe:dcba:9876::/64 ... vpn-tun`。
+ *   ⇒ 本层把 TUN 的 v6 地址写成 /64（64 位前缀），生成器的 `fake-ip-range6` 用**同一个 /64**：
+ *     内核给 AAAA 的假 v6 落在 on-link 网段内 ⇒ 进隧道 ⇒ 按域名交给代理拨号。
+ *     v6 与 v4 一样走代理，设备侧不再有直连 v6 的路径（这正是旧 redir-host 方案的问题：
+ *     真实 AAAA 只会把 v6 流量交给物理网卡）。
+ *     池的 gateway = masked+1 = `fdfe:dcba:9876::1`，正是下面的 TUN_ADDRESS_V6。
+ *     ipv6 关时生成器不写 range6 ⇒ 内核 AAAA 恒空，与只装 v4 的 TUN 一致。
  *
  * 隧道存续期间本进程是**网络与恢复的权威**：订阅网络切换、按承载动态调 MTU、
  * 内核崩溃后就地热恢复（必要时升级一次 TUN 重建）、以事件驱动写入 vpn_status.json
@@ -49,8 +65,35 @@ const VPN_MTU = 1400;
 /** TUN 地址/前缀与 bridge/bridge.go 的 Inet4Address 严格一致（对齐 NekoBox 实测格式） */
 const TUN_ADDRESS = '172.19.0.1';
 const TUN_PREFIX = 30;
+/** IPv6 入站地址：ULA + /64（64 位前缀）（同 FlClash 的 ULA 取值，但前缀放大到 /64）。
+ *  必须是 ULA 而非全局地址：它是 TUN 的对端，不需要可路由。
+ *  /64 是「v6 走代理」的前提：平台的 on-link 路由按此前缀派生（真机 /proc/net/ipv6_route
+ *  取证），生成器的 fake-ip-range6 用同一个 /64，假 v6 才能落进隧道。 */
+const TUN_ADDRESS_V6 = 'fdfe:dcba:9876::1';
+/** 2026-10-21 真机取证：/126 → /64 后，/proc/net/ipv6_route 里出现
+ *  dfe:dcba:9876::/64 ... vpn-tun（旧 /126 时只有 /126）⇒ 假 v6 池的 /64 有了 on-link 路由。
+ *  这一条是「AAAA 走隧道、v6 走代理」的全部基础，不能改回 /126。 */
+const TUN_PREFIX_V6 = 64;
 const TUN_IFNAME = 'vpn-tun';
-const DNS_SERVERS = ['223.5.5.5', '119.29.29.29'];
+/**
+ * DNS 指向 **TUN 内 sentinel**，对齐 FlClash 的 VpnService 构建方式：
+ * `C:\Worker\flclash-src\android\service\src\main\java\com\follow\clash\service\VpnService.kt:298-301`
+ *   IPV4_ADDRESS = 198.18.0.1/30 → addDnsServer(198.18.0.2)
+ *   IPV6_ADDRESS = fdfe:dcba:9876::1/126 → addDnsServer(fdfe:dcba:9876::2)
+ * 本仓 TUN 是 172.19.0.1/30（TUN_ADDRESS/TUN_PREFIX），同子网唯一对端即 172.19.0.2。
+ *
+ * 为什么不用旧值 223.5.5.5 / 119.29.29.29：
+ *   1) 公共 DNS 能否被 `tun.dns-hijack: any:53` 劫持，取决于默认路由是否命中该地址；
+ *      sentinel 落在 TUN 自身子网（平台会装 connected 路由），不依赖任何默认路由；
+ *   2) 系统把「VPN 下发的 DNS 服务器」当作必须可达的配置项，指到 TUN 内地址最稳；
+ *   3) 一旦劫持没生效，公共 DNS 就是明文直连 + 真实 QNAME 外泄 —— 正是旧注释担心的场景，
+ *      而 sentinel 方案下这种失败模式根本不存在（发不出去 = 立刻失败，不会偷偷泄漏）。
+ *
+ * ⚠ 刻意**不加** v6 DNS（FlClash 在 ipv6 时 addDnsServer(DNS6)）：本平台不安装任何 v6
+ * 路由（见 buildTunRoutes 的真机取证），把 DNS 指到 v6 sentinel 会让解析直接进黑洞。
+ * AAAA 由内核解析器经 redir-host 返回真实地址，客户端拿到 v6 后走物理网卡直连。
+ */
+const DNS_SERVERS = ['172.19.0.2'];
 /** 启动错误回传文件名（写入 configPath 同目录，UI 侧读取真实失败原因） */
 const START_ERROR_FILE = 'vpn_start_error.txt';
 /** 启动成功标记文件名（内核 API 就绪后写入，UI 侧轮询） */
@@ -149,6 +192,19 @@ class StartParamsSnapshot {
   public mode: string = '';
   public packagesJson: string = '';
   public needsReview: boolean = false;
+}
+
+/**
+ * TUN 层唯一开关：从生成的那份 YAML 里读回（见 readTunFlagsFromConfig）。
+ * 不用 want 参数下发：内核认的配置和 TUN 装的地址必须是同一份事实，
+ * YAML 是唯一真源，也就天然免疫 want 丢失 / 进程被杀重启后的参数陈旧。
+ *
+ * DNS 接管不在其中：`dns.enable: true` 由生成器**恒写**（设置页已无开关），
+ * 所以本层也恒下发 VpnConfig.dnsAddresses，没有第二个可漂移的状态位。
+ */
+class TunFlags {
+  /** 内核 ipv6 总闸（顶层 `ipv6:`）：同时决定 TUN 是否装 v6 地址 + ::/0 */
+  public ipv6: boolean = false;
 }
 
 export default class SsrvpnVpnExtension extends VpnExtensionAbility implements NetworkStateListener {
@@ -570,15 +626,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       return;
     }
     try {
-      let text = '';
-      const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
-      try {
-        const buf = new ArrayBuffer(262144);
-        const len = fs.readSync(file.fd, buf);
-        text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, len));
-      } finally {
-        fs.closeSync(file);
-      }
+      const text = this.readConfigText(path);
       const patched = text.replace(/^ {2}mtu: \d+$/m, `  mtu: ${this.activeMtu}`);
       if (patched !== text) {
         const wf = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -591,6 +639,94 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     } catch (e) {
       AppLogger.warn(TAG, `config mtu sync skipped: ${AppLogger.errText(e)}`);
     }
+  }
+
+  /** 读配置全文（只读一遍，256KB 上限）。ensureConfigMtu 与 readTunFlagsFromConfig 共用。 */
+  private readConfigText(path: string): string {
+    const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
+    try {
+      const buf = new ArrayBuffer(262144);
+      const len = fs.readSync(file.fd, buf);
+      return util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, len));
+    } finally {
+      fs.closeSync(file);
+    }
+  }
+
+  /**
+   * 从生成的那份 YAML 读回 TUN 需要知道的开关。
+   *
+   * 关键不变量：**TUN 装什么，必须与内核认的完全一致**。
+   *   · `ipv6: true` → 内核开出站 v6 + dns.ipv6；TUN 必须同时装 v6 地址与 ::/0，
+   *     否则 v6 要么被平台塞进 TUN 却无人处理（黑洞），要么绕过 TUN 直连（泄漏）。
+   * DNS 不在读取范围：生成器恒写 `dns.enable: true`，本层恒下发 sentinel。
+   * 所以这里不接 want 参数、也不缓存：每次 onCreate 现读，天然与配置同源，
+   * want 丢失 / 进程被杀重启 / 用户改完开关后重连，三种情况都不会参数陈旧。
+   */
+  private readTunFlagsFromConfig(path: string): TunFlags {
+    const flags = new TunFlags();
+    try {
+      const text = this.readConfigText(path);
+      // 2026-10-21：不再用「整行字面量」正则。覆盖层经 C17 结构化合并后可能出现
+      // 流式 `ipv6: "true"` / `ipv6: yes`，旧正则对它们全部返回 false ⇒ TUN 静默
+      // 退回「IPv4-only」，而内核仍按 YAML 开着双栈 —— 正是本文件头部警告的
+      // 「TUN 与内核不一致」。
+      flags.ipv6 = SsrvpnVpnExtension.readTopLevelBool(text, 'ipv6');
+    } catch (e) {
+      // 读不到 → 退回保守形态（IPv4-only）：宁可少开，也不要装一条
+      // 内核并不认的 ::/0 把设备的 v6 打进黑洞。
+      AppLogger.warn(TAG, `read tun flags failed: ${AppLogger.errText(e)}`);
+    }
+    return flags;
+  }
+
+  /**
+   * 读顶层布尔：兼容 `true` / `yes` / `on` / `1`、带引号写法与行尾注释。
+   *
+   * 只用 `m` 标志 + `^`：顶层键必须**顶格**，因此不会误命中 `dns.ipv6` 这类子键。
+   */
+  private static readTopLevelBool(text: string, key: string): boolean {
+    const re = new RegExp('^' + key + ':[ \\t]*("?)([A-Za-z0-9]+)\\1[ \\t]*(?:#.*)?$', 'm');
+    const m: RegExpMatchArray | null = text.match(re);
+    return m !== null && SsrvpnVpnExtension.isTrueScalar(m[2]);
+  }
+
+  /** YAML 1.1/1.2 里所有被视为「真」的标量写法（内核用 yaml.v3，两种拼写都认）。 */
+  private static isTrueScalar(raw: string): boolean {
+    const v = raw.toLowerCase();
+    return v === 'true' || v === 'yes' || v === 'on' || v === '1';
+  }
+
+  /**
+  /**
+   * 构造 TUN 路由表：v4 默认 + （双栈时）v6 默认。
+   *
+   * ⚠ 2026-10-21 真机复议（本文件头部已记）：平台**丢弃** VpnConfig.routes 里的所有 v6 条目
+   * （::/0 带 family / 不带 family / interface 为空三种写法，c00::/71 具体前缀 —— 全被
+   * 静默丢弃）；v6 真正生效的是 **LinkAddress 前缀派生的 on-link 路由**：/126 只有 /126，
+   * /64 就有 dfe:dcba:9876::/64 ... vpn-tun。所以 v6 的接管不靠这里，靠 TUN_PREFIX_V6。
+   * 下面这条 v6 默认路由只为**向前兼容**保留（新系统版本若肯装，就自动生效）；
+   * 假 v6 池（fake-ip-range6）与它无关 —— 那个 /64 已经在 on-link 上。
+   */
+  private buildTunRoutes(flags: TunFlags): vpnExtension.RouteInfo[] {
+    const routes: vpnExtension.RouteInfo[] = [{
+      interface: TUN_IFNAME,
+      destination: { address: { address: '0.0.0.0', family: 1 }, prefixLength: 0 },
+      gateway: { address: '0.0.0.0', family: 1 },
+      hasGateway: false,
+      isDefaultRoute: true
+    }];
+    if (!flags.ipv6) {
+      return routes;
+    }
+    routes.push({
+      interface: TUN_IFNAME,
+      destination: { address: { address: '::' }, prefixLength: 0 },
+      gateway: { address: '0.0.0.0' },
+      hasGateway: false,
+      isDefaultRoute: true
+    });
+    return routes;
   }
 
   /**
@@ -1192,29 +1328,44 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     // 使 MTU、Kill Switch 与恢复编排完全由本进程掌控，UI 进程被回收也不受影响。
     this.startNetworkAuthority();
 
-    // 项目规格要求 IPv4-only：TUN 仅安装 IPv4 地址和默认路由，明确拒绝 IPv6。
-    // 平台是否丢弃未接管的 IPv6 尚待真机验证，不据此宣称防泄漏。
+    // TUN 参数既要跟「设置页 IPv6 开关」一致，又要跟**内核实际加载的那份 YAML**一致。
+    // YAML 是唯一真源（readTunFlagsFromConfig），所以这里不再从 want 收开关。
     // MTU 按当前物理承载动态取值（蜂窝链路降低分片风险，Wi-Fi/以太网 1400）。
     this.activeMtu = this.mtuForNetwork(this.lastNetworkType);
-    const config: vpnExtension.VpnConfig = {
+    const tunFlags = this.readTunFlagsFromConfig(configPath);
+    // DNS 恒接管：生成器恒写 `dns.enable: true` + `dns-hijack: any:53`，
+    // 这里恒把设备 DNS 指向 TUN sentinel（与 FlClash 同构），没有第二个状态位。
+    const dnsAddresses: string[] = DNS_SERVERS;
+    // 路由表：v4 默认 + （双栈时）v6 默认，见 buildTunRoutes。
+    const tunRoutes: vpnExtension.RouteInfo[] = this.buildTunRoutes(tunFlags);
+    const config: vpnExtension.VpnConfig = tunFlags.ipv6 ? {
+      addresses: [{
+        address: { address: TUN_ADDRESS, family: 1 },
+        prefixLength: TUN_PREFIX
+      }, {
+        address: { address: TUN_ADDRESS_V6, family: 2 },
+        prefixLength: TUN_PREFIX_V6
+      }],
+      routes: tunRoutes,
+      dnsAddresses: dnsAddresses,
+      mtu: this.activeMtu,
+      isIPv4Accepted: true,
+      isIPv6Accepted: true
+    } : {
       addresses: [{
         address: { address: TUN_ADDRESS, family: 1 },
         prefixLength: TUN_PREFIX
       }],
-      routes: [{
-        interface: TUN_IFNAME,
-        destination: { address: { address: '0.0.0.0', family: 1 }, prefixLength: 0 },
-        gateway: { address: '0.0.0.0', family: 1 },
-        hasGateway: false,
-        isDefaultRoute: true
-      }],
-      dnsAddresses: DNS_SERVERS,
+      routes: tunRoutes,
+      dnsAddresses: dnsAddresses,
       mtu: this.activeMtu,
       isIPv4Accepted: true,
       isIPv6Accepted: false
     };
     this.tunConfig = config;
-    AppLogger.info(TAG, `vpn config: IPv4-only, mtu=${this.activeMtu}, net=${this.lastNetworkType}`);
+    AppLogger.info(TAG, `vpn config: ${tunFlags.ipv6 ? 'dual-stack' : 'ipv4-only'}, `
+      + `dns=${dnsAddresses.join(',')}, routes=${tunRoutes.length}, `
+      + `mtu=${this.activeMtu}, net=${this.lastNetworkType}`);
 
     try {
       this.applyAppRouting(config);

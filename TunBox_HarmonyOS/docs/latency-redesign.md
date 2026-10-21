@@ -170,3 +170,163 @@
 > 复现门禁：`node scripts/verify-latency-core-v2.mjs`（A12c 项，本次 **65 passed / 0 failed**）
 > 与 `node scripts/verify-generator-fingerprint.mjs`（指纹一致）。
 > 与本次改动同批的还有 `scripts/verify-config-single-source.mjs`（唯一生成入口，42/0）。
+
+## 九、2026-10-20 指纹变更说明（IPv6 双栈 + DNS 覆写开关）
+
+`scripts/latency-gen-fingerprint.json` 的 `sha256_16` 由 `668f5269db380849` 更新为
+`8490f80ef2985e3a` —— 原因是**设置页新增两个网络开关、配置生成器去掉 IPv4-only 硬编码**，
+与测速引擎 / 延迟口径无关。逐条改动如下：
+
+| 项 | 改动 | 目的 |
+|---|---|---|
+| V6-1 | 顶层 `ipv6:` 与 `dns.ipv6:` 改由 `generate()` 的 `ipv6Enabled` 参数驱动（默认 true）；调用方 `RuntimeConfigBuilder` 传 `settings.ipv6Enabled` | 原来 `ipv6: false` / `dns.ipv6: false` 是硬编码，`ipv6Enabled` 形参声明了却**从未被读** —— IPv6 在任何设置下都不可能生效 |
+| V6-2 | ~~双栈开启时新增 `fake-ip-range6: fc00::/71`~~ → **当天即改回「不下发」**（真机取证后修正） | 2026-10-20 真机三次隧道在线逐次对账 `/proc/net/ipv6_route`：HarmonyOS **不安装 VpnConfig 里的任何 IPv6 路由** —— `::/0` 的三种写法（destination/gateway 带 `family:2`、不带 family、`interface` 留空）与 `fc00::/71` 具体前缀路由**全部被静默丢弃**，vpn-tun 上只剩地址派生的 `/126`、`fe80::/64`、`/128`、`ff00::/8`（v4 默认路由正常装上）。假 v6 池没有路由可达 ⇒ 拿到 `fc00::x` 的应用必然连不通，故删掉该行；`dns.ipv6` 保留 |
+| V6-3 | 删除 `disable-ipv6: true`，并从 `KNOWN_TOP_LEVEL_KEYS` 移除该键 | 它不是 mihomo 顶层键（非 strict unmarshal ⇒ 静默忽略；实测塞 `totally-bogus-key` 后 `mihomo -t` 仍 successful），留着只会误导「IPv6 已关闭」 |
+| L-TO | 2026-10-20 晚：单节点测速超时 5000ms → **3000ms**（LatencyTimeout.DEFAULT_TIMEOUT_MS / LatencyProbeLimits.NODE_TIMEOUT_MS / GROUP_TEST_TIMEOUT_MS / ClashApiService.testLatencyDetailed 的默认值四处同改） | 用户明确要求「超时判断现在是 5 秒改为 3 秒」；3s 有历史真机证据：飞鸟云 35 个 hysteria2 节点在 3s 下能测出 143/558/560ms，而 1s 时 31/31 全误杀 —— 3s 既能测出慢节点又比 5s 少等 2 秒/节点 |
+| V6-4 | 2026-10-20 晚曾按方案 B 把 `dns.ipv6` 拆成独立开关、`fake-ip-range6` 做成高级项；**用户当天复核后要求精简** ⇒ 两处一起撤销：`dns.ipv6` 仍由 `ipv6Enabled` 统一驱动，`fake-ip-range6` 恢复「永不产出」 | 精简理由：`dns.ipv6` 只在 `dns:` 段存在时才有意义（关掉「DNS 覆写」整段 dns 都不生成），单独摆开关会出现「开着却无效」的死开关；`fake-ip-range6` 在 HarmonyOS 上因不装 v6 路由必然是黑洞，留一个能填的输入框只会误导。最终设置页只剩「IPv6 双栈 / DNS 覆写」两个开关 |
+| DNS-1 | `dns:` 整段抽成 `private static pushDnsSection()`（唯一写入点，导出 YAML 字节不变；`blockSites` 由调用方规范化后传入，路由层兜底共用同一份） | 让「DNS 覆写」开关能整段关闭，而不必复制粘贴 150 行 |
+| DNS-2 | 新增 `settings.dnsOverrideEnabled` 门：关闭时只写 `dns: { enable: false }`、不产 `tun.dns-hijack` | 内核不跑 DNS 却仍劫持 53 ⇒ 设备原本正常的系统 DNS 会被打断 |
+
+> 复现门禁：`node scripts/verify-generator-fingerprint.mjs`、
+> `node scripts/verify-vpn-architecture.mjs`（IPv6 / DNS 断言已同步改写）、
+> `node scripts/verify-config-single-source.mjs`（唯一生成入口）、
+> `node scripts/verify-config-generation-integrity.mjs`（真内核 `mihomo -t` 判定，61/0）。
+> 真机取证：2026-10-20 hdc 实测设备有全局 IPv6（2409:8a55:d154:dae1::/64）而隧道在线时
+> `ping6 2001:4860:4860::8888` 仍直连成功、`vpn-tun` 上 `::/0` 为 0 条 ⇒ v6 绕过代理；
+> 本改动后需在真机复验：`::/0` 出现在 `vpn-tun`、隧道 DNS 对 AAAA 有 v6 应答。
+
+## 十、2026-10-21 指纹变更说明（订阅 DNS 上游透传：修「测速几乎全部超时」）
+
+指纹：`22c9d271de845e95`。改动**只发生在配置生成器的 DNS 段**（`generate()` 参数表 +
+`pushDnsSection()` + 五个校验 helper），与测速引擎、延迟口径无关。
+
+### 为什么必须改
+
+用户报障：「这个订阅在 TunBox 测速几乎全部超时，FlClash 测速完全正常」（筋斗云 anytls）与
+「FlClash 解析 36 个节点、TunBox 少了 20 个，测速也全部超时」（pronetwork hy2/tuic）。
+
+真机 + 真实内核（Mihomo Meta 1.10.0）双重取证后的根因：**机场把「入口域名 → 真实入口 IP」
+只告诉自家私有 DoH**，公共 DNS 解析出来的是 Cloudflare / 阿里 WAF 前置 IP：
+
+| 订阅 | 承载「代理域名解析上游」的键 | 公共 DNS 的答案 | 私有 DoH 的答案 |
+|---|---|---|---|
+| 筋斗云 | `dns.proxy-server-nameserver` | `172.64.153.74`（CF），18104–18503 **全部 TCP timeout** | `35.220.165.7` 等 GCP 入口，**OPEN** |
+| pronetwork | `dns.nameserver-policy`（`+.jushuitan.com`） | `60.205.172.133`（阿里 WAF），4430 可握手但**不服务** anytls/hy2/tuic | `64.120.95.49` / `36.226.53.194` 等真实机房 |
+
+而本生成器此前把订阅 `dns:` **整段丢弃**、固定写公共 DoT ⇒ 两个订阅的域名节点必然全灭。
+真实内核单变量实验（配置只差一行）：订阅1 原样 **20/23** 通 → 只删 `proxy-server-nameserver` 变 **7/23**；
+订阅2 原样 **30/36** → 只删 `nameserver-policy` 变 **0/36**。
+
+### 改了什么
+
+| 项 | 改动 | 目的 |
+|---|---|---|
+| D1 | `generate()` 末尾新增 `subscriptionDnsProxyServers: string[] = []`、`subscriptionDnsPolicies: string[][] = []` | 给订阅 DNS 上游一条**显式入参**通道（生成器不自己读订阅，保持单一真源） |
+| D2 | `pushDnsSection()` 的 `proxy-server-nameserver:` 改三分支：订阅上游 > 订阅 policy（**留空**）> 内置公共 DoT | 订阅1 走第一支；订阅2 必须走第二支——mihomo `hub/executor/executor.go:304-307` 里该键非空就用**专用解析器**且不查 `nameserver-policy`，留着 DoT 会把 policy 顶掉（实测 `31se.jushuitan.com → 60.205.172.133` 全灭） |
+| D3 | 新增 `normalizeNameservers()` / `normalizeNameserver()`：上游白名单（https/tls/quic/h3/udp/tcp/system/dhcp/裸 IP:port），拒绝含空格/引号/反斜杠/逗号/括号的输入 | 订阅内容是不可信输入，拼进 YAML 前必须过关（防注入破坏行结构） |
+| D4 | 新增 `normalizeDnsPolicies()` / `normalizePolicySuffix()` / `policyMatchesAny()`：只保留**后缀命中本份配置节点域名**的 policy 条目 | 机场常在 policy 里顺手写别的域名（如订阅1 的 `+.bestqaq.com`、订阅2 的 `+.bokecc.com`），注入进用户 DNS 策略属于越界 |
+| D5 | 同一后缀的多个上游合并成**一个** policy 键 + 多值列表 | 机场常给两个私有 DoH 互为冗余；逐条 push 同名键 = YAML 重复键 ⇒ 内核整份拒载 |
+| D6 | `Subscription` 新增 `subDnsProxyServers` / `subDnsPolicies`（JSON），`SubscriptionService.applyDnsSections()` 在三条导入/刷新路径落账，`subscriptionDnsProxyServers()/subscriptionDnsPolicies()` 聚合给 profile | 与 `subRules` / `subRuleProviders` 同一套模式：拉取时提取、生成时使用 |
+
+### 复现与门禁
+
+- `node scripts/verify-config-generation-integrity.mjs` 新增 **[14] 订阅 dns 上游透传** 五个场景
+  （无订阅→DoT 兜底 / 有上游→整段替换 / 只有 policy→该键留空且 policy 生效 /
+  policy 与节点无关→不注入 / 非法上游→过滤）
+- `node scripts/verify-vpn-architecture.mjs` 新增 4 条分支形状与接线断言
+  （`dns.subscription-upstream-branch` / `-policy-branch` / `-upstream-wired` / `-policy-wired`）
+  —— 此前只锁「DoT 字面量还在源码里」，等于奖励把订阅分支写死成 DoT
+- 本机真内核实测（`mihomo.exe -t` + `/proxies/{name}/delay`）：
+  订阅1 修复后 `香港01 256ms / 美国03 501ms`；订阅2 修复后 `hy2 233ms / anytls 408ms / 280ms`（修复前全 503/504）
+- 端到端取证报告：`C:\Worker\diag\DIAGNOSIS_2026-10-20.md`、`kernel-lab.md`、`device-flclash.md`
+
+## 十一、2026-10-21 指纹变更说明（更正 IPv6/AAAA 事实 + 探针判据）
+
+指纹：`22c9d271de845e95` → `5b482c987987d0db`。**只改了 `ClashConfigGenerator.ets` 的注释，导出的 YAML 逐字节不变**（`fake-ip-range6` 依旧不产出）。
+
+> ⚠ 本节 P-1 / P-2 / T-2 三项（按 `isDnsOverrideEnabled()` 分流探针、`dnsOverrideActive` 快照、
+> `TunFlags.dnsOverride` 默认 false）已在 §十二（2026-10-21 删除 DNS 覆写开关）中**整体废弃**：
+> 开关不存在了，探针恢复严格判据，TUN 不再读 `dns.enable`。保留本节仅为还原当时的推理链。
+
+### 为什么改
+
+上一节（§九 V6-2）的结论只有一半：平台不装 v6 路由 ⇒ 删掉 `fake-ip-range6` 是对的；但随之写进生成器注释的「`dns.ipv6` 保留，AAAA 返回**真实** v6 地址，v6-only 站点可用」与内核源码矛盾：
+
+- `dns/middleware.go:149-197` 的 `withFakeIP`：`fakePool6 == nil` 时 AAAA 直接 `handleMsgWithEmptyAnswer`，**比 `withResolver` 的 `ipv6` 判断（`:205-208`）更早短路**；
+- `dns/enhancer.go:172-194` 的 `NewEnhancer`：只有 `cfg.IPv6` 为真**且** `FakeIPPool6 != nil` 才装配 v6 池；
+- `config/config.go:1586-1600`：`FakeIPPool6` 仅在 `dns.fake-ip-range6` 有效时创建。
+
+⇒ 当前配置下 AAAA **恒为空**，`dns.ipv6` 对客户端拿到的答案没有影响，v6-only 站点不可用。
+
+### 连带修正
+
+| 项 | 改动 | 目的 |
+|---|---|---|
+| P-1 | `OrchestratorHealthProbes.probeIpv6` 按 `isDnsOverrideEnabled()` 分流：覆写开 → `skip`（写明「已知限制，不是故障」）；覆写关 → `fail` + 建议关闭 IPv6 双栈，修复动作 `check-uplink` | 旧实现固定 `fail + 重启隧道`，在默认配置下每个用户都会看到一条永远修不好的红项 |
+| P-2 | `ConnectionOrchestrator` 新增 `dnsOverrideActive` 快照 + `isDnsOverrideEnabled()`（与 `ipv6Active` 同源同时刻，断开时清零） | 探针需要可信的「本次连接是否接管 DNS」事实，不能回读可变设置 |
+| T-1 | `VpnExtensionAbility.readTunFlagsFromConfig` 改用 `readTopLevelBool` / `readNestedBool`（容忍 `yes/on/1`、带引号、流式 `dns: {enable: true}`、行尾注释、CRLF） | 旧实现是整行字面量正则；覆盖层经 C17 结构化合并后一旦变成流式写法，TUN 会静默退回「IPv4-only + 不覆盖 DNS」，而内核照旧接管 DNS |
+| D-1 | `DNS_SERVERS` 由公共 DNS `223.5.5.5/119.29.29.29` 改为 TUN 内 sentinel `172.19.0.2`（对齐 FlClash `android/service/.../VpnService.kt:300` 的 `DNS = "198.18.0.2"`；本仓 TUN 为 `172.19.0.1/30`，对端唯一地址）；**刻意不下发 v6 DNS** | 公共 DNS 能否被 `tun.dns-hijack: any:53` 截住取决于默认路由是否命中；sentinel 落在 TUN 自身子网（平台装 connected 路由），不依赖默认路由。劫持一旦失效，公共 DNS 是明文直连 + 真实 QNAME 外泄，sentinel 只会立刻失败。v6 DNS 不下发是因为本平台不装 v6 路由（下发即黑洞） |
+| T-2 | `TunFlags.dnsOverride` 默认值 `true` → `false`，并新增门禁 `ext.dns-override-default-off` | catch 分支注释写的是「退回保守形态（IPv4-only + 不覆盖 DNS）」，但字段默认 true：读 YAML 失败时 TUN 会把系统 DNS 指到 sentinel，而内核没接管 ⇒ 整机解析黑洞 |
+| D-2 | 文件头 IPv6 段落改为与 `buildTunRoutes` 真机取证一致（平台不装 v6 路由 ⇒ 双栈开启 ≠ v6 已接管，v6 仍走 wlan0） | 同一文件里两段注释互相矛盾（旧文写「双栈默认开后该通道被 TUN 接管」），是 I2「三处 v6 描述互斥」之一 |
+
+### FlClash 对照（真机/源码取证，供后续 P0 整改用）
+
+- TUN 构建：`VpnService.kt:179-229` —— v4 地址 + `addRoute("0.0.0.0", 0)`；`ipv6` 为真时才 `addAddress(fdfe:dcba:9876::1/126)` 并 `addRoute("::", 0)`，DNS 用 `198.18.0.2` / `fdfe:dcba:9876::2`（`:298-301`）。
+- IPv6 默认值：`flutter_config.pretty.json:128,188,215` —— `vpnProps.ipv6=false`、`patchClashConfig.ipv6=false`、`dns.ipv6=false`，三层默认**全关**；TunBox 默认「开」但实际不生效（AAAA 恒空），这是文案与事实背离的根源。
+- DNS：真机运行配置 `diag/device-flclash/flclash/runtime_config_dns_block.txt:8-60` —— `dns.enable: true`、`enhanced-mode: redir-host`（**不是 fake-ip**）、`fake-ip-range6: ""`、订阅的 `nameserver-policy` 原样透传、订阅没给 `proxy-server-nameserver` 时保持 `null`（主解析器才查 policy）。
+- ⇒ FlClash 没有「DNS 覆写开关」：DNS 恒接管；`dnsHijacking` 只决定劫持目标是 sentinel 还是 `0.0.0.0`（`VpnService.kt:77-89`）。TunBox 把「应用劫持 / 内核解析 / 代理入口解析」捆在 `dns.enable` 一个开关上，是与 FlClash 最大的结构性差异。
+
+### 复现门禁
+
+- `node scripts/verify-generator-fingerprint.mjs`
+- `node scripts/verify-vpn-architecture.mjs`（新增 `ext.tun-flags-*-tolerant`、`probe.ipv6-*`、`orch.dns-override-active-flag`）
+- `node scripts/verify-logic-pure.mjs`
+
+## 十二、2026-10-21 指纹变更说明（删除「DNS 覆写」开关 + v6 也走代理）
+
+指纹：`5b482c987987d0db` → `17bcf4ec1a71c110` → `dc81cce4e9a28701`（本次）。
+
+本次**导出 YAML 有实质变化**：`enhanced-mode` 为 `fake-ip`（v4 假池 `198.18.0.1/16`），
+ipv6 开时额外下发 `fake-ip-range6: fdfe:dcba:9876::/64`；`dns.enable` 与 `tun.dns-hijack` 恒开。
+
+### 产品决定
+
+用户明确要求：**去掉设置页里那一大段 IPv6 解释，并且 v6 必须走代理（不能直连）**。
+
+- 设置页 `SettingsPage` 的 IPv6 说明压缩成一句：「开启后 IPv6 与 IPv4 一样走代理（AAAA 返回隧道内地址，不直连）；关闭则纯 IPv4。」
+  开关本身保留（唯一决策点 `ipv6Enabled`），没有第二个 fake 池高级项。
+- 旧的「v6 直连物理网卡」文案与 redir-host 方案一并退场。
+
+### 为什么是 fake-ip + range6（2026-10-21 真机复议）
+
+| 配置 | 客户端拿到的 AAAA | v6 走向 |
+|---|---|---|
+| `redir-host` + `dns.ipv6: true`（上一版） | 上游真实地址 | **直连物理网卡**（设备 v6 完全绕过代理） |
+| `fake-ip` 无 range6 | 空（`withFakeIP`：`fakePool6 == nil` 直接回空） | v6-only 站点不可用 |
+| `fake-ip` + range6 **与 TUN 同段 /64**（本次） | 隧道内假 v6（`fdfe:dcba:9876::4` 起） | **进隧道 → 按域名交给代理拨号** |
+
+关键取证（真机 192.168.10.5:39933，隧道在线）：
+
+- 平台**丢弃** `VpnConfig.routes` 里的所有 v6 条目（`::/0` 三种写法、`fc00::/71` 实测全被静默丢弃）；
+- 但平台**会按 `LinkAddress` 前缀派生 on-link 路由**：`TUN_PREFIX_V6 = 126` 时 `/proc/net/ipv6_route` 只有
+  `fdfedcba987600000000000000000000 7e ... vpn-tun`；改成 `64` 后立刻出现
+  `fdfedcba987600000000000000000000 40 ... vpn-tun`（`0x40` = /64）。
+- 于是假 v6 池（`fake-ip-range6: fdfe:dcba:9876::/64`，gateway = `::1` = TUN 地址，首个假地址 `::4`）
+  落在 on-link 网段内，`ping -6 fdfe:dcba:9876::4` 有回包，core.log 记 `[ICMP] ... using fake ping echo`。
+- `config/config.go:parseIPV6` 只在 `!IPv6 || !verifyIP6()` 时清空 `FakeIPRange6`；本次 core.log 的
+  `[TUN] ... ([198.18.0.1/30],[fdfe:dcba:9876::1/126])` 说明 v6 地址未被清空 ⇒ range6 生效。
+
+### 连带行为变化
+
+1. **DNS 假池回归**：`fake-ip-filter` 重新放行局域网 / STUN / NTP / 门户探活（这些必须拿真实地址）。
+2. **DOMAIN 规则靠假 IP 映射**，`sniffer.force-dns-mapping` 保留作 SNI 不一致时的兜底。
+3. **ipv6 关 ⇒ 不下发 range6** ⇒ `FakeIPPool6 == nil` ⇒ AAAA 恒空，与只装 v4 的 TUN 一致（不会留下无路由的假 v6）。
+4. **v6-only 站点**：应用拿到假 AAAA → 进隧道 → 代理出口解析真实 v6 并连接。
+
+### 复现门禁
+
+- `node scripts/verify-generator-fingerprint.mjs`（17bcf4ec1a71c110）
+- `node scripts/verify-vpn-architecture.mjs`（267 项；新增 `gen.dns.redir-host` / `ext.dns-always-sentinel` / `orch.no-dns-override-flag` 等反向断言）
+- `node scripts/verify-config-generation-integrity.mjs`（70 项，含**真实内核** `mihomo -t` 接受新配置）
+- `node scripts/verify-arkts-compile.mjs`（DevEco `assembleHap` 3/3）
+- `node scripts/verify-config-single-source.mjs`（42） / `verify-connect-stability.mjs`（38） / `verify-logic-pure.mjs`（228）

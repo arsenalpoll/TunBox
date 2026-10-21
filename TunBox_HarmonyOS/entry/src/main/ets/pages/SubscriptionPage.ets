@@ -346,6 +346,13 @@ export struct SubscriptionPage {
   /** 长按删除单个节点目标（确认框标题展示用） */
   @State deleteNodeTargetName: string = '';
   private deleteNodeTargetId: string = '';
+  /**
+   * 批量多选（2026-10-20，与节点页同一交互）：长按任一节点卡片进入选择态，
+   * 卡片左上角圆圈变成勾选，底部浮出「取消 · 已选 N · 全选 · 删除」操作条。
+   * 删除复用 SubscriptionService.removeNode（本地屏蔽台账：刷新后不再出现）。
+   */
+  @State nodeSelectMode: boolean = false;
+  @State selectedNodeIds: string[] = [];
   @State spinTick: number = 0;
   private service: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
@@ -360,12 +367,12 @@ export struct SubscriptionPage {
       }
     })
   });
-  /** 长按节点后的单节点删除确认框（复用 SubscriptionService.removeNode） */
+  /** 删除确认框（单个/批量共用：getNodeName 传的是节点名或「A、B、C 等 N 个节点」摘要） */
   private deleteNodeDialog: CustomDialogController = new CustomDialogController({
     builder: NodeDeleteConfirmDialog({
       getNodeName: (): string => this.deleteNodeTargetName,
       onConfirm: () => {
-        this.doDeleteNode();
+        this.doDeleteSelectedNodes();
       }
     }),
     autoCancel: true
@@ -503,10 +510,14 @@ export struct SubscriptionPage {
       Row({ space: 6 }) {
         Stack({ alignContent: Alignment.Center }) {
           Circle({ width: 16, height: 16 })
-            .fill(node.id === this.activeNodeId ? TunBoxColors.primary : Color.Transparent)
-            .stroke(node.id === this.activeNodeId ? TunBoxColors.primary : TunBoxColors.textMuted)
+            .fill(this.nodeSelectMode
+              ? (this.isNodeSelected(node.id) ? TunBoxColors.primary : Color.Transparent)
+              : (node.id === this.activeNodeId ? TunBoxColors.primary : Color.Transparent))
+            .stroke(this.nodeSelectMode
+              ? (this.isNodeSelected(node.id) ? TunBoxColors.primary : TunBoxColors.textMuted)
+              : (node.id === this.activeNodeId ? TunBoxColors.primary : TunBoxColors.textMuted))
             .strokeWidth(1.6)
-          if (node.id === this.activeNodeId) {
+          if (this.nodeSelectMode ? this.isNodeSelected(node.id) : node.id === this.activeNodeId) {
             Circle({ width: 5, height: 5 }).fill(TunBoxColors.textOnPrimary)
           }
         }.width(16).height(16)
@@ -541,13 +552,23 @@ export struct SubscriptionPage {
       width: node.id === this.activeNodeId ? 1.5 : 1,
       color: node.id === this.activeNodeId ? TunBoxColors.primary : TunBoxColors.cardBorder
     })
-    .onClick(() => this.selectNode(node))
-    // 长按弹出单节点删除确认框（与节点页长按删除同语义）
+    .onClick(() => this.onNodeCardTap(node))
+    // 长按进入批量多选（2026-10-20）：先勾上被长按的这个节点
     .gesture(LongPressGesture().onAction(() => {
-      this.deleteNodeTargetId = node.id;
-      this.deleteNodeTargetName = node.name;
-      this.deleteNodeDialog.open();
+      if (this.nodeSelectMode) {
+        return;
+      }
+      this.enterNodeSelectMode(node.id);
     }))
+  }
+
+  /** 选择态下点卡片 = 勾选/取消；平时 = 选中该节点为当前出口 */
+  private onNodeCardTap(node: ProxyNode): void {
+    if (this.nodeSelectMode) {
+      this.toggleSelectedNode(node.id);
+      return;
+    }
+    this.selectNode(node);
   }
 
   private isOpen(id: string): boolean {
@@ -1061,6 +1082,96 @@ export struct SubscriptionPage {
    * - 删除的是当前选中节点时清空偏好（所有消费方都有 nodes[0] 兜底），并同步
    *   页面态 activeNodeId/activeSubId，避免状态卡仍显示已删节点。
    */
+  // ── 批量多选：状态流转（2026-10-20）────────────────────────────────────
+
+  private enterNodeSelectMode(nodeId: string): void {
+    this.nodeSelectMode = true;
+    this.selectedNodeIds = [nodeId];
+  }
+
+  private exitNodeSelectMode(): void {
+    this.nodeSelectMode = false;
+    this.selectedNodeIds = [];
+  }
+
+  private isNodeSelected(nodeId: string): boolean {
+    return this.selectedNodeIds.indexOf(nodeId) >= 0;
+  }
+
+  private toggleSelectedNode(nodeId: string): void {
+    const index = this.selectedNodeIds.indexOf(nodeId);
+    const next: string[] = this.selectedNodeIds.slice();
+    if (index >= 0) {
+      next.splice(index, 1);
+    } else {
+      next.push(nodeId);
+    }
+    this.selectedNodeIds = next;
+  }
+
+  /** 全选/取消全选：范围 = 当前已展开订阅里的全部节点（未展开的不在视野里，不误选） */
+  private toggleSelectAllNodes(): void {
+    const ids: string[] = [];
+    for (const sub of this.subs) {
+      if (this.isOpen(sub.id)) {
+        for (const node of this.nodesSortedByLatency(sub.id)) {
+          ids.push(node.id);
+        }
+      }
+    }
+    this.selectedNodeIds = this.selectedNodeIds.length >= ids.length ? [] : ids;
+  }
+
+  private confirmDeleteSelectedNodes(): void {
+    if (this.selectedNodeIds.length === 0) {
+      return;
+    }
+    const names: string[] = [];
+    for (const id of this.selectedNodeIds) {
+      const node = this.service.findNode(id);
+      if (node !== null) {
+        names.push(`「${node.name}」`);
+      }
+    }
+    if (names.length === 0) {
+      this.exitNodeSelectMode();
+      return;
+    }
+    const head: string = names.slice(0, 3).join('、');
+    this.deleteNodeTargetName = names.length > 3 ? `${head} 等 ${names.length} 个节点` : head;
+    this.deleteNodeDialog.open();
+  }
+
+  /** 批量删除：逐个 removeNode（失败不中断，最后汇报成功数） */
+  private async doDeleteSelectedNodes(): Promise<void> {
+    const ids: string[] = this.selectedNodeIds.slice();
+    if (ids.length === 0) {
+      return;
+    }
+    let removedCount = 0;
+    let activeRemoved = false;
+    for (const id of ids) {
+      if (this.activeNodeId === id) {
+        activeRemoved = true;
+      }
+      const ok = await this.service.removeNode(id);
+      if (ok) {
+        removedCount += 1;
+      }
+    }
+    if (activeRemoved) {
+      this.settings.preferredNodeId = '';
+      this.settings.preferredNodeSubscriptionId = '';
+      await SettingsService.save(this.settings);
+      this.activeNodeId = '';
+      this.activeSubId = '';
+    }
+    this.exitNodeSelectMode();
+    this.reload();
+    this.showToast(removedCount === ids.length ? `已删除 ${removedCount} 个节点`
+      : `已删除 ${removedCount}/${ids.length} 个（部分失败，可重试）`);
+  }
+
   private async doDeleteNode(): Promise<void> {
     const nodeId = this.deleteNodeTargetId;
     this.deleteNodeTargetId = '';
@@ -1585,6 +1696,45 @@ export struct SubscriptionPage {
         .alignItems(HorizontalAlign.Center)
         .hitTestBehavior(HitTestMode.None)
         .zIndex(20)
+      }
+      // ── 批量多选操作条（2026-10-20）：长按节点后浮在底部，对齐节点页交互 ──
+      if (this.nodeSelectMode) {
+        Row({ space: 10 }) {
+          Text('取消')
+            .fontSize(13).fontColor(TunBoxColors.textSecondary)
+            .height(36).padding({ left: 14, right: 14 })
+            .borderRadius(18).backgroundColor(TunBoxColors.chipBg)
+            .textAlign(TextAlign.Center)
+            .onClick(() => this.exitNodeSelectMode())
+          Text(`已选 ${this.selectedNodeIds.length}`)
+            .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+            .layoutWeight(1)
+          Text('全选')
+            .fontSize(13).fontColor(TunBoxColors.primary)
+            .height(36).padding({ left: 14, right: 14 })
+            .borderRadius(18).backgroundColor(TunBoxColors.chipBg)
+            .textAlign(TextAlign.Center)
+            .onClick(() => this.toggleSelectAllNodes())
+          Row({ space: 4 }) {
+            Image($r('app.media.ic_delete')).width(14).height(14)
+              .fillColor(this.selectedNodeIds.length > 0 ? TunBoxColors.danger : TunBoxColors.textMuted)
+            Text('删除').fontSize(13).fontWeight(FontWeight.Medium)
+              .fontColor(this.selectedNodeIds.length > 0 ? TunBoxColors.danger : TunBoxColors.textMuted)
+          }
+          .height(36).padding({ left: 14, right: 14 })
+          .borderRadius(18).backgroundColor(TunBoxColors.chipBg)
+          .onClick(() => this.confirmDeleteSelectedNodes())
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16 })
+        .margin({ left: 12, right: 12, bottom: 100 })
+        .height(52)
+        .backgroundColor(TunBoxColors.surfaceCard)
+        .borderRadius(20)
+        .borderWidth(1)
+        .borderColor(TunBoxColors.cardBorder)
+        .shadow({ radius: 14, color: TunBoxColors.toastShadow, offsetX: 0, offsetY: 4 })
+        .zIndex(30)
       }
     }
     .width('100%').height('100%')

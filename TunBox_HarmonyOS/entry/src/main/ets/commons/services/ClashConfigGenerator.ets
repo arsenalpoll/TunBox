@@ -3,7 +3,11 @@
  * 移植自 upstream: packages/ssrvpn_shared/lib/services/clash_config_generator.dart
  *
  * 关键约束（与 upstream 行为一致）：
- * - IPv4-only：DNS 不解析 AAAA，ipv6: false
+ * - DNS 恒接管（设置页无开关）：`dns.enable: true` + `tun.dns-hijack: any:53` +
+ *   VpnConfig.dnsAddresses 指向 TUN sentinel，三处同生同灭
+ * - IPv6 双栈由设置项 ipv6Enabled 决定（默认开）：开 ⇒ ipv6: true + dns.ipv6: true +
+ *   fake-ip-range6（假 v6 池落在 TUN 自己的 fdfe:dcba:9876::/64 内 ⇒ AAAA 返回隧道内地址，
+ *   v6 与 v4 一样走隧道/代理，设备侧没有直连 v6 路径）
  * - external-controller 仅绑定 127.0.0.1，secret 由调用方注入
  * - TUN 通过 VpnExtensionAbility 的 fd 注入，配置仅声明 tun.enable
  * - 国内直连规则 + 强制代理站点规则
@@ -164,13 +168,21 @@ export class ClashConfigGenerator {
     }
   }
 
+  /**
+   * 生成一份 mihomo YAML。
+   *
+   * `ipv6Enabled` 是 IPv6 双栈总开关（默认 true = 产品默认开）：生产路径由
+   * RuntimeConfigBuilder 从 `settings.ipv6Enabled` 传入，是**唯一**决策点；
+   * 默认值取 true 是为了让「忘了传参」的调用方也落在产品默认态上，而不是静默退回 IPv4-only。
+   */
   static generate(selectedNode: ProxyNode, allNodes: ProxyNode[], settings: AppSettings,
     mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
-    ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
+    ipv6Enabled: boolean = true, proxyHosts: Record<string, string> = {},
     tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = [],
     ruleProviderReady: boolean = true, useSmart: boolean = false,
     subscriptionRules: string[] = [], subscriptionRuleProviders: string = '',
-    smartTestUrl: string = ''): string {
+    smartTestUrl: string = '',
+    subscriptionDnsProxyServers: string[] = [], subscriptionDnsPolicies: string[][] = []): string {
     const lines: string[] = [];
 
     lines.push('mixed-port: ' + mixedPort);
@@ -183,10 +195,18 @@ export class ClashConfigGenerator {
     const level = (settings.coreLogLevel ?? '').trim().toLowerCase();
     lines.push('log-level: ' + (level === 'debug' || level === 'info' || level === 'error'
       || level === 'silent' ? level : 'warning'));
-    // 项目规格统一为 IPv4-only：同时关闭 mihomo 全局 IPv6 与 DNS AAAA，
-    // 配合 VpnExtensionAbility 的 IPv4-only TUN，消除 IPv6 绕过及泄漏通道。
-    lines.push('ipv6: false');
-    lines.push('disable-ipv6: true');
+    // ── IPv6 双栈（设置页开关，默认开）──
+    // 顶层 `ipv6` 是 mihomo 的**唯一总闸**：它同时决定出站 v6 解析与 DNS 侧 v6，
+    // 并由 hub/executor/executor.go:108 传给 updateDNS(cfg.DNS, cfg.General.IPv6)。
+    // TUN 侧的 v6 地址与 ::/0 路由由 VpnExtensionAbility 读**同一份 YAML 的这一行**安装，
+    // 两处必须同源，否则会出现「内核不认 v6、流量却被塞进 TUN」的死路。
+    //
+    // 【2026-10-20 删掉 `disable-ipv6: true`】那不是 mihomo 的合法顶层键（RawConfig
+    // 无此字段；只有 dns/util.go:213 的 warp 客户端参数表里有同名项）。mihomo 用非
+    // strict 的 yaml.Unmarshal（config/config.go:646）⇒ 未知键**静默忽略**。实测：
+    // 往配置里塞 totally-bogus-key 后 `mihomo.exe -t` 仍报 test successful。它从来没
+    // 起过作用，留着只会让人误以为「IPv6 已经被关掉了」——真正生效的只有本行与 dns.ipv6。
+    lines.push('ipv6: ' + (ipv6Enabled ? 'true' : 'false'));
     // 【unified-delay: true · 2026-10-20 二次取证修正】
     //
     // mihomo `adapter/adapter.go:202-278`（URLTest）的事实：
@@ -226,163 +246,43 @@ export class ClashConfigGenerator {
     // `find-process-mode: off` 与 `find-process-mode: "off"` 内核都接受）。
     lines.push('find-process-mode: "off"');
     lines.push('');
-    lines.push('dns:');
-    lines.push('  enable: true');
-    lines.push(`  listen: 127.0.0.1:${dnsPort}`);
-    lines.push('  ipv6: false');
-    lines.push('  enhanced-mode: fake-ip');
-    lines.push('  cache-algorithm: arc');
-    lines.push('  fake-ip-range: 198.18.0.1/16');
-    // DNS 上游必须用裸 IP(不走引导解析): 用域名会引发解析死锁 ——
-    // 解析 DoH 域名 → DoH 请求 → 又需要域名 → 回环超时(真机 core.log 实证)。
-    // 这里只承担"引导"职责(给需要按域名寻址的上游解析地址)，不承担业务解析。
-    lines.push('  default-nameserver:');
-    lines.push('    - 223.5.5.5');
-    lines.push('    - 119.29.29.29');
-    // ── 防泄露核心：业务解析全部走**加密**上游，且**不**强制走代理链 ──
-    //
-    // 【为什么业务解析必须加密】
-    // 改前 nameserver 是 223.5.5.5/119.29.29.29 的明文 UDP/53。内核
-    // config.Parse 时 respect-rules=false → dns_dialer 裸 dial，于是用户访问的
-    // **每一个域名**都以明文 QNAME 走物理网卡发出去，连 fallback 已用加密 DoT
-    // 答过的境外域名也一样（nameserver 与 fallback 竞速，明文包早已发出）。
-    //
-    // 【为什么 primary 必须是国内解析器，且绝不能开 respect-rules】
-    // 这两条是 5.8.0 反馈「全局模式下华为应用商店加载失败」的根因，写死勿动：
-    //  1) 国内 CDN 的调度依赖**境内解析器返回的境内边缘节点**。若把海外解析器
-    //     设为 primary，appmarket.huawei.com / *.hicloud.com 这类**非 .cn 后缀**
-    //     的国内服务会被解析到境外边缘，应用商店自然加载不出来。
-    //  2) respect-rules: true 让 DNS 查询遵从分流规则；全局模式下所有流量走
-    //     GLOBAL 代理，于是连国内域名的 DNS 都被推到境外节点上问 —— 又慢又 geo 错。
-    // 正确做法是**只加密、不改路由**：DNS 仍然直连，只是不再用明文 UDP。
-    //
-    // 实测可达性与证书（2026-10 国内网络，本机逐个握手验签）：
-    //   tls://223.5.5.5:853   AliDNS  DoT  证书含 IP SAN=223.5.5.5  ✅ 直连可达
-    //   tls://1.12.12.12:853  DNSPod  DoT  证书含 IP SAN=1.12.12.12 ✅ 直连可达
-    //   https://1.1.1.1:443   Cloudflare DoH ❌ TCP 超时（国内不可直连）
-    //   https://8.8.8.8:443   Google    DoH ❌ TCP 超时（国内不可直连）
-    // 所以 primary 一律用国内 DoT；境外解析器只作 fallback，且必须走 853（853 实测可达）。
-    lines.push('  nameserver:');
-    lines.push('    - tls://223.5.5.5:853');
-    lines.push('    - tls://1.12.12.12:853');
-    // DIRECT 命中的域名专用上游：内核按 respectRules=false 单独构造 DirectResolver，
-    // 永远直连、永远不进 fake-ip，因此不存在"直连分支也走代理"的回环。
-    lines.push('  direct-nameserver:');
-    lines.push('    - tls://223.5.5.5:853');
-    lines.push('    - tls://1.12.12.12:853');
-    // direct-nameserver 不再套用下面的 nameserver-policy，避免策略把直连域名
-    // 又拽回代理侧解析。
-    lines.push('  direct-nameserver-follow-policy: false');
-    // ── fallback 与 geoip.metadb 强绑定（坑 40）──
-    // mihomo 的 `fallback` 一旦非空、且没有显式 `fallback-filter` 时，会套用默认
-    // `fallback-filter: {geoip: true, geoip-code: CN}`，于是在 config.Parse 阶段就
-    // 同步调用 RC.NewGEOIP → geodata.InitGeoIP() 去加载 MMDB。全新安装时
-    // geoip.metadb 不存在，内核会**在启动路径里**联网下载（github.com，国内直连
-    // 不可达），结果是启动静默阻塞到超时后直接
-    // `load GeoIP dns fallback filter error, can't download MMDB` → 配置解析失败、
-    // 内核永远起不来（真机 core.log 停在 "Can't find MMDB, start download"）。
-    // 注意这条路与 GEOIP 规则无关：即使已经按 useGeoip 去掉了 GEOIP 规则，
-    // 只要 fallback 还在，MMDB 依然会被加载 —— 所以 fallback 必须同受 useGeoip 约束。
-    // 降级语义：未就绪就整块不声明（内核走 nameserver 单路解析），后台补齐
-    // geoip.metadb 后下次连接自动恢复完整分流。
-    //
-    // fallback 只在「nameserver 的应答被判定为非 CN」时才采用（默认
-    // fallback-filter: geoip/cn），所以境外域名仍能拿到境外解析，不会被国内解析器
-    // 污染成假地址；国内域名走 primary，拿到的仍是境内边缘。
-    // 端点只留 1.1.1.1:853 一个，**刻意不加冗余**：2026-10 国内网络实测，
-    // 境外加密解析器里只有 Cloudflare 的 853 可直连（证书含 IP SAN=1.1.1.1）；
-    // 8.8.8.8 / 8.8.4.4 / 9.9.9.9 / 149.112.112.112 / 208.67.222.222 /
-    // 64.6.64.6 / 185.228.168.9 的 853 全部 TCP 超时，Cloudflare/Google 的
-    // 443(DoH) 同样超时。写多个不可达条目不是"冗余保险"，而是让**每个境外域名
-    // 解析都要多付一次连接超时**，反而拖慢首次打开。宁可单点但可达。
-    if (useGeoip) {
-      lines.push('  fallback:');
-      lines.push('    - tls://1.1.1.1:853');
-    }
-    // fallback 与 nameserver 竞速（命中国内即返回，避免 fallback 拖慢国内解析）。
-    lines.push('  strategy: prefer_ipv4');
-    lines.push('  disable-cache: false');
-    // 代理服务器域名的专用解析: 不走 fake-ip(否则内核拿 198.18.x.x 假地址拨号
-    // 代理服务器, 全部 i/o timeout —— 真机 core.log 实证), 用真实 DNS 直出。
-    // 内核以 respectRules=false 解析本项，且永不套 fake-ip，所以这是防
-    // 「解析代理域名 → 又需要代理解析代理域名」回环的关键，**不可删**。
-    //
-    // ## 2026-10-19 稳定性：明文 UDP/53 → 加密 DoT（**必须与 pin 策略同源**）
-    //
-    // 旧注释的前提是「这些域名在 UI 进程已被 DoH 预解析并写进 YAML hosts:，
-    // 运行期几乎不会被真的问到」，因此用明文 UDP 换取「DoT 抖动时仍可解析」的鲁棒性。
-    // 但 0.4.0 起 DoHResolver 改成「短 TTL 记录一律不 pin」（机场入口域名 TTL 实测
-    // 60~120s，见该文件头真机取证），于是这个前提**不再成立**：
-    // 绝大多数节点域名不会被写进 hosts:，内核运行期**必须自己解析它们**，
-    // 而明文 UDP/53 在国内网络会被投毒（实测：www.google.com 明文返回
-    // 185.45.5.35，DoH 返回 142.251.155.119）→ 拨代理服务器打到假 IP →
-    // 全部节点超时 → 「连上了但没有出口 / 公网 IP 查不到」。
-    //
-    // 所以这里改为与 `nameserver` 相同的**加密 DoT**（223.5.5.5 / 1.12.12.12，
-    // 均实测直连可达且证书含 IP SAN）。两个端点互为冗余，单点抖动仍可解析；
-    // 且 DoT 走 853/TCP，不经 UDP/53，不受投毒影响。
-    // ⚠ 与 DoHResolver 的 pin 策略是**同一件事的两面**：如果将来恢复「短 TTL 也 pin」，
-    //    这里才可以考虑退回明文（但没必要——加密只多几毫秒握手，且有缓存）。
-    lines.push('  proxy-server-nameserver:');
-    lines.push('    - tls://223.5.5.5:853');
-    lines.push('    - tls://1.12.12.12:853');
-    // ── 国内域名显式钉到国内加密 DoT ──
-    // direct-nameserver 已覆盖 DIRECT 分支，这里再加一层是为了让意图可审计、
-    // 且不依赖内核对 direct-nameserver 的适用面判断。
-    // 刻意只用**纯后缀**，不用 `geosite:` —— geosite/geodata 会在 config.Parse
-    // 阶段触发同步下载，正是坑 40 那个 90s 启动阻塞的同类。
-    lines.push('  nameserver-policy:');
-    lines.push('    "+.cn":');
-    lines.push('      - tls://223.5.5.5:853#DIRECT');
-    lines.push('    "+.com.cn":');
-    lines.push('      - tls://223.5.5.5:853#DIRECT');
-    lines.push('    "+.net.cn":');
-    lines.push('      - tls://223.5.5.5:853#DIRECT');
-    lines.push('    "+.org.cn":');
-    lines.push('      - tls://223.5.5.5:853#DIRECT');
-    lines.push('    "+.gov.cn":');
-    lines.push('      - tls://223.5.5.5:853#DIRECT');
-    // ── P0-3 DNS 层 REJECT 预匹配 ──
-    // 强制拦截网站在 nameserver-policy 里直接拒绝（rcode://refused）：DNS 查询
-    // 在解析层就拿到 NXDOMAIN/REFUSED，不建立 TCP 连接、不发出明文 QNAME、
-    // 不进入 fake-ip —— 比仅路由层 REJECT 少一次完整连接尝试（省电省流量）。
-    // mihomo nameserver-policy 值支持 rcode:// 协议（与 upstream 同位置解析）。
+    // ── DNS：恒接管，无开关（2026-10-21 产品定案）──
+    // 设置页的「DNS 覆写」开关已删除。`dns:` 整段由 pushDnsSection 恒产出，
+    // VpnExtensionAbility 恒把 VpnConfig.dnsAddresses 指向 TUN 内 sentinel，
+    // `tun.dns-hijack: any:53` 恒开 —— 三处同生同灭，不存在「内核跑 DNS 但设备
+    // 没指过来」或「设备指过来但内核没接管 ⇒ 全局解析黑洞」的中间态。
+    // 与 FlClash 同构：它也没有这个开关（VpnService.kt 恒设 DNS=198.18.0.2）。
+    // 强制拦截站点：DNS 层 REJECT 预匹配（nameserver-policy）与后面路由层兜底
+    // 共用同一份规范化结果 —— 只算一次，避免两处各自 normalize 出不同集合。
     const blockSites = ClashConfigGenerator.normalizeDomains(settings.forceBlockSites);
-    for (const site of blockSites) {
-      lines.push(`    "+.${site}": rcode://refused`);
-    }
-    // fake-ip 过滤：局域网/系统/直连目标不返回假 IP，避免误伤本地发现与测速。
-    // STUN / NTP / 反向解析 / 门户探活这一类必须给真实地址：给假地址会让它们
-    // 退化成一次无意义的明文 nameserver 查询，同时破坏连通性探测。
-    lines.push('  fake-ip-filter:');
-    lines.push('    - "*.lan"');
-    lines.push('    - "*.local"');
-    lines.push('    - "localhost"');
-    lines.push('    - "*.localhost"');
-    lines.push('    - "+.home.arpa"');
-    lines.push('    - "*.msftconnecttest.com"');
-    lines.push('    - "*.msftncsi.com"');
-    lines.push('    - "+.captive.apple.com"');
-    lines.push('    - "localhost.ptlogin2.qq.com"');
-    lines.push('    - "+.market.xiaomi.com"');
-    lines.push('    - "+.srv.nintendo.net"');
-    lines.push('    - "stun.*.*"');
-    lines.push('    - "+.stun.*.*"');
-    lines.push('    - "stun.l.google.com"');
-    lines.push('    - "+.pool.ntp.org"');
-    lines.push('    - "time.*"');
-    lines.push('    - "+.time.*"');
-    lines.push('    - "+.arpa"');
-    lines.push('    - "+.in-addr.arpa"');
-    lines.push('    - "+.ip6.arpa"');
-    lines.push('');
+    // 订阅自带的「代理域名解析上游」（2026-10-20「测速全部超时」定案）。
+    //
+    // 机场把「入口域名 → 真实入口 IP」只告诉自家私有 DoH（订阅1 在
+    // `dns.proxy-server-nameserver`，订阅2 在 `dns.nameserver-policy`）。此前生成器
+    // 把订阅 dns 整段丢弃、固定写公共 DoT ⇒ 入口域名解析成 Cloudflare / 阿里 WAF
+    // 前置 IP，那些 IP 上代理端口不通（18104–18503 TCP timeout）或不提供协议服务
+    // （4430 可握手但不服务 anytls/hy2/tuic）⇒ 节点全部超时。
+    //
+    // 真实内核单变量实验（Mihomo Meta 1.10.0，配置只差一行）：
+    // 订阅1 原样 20/23 通 → 删 `proxy-server-nameserver` 变 7/23；
+    // 订阅2 原样 30/36 → 删 `nameserver-policy` 变 0/36。
+    //
+    // 口径：**订阅给了就用订阅的**（与 FlClash 行为一致：它 dns-override 为空集、
+    // 订阅 dns 原样进内核）；订阅没给才回落到内置公共 DoT。
+    // policy 只保留后缀命中**本份配置的节点域名**的条目，不把机场针对其它域名的
+    // 策略带进用户的 DNS 策略里。
+    const subDnsServers = ClashConfigGenerator.normalizeNameservers(subscriptionDnsProxyServers);
+    const subDnsPolicies = ClashConfigGenerator.normalizeDnsPolicies(subscriptionDnsPolicies, allNodes);
+    ClashConfigGenerator.pushDnsSection(lines, settings, dnsPort, useGeoip, ipv6Enabled, blockSites,
+      subDnsServers, subDnsPolicies);
     // ── 域名嗅探（对齐 Clash Verge / FlClash 默认开启的 sniffer）──────────────
-    // fake-ip 模式下内核拿到的目标地址是 198.18.x.x，DOMAIN 类规则依赖 DNS 映射反查；
-    // TLS ClientHello SNI 与 DNS 记录不一致（CDN、直连 IP、QUIC）时必须靠嗅探还原
-    // 真实域名才能正确命中 DOMAIN/GEOIP 规则。键位以本仓库内核源码 config.go 的
-    // RawSniffer 为准：顶层 sniffer 键，sniff 为「协议名 → 配置」map（键必须是大写
-    // 规范名 HTTP/TLS/QUIC，见 parseSniffer 的大小写匹配逻辑），空值 {} = 继承全局
-    // override-destination；parse-pure-ip 让纯 IP 直连流量同样被嗅探。
+    // ── 澄清：redir-host（2026-10-21 起）下内核拿到的是**真实**目标 IP，
+    // DOMAIN 类规则靠 redir-host 映射（dns/middleware.go:99 withMapping 记录 IP→域名）
+    // 反查；TLS ClientHello SNI 与 DNS 记录不一致（CDN、直连 IP、QUIC）时仍靠嗅探
+    // 还原真实域名，force-dns-mapping 让映射在嗅探后依然生效。键位以本仓库内核源码
+    // config.go 的 RawSniffer 为准：顶层 sniffer 键，sniff 为「协议名 → 配置」map
+    // （键必须是大写规范名 HTTP/TLS/QUIC，见 parseSniffer 的大小写匹配逻辑），空值 {}
+    // = 继承全局 override-destination；parse-pure-ip 让纯 IP 直连流量同样被嗅探。
     if (settings.sniffingEnabled !== false) {
       lines.push('sniffer:');
       lines.push('  enable: true');
@@ -400,19 +300,22 @@ export class ClashConfigGenerator {
     // 【C22】键名是 store-selected（mihomo RawConfig.Profile.StoreSelected），
     // 旧写法 store-selections 是**错键** → 内核不认 → 「记住选择」静默失效。
     lines.push('  store-selected: true');
-    lines.push('  store-fake-ip: true');
     lines.push('');
     lines.push('tun:');
     // headless 测速模式: tun.enable=false, 内核只开 mixed/API 端口, 不建隧道不碰 VPN 权限
     lines.push('  enable: ' + (tunEnabled ? 'true' : 'false'));
     lines.push('  stack: gvisor');  // fd 注入 + 沙箱无 iptables, 只有 gvisor 可用
-    // DNS 覆写(TUN 层): 所有目标端口 53 的 DNS 请求一律劫持进内核解析。
+    // DNS 接管(TUN 层): 所有目标端口 53 的 DNS 请求一律劫持进内核解析。
+    // 与 `dns.enable` 恒同开：内核 DNS 恒启用（设置页已无此开关），设备侧的
+    // VpnConfig.dnsAddresses 也恒指向 sentinel —— 三处必须同步，否则劫持到的查询
+    // 没人应答，设备原本正常的系统 DNS 会被打断。
     lines.push('  dns-hijack:');
     lines.push('    - any:53');
     lines.push('  auto-route: false');   // 路由由 VpnExtensionAbility 安装（默认路由 = 系统级 Kill Switch）
     lines.push('  auto-detect-interface: false');
     // 说明：strict-route 依赖 nftables/iptables，OHOS gvisor+fd 注入沙箱不可用，
-    // 故不启用；Kill Switch 由 Extension 的 IPv4-only 默认路由 + 内核存活监控保证。
+    // 故不启用；Kill Switch 由 Extension 的默认路由（IPv4 0.0.0.0/0 + 可选 IPv6 ::/0）
+    // 与内核存活监控保证。
     lines.push('  mtu: 1400');          // 缺省值；Extension 按物理承载改写并下发 VpnConfig.mtu
     lines.push('');
     // ── hosts: 代理服务器域名的防投毒固定解析(UI 进程 DoH 预解析结果) ──
@@ -892,7 +795,7 @@ export class ClashConfigGenerator {
       }
     }
     // P0-3 路由层兜底：SNI 嗅探/纯 IP 直连等不经过 DNS 解析的路径仍可能到达
-    // 被拦截域名（fake-ip 被绕过时），这里再拦一次。与 DNS 层条目同源
+    // 被拦截域名（DNS 层的 rcode://refused 没经过时），这里再拦一次。与 DNS 层条目同源
     // （settings.forceBlockSites），DIRECT 域名优先级更高（不生成冲突规则）。
     for (const site of blockSites) {
       if (!directSites.includes(site)) {
@@ -993,6 +896,262 @@ export class ClashConfigGenerator {
    * 用户只看到「覆盖层没生效」却没有任何线索。现在返回值语义不变（false =
    * 整段不生效），但会 AppLogger.warn 出具体被拒的键名。
    */
+
+  /**
+   * DNS 段（全仓唯一写入点）：`dns:` 整块由本方法产出。
+   *
+   * 2026-10-21：设置页「DNS 覆写」开关已删除 —— 本方法**恒被调用**，`enable: true` 恒写。
+   * 设备侧（VpnConfig.dnsAddresses）与 `tun.dns-hijack` 也恒开，三处同生同灭。
+   *
+   * 调用点只允许 generate() 一处（隧道与测速核共用同一份 dns 段；
+   * 闸门 verify-config-single-source 会比对两份产物的一致性）。
+   */
+  private static pushDnsSection(lines: string[], settings: AppSettings, dnsPort: number,
+    useGeoip: boolean, ipv6Enabled: boolean, blockSites: string[],
+    subDnsServers: string[] = [], subDnsPolicies: string[][] = []): void {
+    lines.push('dns:');
+    lines.push('  enable: true');
+    lines.push(`  listen: 127.0.0.1:${dnsPort}`);
+    // dns.ipv6 = 是否让内核解析器返回 AAAA，与顶层 ipv6（TUN 双栈/出站 v6）
+    // 由**同一个**「IPv6 双栈」开关驱动。
+    //
+    // ⚠ 2026-10-21 二次定案：enhanced-mode 回到 fake-ip，并且 ipv6 开时**必须**同时下发
+    // fake-ip-range6 —— 这是「v6 也走代理」在本平台唯一可行的形态：
+    //   · 平台会丢弃 VpnConfig.routes 里的所有 v6 条目（::/0 三种写法 + fc00::/71 实测全被
+    //     静默丢弃），但**会**按 LinkAddress 的前缀派生 on-link 路由。真机对账
+    //     /proc/net/ipv6_route：地址写 /126 时 vpn-tun 只有 fdfe:dcba:9876::/126；
+    //     把前缀改成 /64 后立刻出现 `fdfe:dcba:9876::/64 ... vpn-tun`。
+    //   · 于是把假 v6 池放进 TUN 自己那个 /64：AAAA 返回假 v6 → 命中 on-link 路由 →
+    //     进隧道 → 内核按域名交给代理拨号。v6 目标由**代理出口**解析并连接，
+    //     设备侧不存在任何直连 v6 路径（这正是旧 redir-host 方案做不到的：
+    //     真实 AAAA 只会把 v6 流量交给物理网卡）。
+    //   · 池的 gateway = masked+1 = fdfe:dcba:9876::1，正是 TUN 的 v6 地址
+    //     （component/fakeip/pool.go New：gateway = hostAddr.Next()）；首个假地址是 ::4，
+    //     与 TUN 地址/网关不冲突。
+    //   · ipv6 关时**不写** range6 ⇒ FakeIPPool6 == nil ⇒ AAAA 恒空
+    //     （middleware.go 的 withFakeIP：fakePool6 == nil 直接回空答案），与只装 v4 的
+    //     TUN 一致，不会出现「假 v6 发出去没人接」的黑洞。
+    // v4 侧继续用 198.18.0.1/16 假池（FlClash 同款），DOMAIN 规则靠 fake-ip 映射命中，
+    // sniffer.force-dns-mapping 仍然保留（SNI 与 DNS 不一致时兜底）。
+    lines.push('  ipv6: ' + (ipv6Enabled ? 'true' : 'false'));
+    lines.push('  enhanced-mode: fake-ip');
+    lines.push('  cache-algorithm: arc');
+    lines.push('  fake-ip-range: 198.18.0.1/16');
+    if (ipv6Enabled) {
+      lines.push('  fake-ip-range6: fdfe:dcba:9876::/64');
+    }
+    // DNS 上游必须用裸 IP(不走引导解析): 用域名会引发解析死锁 ——
+    // 解析 DoH 域名 → DoH 请求 → 又需要域名 → 回环超时(真机 core.log 实证)。
+    // 这里只承担"引导"职责(给需要按域名寻址的上游解析地址)，不承担业务解析。
+    lines.push('  default-nameserver:');
+    lines.push('    - 223.5.5.5');
+    lines.push('    - 119.29.29.29');
+    // ── 防泄露核心：业务解析全部走**加密**上游，且**不**强制走代理链 ──
+    //
+    // 【为什么业务解析必须加密】
+    // 改前 nameserver 是 223.5.5.5/119.29.29.29 的明文 UDP/53。内核
+    // config.Parse 时 respect-rules=false → dns_dialer 裸 dial，于是用户访问的
+    // **每一个域名**都以明文 QNAME 走物理网卡发出去，连 fallback 已用加密 DoT
+    // 答过的境外域名也一样（nameserver 与 fallback 竞速，明文包早已发出）。
+    //
+    // 【为什么 primary 必须是国内解析器，且绝不能开 respect-rules】
+    // 这两条是 5.8.0 反馈「全局模式下华为应用商店加载失败」的根因，写死勿动：
+    //  1) 国内 CDN 的调度依赖**境内解析器返回的境内边缘节点**。若把海外解析器
+    //     设为 primary，appmarket.huawei.com / *.hicloud.com 这类**非 .cn 后缀**
+    //     的国内服务会被解析到境外边缘，应用商店自然加载不出来。
+    //  2) respect-rules: true 让 DNS 查询遵从分流规则；全局模式下所有流量走
+    //     GLOBAL 代理，于是连国内域名的 DNS 都被推到境外节点上问 —— 又慢又 geo 错。
+    // 正确做法是**只加密、不改路由**：DNS 仍然直连，只是不再用明文 UDP。
+    //
+    // 实测可达性与证书（2026-10 国内网络，本机逐个握手验签）：
+    //   tls://223.5.5.5:853   AliDNS  DoT  证书含 IP SAN=223.5.5.5  ✅ 直连可达
+    //   tls://1.12.12.12:853  DNSPod  DoT  证书含 IP SAN=1.12.12.12 ✅ 直连可达
+    //   https://1.1.1.1:443   Cloudflare DoH ❌ TCP 超时（国内不可直连）
+    //   https://8.8.8.8:443   Google    DoH ❌ TCP 超时（国内不可直连）
+    // 所以 primary 一律用国内 DoT；境外解析器只作 fallback，且必须走 853（853 实测可达）。
+    lines.push('  nameserver:');
+    lines.push('    - tls://223.5.5.5:853');
+    lines.push('    - tls://1.12.12.12:853');
+    // DIRECT 命中的域名专用上游：内核按 respectRules=false 单独构造 DirectResolver，
+    // 永远直连、不经过代理链，因此不存在"直连分支也走代理"的回环。
+    lines.push('  direct-nameserver:');
+    lines.push('    - tls://223.5.5.5:853');
+    lines.push('    - tls://1.12.12.12:853');
+    // direct-nameserver 不再套用下面的 nameserver-policy，避免策略把直连域名
+    // 又拽回代理侧解析。
+    lines.push('  direct-nameserver-follow-policy: false');
+    // ── fallback 与 geoip.metadb 强绑定（坑 40）──
+    // mihomo 的 `fallback` 一旦非空、且没有显式 `fallback-filter` 时，会套用默认
+    // `fallback-filter: {geoip: true, geoip-code: CN}`，于是在 config.Parse 阶段就
+    // 同步调用 RC.NewGEOIP → geodata.InitGeoIP() 去加载 MMDB。全新安装时
+    // geoip.metadb 不存在，内核会**在启动路径里**联网下载（github.com，国内直连
+    // 不可达），结果是启动静默阻塞到超时后直接
+    // `load GeoIP dns fallback filter error, can't download MMDB` → 配置解析失败、
+    // 内核永远起不来（真机 core.log 停在 "Can't find MMDB, start download"）。
+    // 注意这条路与 GEOIP 规则无关：即使已经按 useGeoip 去掉了 GEOIP 规则，
+    // 只要 fallback 还在，MMDB 依然会被加载 —— 所以 fallback 必须同受 useGeoip 约束。
+    // 降级语义：未就绪就整块不声明（内核走 nameserver 单路解析），后台补齐
+    // geoip.metadb 后下次连接自动恢复完整分流。
+    //
+    // fallback 只在「nameserver 的应答被判定为非 CN」时才采用（默认
+    // fallback-filter: geoip/cn），所以境外域名仍能拿到境外解析，不会被国内解析器
+    // 污染成假地址；国内域名走 primary，拿到的仍是境内边缘。
+    // 端点只留 1.1.1.1:853 一个，**刻意不加冗余**：2026-10 国内网络实测，
+    // 境外加密解析器里只有 Cloudflare 的 853 可直连（证书含 IP SAN=1.1.1.1）；
+    // 8.8.8.8 / 8.8.4.4 / 9.9.9.9 / 149.112.112.112 / 208.67.222.222 /
+    // 64.6.64.6 / 185.228.168.9 的 853 全部 TCP 超时，Cloudflare/Google 的
+    // 443(DoH) 同样超时。写多个不可达条目不是"冗余保险"，而是让**每个境外域名
+    // 解析都要多付一次连接超时**，反而拖慢首次打开。宁可单点但可达。
+    if (useGeoip) {
+      lines.push('  fallback:');
+      lines.push('    - tls://1.1.1.1:853');
+    }
+    // fallback 与 nameserver 竞速（命中国内即返回，避免 fallback 拖慢国内解析）。
+    lines.push('  strategy: prefer_ipv4');
+    lines.push('  disable-cache: false');
+    // 代理服务器域名的专用解析: 必须拿到真实地址(不能被本地假池/污染答案带偏，
+    // 否则内核拿假 IP 拨代理服务器 → 全部 i/o timeout —— 真机 core.log 实证)，
+    // 用真实 DNS 直出。内核以 respectRules=false 解析本项，所以这是防
+    // 「解析代理域名 → 又需要代理解析代理域名」回环的关键，**不可删**。
+    //
+    // ## 2026-10-19 稳定性：明文 UDP/53 → 加密 DoT（**必须与 pin 策略同源**）
+    //
+    // 旧注释的前提是「这些域名在 UI 进程已被 DoH 预解析并写进 YAML hosts:，
+    // 运行期几乎不会被真的问到」，因此用明文 UDP 换取「DoT 抖动时仍可解析」的鲁棒性。
+    // 但 0.4.0 起 DoHResolver 改成「短 TTL 记录一律不 pin」（机场入口域名 TTL 实测
+    // 60~120s，见该文件头真机取证），于是这个前提**不再成立**：
+    // 绝大多数节点域名不会被写进 hosts:，内核运行期**必须自己解析它们**，
+    // 而明文 UDP/53 在国内网络会被投毒（实测：www.google.com 明文返回
+    // 185.45.5.35，DoH 返回 142.251.155.119）→ 拨代理服务器打到假 IP →
+    // 全部节点超时 → 「连上了但没有出口 / 公网 IP 查不到」。
+    //
+    // 所以这里改为与 `nameserver` 相同的**加密 DoT**（223.5.5.5 / 1.12.12.12，
+    // 均实测直连可达且证书含 IP SAN）。两个端点互为冗余，单点抖动仍可解析；
+    // 且 DoT 走 853/TCP，不经 UDP/53，不受投毒影响。
+    // ⚠ 与 DoHResolver 的 pin 策略是**同一件事的两面**：如果将来恢复「短 TTL 也 pin」，
+    //    这里才可以考虑退回明文（但没必要——加密只多几毫秒握手，且有缓存）。
+    lines.push('  proxy-server-nameserver:');
+    if (subDnsServers.length > 0) {
+      // 订阅自带的上游优先：机场把入口域名的真实 IP 只告诉自家私有 DoH，
+      // 用公共 DNS 解析出来的是 Cloudflare / WAF 前置 IP（代理端口不通）。
+      // 这里**整段替换**而不是与公共 DoT 混排 —— mihomo 对同一层多个上游是
+      // 并发取首个成功应答，混进公共 DNS 会让错答案抢跑（等于没修）。
+      for (const server of subDnsServers) {
+        lines.push(`    - "${ClashConfigGenerator.escapeYaml(server)}"`);
+      }
+    } else if (subDnsPolicies.length > 0) {
+      // ⚠ 订阅只给了 `nameserver-policy`（pronetwork 系面板）、没给
+      // `proxy-server-nameserver` 时，这里**必须写空列表** —— 不能回落到公共 DoT。
+      // 原因是 mihomo 的解析器选择逻辑（hub/executor/executor.go:304-307）：
+      // `proxy-server-nameserver` 非空 ⇒ 代理服务器域名走**专用解析器**，而专用解析器
+      // **不查 nameserver-policy**；为空 ⇒ 退回主解析器，`nameserver-policy` 才会生效。
+      // 订阅2 实测：保留 DoT 时 `31se.jushuitan.com` 被解析成阿里 WAF 60.205.172.133
+      // （全部超时）；删掉这行后主解析器按 policy 走私有 DoH，30/36 恢复。
+      lines.push('    # 订阅用 DNS 策略指定入口域名上游；此处留空让 policy 生效');
+    } else {
+      lines.push('    - tls://223.5.5.5:853');
+      lines.push('    - tls://1.12.12.12:853');
+    }
+    // ── 国内域名显式钉到国内加密 DoT ──
+    // direct-nameserver 已覆盖 DIRECT 分支，这里再加一层是为了让意图可审计、
+    // 且不依赖内核对 direct-nameserver 的适用面判断。
+    // 刻意只用**纯后缀**，不用 `geosite:` —— geosite/geodata 会在 config.Parse
+    // 阶段触发同步下载，正是坑 40 那个 90s 启动阻塞的同类。
+    lines.push('  nameserver-policy:');
+    lines.push('    "+.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.com.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.net.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.org.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    lines.push('    "+.gov.cn":');
+    lines.push('      - tls://223.5.5.5:853#DIRECT');
+    // ── P0-3 DNS 层 REJECT 预匹配 ──
+    // 强制拦截网站在 nameserver-policy 里直接拒绝（rcode://refused）：DNS 查询
+    // 在解析层就拿到 NXDOMAIN/REFUSED，不建立 TCP 连接、不发出明文 QNAME ——
+    // 比仅路由层 REJECT 少一次完整连接尝试（省电省流量）。
+    // mihomo nameserver-policy 值支持 rcode:// 协议（与 upstream 同位置解析）。
+    // blockSites 由调用方 generate() 规范化后传入：后面路由层的兜底规则用同一份。
+    for (const site of blockSites) {
+      lines.push(`    "+.${site}": rcode://refused`);
+    }
+    // ── 订阅自带的入口域名策略（2026-10-20「测速全部超时」定案）──
+    // 订阅2（pronetwork 系面板）没有 `proxy-server-nameserver`，它靠
+    // `nameserver-policy` 把 `+.jushuitan.com` 这类入口域名指向自家私有 DoH；
+    // 丢掉这条策略 ⇒ 公共 DNS 把入口解析到阿里云 WAF 前置 IP（4430 能握手但
+    // 不服务 anytls/hy2/tuic）⇒ 0/36 全部失败。保留后 30/36 恢复。
+    //
+    // 只写「后缀命中本份配置节点域名」的条目（过滤在 normalizeDnsPolicies 做）。
+    // 与上面内置的 .cn 系列去重：YAML mapping 重复键会被内核整份拒载。
+    const usedPolicySuffixes: Set<string> = new Set<string>();
+    usedPolicySuffixes.add('+.cn');
+    usedPolicySuffixes.add('+.com.cn');
+    usedPolicySuffixes.add('+.net.cn');
+    usedPolicySuffixes.add('+.org.cn');
+    usedPolicySuffixes.add('+.gov.cn');
+    for (const site of blockSites) {
+      usedPolicySuffixes.add(`+.${site}`);
+    }
+    // 同一后缀可能有多个上游（机场给两个私有 DoH 互为冗余）→ 合并成**一个**
+    // YAML 键 + 多值列表（重复键会被内核整份拒载，绝不能逐条 push 同名键）。
+    const policyServers: Map<string, string[]> = new Map<string, string[]>();
+    const policyOrder: string[] = [];
+    for (const pair of subDnsPolicies) {
+      const suffix = pair[0];
+      const server = pair[1];
+      if (suffix.length === 0 || server.length === 0 || usedPolicySuffixes.has(suffix)) {
+        continue;
+      }
+      let list = policyServers.get(suffix);
+      if (list === undefined) {
+        list = [];
+        policyServers.set(suffix, list);
+        policyOrder.push(suffix);
+      }
+      if (!list.includes(server)) {
+        list.push(server);
+      }
+    }
+    for (const suffix of policyOrder) {
+      const list = policyServers.get(suffix);
+      if (list === undefined || list.length === 0) {
+        continue;
+      }
+      usedPolicySuffixes.add(suffix);
+      lines.push(`    "${ClashConfigGenerator.escapeYaml(suffix)}":`);
+      for (const server of list) {
+        lines.push(`      - "${ClashConfigGenerator.escapeYaml(server)}"`);
+      }
+    }
+    // fake-ip 过滤：局域网/系统/直连目标必须拿**真实**地址 —— 给假地址会让
+    // 本地发现、STUN 打洞、NTP 校时、门户探活全部退化成一次无意义的查询。
+    // fake-ip 模式下这是唯一放行手段，**不可删**。
+    lines.push('  fake-ip-filter:');
+    lines.push('    - "*.lan"');
+    lines.push('    - "*.local"');
+    lines.push('    - "localhost"');
+    lines.push('    - "*.localhost"');
+    lines.push('    - "+.home.arpa"');
+    lines.push('    - "*.msftconnecttest.com"');
+    lines.push('    - "*.msftncsi.com"');
+    lines.push('    - "+.captive.apple.com"');
+    lines.push('    - "localhost.ptlogin2.qq.com"');
+    lines.push('    - "+.market.xiaomi.com"');
+    lines.push('    - "+.srv.nintendo.net"');
+    lines.push('    - "stun.*.*"');
+    lines.push('    - "+.stun.*.*"');
+    lines.push('    - "stun.l.google.com"');
+    lines.push('    - "+.pool.ntp.org"');
+    lines.push('    - "time.*"');
+    lines.push('    - "+.time.*"');
+    lines.push('    - "+.arpa"');
+    lines.push('    - "+.in-addr.arpa"');
+    lines.push('    - "+.ip6.arpa"');
+    lines.push('');
+  }
+
   static validateYamlOverride(text: string): boolean {
     if (text.length > 8 * 1024) {
       AppLogger.warn(TAG, 'yaml override rejected: exceeds 8KB limit (whole override ignored)');
@@ -1257,7 +1416,10 @@ export class ClashConfigGenerator {
     'mixed-port', 'port', 'socks-port', 'redir-port', 'tproxy-port', 'mixed-port-range',
     'external-controller', 'external-controller-cors', 'external-controller-tls',
     'external-ui', 'external-ui-name', 'external-ui-url', 'secret',
-    'mode', 'log-level', 'ipv6', 'disable-ipv6', 'unified-delay', 'tcp-concurrent',
+    'mode', 'log-level', 'ipv6', 'unified-delay', 'tcp-concurrent',
+    // ⚠ 这里刻意**没有** `disable-ipv6`：它不是 mihomo 的顶层键（RawConfig 无此字段），
+    // 写进覆盖层只会被非 strict 的 yaml.Unmarshal 静默忽略。列在这里会让它被当成
+    // 「已知键」而不告警，用户便以为已经关了 IPv6 —— 去掉后写入会得到 unknown-key 警告。
     'keep-alive-idle', 'keep-alive-interval', 'udp-timeout', 'find-process-mode',
     'allow-lan', 'bind-address', 'disable-keep-alive', 'authentication', 'listeners',
     'interface-name', 'routing-mark', 'global-client-fingerprint', 'geodata-mode',
@@ -2470,6 +2632,154 @@ export class ClashConfigGenerator {
   }
 
   /** 规范化域名列表并去重，忽略无法安全表达的条目。 */
+  /**
+   * 规范化订阅给的 DNS 上游列表（单一真源：写入 YAML 前的唯一白名单关口）。
+   *
+   * 只放行内核认识的写法，并**拒绝**任何可能破坏 YAML 行结构的字符（空格/引号/
+   * 反斜杠/逗号/括号）—— 订阅内容是不可信输入，拼进 YAML 前必须先过关。
+   */
+  static normalizeNameservers(values: string[]): string[] {
+    const out: string[] = [];
+    const seen: Set<string> = new Set<string>();
+    for (const raw of values) {
+      const value = ClashConfigGenerator.normalizeNameserver(raw);
+      if (value.length === 0 || seen.has(value)) {
+        continue;
+      }
+      if (out.length >= 8) {
+        break;
+      }
+      seen.add(value);
+      out.push(value);
+    }
+    return out;
+  }
+
+  /** 单个上游的校验（合法返回原值，非法返回空串） */
+  static normalizeNameserver(raw: string): string {
+    const value = raw.trim();
+    if (value.length === 0 || value.length > 512) {
+      return '';
+    }
+    for (let i = 0; i < value.length; i++) {
+      const ch = value.charAt(i);
+      if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '"' || ch === '\''
+        || ch === '\\' || ch === ',' || ch === '[' || ch === ']' || ch === '{' || ch === '}') {
+        return '';
+      }
+    }
+    const lower = value.toLowerCase();
+    const schemes: string[] = ['https://', 'tls://', 'quic://', 'h3://', 'udp://', 'tcp://'];
+    for (const scheme of schemes) {
+      if (lower.startsWith(scheme)) {
+        return value;
+      }
+    }
+    if (lower === 'system' || lower.startsWith('dhcp://')) {
+      return value;
+    }
+    // 裸 IPv4（可选端口）也接受：机场私有 DNS 常直接给 IP:port
+    if (/^\d{1,3}(\.\d{1,3}){3}(:\d{1,5})?$/.test(value)) {
+      return value;
+    }
+    return '';
+  }
+
+  /**
+   * 规范化订阅的 `nameserver-policy` 条目：[后缀, 上游]。
+   *
+   * @param pairs 订阅里提取出的 [后缀, 上游] 对（可能是 `+.domain` / `*.domain` / 裸域名）
+   * @param nodes 本份配置的全部节点（用于判断「这条策略是不是机场自己的入口域名」）
+   *
+   * 只保留命中节点域名的条目：机场常在 policy 里顺手写别的机场/自用域名，
+   * 那些与本 App 无关，注入进用户 DNS 策略属于越界。
+   */
+  static normalizeDnsPolicies(pairs: string[][], nodes: ProxyNode[]): string[][] {
+    const domains: string[] = [];
+    const seenDomain: Set<string> = new Set<string>();
+    for (const node of nodes) {
+      const server = (node.server ?? '').trim().toLowerCase();
+      if (server.length === 0 || seenDomain.has(server)) {
+        continue;
+      }
+      seenDomain.add(server);
+      domains.push(server);
+    }
+    const out: string[][] = [];
+    const seenPair: Set<string> = new Set<string>();
+    const suffixCount: Map<string, number> = new Map<string, number>();
+    for (const pair of pairs) {
+      if (pair.length < 2) {
+        continue;
+      }
+      const suffix = ClashConfigGenerator.normalizePolicySuffix(pair[0]);
+      const server = ClashConfigGenerator.normalizeNameserver(pair[1]);
+      if (suffix.length === 0 || server.length === 0) {
+        continue;
+      }
+      if (!ClashConfigGenerator.policyMatchesAny(suffix, domains)) {
+        continue;
+      }
+      const id = `${suffix}\u0000${server}`;
+      if (seenPair.has(id)) {
+        continue; // 同一 [后缀, 上游] 只留一条
+      }
+      // 同一后缀允许多个上游（互为冗余，写成 YAML 列表）：机场常给两个私有 DoH，
+      // 只留一个会把可靠性降成单点。上限 4 个/后缀，避免脏订阅刷爆配置。
+      const count = suffixCount.get(suffix) ?? 0;
+      if (count >= 4) {
+        continue;
+      }
+      if (out.length >= 16) {
+        break;
+      }
+      seenPair.add(id);
+      suffixCount.set(suffix, count + 1);
+      out.push([suffix, server]);
+    }
+    return out;
+  }
+
+  /** 规范化 policy 后缀（保留通配前缀；非法返回空串） */
+  private static normalizePolicySuffix(raw: string): string {
+    let value = raw.trim().toLowerCase();
+    let wildcard = false;
+    if (value.startsWith('+.') || value.startsWith('*.')) {
+      wildcard = true;
+      value = value.substring(2);
+    } else if (value.startsWith('.')) {
+      wildcard = true;
+      value = value.substring(1);
+    }
+    if (value.length === 0 || value.length > 253) {
+      return '';
+    }
+    for (let i = 0; i < value.length; i++) {
+      const ch = value.charAt(i);
+      if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '"' || ch === '\''
+        || ch === '\\' || ch === ',' || ch === ':' || ch === '#' || ch === '[' || ch === ']'
+        || ch === '{' || ch === '}') {
+        return '';
+      }
+    }
+    return wildcard ? `+.${value}` : value;
+  }
+
+  /** policy 后缀是否命中任一节点域名（通配符按后缀匹配，裸域名按精确匹配） */
+  private static policyMatchesAny(suffix: string, domains: string[]): boolean {
+    const wildcard = suffix.startsWith('+.');
+    const base = wildcard ? suffix.substring(2) : suffix;
+    for (const domain of domains) {
+      if (domain === base) {
+        return true;
+      }
+      if (wildcard && domain.endsWith(`.${base}`)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private static normalizeDomains(values: string[]): string[] {
     const seen = new Set<string>();
     const out: string[] = [];

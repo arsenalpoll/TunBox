@@ -433,7 +433,7 @@ function generateConfig(opts) {
     o.dnsPort === undefined ? 1053 : o.dnsPort,
     o.apiSecret === undefined ? 'secret' : o.apiSecret,
     o.useGeoip === undefined ? false : o.useGeoip,
-    o.ipv6Enabled === undefined ? false : o.ipv6Enabled,
+    o.ipv6Enabled === undefined ? true : o.ipv6Enabled,
     o.proxyHosts || {},
     o.tunEnabled === undefined ? true : o.tunEnabled,
     o.proxyGroups || [],
@@ -441,6 +441,9 @@ function generateConfig(opts) {
     o.useSmart === undefined ? false : o.useSmart,
     o.subscriptionRules || [],
     o.subscriptionRuleProviders || '',
+    o.smartTestUrl || '',
+    o.subscriptionDnsProxyServers || [],
+    o.subscriptionDnsPolicies || [],
   );
 }
 
@@ -782,6 +785,116 @@ section('[13] 真实内核阴性对照：手工造坏的配置必须被内核拒
     ok(!res.ok, '坏配置（重复顶层键 + 带引号布尔）被真实内核拒载（判定有牙齿）',
       res.output.split('\n').filter((l) => l.includes('error') || l.includes('cannot')).slice(0, 4).join('\n       '));
   }
+}
+
+// ── 场景 14：订阅自带 DNS 上游（2026-10-20「测速全部超时」定案的回归闸门）──
+section('[14] 订阅 dns 上游透传：proxy-server-nameserver / nameserver-policy 三分支');
+{
+  const dnsBlock = (cfg) => {
+    const lines = cfg.split('\n');
+    const start = lines.indexOf('dns:');
+    if (start < 0) return '';
+    const out = [];
+    for (let i = start + 1; i < lines.length; i++) {
+      if (lines[i].length > 0 && !lines[i].startsWith(' ')) break;
+      out.push(lines[i]);
+    }
+    return out.join('\n');
+  };
+  const proxyNsBlock = (cfg) => {
+    const block = dnsBlock(cfg).split('\n');
+    const start = block.indexOf('  proxy-server-nameserver:');
+    if (start < 0) return null;
+    const out = [];
+    for (let i = start + 1; i < block.length; i++) {
+      if (block[i].length > 0 && !block[i].startsWith('    ')) break;
+      out.push(block[i]);
+    }
+    return out.join('\n');
+  };
+  // a) 订阅没给 → 内置公共 DoT（原行为；加了分支也不能丢兜底）
+  {
+    const blk = proxyNsBlock(generateConfig({}));
+    ok(blk !== null && blk.includes('- tls://223.5.5.5:853'),
+      '无订阅 dns：proxy-server-nameserver 回落到内置 DoT');
+  }
+  // b) 订阅给了 proxy-server-nameserver → 整段替换（绝不能与公共 DoT 混排）
+  {
+    const blk = proxyNsBlock(generateConfig({
+      subscriptionDnsProxyServers: [
+        'https://ns1.pubdns.co/dns-hyy/abc',
+        'https://dnsdoh.trafficmanager.net/dns-hyy/abc',
+      ],
+    })) || '';
+    ok(blk.includes('https://ns1.pubdns.co/dns-hyy/abc'), '订阅上游写进 proxy-server-nameserver');
+    ok(!blk.includes('tls://223.5.5.5:853'), '有订阅上游时不得混入公共 DoT（并发首答会让错答案抢跑）');
+  }
+  // c) 订阅只给 nameserver-policy → 该键必须留空，policy 才会被主解析器采纳
+  {
+    const nodes = [makeNode('jp-1', { server: 'best.jushuitan.com' })];
+    const cfg = generateConfig({
+      nodes,
+      subscriptionDnsPolicies: [['+.jushuitan.com', 'https://bvd-api.dohcore.com:2096/dns-query/x']],
+    });
+    const blk = proxyNsBlock(cfg) || '';
+    ok(!blk.includes('tls://'), '只有 policy 时 proxy-server-nameserver 留空（非空会让 policy 失效）');
+    ok(cfg.includes('"+.jushuitan.com":'), 'policy 后缀写进 nameserver-policy');
+    ok(cfg.includes('bvd-api.dohcore.com'), 'policy 上游写进配置');
+  }
+  // d) policy 与节点域名无关 → 不注入（不把机场其它域名的策略带进用户 DNS）
+  {
+    const cfg = generateConfig({
+      nodes: [makeNode('x', { server: 'example.invalid' })],
+      subscriptionDnsPolicies: [['+.jushuitan.com', 'https://bvd-api.dohcore.com:2096/dns-query/x']],
+    });
+    ok(!cfg.includes('jushuitan'), '与节点域名无关的 policy 不注入');
+  }
+  // e) 非法上游（空格/引号/未知 scheme）一律过滤，合法 IP:port 保留
+  {
+    const blk = proxyNsBlock(generateConfig({
+      subscriptionDnsProxyServers: ['https://evil example.com/x', '"quoted"', 'bogus://x', '1.2.3.4:53'],
+    })) || '';
+    ok(blk.includes('1.2.3.4:53'), '合法的 IP:port 上游保留');
+    ok(!blk.includes('evil example.com') && !blk.includes('bogus://'), '非法/未知上游被过滤');
+  }
+}
+
+// ── 场景 15：DNS 恒接管 + fake-ip（2026-10-21：v6 也必须走代理）────────────
+section('[15] DNS 恒接管 + fake-ip：range6 落在 TUN 的 /64，AAAA 走隧道');
+{
+  const dnsOf = (cfg) => {
+    const lines = cfg.split('\n');
+    const start = lines.indexOf('dns:');
+    if (start < 0) {
+      return '';
+    }
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (lines[i].length > 0 && !lines[i].startsWith(' ')) {
+        end = i;
+        break;
+      }
+    }
+    return lines.slice(start, end).join('\n');
+  };
+
+  const cfg = generateConfig({});
+  const blk = dnsOf(cfg);
+  ok(blk.length > 0, 'dns: 段恒存在（开关已删，无法整段关闭）');
+  ok(blk.includes('  enable: true'), 'dns.enable 恒为 true');
+  ok(blk.includes('  enhanced-mode: fake-ip'), 'enhanced-mode 是 fake-ip（v6 也交给隧道）');
+  ok(blk.includes('  fake-ip-range: 198.18.0.1/16'), 'v4 假池 198.18.0.1/16');
+  ok(blk.includes('  fake-ip-range6: fdfe:dcba:9876::/64'), 'v6 假池 = TUN 自己的 /64（有 on-link 路由）');
+  ok(blk.includes('  fake-ip-filter:'), 'fake-ip-filter 放行局域网/STUN/NTP/门户探活');
+  ok(!cfg.includes('store-fake-ip'), '不写 store-fake-ip');
+  ok(cfg.includes('  dns-hijack:') && cfg.includes('    - any:53'), 'tun.dns-hijack 恒开（any:53）');
+  ok(blk.includes('  ipv6: true'), '默认双栈开 → dns.ipv6: true');
+
+  const offBlk = dnsOf(generateConfig({ ipv6Enabled: false }));
+  ok(offBlk.includes('  ipv6: false'), '关掉双栈 → dns.ipv6: false（AAAA 由内核回空）');
+  ok(!offBlk.includes('fake-ip-range6'), '关掉双栈 → 不下发 range6（否则假 v6 无路由）');
+  kernelOk(cfg, '默认配置（fake-ip + range6 + dns-hijack 恒开）');
+  kernelOk(cfg, '默认配置（fake-ip + range6 + dns-hijack 恒开）');
 }
 
 console.log(`\n${passed} passed, ${failed} failed, ${deferred} deferred`);

@@ -163,8 +163,8 @@ export function vpnArchTest() {
       expect(resolveAuthority(false, 0, true).connected).assertFalse();
     });
 
-    // ── 生成的内核配置必须保持 IPv4-only 与性能参数 ───────────────────
-    it('generated_config_is_ipv4_only_and_tuned', 0, () => {
+    // ── 生成的内核配置：DNS 恒接管（fake-ip）+ 可选双栈 + 性能参数 ──────────
+    it('generated_config_dns_always_on_and_tuned', 0, () => {
       const settings = new AppSettings();
       const node = new ProxyNode();
       node.name = 'UT-HK';
@@ -174,12 +174,22 @@ export function vpnArchTest() {
       node.password = 'pw';
       const yaml = ClashConfigGenerator.generate(node, [node], settings, 7890, 9090, 1053,
         'ut-secret', false, false, {}, true, []);
+      // 第 9 个实参 ipv6Enabled=false ⇒ 顶层与 dns 侧同为 false
       expect(yaml.includes('ipv6: false')).assertTrue();
-      expect(yaml.includes('disable-ipv6: true')).assertTrue();
+      // 伪键不产出；假池在 fake-ip 模式下存在，但 ipv6Enabled=false 时不得下发 range6
+      expect(yaml.includes('disable-ipv6: true')).assertFalse();
+      expect(yaml.includes('store-fake-ip')).assertFalse();
+      expect(yaml.includes('enhanced-mode: fake-ip')).assertTrue();
+      expect(yaml.includes('fake-ip-range: 198.18.0.1/16')).assertTrue();
       expect(yaml.includes('fake-ip-range6')).assertFalse();
+      expect(yaml.includes('fake-ip-filter:')).assertTrue();
+      expect(yaml.includes('  enable: true')).assertTrue();
+      expect(yaml.includes('dns-hijack:')).assertTrue();
+      expect(yaml.includes('    - any:53')).assertTrue();
       expect(yaml.includes('inet6-address')).assertFalse();
       expect(yaml.includes('cache-algorithm: arc')).assertTrue();
-      expect(yaml.includes('fallback:')).assertTrue();
+      // useGeoip=false ⇒ 整块 fallback 不声明（否则内核启动期会去下载 MMDB：坑 40）
+      expect(yaml.includes('fallback:')).assertFalse();
       expect(yaml.includes('keep-alive-interval:')).assertTrue();
       expect(yaml.includes('udp-timeout:')).assertTrue();
       expect(yaml.includes('tcp-concurrent: true')).assertTrue();

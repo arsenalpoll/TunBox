@@ -21,6 +21,7 @@ import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { common } from '@kit.AbilityKit';
 import { privacyManager } from '@kit.AppGalleryKit';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { ThemeService, AppThemeMode } from '../theme/ThemeService';
 import { TopNavBar } from '../components/TopNavBar';
 import { AppInfo } from '../commons/utils/AppInfo';
 import { SettingsService } from '../commons/services/SettingsService';
@@ -75,6 +76,14 @@ export struct SettingsView {
   @State assetSource: string = 'auto';
   @State geoUpdatingId: string = '';
   @State quotaNotifyEnabled: boolean = true;
+  // ── 网络（IPv6 双栈，产品默认开）──
+  @State ipv6Enabled: boolean = true;
+  /**
+   * 深浅色主题（2026-10-20 新增）：直接镜像 ThemeService 在 AppStorage 里的 theme_mode，
+   * 因此主页太阳按钮改了它也会同步（StorageLink 双向）。
+   * SYSTEM = 跟随系统（默认）；LIGHT / DARK = 用户固定。
+   */
+  @StorageLink('theme_mode') themeMode: AppThemeMode = AppThemeMode.SYSTEM;
   // ── 测速地址 ──
   /** 输入框里的测速地址（未保存的编辑态） */
   @State testLatencyUrl: string = '';
@@ -117,6 +126,7 @@ export struct SettingsView {
     // 每次进入：从持久化读取真实值回填（缺字段/脏值由 AppSettings.fromJson 兜底）
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
+    this.ipv6Enabled = this.settings.ipv6Enabled;
     this.assetSource = this.settings.assetSource;
     this.testLatencyUrl = this.settings.testLatencyUrl;
     this.refreshGeoStatuses();
@@ -191,6 +201,69 @@ export struct SettingsView {
       promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
     }).catch((): void => {
       promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
+  }
+
+  // ── 网络（IPv6 双栈）─────────────────────────────────────────────
+
+  /**
+   * IPv6 双栈开关。
+   *
+   * 这个开关同时改两处，且两处必须一起改（否则 v6 会黑洞或被绕过）：
+   *   ① 生成的 YAML：`ipv6:` / `dns.ipv6:`（enhanced-mode 为 redir-host，AAAA 走真实上游）；
+   *   ② TUN：扩展进程读**同一份 YAML 的 ipv6 行**决定是否装 v6 地址与 ::/0。
+   * 也就是说这里只负责把值写进设置，其余联动都是「一份配置、两处读同一真源」。
+   *
+   * DNS 不在这里：内核 DNS 恒接管（生成器恒写 enable/dns-hijack，扩展恒下发 sentinel），
+   * 原来的「DNS 覆写」开关已于 2026-10-21 随产品定案删除。
+   */
+  private setIpv6Enabled(v: boolean): void {
+    this.ipv6Enabled = v;
+    this.settings.ipv6Enabled = v;
+    // 字段级写：只改这一个字段（整单覆盖会把别的写者刚写的值盖回旧值）
+    SettingsService.patchSettings((s: AppSettings): void => {
+      s.ipv6Enabled = v;
+    }).then((): void => {
+      this.applyNetworkSwitch();
+    }).catch((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
+  }
+
+
+  /**
+   * 深浅色主题：默认跟随系统（SYSTEM）。关掉「跟随系统」时固定为当前外观，
+   * 之后由主页太阳按钮在浅色/深色之间切换（ThemeService.toggle）。
+   * setMode 内部会 setColorMode + 刷新 AppStorage 的 theme_mode / theme_revision，
+   * 全 App 立即重绘；不涉及隧道，所以不需要重连。
+   */
+  private setFollowSystemTheme(follow: boolean): void {
+    const next: AppThemeMode = follow
+      ? AppThemeMode.SYSTEM
+      : (ThemeService.isDark() ? AppThemeMode.DARK : AppThemeMode.LIGHT);
+    ThemeService.setMode(next).then((): void => {
+      promptAction.showToast({
+        message: follow ? '主题已跟随系统' : '已固定当前主题（主页太阳按钮可切换）'
+      });
+    }).catch((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
+  }
+
+  /**
+   * 两个开关都改变「TUN + 内核配置」，热更新改不了 —— 已连接时必须重建隧道。
+   * restartIfConnected 内部会重新 `SettingsService.load()`，所以拿到的一定是刚落盘的新值；
+   * 未连接时它直接返回 false，下次手动连接自然带上新配置。
+   */
+  private applyNetworkSwitch(): void {
+    this.orchestrator.restartIfConnected('network-settings').then((restarted: boolean): void => {
+      promptAction.showToast({
+        message: restarted
+          ? '已保存，隧道正在按新配置重连'
+          : $r('app.string.settings_saved_toast')
+      });
+    }).catch((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
     });
   }
 
@@ -376,6 +449,67 @@ export struct SettingsView {
             .backgroundColor(TunBoxColors.surfaceCard)
             .border({ width: 1, color: TunBoxColors.cardBorder })
             .onClick(() => router.pushUrl({ url: 'pages/RulesPage' }))
+
+            // ── 主题：跟随系统（2026-10-20 新增，默认跟随）──
+            Column({ space: 10 }) {
+              Row({ space: 8 }) {
+                Row() {
+                  Image($r('app.media.ic_globe'))
+                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                }
+                .width(28).height(28).borderRadius(8)
+                .backgroundColor(TunBoxColors.primaryLight)
+                .justifyContent(FlexAlign.Center)
+                Text('主题').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Blank()
+              }.width('100%').alignItems(VerticalAlign.Center)
+
+              Row() {
+                Text('主题跟随系统')
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Toggle({ type: ToggleType.Switch, isOn: this.themeMode === AppThemeMode.SYSTEM })
+                  .selectedColor(TunBoxColors.primary)
+                  .onChange((v: boolean): void => this.setFollowSystemTheme(v))
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text('开启时系统切换深色/浅色，App 自动跟着变（默认开启）；'
+                + '关闭后固定当前主题，可用主页太阳按钮在浅色/深色之间切换。')
+                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+            }
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+
+            // ── 网络：IPv6 双栈（2026-10-20 新增，默认开）──
+            // 改变 TUN 与内核配置，改完会触发一次自动重连（见 applyNetworkSwitch）。
+            // DNS 已不在设置页：内核 DNS 恒接管，没有可配的开关（2026-10-21 定案）。
+            Column({ space: 10 }) {
+              Row({ space: 8 }) {
+                Row() {
+                  Image($r('app.media.ic_network'))
+                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                }
+                .width(28).height(28).borderRadius(8)
+                .backgroundColor(TunBoxColors.primaryLight)
+                .justifyContent(FlexAlign.Center)
+                Text('网络').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Blank()
+              }.width('100%').alignItems(VerticalAlign.Center)
+
+              Row() {
+                Text('IPv6 双栈')
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Toggle({ type: ToggleType.Switch, isOn: this.ipv6Enabled })
+                  .selectedColor(TunBoxColors.primary)
+                  .onChange((v: boolean): void => this.setIpv6Enabled(v))
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text('开启后 IPv6 与 IPv4 一样走代理（AAAA 返回隧道内地址，不直连）；关闭则纯 IPv4。改动会自动重连生效。')
+                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+            }
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
 
             // ── 测速地址（前台批 / 后台批 / 生成器 smart 组共用同一真源）──
             Column({ space: 10 }) {

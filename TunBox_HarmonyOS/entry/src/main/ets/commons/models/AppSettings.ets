@@ -141,13 +141,28 @@ export class AppSettingsJson {
   smartPolicyPriority: string = '';
   /**
    * 域名嗅探（sniffer）：从 TLS ClientHello / HTTP Host / QUIC 握手里还原真实目标域名。
-   * fake-ip 模式下 DNS 应答是 198.18.x.x，若不嗅探，DOMAIN 规则只能靠内核反查 fake-ip
-   * 映射命中，TLS SNI 与 DNS 不一致的场景（CDN / 直连 IP 访问）会分错流。默认开启，
-   * 与 Clash Verge / FlClash 等主流客户端一致。旧版本配置缺字段时取默认 true。
+   * DNS 恒由内核接管（redir-host：应答是真实地址），DOMAIN 规则靠 IP→域名映射反查；
+   * TLS SNI 与 DNS 不一致的场景（CDN / 直连 IP 访问）仍必须靠嗅探才能分对流向。
+   * 默认开启，与 Clash Verge / FlClash 等主流客户端一致。旧版本配置缺字段时取默认 true。
    */
   sniffingEnabled: boolean = true;
   /** 内核日志级别（log-level）：debug/info/warning/error/silent；默认 warning（现状）。 */
   coreLogLevel: string = 'warning';
+  /**
+   * IPv6 双栈开关（默认 **true**）。
+   *
+   * true  ⇒ 生成 ipv6: true + dns.ipv6: true + fake-ip-range6: fdfe:dcba:9876::/64
+   *         （假 v6 池落在 TUN 自己的 /64 内）⇒ AAAA 返回隧道内地址，v6 与 v4 一样走代理；
+   *         VpnExtensionAbility 装 fdfe:dcba:9876::1/64 + isIPv6Accepted: true。
+   * false ⇒ 生成 ipv6: false + dns.ipv6: false（不下发 range6，AAAA 恒空），TUN 仅 IPv4。
+   *
+   * 真机取证（2026-10-21）：平台丢弃 VpnConfig.routes 的 v6 条目，但会按 LinkAddress 前缀
+   * 派生 on-link 路由（/126 只有 /126，/64 就有 fdfe:dcba:9876::/64）⇒ 假 v6 有路可达、进隧道、
+   * 由代理出口解析真实 v6；设备侧不存在直连 v6 的路径。
+   *
+   * 缺字段取 true（升级上来的老配置也默认开），显式 false 才关闭。
+   */
+  ipv6Enabled: boolean = true;
   /**
    * 订阅配额提醒（流量不足/即将到期发系统通知）。默认开启。
    * 阈值常量见 SubscriptionQuotaService：流量剩 <10% 或 3 天内到期。
@@ -269,6 +284,8 @@ export class AppSettings {
   sniffingEnabled: boolean = true;
   /** 内核日志级别：debug/info/warning/error/silent（默认 warning = 现状行为） */
   coreLogLevel: string = 'warning';
+  /** IPv6 双栈开关（默认 true；语义见 AppSettingsJson.ipv6Enabled 注释） */
+  ipv6Enabled: boolean = true;
   /** 订阅配额提醒开关（默认 true；阈值见 SubscriptionQuotaService） */
   quotaNotifyEnabled: boolean = true;
   /** geo 资产下载源偏好：auto/jsdelivr/ghproxy/github（非法回落 auto） */
@@ -318,6 +335,7 @@ export class AppSettings {
     j.smartPolicyPriority = this.smartPolicyPriority;
     j.sniffingEnabled = this.sniffingEnabled;
     j.coreLogLevel = this.coreLogLevel;
+    j.ipv6Enabled = this.ipv6Enabled;
     j.quotaNotifyEnabled = this.quotaNotifyEnabled;
     j.assetSource = this.assetSource;
     j.quotaAlertMarks = this.quotaAlertMarks;
@@ -463,6 +481,10 @@ export class AppSettings {
     const level = typeof j.coreLogLevel === 'string' ? j.coreLogLevel.trim().toLowerCase() : '';
     s.coreLogLevel = (level === 'debug' || level === 'info' || level === 'warning'
       || level === 'error' || level === 'silent') ? level : 'warning';
+    // IPv6 双栈：缺字段取默认 true（升级上来的老配置默认开启），
+    // 只有显式 false 才关闭 —— 与「默认开」的产品口径一致。
+    // DNS 接管已无开关（恒开），老配置里残留的 dnsOverrideEnabled 直接忽略。
+    s.ipv6Enabled = j.ipv6Enabled === false ? false : true;
     s.quotaNotifyEnabled = j.quotaNotifyEnabled === false ? false : true;
     const source = typeof j.assetSource === 'string' ? j.assetSource.trim().toLowerCase() : '';
     s.assetSource = (source === 'jsdelivr' || source === 'ghproxy' || source === 'github')

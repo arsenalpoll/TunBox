@@ -88,6 +88,10 @@ class OrchestratorHealthViewAdapter implements OrchestratorHealthView {
     return this.orch.checkDnsResolvable();
   }
 
+  checkIpv6Resolvable(): Promise<boolean> {
+    return this.orch.checkIpv6Resolvable();
+  }
+
   checkEgressReachable(): Promise<boolean> {
     return this.orch.checkEgressReachable();
   }

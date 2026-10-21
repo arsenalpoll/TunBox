@@ -1727,9 +1727,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    *  - 不通则报 fix-dns，而那个修复动作本来就是空操作，用户被误导。
    * 另外它还会把用户的探测域名再泄露一次给两家第三方解析商。
    *
-   * 改用系统解析器后：隧道在时该查询走 VpnConfig.dnsAddresses（223.5.5.5）
-   * → 被 TUN 接管 → any:53 劫持进内核 fake-ip 解析链路 —— 这一次探测真正走的就是
-   * 用户业务流量所走的那条 DNS 路径。隧道不在时它退化为普通系统解析，符合探针语义。
+   * 改用系统解析器后：隧道在时该查询走 VpnConfig.dnsAddresses（TUN sentinel 172.19.0.2）
+   * → 被 TUN 接管 → any:53 劫持进内核 DNS 解析链路（redir-host：拿回真实地址）——
+   * 这一次探测真正走的就是用户业务流量所走的那条 DNS 路径。隧道不在时它退化为
+   * 普通系统解析，符合探针语义。
    */
   async checkDnsResolvable(): Promise<boolean> {
     try {
@@ -1737,6 +1738,42 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return Array.isArray(addresses) && addresses.length > 0;
     } catch (e) {
       AppLogger.info(TAG, `dns self-check failed: ${AppLogger.errText(e)}`);
+      return false;
+    }
+  }
+
+  /**
+   * IPv6 双栈端到端探针：客户端侧（系统解析器 → 隧道 DNS）能否拿到 AAAA。
+   *
+   * 必须用 `connection.getAddressesByName` 走**系统解析路径**（与普通应用一致）。
+   * 不能用 Clash REST `/dns/query`：mihomo 那条路由绕过了 withResolver(ipv6=false)
+   * （hub/route/dns.go:44），即使 dns.ipv6=false 也会返回 AAAA —— 会给出假阳性，
+   * 正是这次报障里「看着有 v6、实际 AAAA 被清空」最容易踩的坑。
+   */
+  async checkIpv6Resolvable(): Promise<boolean> {
+    try {
+      // 注意：`getAddressesByName` 返回的是 **NetAddress 对象**（{address, family}），
+      // 不是字符串数组（SDK @ohos.net.connection.d.ts:2258-2267，family 1=IPv4 / 2=IPv6）。
+      const addresses = await connection.getAddressesByName('ipv6.google.com');
+      if (!Array.isArray(addresses)) {
+        return false;
+      }
+      for (let i = 0; i < addresses.length; i++) {
+        const entry = addresses[i];
+        if (entry === null || entry === undefined) {
+          continue;
+        }
+        // family 优先；拿不到 family 时退回「地址里含冒号 ⇒ v6 字面量」。
+        if (entry.family === 2) {
+          return true;
+        }
+        if (typeof entry.address === 'string' && entry.address.indexOf(':') >= 0) {
+          return true;
+        }
+      }
+      return false;
+    } catch (e) {
+      AppLogger.info(TAG, `ipv6 self-check failed: ${AppLogger.errText(e)}`);
       return false;
     }
   }
@@ -2838,6 +2875,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     profile.proxyGroups = subs.proxyGroups;
     profile.subscriptionRules = subs.subscriptionRulesLines();
     profile.subscriptionRuleProviders = subs.subscriptionRuleProvidersBlock();
+    // 订阅自带 DNS 上游：机场入口域名的真实 IP 只在自家私有 DoH 里，
+    // 丢掉 → 公共 DNS 给出 CF/WAF 前置 IP → 该订阅节点全部超时（2026-10-20 定案）。
+    profile.subscriptionDnsProxyServers = subs.subscriptionDnsProxyServers();
+    profile.subscriptionDnsPolicies = subs.subscriptionDnsPolicies();
     profile.selectedNodeName = selectedNodeName;
     profile.mixedPort = ports.mixedPort;
     profile.apiPort = ports.apiPort;
@@ -3080,8 +3121,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 系统不会重新回调 onCreate（TUN/内核启动逻辑不会重放）。
       // 因此每次连接前先停掉既有 VPN 扩展（触发 onDestroy → 内核停止），
       // 等待进程退出后重新拉起，保证新配置/新节点真正生效。
-      // 注意: 停旧隧道也必须在 IPv6 探测之前 —— 隧道存活时 ::/0 路由指向
-      // 隧道自身, 探测会误报"有 IPv6"。
+      // 注意: 停旧隧道也必须在任何「本机出网能力」探测之前 —— 隧道存活时默认路由
+      // （v4 0.0.0.0/0、双栈时还有 ::/0）指向隧道自身，探测会测到隧道而不是物理承载。
       try {
         const stopWant: Want = {
           bundleName: 'com.tunbox.client',
@@ -3141,9 +3182,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 并且把**本次要连的节点**排在最前解析，预算再紧也先把它 pin 住 ——
       // 连不上当前节点的代价远高于漏 pin 几个备用节点。
 
-      // 项目规格统一为 IPv4-only：不再探测/启用 IPv6 入站，Extension 与 YAML
-      // 均强制关闭 IPv6，杜绝 IPv6 泄漏通道。仅保留代理服务器域名的 DoH 防投毒预解析。
-      this.ipv6Active = false;
+      // IPv6 双栈（设置页开关，默认开）：这里只做「记录意图」，真正落地的两处分别是
+      //   ① YAML：RuntimeConfigBuilder 把 settings.ipv6Enabled 传给生成器（ipv6 / dns.ipv6
+      //      两行同开同关；DNS 段是 redir-host，AAAA 走真实上游）；
+      //   ② TUN：VpnExtensionAbility 读**同一份 YAML 的 ipv6 行**决定是否装 v6 地址与 ::/0。
+      // 之所以不在这里额外下发 want 参数：TUN 与内核必须同源，YAML 已经是唯一真源，
+      // 多一条 want 通道就多一个「两处不一致 ⇒ v6 黑洞/泄漏」的机会。
+      // ipv6Active 仅供诊断/健康探针展示真实意图，不再参与任何下发决策。
+      this.ipv6Active = settings.ipv6Enabled !== false;
       const priorityDomains: string[] = (target.server.length > 0) ? [target.server] : [];
       // 端口探测提前发起，与下面的 DoH 预解析并行推进：两者互不依赖
       // （端口探测只 bind/close 本地回环，DoH 只发 HTTPS 查询），
@@ -3274,7 +3320,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 拉起 VPN 能力（首次会弹系统 VPN 授权框）；TUN 建立 + 内核启动都在扩展进程完成。
       // 扩展进程把启动结果写入 vpn_start_error.txt（空文件/不存在 = 成功，非空 = 失败原因），
       // 并写入 vpn_start_ok.txt 成功标记 —— UI 进程通过文件轮询确认，绕开跨进程 loopback 探测的不确定性。
-      // IPv4-only 由扩展进程内 VpnConfig 固定实现（isIPv6Accepted=false），UI 不再下发双栈开关。
+      // IPv6 双栈**不走** want：扩展进程读的是这份已落盘的 YAML
+      // （readTunFlagsFromConfig 解析 `ipv6:`），保证 TUN 与内核同源。
+      // DNS 恒接管，不需要任何开关下发（生成器恒写 enable/dns-hijack）。
       // 传明确模式及单一激活名单；JSON 保留包名边界，不再通过 CSV 猜测模式。
       const vpnParams: Record<string, string | number | boolean> = {};
       vpnParams['configPath'] = configPath;

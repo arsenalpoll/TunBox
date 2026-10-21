@@ -104,6 +104,19 @@ export class RuntimeConfigProfile {
   subscriptionRules: string[] = [];
   /** 订阅 rule-providers 段（原文）。 */
   subscriptionRuleProviders: string = '';
+  /**
+   * 订阅自带的 DNS 上游（`dns.proxy-server-nameserver` 条目，已去重）。
+   *
+   * 生成器在 `proxy-server-nameserver:` 里**优先**写这一路；空数组 = 订阅没给
+   * （退回内置公共 DoT）。丢掉它机场入口域名就会被公共 DNS 解析成
+   * Cloudflare / WAF 前置 IP，该订阅的域名节点全部超时（2026-10-20 真机定案）。
+   */
+  subscriptionDnsProxyServers: string[] = [];
+  /**
+   * 订阅自带的 `nameserver-policy` 条目（[后缀, 上游] 对）。
+   * 生成器只写「后缀命中节点域名」的那些（pronetwork 系订阅靠它把入口解析对）。
+   */
+  subscriptionDnsPolicies: string[][] = [];
 
   /**
    * 用户当前选中的节点**名**。
@@ -337,16 +350,23 @@ export class RuntimeConfigBuilder {
 
     // 测速核是 headless 的延迟探测内核：不开 TUN（避免抢设备的 TUN 设备）。
     const tunEnabled = mode !== RuntimeConfigMode.TEST;
+    // IPv6 双栈：**唯一**决策点就在这里。生产值来自 settings.ipv6Enabled（设置页开关，
+    // 默认开）；缺失/脏值按「开」处理，与 AppSettings.fromJson 的口径一致。
+    // 生成器只收这一个布尔，不再自己读设置 —— 隧道与测速核共用同一决策结果。
+    const ipv6Enabled: boolean = profile.settings.ipv6Enabled !== false;
 
     const yaml = ClashConfigGenerator.generate(
       node, profile.nodes, profile.settings,
       profile.mixedPort, profile.apiPort, profile.dnsPort, profile.apiSecret,
-      options.useGeoip, false, hosts, tunEnabled, profile.proxyGroups,
+      options.useGeoip, ipv6Enabled, hosts, tunEnabled, profile.proxyGroups,
       options.ruleProviderReady, options.useSmart,
       profile.subscriptionRules, profile.subscriptionRuleProviders,
       // smart 组的测速地址：这里只传**用户填的原始值**，规则由生成器侧的
       // LatencyTestUrl.effective()（唯一真源）统一处理（审计 F12）。
-      profile.settings.testLatencyUrl);
+      profile.settings.testLatencyUrl,
+      // 订阅自带 DNS 上游（proxy-server-nameserver / nameserver-policy）：
+      // 机场入口域名的真实 IP 只有这些上游知道，不能丢（2026-10-20 全超时定案）。
+      profile.subscriptionDnsProxyServers, profile.subscriptionDnsPolicies);
 
     const result = new RuntimeConfigResult();
     result.yaml = yaml;
@@ -361,7 +381,7 @@ export class RuntimeConfigBuilder {
     AppLogger.info(TAG, `runtime config built: mode=${mode} bytes=${yaml.length} `
       + `hosts=${result.hostsCount} useSmart=${options.useSmart} `
       + `ruleProviderReady=${options.ruleProviderReady} useGeoip=${options.useGeoip} `
-      + `node="${options.selectedNodeName}"`);
+      + `ipv6=${ipv6Enabled} node="${options.selectedNodeName}"`);
     return result;
   }
 }

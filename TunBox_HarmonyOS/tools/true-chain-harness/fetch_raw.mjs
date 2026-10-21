@@ -16,7 +16,7 @@ const outDir = process.argv[3] || join(audit, 'input', 'raw');
 mkdirSync(outDir, { recursive: true });
 
 const subs = JSON.parse(readFileSync(subsPath, 'utf8'));
-const UAS = ['clash-verge/v1.7.7', 'clash.meta/v1.18.8'];
+const UAS = ['clash-verge/v2.4.2', 'clash.meta/v1.19.32'];
 const rows = [];
 for (const s of subs) {
   if (s.url.startsWith('local://')) continue;

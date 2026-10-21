@@ -34,12 +34,14 @@ export interface OrchestratorHealthView {
   isIntentConsistent(): Promise<boolean>;
   /** 扩展进程回写的启动错误（空 = 无错误） */
   startErrorText(): string;
-  /** 本次连接是否启用 IPv6 入站 */
+  /** 本次连接是否启用 IPv6 双栈（= 设置页 IPv6 开关，默认开） */
   isIpv6Enabled(): boolean;
   /** Clash API 是否可达 */
   checkClashApiReachable(): Promise<boolean>;
   /** DNS 是否可解析 */
   checkDnsResolvable(): Promise<boolean>;
+  /** 客户端侧 AAAA 解析是否真的能拿到 v6 地址（IPv6 双栈的端到端判据） */
+  checkIpv6Resolvable(): Promise<boolean>;
   /** IPv4 出口是否连通（generate_204） */
   checkEgressReachable(): Promise<boolean>;
 }
@@ -135,12 +137,31 @@ export class OrchestratorHealthProbes implements LinkHealthProbes {
     });
   }
 
+  /**
+   * IPv6 双栈探针（2026-10-21 DNS 恒接管后重写判据）。
+   *
+   * 判据：**客户端侧 AAAA 解析**能不能拿到 v6 地址。
+   *
+   * DNS 已恒接管、且生成器改用 `enhanced-mode: redir-host`（没有 fake 池），
+   * AAAA 由 `withResolver` 直接向上游要真实地址，只受 `dns.ipv6` 控制
+   * （dns/middleware.go:205-208）。所以「拿不到 AAAA」不再是配置必然，而是
+   * 当前网络/上游确实没有 v6 ⇒ 如实报 fail 并建议关闭开关（避免设备一半流量
+   * 走不通），修复动作标 check-uplink。开关关闭时仍 skip。
+   */
   probeIpv6(): Promise<ProbeOutcome> {
-    // 项目规格 IPv4-only：ipv6Active 恒为 false，诊断报告记 skip 而非误报 pass
-    if (this.view.isIpv6Enabled()) {
-      return Promise.resolve(ProbeOutcome.skip('IPv4-only 规格：IPv6 入站已关闭'));
+    if (!this.view.isIpv6Enabled()) {
+      return Promise.resolve(ProbeOutcome.skip('IPv6 双栈已在设置中关闭（设置 → 网络）'));
     }
-    return Promise.resolve(ProbeOutcome.skip('IPv4-only 规格：未启用 IPv6 入站'));
+    if (!this.view.isHeartbeatAlive()) {
+      return Promise.resolve(ProbeOutcome.skip('内核未运行，跳过 IPv6 检查'));
+    }
+    return this.view.checkIpv6Resolvable().then((ok: boolean): ProbeOutcome => {
+      if (ok) {
+        return ProbeOutcome.pass('IPv6 双栈生效（AAAA 解析正常）');
+      }
+      return ProbeOutcome.fail('IPv6 双栈已开启，但当前网络解析不到 v6 地址',
+        '当前网络/运营商未提供 IPv6：建议在「设置 → 网络」关闭 IPv6 双栈', 'check-uplink');
+    });
   }
 
   probeIntentConsistency(): Promise<ProbeOutcome> {

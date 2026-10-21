@@ -370,14 +370,14 @@ await checkAsync('B3 请求 URL 形状与内核路由一致（/proxies/{name}/de
   ok(u.indexOf('/proxies/') > 0, `URL 形状: ${u}`);
   ok(u.indexOf('%E9%A6%99%E6%B8%AF') > 0, `节点名未做 URL 编码: ${u}`);
   ok(u.indexOf('url=https%3A%2F%2Fx.example.com%2Fg') > 0, `url 参数未编码: ${u}`);
-  ok(u.indexOf('timeout=5000') > 0, `timeout 参数不是内核预算: ${u}`);
+  ok(u.indexOf('timeout=3000') > 0, `timeout 参数不是内核预算: ${u}`);
 });
 await checkAsync('B4 外层超时 = 内核预算 + 余量（排队等待不计入节点预算）', async () => {
   const t = new FakeTransport({ responseCode: 200, body: '{"delay":10}' });
   await LatencyProbe.probeOne('n3', 'https://x.example.com/g', endpoint(), t);
   eq(t.calls[0].timeoutMs, LatencyProbeLimits.NODE_TIMEOUT_MS + LatencyProbeLimits.OUTER_EXTRA_MS,
     '外层超时');
-  eq(t.calls[0].timeoutMs, 6200, '外层超时数值');
+  eq(t.calls[0].timeoutMs, 4200, '外层超时数值');
 });
 check('B5 源码断言：probeOne 里只有一次 transport.get（探针不重试）', () => {
   const src = fs.readFileSync(path.join(latencyDir, 'LatencyProbe.ets'), 'utf8');
@@ -753,7 +753,7 @@ check('F3 陈旧结论标记（超过 TTL 灰显但保留）', () => {
 console.log('── G. 参数集中在常量区 ──');
 
 check('G1 参数常量区的取值', () => {
-  eq(LatencyProbeLimits.NODE_TIMEOUT_MS, 5000, 'NODE_TIMEOUT_MS');
+  eq(LatencyProbeLimits.NODE_TIMEOUT_MS, 3000, 'NODE_TIMEOUT_MS');
   eq(LatencyProbeLimits.OUTER_EXTRA_MS, 1200, 'OUTER_EXTRA_MS');
   eq(LatencyProbeLimits.WORKERS, 50, 'WORKERS');
   eq(LatencyProbeLimits.MAX_INFLIGHT, 50, 'MAX_INFLIGHT');
@@ -766,12 +766,12 @@ check('G2 源码断言：超时/并发魔数只出现在 LatencyProbeLimits 类�
   const end = src.indexOf('\nexport ', start + 10);
   const region = src.substring(start, end < 0 ? src.length : end);
   const outside = src.substring(0, start) + (end < 0 ? '' : src.substring(end));
-  for (const num of ['5000', '1200', '60000']) {
+  for (const num of ['3000', '1200', '60000']) {
     ok(region.indexOf(num) >= 0, `常量区里找不到 ${num}`);
     ok(outside.indexOf(num) < 0, `魔数 ${num} 散落在常量区之外`);
   }
   const storeSrc = stripComments(fs.readFileSync(path.join(latencyDir, 'LatencyStore.ets'), 'utf8'));
-  for (const num of ['5000', '1200', '60000']) {
+  for (const num of ['3000', '1200', '60000']) {
     ok(storeSrc.indexOf(num) < 0, `LatencyStore.ets 里出现了魔数 ${num}`);
   }
 });

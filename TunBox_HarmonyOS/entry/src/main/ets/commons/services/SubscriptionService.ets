@@ -575,6 +575,33 @@ export class SubscriptionService {
     sub.subRuleProviders = sections.providers;
   }
 
+  /**
+   * 订阅原文 → 该订阅的 **dns 上游**落账（2026-10-20「测速全超时」定案）。
+   *
+   * 机场把「入口域名 → 真实入口 IP」只告诉自家私有 DoH；公共 DNS 给出的是
+   * Cloudflare / 阿里 WAF 前置 IP，那些 IP 上代理端口不通或不提供协议服务。
+   * 因此 `dns.proxy-server-nameserver` 与 `dns.nameserver-policy` 必须带进运行配置：
+   * 真实内核单变量实验里，订阅1 只删 `proxy-server-nameserver` 就从 20/23 掉到 7/23，
+   * 订阅2 只删 `nameserver-policy` 就从 30/36 掉到 0/36。
+   *
+   * 任何异常都按「订阅未提供 dns 上游」处理（退回内置公共 DoT），绝不影响节点导入。
+   */
+  private static applyDnsSections(sub: Subscription, body: string): void {
+    let servers: string[] = [];
+    let pairs: string[][] = [];
+    try {
+      const dnsText = YamlMerger.extractSection(body, 'dns');
+      if (dnsText.trim().length > 0) {
+        servers = YamlMerger.extractDnsProxyServers(dnsText);
+        pairs = YamlMerger.extractDnsPolicyPairs(dnsText);
+      }
+    } catch (e) {
+      // 提取失败 = 无 dns 上游（生成时走内置公共 DoT）
+    }
+    sub.subDnsProxyServers = servers.length > 0 ? JSON.stringify(servers) : '';
+    sub.subDnsPolicies = pairs.length > 0 ? JSON.stringify(pairs) : '';
+  }
+
   /** 登记 provider（生成器 planRawProviders 只认登记表 + 文件存在性） */
   private registerRawProvider(subscriptionId: string, nodeEstimate: number): void {
     const entry = new RawProviderEntry();
@@ -1145,6 +1172,13 @@ export class SubscriptionService {
       }
       if (typeof j.subRuleProviders !== 'string' || j.subRuleProviders.length > 256 * 1024) {
         j.subRuleProviders = '';
+      }
+      // 订阅 dns 上游：非法值就地归一（旧存储无这些键），绝不丢订阅
+      if (typeof j.subDnsProxyServers !== 'string' || j.subDnsProxyServers.length > 8 * 1024) {
+        j.subDnsProxyServers = '';
+      }
+      if (typeof j.subDnsPolicies !== 'string' || j.subDnsPolicies.length > 64 * 1024) {
+        j.subDnsPolicies = '';
       }
       out.push(Subscription.fromPersistJson(j));
     }
@@ -2177,6 +2211,8 @@ export class SubscriptionService {
         parsedGroups = SubscriptionParser.parseProxyGroups(dispatch.body, sub.id);
         // 订阅自带 rules/rule-providers 段落账（无规则段时清空旧值）
         SubscriptionService.applyRulesSections(sub, dispatch.body);
+        // 订阅自带 dns 上游（proxy-server-nameserver / nameserver-policy）落账
+        SubscriptionService.applyDnsSections(sub, dispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -2454,6 +2490,8 @@ export class SubscriptionService {
         parsedGroups = SubscriptionParser.parseProxyGroups(dispatch.body, id);
         // 本地伪订阅刷新：自带 rules/rule-providers 段同样重新落账（原文可能已变化）
         SubscriptionService.applyRulesSections(sub, dispatch.body);
+        // dns 上游同理（本地文件可能换了订阅源）
+        SubscriptionService.applyDnsSections(sub, dispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length
           + diagnostics.invalidCount + diagnostics.unsupportedCount;
       } else {
@@ -2550,6 +2588,8 @@ export class SubscriptionService {
         parsedGroups = SubscriptionParser.parseProxyGroups(localDispatch.body, sub.id);
         // 本地 YAML 导入：自带 rules/rule-providers 段随订阅一并落账
         SubscriptionService.applyRulesSections(sub, localDispatch.body);
+        // 本地 YAML 导入同样保留 dns 上游
+        SubscriptionService.applyDnsSections(sub, localDispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -2674,6 +2714,83 @@ export class SubscriptionService {
         }
         seen.add(t);
         out.push(t);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 全部启用订阅的 **dns 上游**（`proxy-server-nameserver` 条目，去重、上限 8 条）。
+   *
+   * 供配置生成器写到 `proxy-server-nameserver:` —— 这一路决定「代理服务器域名用谁解析」，
+   * 丢掉它机场入口域名就会被公共 DNS 解析成 Cloudflare/WAF 前置 IP，节点全部超时
+   * （2026-10-20 真实内核单变量实验：20/23 → 7/23）。
+   */
+  subscriptionDnsProxyServers(): string[] {
+    const out: string[] = [];
+    const seen: Set<string> = new Set<string>();
+    for (const s of this.subscriptions) {
+      if (!s.enabled || s.id === DIRECT_GROUP_ID || s.subDnsProxyServers.length === 0) {
+        continue;
+      }
+      let list: string[] = [];
+      try {
+        list = JSON.parse(s.subDnsProxyServers) as string[];
+      } catch (e) {
+        list = [];
+      }
+      for (const raw of list) {
+        const value = raw.trim();
+        if (value.length === 0 || seen.has(value)) {
+          continue;
+        }
+        if (out.length >= 8) {
+          return out;
+        }
+        seen.add(value);
+        out.push(value);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 全部启用订阅的 `nameserver-policy` 条目（[后缀, 上游] 对，去重、上限 64 对）。
+   *
+   * 生成器只保留**后缀命中节点域名**的条目 —— 订阅2（pronetwork）就是靠
+   * `+.jushuitan.com → 私有 DoH` 这一条把入口解析对，删掉即 0/36 全灭。
+   */
+  subscriptionDnsPolicies(): string[][] {
+    const out: string[][] = [];
+    const seen: Set<string> = new Set<string>();
+    for (const s of this.subscriptions) {
+      if (!s.enabled || s.id === DIRECT_GROUP_ID || s.subDnsPolicies.length === 0) {
+        continue;
+      }
+      let pairs: string[][] = [];
+      try {
+        pairs = JSON.parse(s.subDnsPolicies) as string[][];
+      } catch (e) {
+        pairs = [];
+      }
+      for (const pair of pairs) {
+        if (pair.length < 2) {
+          continue;
+        }
+        const suffix = pair[0].trim();
+        const server = pair[1].trim();
+        if (suffix.length === 0 || server.length === 0) {
+          continue;
+        }
+        const id = `${suffix}\u0000${server}`;
+        if (seen.has(id)) {
+          continue;
+        }
+        if (out.length >= 64) {
+          return out;
+        }
+        seen.add(id);
+        out.push([suffix, server]);
       }
     }
     return out;
@@ -3359,4 +3476,8 @@ export class SubscriptionJson {
   subRules?: string;
   /** 订阅 yaml 自带 rule-providers 段（后加字段，旧存储无此键，读取端 ?? '' 兜底） */
   subRuleProviders?: string;
+  /** 订阅 dns.proxy-server-nameserver 上游（JSON 字符串数组；后加字段，?? '' 兜底） */
+  subDnsProxyServers?: string;
+  /** 订阅 dns nameserver-policy 条目（JSON 二维数组；后加字段，?? '' 兜底） */
+  subDnsPolicies?: string;
 }

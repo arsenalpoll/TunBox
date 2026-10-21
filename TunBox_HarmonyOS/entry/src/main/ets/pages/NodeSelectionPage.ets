@@ -91,17 +91,20 @@ interface SubChip {
   name: string;
 }
 
-/** 长按节点后的删除确认对话框；与网站规则编辑无关。 */
+/**
+ * 批量删除确认对话框（2026-10-20 替换原来的单节点删除框）。
+ * 语义不变：删掉的是本地台账，节点在订阅刷新后不会再出现。
+ */
 @CustomDialog
-struct NodeDeleteDialog {
+struct NodeBatchDeleteDialog {
   controller?: CustomDialogController;
-  getNodeName: () => string = (): string => '';
+  getSummary: () => string = (): string => '';
   onConfirm: () => void = () => {};
 
   build() {
     Column({ space: 14 }) {
       Text('删除节点').fontSize(17).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-      Text(`确定删除「${this.getNodeName()}」吗？该节点在订阅刷新后不会再出现。`)
+      Text(`确定删除 ${this.getSummary()} 吗？这些节点在订阅刷新后不会再出现。`)
         .fontSize(13).fontColor(Ui.textSecondary)
       Row({ space: 12 }) {
         Button('取消')
@@ -215,14 +218,20 @@ struct NodeSelectionPage {
   @State sortMode: string = NodeSortModes.DEFAULT;
   /** 最近一次测速快照（内存镜像，随设置持久化） */
   private sortSnapshot: NodeSortSnapshot | null = null;
-  /** 长按删除节点目标 */
-  @State deleteTargetName: string = '';
-  private deleteTargetId: string = '';
-  private deleteNodeDialog: CustomDialogController = new CustomDialogController({
-    builder: NodeDeleteDialog({
-      getNodeName: (): string => this.deleteTargetName,
+  /**
+   * 批量多选（2026-10-20，用户选定的方案 1「就地长按多选」）：
+   * 长按任一节点进入选择态 —— 顶栏切成「取消 · 已选 N · 全选 · 删除」，行前出现勾选圆点；
+   * 删除走一次确认后逐个 removeNode（复用「刷新后不再出现」的本地屏蔽台账）。
+   */
+  @State selectMode: boolean = false;
+  @State selectedNodeIds: string[] = [];
+  /** 确认框正文：把选中节点名摘要成一句（>3 个折叠为「A、B、C 等 N 个节点」） */
+  @State batchDeleteSummary: string = '';
+  private batchDeleteDialog: CustomDialogController = new CustomDialogController({
+    builder: NodeBatchDeleteDialog({
+      getSummary: (): string => this.batchDeleteSummary,
       onConfirm: () => {
-        this.doDeleteNode();
+        this.doDeleteSelected();
       }
     }),
     autoCancel: true
@@ -1225,29 +1234,111 @@ struct NodeSelectionPage {
     }
   }
 
-  /** 长按删除单个节点 */
-  private async doDeleteNode(): Promise<void> {
-    if (this.deleteTargetId.length === 0) {
+  // ── 批量多选：状态流转与小工具（2026-10-20）────────────────────────────
+
+  /** 长按进入选择态，并把被长按的那个节点先勾上（符合「我长按谁就先选谁」的直觉） */
+  private enterSelectMode(nodeId: string): void {
+    this.selectMode = true;
+    this.selectedNodeIds = [nodeId];
+  }
+
+  private exitSelectMode(): void {
+    this.selectMode = false;
+    this.selectedNodeIds = [];
+  }
+
+  private isNodeSelected(nodeId: string): boolean {
+    return this.selectedNodeIds.indexOf(nodeId) >= 0;
+  }
+
+  /** 选择态下点行 = 勾选/取消勾选；非选择态仍是「选中该节点作为当前出口」 */
+  private onNodeTap(node: ProxyNode): void {
+    if (this.selectMode) {
+      // 合成行（自动选择）不在订阅里，不可删除 —— 选择态下直接忽略点击
+      if (node.id === SMART_ROW_ID) {
+        return;
+      }
+      this.toggleSelectedNode(node.id);
       return;
     }
-    const removed = this.subs.findNode(this.deleteTargetId);
-    const wasSelected = this.settings.preferredNodeId === this.deleteTargetId;
-    const ok = await this.subs.removeNode(this.deleteTargetId);
-    this.deleteTargetId = '';
-    if (!ok) {
-      promptAction.showToast({ message: '删除失败，请重试' });
+    this.selectNode(node);
+  }
+
+  private toggleSelectedNode(nodeId: string): void {
+    const index = this.selectedNodeIds.indexOf(nodeId);
+    const next: string[] = this.selectedNodeIds.slice();
+    if (index >= 0) {
+      next.splice(index, 1);
+    } else {
+      next.push(nodeId);
+    }
+    this.selectedNodeIds = next;
+  }
+
+  /** 全选/取消全选：作用范围 = 当前可见的普通节点（尊重搜索与订阅筛选；合成行不可删） */
+  private toggleSelectAllNodes(): void {
+    const visible: NodeRow[] = this.searchFiltered(this.nodes);
+    const ids: string[] = [];
+    for (const row of visible) {
+      if (row.isSmart !== true) {
+        ids.push(row.node.id);
+      }
+    }
+    this.selectedNodeIds = this.selectedNodeIds.length >= ids.length ? [] : ids;
+  }
+
+  /** 弹确认框（把名字摘要成一句，避免 30 个节点名把对话框撑爆） */
+  private confirmDeleteSelected(): void {
+    if (this.selectedNodeIds.length === 0) {
       return;
     }
-    if (wasSelected) {
+    const picked: string[] = [];
+    for (const id of this.selectedNodeIds) {
+      const node = this.subs.findNode(id);
+      if (node !== null) {
+        picked.push(`「${node.name}」`);
+      }
+    }
+    if (picked.length === 0) {
+      this.exitSelectMode();
+      return;
+    }
+    const head: string = picked.slice(0, 3).join('、');
+    this.batchDeleteSummary = picked.length > 3 ? `${head} 等 ${picked.length} 个节点` : head;
+    this.batchDeleteDialog.open();
+  }
+
+  /** 批量删除：逐个走同一 removeNode（失败不中断，最后汇报成功数） */
+  private async doDeleteSelected(): Promise<void> {
+    const ids: string[] = this.selectedNodeIds.slice();
+    if (ids.length === 0) {
+      return;
+    }
+    let removedCount = 0;
+    let removedSelected = false;
+    for (const id of ids) {
+      if (this.settings.preferredNodeId === id) {
+        removedSelected = true;
+      }
+      const ok = await this.subs.removeNode(id);
+      if (ok) {
+        removedCount += 1;
+      }
+    }
+    if (removedSelected) {
       this.settings.preferredNodeId = '';
-      // 字段级写：只改这一个字段，不覆盖别人（设置页/自动切换）刚写进去的值
+      // 字段级写：只改这一个字段，不覆盖别人刚写进去的值
       await SettingsService.patchSettings((s: AppSettings): void => {
         s.preferredNodeId = '';
       });
       this.selectedName = this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '';
     }
+    this.exitSelectMode();
     this.rebuildRows();
-    promptAction.showToast({ message: removed !== null ? `已删除「${removed.name}」` : '已删除' });
+    promptAction.showToast({
+      message: removedCount === ids.length ? `已删除 ${removedCount} 个节点`
+        : `已删除 ${removedCount}/${ids.length} 个（部分失败，可重试）`
+    });
   }
 
   /**
@@ -1633,6 +1724,52 @@ struct NodeSelectionPage {
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
+        // ── 批量多选顶栏（长按任一节点进入；非选择态不渲染）──
+        if (this.selectMode) {
+          Row({ space: 10 }) {
+            Row() {
+              Image($r('app.media.ic_close'))
+                .width(18).height(18).fillColor(Ui.textPrimary)
+            }
+            .width(36).height(36)
+            .justifyContent(FlexAlign.Center)
+            .alignItems(VerticalAlign.Center)
+            .borderRadius(18)
+            .backgroundColor(Ui.surfaceMuted)
+            .onClick(() => this.exitSelectMode())
+            Text(`已选 ${this.selectedNodeIds.length}`)
+              .fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor(Ui.textPrimary)
+              .layoutWeight(1)
+            Text('全选')
+              .fontSize(13).fontColor(Ui.primary)
+              .height(36)
+              .padding({ left: 12, right: 12 })
+              .borderRadius(18)
+              .backgroundColor(Ui.primaryBlueFill)
+              .borderWidth(1).borderColor(Ui.borderStrong)
+              .textAlign(TextAlign.Center)
+              .onClick(() => this.toggleSelectAllNodes())
+            Row({ space: 5 }) {
+              Image($r('app.media.ic_delete'))
+                .width(14).height(14)
+                .fillColor(this.selectedNodeIds.length > 0 ? Ui.error : Ui.textTertiary)
+              Text('删除')
+                .fontSize(13).fontWeight(FontWeight.Medium)
+                .fontColor(this.selectedNodeIds.length > 0 ? Ui.error : Ui.textTertiary)
+            }
+            .height(36)
+            .padding({ left: 12, right: 12 })
+            .borderRadius(18)
+            .backgroundColor(Ui.surfaceMuted)
+            .borderWidth(1).borderColor(Ui.border)
+            .onClick(() => this.confirmDeleteSelected())
+          }
+          .width('100%')
+          .height(56)
+          .padding({ left: 16, right: 16 })
+        }
+
         // ── 顶栏（对齐原版: 返回 + 当前节点 + 刷新/闪电图标组） ──
         Row() {
           Row() {
@@ -1742,6 +1879,8 @@ struct NodeSelectionPage {
         .width('100%')
         .height(56)
         .padding({ left: 16, right: 16 })
+        // 选择态下整条常规顶栏让位给上面的「已选 N · 全选 · 删除」条
+        .visibility(this.selectMode ? Visibility.None : Visibility.Visible)
 
         // ── 组级诊断条 ──
         // 整组同因全败时，折叠成**一条**能说清原因的诊断条
@@ -1938,9 +2077,8 @@ struct NodeSelectionPage {
                         this.NodeCard(row)
                       }
                       .gesture(LongPressGesture().onAction(() => {
-                        this.deleteTargetId = row.node.id;
-                        this.deleteTargetName = row.node.name;
-                        this.deleteNodeDialog.open();
+                        // 长按进入批量多选（2026-10-20）：先勾上被长按的这个节点
+                        this.enterSelectMode(row.node.id);
                       }))
                     }, (row: NodeRow) => this.groupKey(groupRow.group) + '#m#' + row.node.id + '#'
                       + this.latencyTick.toString() + '#' + this.testingName)
@@ -1972,9 +2110,8 @@ struct NodeSelectionPage {
                 if (row.isSmart === true) {
                   return;
                 }
-                this.deleteTargetId = row.node.id;
-                this.deleteTargetName = row.node.name;
-                this.deleteNodeDialog.open();
+                // 长按进入批量多选（2026-10-20）
+                this.enterSelectMode(row.node.id);
               }))
             }, (row: NodeRow) => row.node.id + '#' + this.latencyTick.toString() + '#' + this.testingName)
           }
@@ -2039,6 +2176,25 @@ struct NodeSelectionPage {
     }
   }
 
+  /** 批量多选的勾选圆点（只在选择态渲染：未选空心、选中实心 + 白勾） */
+  @Builder
+  SelectDot(selected: boolean) {
+    Row() {
+      if (selected) {
+        Image($r('app.media.ic_check'))
+          .width(12).height(12)
+          .fillColor(Color.White)
+      }
+    }
+    .width(20).height(20)
+    .borderRadius(10)
+    .borderWidth(1.5)
+    .borderColor(selected ? Ui.primary : Ui.borderStrong)
+    .backgroundColor(selected ? Ui.primary : Color.Transparent)
+    .justifyContent(FlexAlign.Center)
+    .alignItems(VerticalAlign.Center)
+  }
+
   @Builder
   NodeCard(row: NodeRow) {
     if (row.isSmart === true) {
@@ -2081,7 +2237,7 @@ struct NodeSelectionPage {
         .alignItems(HorizontalAlign.Start)
       }
       .layoutWeight(1)
-      .onClick(() => this.selectNode(row.node))
+      .onClick(() => this.onNodeTap(row.node))
 
       Image($r('app.media.ic_check'))
         .width(18).height(18)
@@ -2101,6 +2257,9 @@ struct NodeSelectionPage {
   RealNodeCard(row: NodeRow) {
     Row() {
       Row({ space: 12 }) {
+        if (this.selectMode) {
+          this.SelectDot(this.isNodeSelected(row.node.id))
+        }
         CountryFlagIcon({ nodeName: row.node.name, iconSize: 26 })
         Column({ space: 3 }) {
           // ── 第一行：名称 + 延迟 ──
@@ -2149,7 +2308,7 @@ struct NodeSelectionPage {
         .alignItems(HorizontalAlign.Start)
       }
       .layoutWeight(1)
-      .onClick(() => this.selectNode(row.node))
+      .onClick(() => this.onNodeTap(row.node))
 
       Image($r('app.media.ic_check'))
         .width(18).height(18)

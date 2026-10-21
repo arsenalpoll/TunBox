@@ -66,7 +66,9 @@ const TAG: string = 'LatencyProbe';
  * 测速参数集中区（**唯一允许出现魔数的地方**）。
  *
  * 取值依据：
- *  - `NODE_TIMEOUT_MS` 5000：单个节点的一次测速预算（内核 timeout 参数）。
+ *  - `NODE_TIMEOUT_MS` 3000：单个节点的一次测速预算（内核 timeout 参数）。
+ *    2026-10-20 晚用户要求由 5000 改为 3000；与 `LatencyTimeout.DEFAULT_TIMEOUT_MS`
+ *    必须同值（闸门 verify-latency-core-v2 断言两者相等）。
  *  - `OUTER_EXTRA_MS` 1200：外层 HTTP 超时相对内核预算的余量。内核在自己的
  *    timeout 到点后要先拆 dial 上下文、再序列化 504 回写 socket（弱网/高负载时
  *    可能上百毫秒）。余量太小 → 客户端先超时 → 拿到的是传输层错误而不是内核明确的
@@ -80,8 +82,8 @@ const TAG: string = 'LatencyProbe';
  *    超了就是「排队超时」（根本没拨号），归非判定。
  */
 export class LatencyProbeLimits {
-  /** 单节点的测速预算（内核 timeout 参数，单位 ms） */
-  static readonly NODE_TIMEOUT_MS: number = 5000;
+  /** 单节点的测速预算（内核 timeout 参数，单位 ms）：2026-10-20 晚由 5000 改为 3000 */
+  static readonly NODE_TIMEOUT_MS: number = 3000;
   /** 外层 HTTP 超时相对内核预算的余量 */
   static readonly OUTER_EXTRA_MS: number = 1200;
   /** worker 数 / 队列深度（对齐 FlClash 的 client concurrency 50） */
