@@ -78,11 +78,17 @@ public sealed class ProxyGroup
     public string SubscriptionId { get; set; } = "";
 }
 
+/// <summary>订阅来源类型：url / file / proxy-provider（对齐 FlClash；proxy-provider 订阅节点由内核运行时下载）。</summary>
+public enum SubscriptionType { Url, File, ProxyProvider }
+
 /// <summary>一条订阅及其解析出的流量/到期信息（subscription-userinfo 响应头）。</summary>
 public sealed class Subscription
 {
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
+    public SubscriptionType Type { get; set; } = SubscriptionType.Url;
+    /// <summary>proxy-provider 模式下的原始 YAML 片段，原样透传进生成的 config.yaml。</summary>
+    public string ProxyProviderYaml { get; set; } = "";
     public string Url { get; set; } = "";
     public long UpdatedAtMs { get; set; }
     public long UploadBytes { get; set; } = -1;
@@ -143,6 +149,8 @@ public sealed class AppSettings
     public bool Ipv6Enabled { get; set; }
     /// <summary>DNS 复写：用户接管解析用的 nameserver（对齐 Verge / FlClash 的「DNS 覆写」）。</summary>
     public bool DnsOverrideEnabled { get; set; }
+    /// <summary>DNS 永远接管：对齐 FlClash，DNS 始终生效，fake-ip 规则不动，redir-host 模式。</summary>
+    public bool DnsAlwaysHijack { get; set; } = true;
     /// <summary>复写用的 DNS 服务器；只换 nameserver，引导 DNS 与 fake-ip 规则不动。</summary>
     // 下面这些名单同理：只读集合能存不能读，一律给 setter（见 NodeLibrary 的注释）。
     public List<string> DnsServers { get; set; } = new();
@@ -173,8 +181,11 @@ public sealed class AppSettings
     public string HotkeyToggleTun { get; set; } = "";
 
     // ── TUN 高级项（对齐 FlClash 的 TUN 设置）────────────────────────────
-    /// <summary>网卡 MTU；1280-65535 之外生成配置时归一回 1500。</summary>
-    public int TunMtu { get; set; } = 1500;
+    /// <summary>网卡 MTU；FlClash 默认 9000，1280-65535 之外生成配置时归一回 9000。</summary>
+    public int TunMtu { get; set; } = 9000;
+
+    /// <summary>WebDAV 备份/恢复（对齐 FlClash 的 davProps）。</summary>
+    public DavProps Dav { get; set; } = new();
     /// <summary>严格路由：拒绝绕过 TUN 的流量（防漏，但某些内网工具会失联）。</summary>
     public bool TunStrictRoute { get; set; }
     /// <summary>端点独立 NAT（UDP 对称 NAT 场景的兼容选项）。</summary>
@@ -199,4 +210,15 @@ public sealed class AppSettings
 
     /// <summary>系统代理指向哪个端口：混合优先，其次独立 HTTP。返回 0 表示不该开系统代理。</summary>
     public int SystemProxyPort() => MixedPort > 0 ? MixedPort : HttpPort;
+}
+
+/// <summary>WebDAV 备份/恢复参数（对齐 FlClash 的 DAVProps）。</summary>
+public sealed class DavProps
+{
+    public string Url { get; set; } = "";
+    public string Username { get; set; } = "";
+    public string Password { get; set; } = "";
+    public string RemotePath { get; set; } = "/TunBox/backup.zip";
+    public int IntervalMinutes { get; set; } = 0; // 0 = 关闭自动备份
+    public bool Enabled { get; set; }
 }

@@ -28,59 +28,58 @@ public sealed class ConnectionManager : IDisposable
     public ControllerClient Api { get; } = new();
 
     public event Action? Changed;
-    public string? LastError { get; private set; }
-    public ProxyDropStats? LastDrop { get; private set; }
-
-    public TunnelState State { get; private set; } = TunnelState.Disconnected;
 
     /// <summary>内核进程活着且控制器可达（待命或已连接都算）。</summary>
-    public bool CoreAlive => State is TunnelState.Connected or TunnelState.Standby;
+    public bool CoreAlive => AppState.Current.CoreAlive;
 
+    public TunnelState State => AppState.Current.TunnelState;
     /// <summary>虚拟网卡是否真的建起来了（只在 TunEnabled 时有意义）。</summary>
-    public bool TunActive { get; private set; }
-    public IReadOnlyList<ProxyNode> Nodes => _lib.Nodes;
-    public IReadOnlyList<ProxyGroup> Groups => _lib.Groups;
-    public IReadOnlyList<Subscription> Subscriptions => _lib.Subscriptions;
-    public AppSettings Settings { get; private set; }
-    public IReadOnlyList<string> ImportWarnings { get; private set; } = Array.Empty<string>();
+    public bool TunActive => AppState.Current.TunActive;
+    public IReadOnlyList<ProxyNode> Nodes => AppState.Current.Nodes;
+    public IReadOnlyList<ProxyGroup> Groups => AppState.Current.Groups;
+    public IReadOnlyList<Subscription> Subscriptions => AppState.Current.Subscriptions;
+    public AppSettings Settings => AppState.Current.Settings;
+    public IReadOnlyList<string> ImportWarnings => AppState.Current.ImportWarnings;
 
     /// <summary>热重载没谈拢时留下的那句话，UI 拿来解释「为什么还要下次连接才生效」。</summary>
-    public string? PendingConfigNote { get; private set; }
+    public string? PendingConfigNote => AppState.Current.PendingConfigNote;
 
     /// <summary>本轮配置生成时覆写环节的警告（Merge/Script 没生效的原因）；null = 覆写全部生效。</summary>
-    public string? LastOverrideNote { get; private set; }
-
-    private NodeLibrary _lib;
+    public string? LastOverrideNote => AppState.Current.LastOverrideNote;
 
     public ConnectionManager(Workspace workspace)
     {
         _ws = workspace;
-        Settings = _ws.LoadSettings();
-        _lib = _ws.LoadNodes();
+        // 单一状态源：所有设置与节点库一次性加载进 AppState.Current，后续不再维护副本。
+        AppState.Current.Settings = _ws.LoadSettings();
+        var lib = _ws.LoadNodes();
+        AppState.Current.Nodes = lib.Nodes;
+        AppState.Current.Groups = lib.Groups;
+        AppState.Current.Subscriptions = lib.Subscriptions;
         // 孤儿清理：订阅被删后残留的节点会让「计数 24、列表 12」——两套账必须对齐。
-        var liveSubIds = _lib.Subscriptions.Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
-        _lib.Nodes.RemoveAll(n => !liveSubIds.Contains(n.SubscriptionId));
-        _lib.Groups.RemoveAll(g => !liveSubIds.Contains(g.SubscriptionId));
+        var liveSubIds = AppState.Current.Subscriptions.Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
+        AppState.Current.Nodes.RemoveAll(n => !liveSubIds.Contains(n.SubscriptionId));
+        AppState.Current.Groups.RemoveAll(g => !liveSubIds.Contains(g.SubscriptionId));
         // 老数据里跨订阅重复的 id 在启动这一刻就治好并落盘（否则 PROXY 成员表会少节点，
         // 用户点那些节点就被内核拒「proxy not exist」）。
-        if (EnsureUniqueIds(_lib.Nodes)) PersistNodes();
+        if (EnsureUniqueIds(AppState.Current.Nodes)) PersistNodes();
         // 老默认测速地址迁移:cp.cloudflare 的延迟口径与 Verge(gstatic)差一截,
         // 用户看到「Verge 几十毫秒、TunBox 两百多」多半是它;只迁移从未改过的默认值。
-        if (Settings.TestUrl == "http://cp.cloudflare.com/generate_204")
+        if (AppState.Current.Settings.TestUrl == "http://cp.cloudflare.com/generate_204")
         {
-            Settings.TestUrl = "https://www.gstatic.com/generate_204";
+            AppState.Current.Settings.TestUrl = "https://www.gstatic.com/generate_204";
             PersistSettings();
         }
-        Api.Configure(Settings.ApiPort, Settings.ApiSecret);
+        Api.Configure(AppState.Current.Settings.ApiPort, AppState.Current.Settings.ApiSecret);
         // 先把随程序发布的 LightGBM 模型放进内核 home：不放到时候 smart 组不发射，
         // 界面上「自动选择」这一条会凭空消失（要等第一次 BuildConfig 才补上，太晚了）。
         _ws.EnsureSmartModelInPlace();
         _host = new CoreHost(_ws.RuntimeDir);
         _host.StateChanged += s =>
         {
-            if (s != CoreState.Failed || State == TunnelState.Disconnected) return;
-            State = TunnelState.Error;
-            LastError = "内核异常退出，已停止自动恢复。" + _host.TailLog(4);
+            if (s != CoreState.Failed || AppState.Current.TunnelState == TunnelState.Disconnected) return;
+            AppState.Current.SetTunnelState(TunnelState.Error);
+            AppState.Current.SetLastError("内核异常退出，已停止自动恢复。" + _host.TailLog(4));
             TryDisableProxy();
             Changed?.Invoke();
         };
@@ -391,8 +390,8 @@ public sealed class ConnectionManager : IDisposable
         }
 
         var wasAlive = CoreAlive;
-        State = TunnelState.Connecting;
-        LastError = null;
+        AppState.Current.SetTunnelState(TunnelState.Connecting);
+        AppState.Current.SetLastError(null);
         Changed?.Invoke();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var phases = new List<string>();
@@ -411,7 +410,7 @@ public sealed class ConnectionManager : IDisposable
 
             if (standby)
             {
-                State = TunnelState.Standby;
+                AppState.Current.SetTunnelState(TunnelState.Standby);
                 Changed?.Invoke();
                 KickWarmup();
                 return true;
@@ -434,10 +433,10 @@ public sealed class ConnectionManager : IDisposable
         catch (Exception e)
         {
             LastError = e.Message;
-            TunActive = false;
+            AppState.Current.SetTunActive(false);
             _host.Stop();
             TryDisableProxy();
-            State = TunnelState.Error;
+            AppState.Current.SetTunnelState(TunnelState.Error);
             Changed?.Invoke();
             return false;
         }
@@ -631,9 +630,9 @@ public sealed class ConnectionManager : IDisposable
     {
         _host.Stop();
         TryDisableProxy();
-        TunActive = false;
+        AppState.Current.SetTunActive(false);
         TunPending = false;
-        State = TunnelState.Disconnected;
+        AppState.Current.SetTunnelState(TunnelState.Disconnected);
         Changed?.Invoke();
         await Task.CompletedTask;
     }
