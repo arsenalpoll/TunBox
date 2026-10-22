@@ -17,6 +17,7 @@
  * 用户感知：无感保障连接质量，无需任何配置。
  */
 import { router, promptAction } from '@kit.ArkUI';
+import { RulesEditorSnapshot, RulesPageParams } from '../commons/models/RulesEditorSnapshot';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { common } from '@kit.AbilityKit';
 import { privacyManager } from '@kit.AppGalleryKit';
@@ -76,6 +77,7 @@ export struct SettingsView {
   @State assetSource: string = 'auto';
   @State geoUpdatingId: string = '';
   @State quotaNotifyEnabled: boolean = true;
+  @State audioKeepAliveEnabled: boolean = false;
   // ── 网络（IPv6 双栈，产品默认开）──
   @State ipv6Enabled: boolean = true;
   /**
@@ -95,6 +97,7 @@ export struct SettingsView {
   private settingsTitle: string = '';
 
   private settings: AppSettings = new AppSettings();
+  private openingRules: boolean = false;
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
   private subs: SubscriptionService = SubscriptionService.instance();
 
@@ -126,12 +129,29 @@ export struct SettingsView {
     // 每次进入：从持久化读取真实值回填（缺字段/脏值由 AppSettings.fromJson 兜底）
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
+    this.audioKeepAliveEnabled = this.settings.audioKeepAliveEnabled;
     this.ipv6Enabled = this.settings.ipv6Enabled;
     this.assetSource = this.settings.assetSource;
     this.testLatencyUrl = this.settings.testLatencyUrl;
     this.refreshGeoStatuses();
     this.refreshNodeAndSwitchInfo();
     this.refreshPrivacyLink();
+  }
+
+  private async openRulesPage(): Promise<void> {
+    if (this.openingRules) { return; }
+    this.openingRules = true;
+    try {
+      await SettingsService.init(getContext(this) as Context);
+      const settings = await SettingsService.load();
+      const params = new RulesPageParams();
+      params.initialRules = RulesEditorSnapshot.fromSettings(settings);
+      await router.pushUrl({ url: 'pages/RulesPage', params: params });
+    } catch (e) {
+      promptAction.showToast({ message: '读取规则设置失败，请重试' });
+    } finally {
+      this.openingRules = false;
+    }
   }
 
   /** 查询华为应用市场托管的隐私声明链接（AppGallery Kit 隐私管理服务，官方要求应用内入口与弹窗内容一致） */
@@ -172,7 +192,7 @@ export struct SettingsView {
       summary = `仅所选应用 · 已选 ${this.settings.includedApps.length} 个`;
     }
     this.adRulesSummary = this.settings.rulesEnabled
-      ? (this.settings.hyperAdRulesEnabled ? '拦截规则生效中 · HyperADRules 智能去广告' : '规则生效中')
+      ? (this.settings.hyperAdRulesEnabled ? '已开启 · HyperADRules 域名拦截' : '规则已开启')
       : '规则已关闭';
     this.appRoutingSummary = this.settings.appRoutingNeedsReview
       ? summary + ' · 待确认，请进入检查' : summary;
@@ -200,6 +220,21 @@ export struct SettingsView {
     }).then((): void => {
       promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
     }).catch((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
+  }
+
+  private setAudioKeepAlive(v: boolean): void {
+    const previous = this.audioKeepAliveEnabled;
+    this.audioKeepAliveEnabled = v;
+    SettingsService.patchSettings((s: AppSettings): void => {
+      s.audioKeepAliveEnabled = v;
+    }).then((): void => {
+      this.audioKeepAliveEnabled = v;
+      this.settings.audioKeepAliveEnabled = v;
+      promptAction.showToast({ message: '已保存，重新连接后生效' });
+    }).catch((): void => {
+      this.audioKeepAliveEnabled = previous;
       promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
     });
   }
@@ -448,7 +483,7 @@ export struct SettingsView {
             .borderRadius(TunBoxGeometry.cardRadius)
             .backgroundColor(TunBoxColors.surfaceCard)
             .border({ width: 1, color: TunBoxColors.cardBorder })
-            .onClick(() => router.pushUrl({ url: 'pages/RulesPage' }))
+            .onClick(() => { this.openRulesPage(); })
 
             // ── 主题：跟随系统（2026-10-20 新增，默认跟随）──
             Column({ space: 10 }) {
@@ -559,6 +594,25 @@ export struct SettingsView {
                   .border({ width: 1, color: TunBoxColors.cardBorder })
                   .onClick((): void => { this.resetTestUrl(); })
               }.width('100%')
+            }
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+
+            Column({ space: 12 }) {
+              this.SectionHeader($r('app.media.ic_shield'), $r('app.string.settings_background_connection'))
+              Row() {
+                Text('音频保活（下次连接）')
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Toggle({ type: ToggleType.Switch, isOn: this.audioKeepAliveEnabled })
+                  .selectedColor(TunBoxColors.primary)
+                  .onChange((v: boolean): void => this.setAudioKeepAlive(v))
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text('可选：持续播放低音量音频并显示媒体卡片，会增加耗电；电话或其他音频可能中断保活。更改后请重新连接。')
+                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+              Text('连接期间每 30 秒检查后台任务；系统暂停、用户停止时不会强制重启。')
+                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
