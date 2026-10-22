@@ -101,3 +101,7 @@ SSRVPN_HarmonyOS/tools/true-parser-harness/*.ts
 
 # Windows client: standalone FlClash-based repo (own .git, not tracked by this repo)
 TunBox-Windows/
+
+# 本地工具链 / 内核源码克隆（各带自己的 .git，不入本仓）
+.tooling/
+kernel/
