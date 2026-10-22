@@ -9,7 +9,7 @@
  * 支持：ssr:// / ss:// / vless:// / vmess:// / trojan:// / hysteria2://(hy2://) 单链接、
  *       Base64 批量列表、Clash YAML proxies。
  */
-import { ProxyNode, ProxyNodeType, SsrCodec } from './ProxyNode.ts';
+import { ProxyNode, ProxyNodeType, Base64Codec } from './ProxyNode.ts';
 import { ProxyGroup } from './ProxyGroup.ts';
 import { MergedProxy, YamlMergeError, YamlMerger, YamlNodeError } from './YamlMerger.ts';
 import { AppLogger } from './stubs.ts';
@@ -160,7 +160,7 @@ export class SubscriptionParser {
 
     // 2) 整体 Base64 解码后再解析（对应 subscription_parser_base64_part）
     if (nodes.length === 0) {
-      const decoded = SsrCodec.decodeBase64Url(normalized.replace(/\s+/g, ''));
+      const decoded = Base64Codec.decodeBase64Url(normalized.replace(/\s+/g, ''));
       if (decoded.length > 0 && decoded.includes('://')) {
         for (const line of decoded.split(/\r?\n/)) {
           const trimmed = line.trim();

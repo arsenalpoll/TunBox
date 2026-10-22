@@ -4,6 +4,9 @@ import { harness, deferred, flush } from './orchestrator-runtime-harness.mjs';
 function fixture() {
   const h = harness();
   h.settings = { rulesEnabled: true, hyperAdRulesEnabled: true, assetSource: 'github', proxyMode: 'rule' };
+  h.promotes = []; h.removed = [];
+  h.platform.fs.renameSync = (from, to) => h.promotes.push([from, to]);
+  h.platform.fs.unlinkSync = path => { h.removed.push(path); if (path.endsWith('hyper_adrules_ads.mrs')) h.ruleReady = false; };
   h.downloads = 0; h.downloadOK = true; h.downloadGate = null; h.reloads = 0; h.restarts = 0; h.configs = [];
   h.platform.SettingsService.load = async () => ({ ...h.settings });
   h.platform.ensurePrivateDir = () => {};
@@ -38,10 +41,10 @@ async function test(name, fn) {
   catch (e) { failed++; console.log('FAIL ' + name + ': ' + e.message); }
 }
 
-await test('first enable downloads then hot-loads the ad provider without reconnecting', async () => {
+await test('enabling without a file requires manual download and keeps the tunnel', async () => {
   const h = fixture(), start = h.orch.startedAt;
-  assert.equal(await h.orch.applyRulesChanged('enable-ads'), 'hot');
-  assert.equal(h.downloads, 1); assert.equal(h.configs.at(-1).adRule, true);
+  assert.equal(await h.orch.applyRulesChanged('enable-ads'), 'ad-unavailable');
+  assert.equal(h.downloads, 0); assert.equal(h.configs.at(-1).adRule, false);
   assert.equal(h.restarts, 0); assert.equal(h.orch.startedAt, start);
 });
 await test('hot reload uses current disk readiness rather than the previous connection flag', async () => {
@@ -49,11 +52,10 @@ await test('hot reload uses current disk readiness rather than the previous conn
   assert.equal(await h.orch.reloadRulesHot('cached-provider'), true);
   assert.equal(h.configs.at(-1).adRule, true); assert.equal(h.downloads, 0);
 });
-await test('failed asset download is reported as pending instead of false success or reconnect', async () => {
+await test('failed manual download leaves the running configuration unchanged', async () => {
   const h = fixture(); h.downloadOK = false;
-  assert.equal(await h.orch.applyRulesChanged('enable-ads'), 'ad-unavailable');
-  assert.equal(h.reloads, 0); assert.equal(h.restarts, 0);
-  assert.equal(h.orch.state, h.ConnState.CONNECTED);
+  assert.notEqual(await h.orch.refreshGeoAsset('ruleset', 'github'), '');
+  assert.equal(h.reloads, 0); assert.equal(h.restarts, 0); assert.equal(h.orch.state, h.ConnState.CONNECTED);
 });
 await test('disabled ad blocking does not fetch the provider', async () => {
   const h = fixture(); h.settings.hyperAdRulesEnabled = false;
@@ -70,41 +72,41 @@ await test('cached provider applies without downloading', async () => {
   assert.equal(await h.orch.applyRulesChanged('cached'), 'hot');
   assert.equal(h.downloads, 0); assert.equal(h.orch.lastRuleProviderFileReady, true);
 });
-await test('missing file overrides a previously ready connection flag', async () => {
-  const h = fixture(); h.orch.lastRuleProviderFileReady = true; h.downloadOK = false;
+await test('deleted file overrides stale readiness without downloading it again', async () => {
+  const h = fixture(); h.ruleReady = true; h.orch.lastRuleProviderFileReady = true;
+  assert.equal(h.orch.deleteGeoAsset('ruleset'), '');
   assert.equal(await h.orch.applyRulesChanged('removed-file'), 'ad-unavailable');
-  assert.equal(h.reloads, 0); assert.equal(h.restarts, 0);
+  assert.equal(h.configs.at(-1).adRule, false); assert.equal(h.orch.lastRuleProviderFileReady, false);
+  assert.equal(h.downloads, 0); assert.equal(h.restarts, 0);
 });
 await test('disconnected sessions save for next connect without downloading', async () => {
   const h = fixture(); h.orch.state = h.ConnState.DISCONNECTED;
   assert.equal(await h.orch.applyRulesChanged('offline'), 'none');
   assert.equal(h.downloads, 0); assert.equal(h.reloads, 0); assert.equal(h.restarts, 0);
 });
-await test('user stop during download prevents late reload and reconnect', async () => {
+await test('user stop during manual download prevents late reload and reconnect', async () => {
   const h = fixture(), gate = deferred(); h.downloadGate = gate;
-  const task = h.orch.applyRulesChanged('slow-download'); await flush();
+  const task = h.orch.refreshGeoAsset('ruleset', 'github'); await flush();
   assert.equal(h.downloads, 1); h.orch.disconnectRequested = true;
-  gate.resolve(); assert.equal(await task, 'none');
-  assert.equal(h.reloads, 0); assert.equal(h.restarts, 0);
+  gate.resolve(); await task; assert.equal(h.reloads, 0); assert.equal(h.restarts, 0);
 });
-await test('new connection sequence rejects an old download completion', async () => {
+await test('new connection sequence rejects an old manual download completion', async () => {
   const h = fixture(), gate = deferred(); h.downloadGate = gate;
-  const task = h.orch.applyRulesChanged('old-sequence'); await flush();
-  h.orch.connectSeq++; gate.resolve(); assert.equal(await task, 'none');
+  const task = h.orch.refreshGeoAsset('ruleset', 'github'); await flush();
+  h.orch.connectSeq++; gate.resolve(); await task;
   assert.equal(h.reloads, 0); assert.equal(h.restarts, 0);
 });
-await test('new persistent session rejects an old download completion', async () => {
+await test('new persistent session rejects an old manual download completion', async () => {
   const h = fixture(), gate = deferred(); h.downloadGate = gate;
-  const task = h.orch.applyRulesChanged('old-session'); await flush();
-  h.orch.sessionGeneration++; gate.resolve(); assert.equal(await task, 'none');
+  const task = h.orch.refreshGeoAsset('ruleset', 'github'); await flush();
+  h.orch.sessionGeneration++; gate.resolve(); await task;
   assert.equal(h.reloads, 0); assert.equal(h.restarts, 0);
 });
-await test('turning ads off during a failed download still applies the disabled setting', async () => {
-  const h = fixture(), gate = deferred(); h.downloadGate = gate; h.downloadOK = false;
-  const task = h.orch.applyRulesChanged('toggle'); await flush();
-  h.settings.hyperAdRulesEnabled = false; gate.resolve();
-  assert.equal(await task, 'hot'); assert.equal(h.configs.at(-1).adRule, false);
-  assert.equal(h.restarts, 0);
+await test('turning ads off during manual download keeps the applied config disabled', async () => {
+  const h = fixture(), gate = deferred(); h.downloadGate = gate;
+  const task = h.orch.refreshGeoAsset('ruleset', 'github'); await flush();
+  h.settings.hyperAdRulesEnabled = false; gate.resolve(); await task;
+  assert.equal(h.configs.at(-1).adRule, false); assert.equal(h.restarts, 0);
 });
 await test('concurrent provider callers share one transfer and result', async () => {
   const h = fixture(), gate = deferred(); h.downloadGate = gate;
@@ -114,28 +116,27 @@ await test('concurrent provider callers share one transfer and result', async ()
   assert.deepEqual(await Promise.all([a, b]), [true, true]);
   assert.equal(h.orch.ruleProviderDownloadTask, null);
 });
-await test('transport exceptions settle all waiters and permit a later retry', async () => {
+await test('transport exceptions settle all waiters and permit explicit retry', async () => {
   const h = fixture(), gate = deferred(), transport = h.orch.downloadAsset;
   h.orch.downloadAsset = async () => { h.downloads++; await gate.promise; throw new Error('network'); };
   const a = h.orch.downloadRuleProviderAsset('github'), b = h.orch.downloadRuleProviderAsset('github');
   gate.resolve(); assert.deepEqual(await Promise.all([a, b]), [false, false]);
   h.orch.downloadAsset = transport;
-  assert.equal(await h.orch.applyRulesChanged('retry'), 'hot');
+  assert.equal(await h.orch.refreshGeoAsset('ruleset', 'github'), '');
   assert.equal(h.configs.at(-1).adRule, true); assert.equal(h.downloads, 2);
 });
 await test('overlapping saves serialize hot reloads without reconnecting', async () => {
-  const h = fixture(), gate = deferred(); h.downloadGate = gate;
-  const a = h.orch.applyRulesChanged('first'), b = h.orch.applyRulesChanged('second');
-  await flush(); assert.equal(h.downloads, 1); gate.resolve();
-  assert.deepEqual(await Promise.all([a, b]), ['hot', 'hot']);
-  assert.equal(h.restarts, 0); assert.equal(h.downloads, 1);
+  const h = fixture(); h.ruleReady = true;
+  assert.deepEqual(await Promise.all([h.orch.applyRulesChanged('first'), h.orch.applyRulesChanged('second')]), ['hot', 'hot']);
+  assert.equal(h.restarts, 0); assert.equal(h.downloads, 0);
 });
-await test('background provisioning activates rules in the current tunnel', async () => {
+await test('explicit manual update activates rules in the current tunnel', async () => {
   const h = fixture(), start = h.orch.startedAt;
-  h.orch.downloadRuleProviderInBackground(); await flush();
+  assert.equal(await h.orch.refreshGeoAsset('ruleset', 'github'), '');
   assert.equal(h.downloads, 1); assert.equal(h.reloads, 1);
   assert.equal(h.configs.at(-1).adRule, true); assert.equal(h.restarts, 0);
-  assert.equal(h.orch.startedAt, start);
+  assert.equal(h.orch.startedAt, start); assert.equal(h.promotes.length, 1);
+  assert.ok(h.promotes[0][0].endsWith('.next'));
 });
 await test('late profile build cannot write config into a newer session', async () => {
   const h = fixture(), gate = deferred(); h.ruleReady = true;
@@ -165,6 +166,20 @@ await test('controller reload failure still permits the existing reconnect fallb
   h.orch.api.reloadFromPath = async () => { h.reloads++; return false; };
   assert.equal(await h.orch.applyRulesChanged('controller-failure'), 'reconnect');
   assert.equal(h.reloads, 1); assert.equal(h.restarts, 1);
+});
+
+await test('rejected staged config preserves the last accepted configuration', async () => {
+  const h = fixture(); h.ruleReady = true;
+  h.orch.api.reloadFromPath = async () => false;
+  assert.equal(await h.orch.reloadRulesHot('reject'), false);
+  assert.equal(h.promotes.length, 0); assert.ok(h.removed.some(p => p.endsWith('.next')));
+});
+await test('late accepted reload cannot promote configuration after user stop', async () => {
+  const h = fixture(), gate = deferred(); h.ruleReady = true;
+  h.orch.api.reloadFromPath = async () => { await gate.promise; return true; };
+  const task = h.orch.applyRulesChanged('late-accept'); await flush();
+  h.orch.disconnectRequested = true; gate.resolve();
+  assert.equal(await task, 'none'); assert.equal(h.promotes.length, 0); assert.equal(h.restarts, 0);
 });
 
 console.log(JSON.stringify({ baseline: process.argv.includes('--baseline'), passed, failed }));

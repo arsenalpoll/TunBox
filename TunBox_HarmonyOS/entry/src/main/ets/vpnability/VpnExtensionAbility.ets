@@ -45,6 +45,8 @@
  * 守护承担；本文件只负责隧道数据面与其内部自愈。
  */
 import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
+import { common } from '@kit.AbilityKit';
+import { GeoDataInstaller } from '../commons/services/GeoDataInstaller';
 import type Want from '@ohos.app.ability.Want';
 import { util } from '@kit.ArkTS';
 import { fileIo as fs } from '@kit.CoreFileKit';
@@ -1215,6 +1217,8 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     this.stopped = false;
     this.lifecycleGeneration++;
     AppLogger.info(TAG, 'vpn onCreate');
+    // 扩展进程可能先于 UIAbility 被系统拉起：geo 数据在这里也要保证就位
+    GeoDataInstaller.ensure(this.context as common.Context);
     this.writeLaunchEpoch();
     this.appRouting = new AppRoutingRuntime();
     this.tunConfig = null;

@@ -44,7 +44,7 @@ export struct RulesView {
   private ruleApplyEffect(outcome: string): string {
     if (outcome === 'hot') { return '已即时生效（未重建隧道）'; }
     if (outcome === 'reconnect') { return '正在自动重连'; }
-    if (outcome === 'ad-unavailable') { return '广告规则下载失败，请在设置中更新去广告规则集后重试'; }
+    if (outcome === 'ad-unavailable') { return '广告规则尚未下载，请到设置的数据与规则手动更新'; }
     if (outcome === 'pending') { return '另一规则更新进行中，请稍后重试保存'; }
     return '下次连接生效';
   }
@@ -599,7 +599,7 @@ export struct RulesView {
             .padding({
               left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8
             })
-          }.width('100%').layoutWeight(1).scrollBar(BarState.Off)
+          }.width('100%').layoutWeight(1).scrollBar(BarState.Off).edgeEffect(EdgeEffect.Spring)
         } else {
           TopNavBar({ title: '路由与规则' })
           Text('正在读取规则设置…').fontSize(14).fontColor(TunBoxColors.textMuted).margin({ top: 24 })

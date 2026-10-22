@@ -23,7 +23,7 @@
  * 用法: node scripts/verify-vpn-architecture.mjs
  * 退出码: 0 = 全部通过；1 = 有断言失败
  */
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -463,6 +463,68 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   // 不能复用 filterSubId 表达自动选择视图：它是订阅 id，混用会让过滤分支误判合成行
   ok('page.smart.no-filterSubId-reuse',
     !pageSrc.includes('this.filterSubId = SMART_ROW_ID'));
+  // ── 内核组测速：唯一真实入口 = 订阅页「内核智能优选」行尾按钮（2026-10-22）──────
+  // 历史：组测只实现在没有导航入口的 NodeSelectionPage，与订阅页闪电测速形成两套口径，
+  // 2026-10-21 随死页删除；2026-10-22 用户要求「补一个组测真实入口，放在智能优选后面」
+  // ⇒ 在 SubscriptionPage 重新落地，走 ClashApiService.testGroupDetailedResult()。
+  // 本节锁两件事：① 页面层**不得直接拼** `/group/{x}/delay` URL（必须走客户端方法）；
+  //              ② 组测入口只有一个，且在订阅页。
+  {
+    const hits = [];
+    const scan = (dir) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          scan(full);
+        } else if (entry.name.endsWith('.ets')) {
+          // 只判**代码行**：注释里写 `/group/PROXY/delay` 是说明文字，
+          // 曾因为把注释算成调用点而误判（2026-10-22）。
+          const codeLines = readFileSync(full, 'utf8').split('\n').filter((l) => {
+            const t = l.trim();
+            return t.length > 0 && !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*');
+          });
+          if (codeLines.some((l) => /\/group\/[^"`\s]*\/delay/.test(l))) {
+            hits.push(entry.name);
+          }
+        }
+      }
+    };
+    scan(join(etsRoot, 'pages'));
+    ok('latency.group-endpoint-not-hand-built-in-pages', hits.length === 0, `hits=${JSON.stringify(hits)}`);
+    // 2026-10-22（用户要求「测速完全按 FlClash」）：组测速**不再**调
+    // `GET /group/{name}/delay`，改为组内节点**逐个**走 FlclashLatencyService（32 并发）。
+    // 唯一实现 = FlclashLatencyService.start（BackgroundLatencyService 只是薄适配层）。
+    const bgSrc = readFileSync(join(svcDir, 'BackgroundLatencyService.ets'), 'utf8');
+    has('latency.group-test-single-entry', bgSrc, 'FlclashLatencyService.start(');
+    notHas('latency.no-kernel-group-endpoint', bgSrc, 'testGroupDetailedResult(');
+    const flcDelay = readFileSync(join(etsRoot, 'commons/flclash/FlclashDelay.ets'), 'utf8');
+    has('latency.flclash-concurrency-32', flcDelay, 'FLCLASH_DELAY_CONCURRENCY: number = 32');
+    has('latency.flclash-timeout-5000', flcDelay, 'FLCLASH_DELAY_TIMEOUT_MS: number = 5000');
+    has('latency.flclash-url-gstatic', flcDelay, 'https://www.gstatic.com/generate_204');
+    has('latency.group-test-from-page', readFileSync(join(etsRoot, 'pages/SubscriptionPage.ets'), 'utf8'),
+      'BackgroundLatencyService.runKernelGroupTest(');
+    const nodePage = readFileSync(join(etsRoot, 'pages/NodeSelectionPage.ets'), 'utf8');
+    notHas('latency.dead-page-no-group-test', nodePage, 'testGroupDetailedResult');
+  }
+  // ── 订阅只收 Clash（2026-10-21 用户定案）─────────────────────────────
+  // 判「内容」不判「链接」：非 Clash ⇒ 保留已存节点 + 打旧格式标记 + 停自动更新 + 提示换链接。
+  has('subs.clash-only-guard', subsSrc, 'static isClashBody(body: string): boolean');
+  has('subs.clash-only-advice', subsSrc, 'NON_CLASH_ADVICE');
+  // 2026-10-21 改：非 Clash 直接拒（对齐三家），不再写冻结标记
+  notHas('subs.no-legacy-freeze-flag', subsSrc, 'sub.legacyFormat = true;');
+  {
+    const schedSrc = readFileSync(join(svcDir, 'SubscriptionUpdateScheduler.ets'), 'utf8');
+    has('subs.legacy-skips-auto-update', schedSrc, 'if (s.legacyFormat) {');
+  }
+  {
+    const subPage = readFileSync(join(etsRoot, 'pages', 'SubscriptionPage.ets'), 'utf8');
+    has('subs.file-yaml-only', subPage, "opts.fileSuffixFilters = ['.yaml', '.yml'];");
+    has('subs.qr-rejects-node-uri', subPage, '扫码只支持 Clash 订阅二维码');
+    // 2026-10-21 用户二次定案：订阅刷新/新增/删除/编辑**不自动重连**（保持原行为，
+    // 避免用户正在用网时被打断）；只有节点切换才即时重连。
+    notHas('subs.no-reconnect-on-subscription-ops', subPage, 'syncTunnelAfterSubChange');
+    has('subs.reconnect-on-node-select', subPage, 'reconnectWithNode(node,');
+  }
   // ── 测速频率：只在本次启动 / 订阅变更后测一次 ──
   has('page.latency.session-gate', pageSrc, "AppStorage.get<string>('latency_session_stamp')");
   has('page.latency.revision-key', pageSrc, "'subscription_revision'");
@@ -580,9 +642,9 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
   // 订阅自带 DNS 上游必须真的接上（2026-10-20「测速全部超时」定案）：
   // 上面那条只锁「DoT 字面量还在源码里」，会奖励把订阅分支写死成 DoT ——
   // 这里补上「三分支形状 + 入参接线」的断言，改错了会红。
-  has('dns.subscription-upstream-branch', cfgSrc, 'if (subDnsServers.length > 0)');
-  has('dns.subscription-policy-branch', cfgSrc, '} else if (subDnsPolicies.length > 0)');
-  has('dns.subscription-upstream-wired', cfgSrc, 'normalizeNameservers(subscriptionDnsProxyServers)');
+  has('dns.proxy-ns-policy-emitted', cfgSrc, "lines.push('  proxy-server-nameserver-policy:')");
+  has('dns.proxy-ns-neutral-global', cfgSrc, "lines.push('    - tls://223.5.5.5:853')");
+  has('dns.subscription-upstream-wired', cfgSrc, 'normalizeDnsUpstreams(subscriptionDnsUpstreams, allNodes)');
   has('dns.subscription-policy-wired', cfgSrc, 'normalizeDnsPolicies(subscriptionDnsPolicies, allNodes)');
 
   // ── 5.8.0 线上回归的闸门：华为应用商店在全局模式下加载失败 ──
@@ -628,7 +690,9 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
     'fallback 里存在国内不可达的端点，会给每次境外解析叠加一次连接超时');
 
   // nameserver-policy 只能用纯后缀：geosite: 会在 config.Parse 触发同步下载。
-  ok('dns.no-geosite-policy', !/nameserver-policy[\s\S]{0,400}geosite:/.test(cfgSrc));
+  // 判据锁「真的发射了 geosite:」（lines.push 字符串），不按 400 字窗口扫源码 ——
+  // 窗口会把上面那句「不用 geosite:」的说明注释也算进去，注释一挪动就误红。
+  ok('dns.no-geosite-policy', !/lines\.push\([^\n]*geosite:/.test(cfgSrc));
   // proxy-server-nameserver 是刻意的明文回环阻断器，不在业务解析路径上；
   // nameserver / direct-nameserver（业务解析）里不得再出现**明文** UDP。
   // 判据是"裸 IP 条目"（无 scheme），不能拿 IP 子串匹配 ——
@@ -688,6 +752,40 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
   const dohSrc = readFileSync(join(svcDir, 'DoHResolver.ets'), 'utf8');
   has('perf.doh-pins-load', dohSrc, 'await SettingsService.loadDohPins()');
   has('perf.doh-priority-domains', dohSrc, 'priorityDomains: string[] = []');
+
+  // ── 配置落盘安全：暂存 → 内核校验 → 才替换 ──────────────────────────
+  // 内核对坏配置是**整份拒载**，所以热重载必须先让内核接受暂存文件，接受后才原子替换正式配置；
+  // 否则一次坏规则/坏 DNS 落盘就是「重启即整份拒载」，用户最后一份能用的配置被顶掉。
+  has('config.staged-write', orchSrc, 'const stagedPath = `${configPath}.next`;');
+  has('config.staged-validate', orchSrc, 'await this.api.reloadFromPath(stagedPath)');
+  has('config.staged-promote', orchSrc, 'fs.renameSync(stagedPath, configPath)');
+  // 冷启动没有可预校验的内核（设备侧 core 只有 controller 接口，无 `-t` CLI），
+  // 但 2026-10-22 起改成「**扩展自己当校验器**」：本次配置写 `${configPath}.next`，
+  // 扩展按暂存路径拉起，readiness 通过（= 内核真的加载了它）才提升为正式配置。
+  // 拒载路径不会走到提升 ⇒ 正式配置永远保持上一份「内核真的加载过」的字节。
+  has('config.coldstart-staged-write', orchSrc, 'const stagedConfigPath = `${configPath}.next`;');
+  has('config.coldstart-launch-staged', orchSrc, 'vpnParams[\'configPath\'] = stagedConfigPath;');
+  has('config.coldstart-startparams-staged',
+    orchSrc, 'this.writeStartParamsFile(stagedConfigPath, appRouting.mode, appRouting.needsReview, packagesJson);');
+  has('config.coldstart-promote', orchSrc, 'this.acceptStagedConfig(stagedConfigPath, configPath, preparedConfig);');
+  has('config.coldstart-promote-atomic', orchSrc, 'fs.renameSync(tmp, target);');
+  has('config.coldstart-promote-after-connected', orchSrc,
+    'this.state = ConnState.CONNECTED;');
+  ok('config.coldstart-promote-order',
+    orchSrc.indexOf('this.state = ConnState.CONNECTED;') >= 0
+      && orchSrc.indexOf('this.acceptStagedConfig(stagedConfigPath') > orchSrc.indexOf('this.state = ConnState.CONNECTED;')
+      && orchSrc.indexOf('this.acceptStagedConfig(stagedConfigPath') < orchSrc.indexOf('this.snapshotLastGoodConfig();'));
+  // 等价兜底仍保留（内核拒载时回滚到最后一份能连上的配置）
+  has('config.lastgood-snapshot', orchSrc, 'this.snapshotLastGoodConfig();');
+  has('config.lastgood-restore', orchSrc, 'this.restoreLastGoodConfig()');
+
+  // ── 明文 HTTP 订阅默认拒绝（对齐 FlClash / Clash Verge Rev / CMFA）──
+  const fetchSrc = readFileSync(join(svcDir, 'SubscriptionFetchPolicy.ets'), 'utf8');
+  ok('subs.insecure-http-default-false',
+    fetchSrc.includes('allowInsecureHttp: boolean, etag: string') === true
+      && fetchSrc.includes('isValidSubscriptionUrl(urlStr: string, allowInsecureHttp: boolean = false)') === true);
+  has('subs.insecure-http-actionable', fetchSrc, '在「设置 → 允许明文 HTTP 订阅」中显式打开');
+  has('settings.insecure-http-field', subsSrc, 'insecureSubscriptionHttpAllowed()');
 }
 
 // ── 汇总 ──────────────────────────────────────────────────────────────

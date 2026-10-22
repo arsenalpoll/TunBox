@@ -3,7 +3,7 @@
  * 移植自 upstream: SSRVPN_Android/lib/main.dart + app.dart + startup/*（启动编排的 ArkTS 等价）
  */
 import { UIAbility, AbilityConstant, Want } from '@kit.AbilityKit';
-import { window } from '@kit.ArkUI';
+import { window, display } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { SettingsService } from '../commons/services/SettingsService';
@@ -12,6 +12,7 @@ import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrat
 import { UiGuardian } from '../commons/services/UiGuardian';
 import { BackgroundTaskWatch } from '../commons/services/BackgroundTaskWatch';
 import { SubscriptionUpdateScheduler } from '../commons/services/SubscriptionUpdateScheduler';
+import { GeoDataInstaller } from '../commons/services/GeoDataInstaller';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ThemeService } from '../theme/ThemeService';
 
@@ -24,8 +25,40 @@ export default class EntryAbility extends UIAbility {
   /** 自愈编排单航班：冷启动与回前台都走它，避免重复拉起隧道 */
   private healTask: Promise<string> | null = null;
 
+  /**
+   * 按屏幕对角线英寸设置转场时长的规范下限（华为应用市场上架要求）：
+   * < 8.5" → 200ms；8.5~12" → 250ms；> 12" → 300ms。
+   * 实际时长由 TunBoxMotion.ms 取 max(260 设计基线, 该下限)。
+   *
+   * 英寸换算：vp = px / densityPixels；1 英寸 = 160vp（display 的 density 以 160 为基准）。
+   */
+  private applyMotionFloorByScreenSize(): void {
+    try {
+      const d = display.getDefaultDisplaySync();
+      const density = d.densityPixels > 0 ? d.densityPixels : 3;
+      const wVp = d.width / density;
+      const hVp = d.height / density;
+      const inches = Math.sqrt(wVp * wVp + hVp * hVp) / 160;
+      let floor = 200;
+      if (inches > 12) {
+        floor = 300;
+      } else if (inches >= 8.5) {
+        floor = 250;
+      }
+      AppStorage.setOrCreate<number>('tb_motion_required_ms', floor);
+      AppLogger.info(TAG, `screen ${wVp.toFixed(0)}x${hVp.toFixed(0)}vp ≈ ${inches.toFixed(2)}in `
+        + `→ motion floor ${floor}ms`);
+    } catch (e) {
+      // 拿不到 display 时保持设计基线（260ms），不阻断启动
+      AppLogger.warn(TAG, `display probe failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     AppLogger.info(TAG, 'onCreate');
+    this.applyMotionFloorByScreenSize();
+    // geo 数据随包携带：内核启动前必须就位，否则会卡在联网下载 MMDB（20s 超时）
+    GeoDataInstaller.ensure(this.context);
     // 长时任务取消监听（进程级幂等，API 15+）：用户删除任务通知 = 用户主动停止，
     // 需刷新记账并抑制自动重挂（《Background Tasks Kit 接入规范》红线）
     BackgroundTaskWatch.ensure();

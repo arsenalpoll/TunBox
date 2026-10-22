@@ -45,13 +45,16 @@ export const RAW_SUB_DIR_MODE = 0o700;
 export const RAW_SUB_FILE_MODE = 0o600;
 /** provider 名前缀（与节点名/其他 provider 隔离，避免组内重名） */
 export const RAW_PROVIDER_NAME_PREFIX = 'raw-';
-/** provider 健康检查（file provider 同样支持；失败时的表现需真机确认）
- *  URL 必须是 HTTPS：mihomo 的 URLTest 在 unified-delay 开启时连发两次 HEAD，
- *  官方在该分支告警 "using HTTP may result in failed tests"，并点名
- *  provider.health-check.url / group.url 应使用 HTTPS。
- *  明文 HTTP 的 generate_204 在部分机场/运营商链路上会被劫持或重定向，
- *  表现为「provider 健康检查恒失败」→ 整组节点被判死。 */
-export const RAW_PROVIDER_HEALTH_CHECK_ENABLED: boolean = true;
+/** provider 健康检查开关（2026-10-22 起**关闭**）。
+ *
+ * 为什么关：健康检查是**第二套、不受 App 控制**的测速源 ——
+ *  · 它按自己的 interval 周期性打网络，与 App 的 LatencyEngine、组的 url-test 三份并行；
+ *  · 它的结果只影响 provider 视图里的「延迟」列，App 界面的延迟全部来自 `/proxies/{name}/delay`；
+ *  · https 的 generate_204 在受限出口会 TLS 握手挂起（本仓已因此把测速 URL 统一成 http），
+ *    而 provider 的 URL 是**生成配置里的静态值**，没法按节点分化。
+ * 关掉它 = 少一套并发源、少一类「不知道谁在打网络」的现场。要恢复请看 git 历史。
+ */
+export const RAW_PROVIDER_HEALTH_CHECK_ENABLED: boolean = false;
 export const RAW_PROVIDER_HEALTH_CHECK_URL = 'https://www.gstatic.com/generate_204';
 export const RAW_PROVIDER_HEALTH_CHECK_INTERVAL = 300;
 
@@ -94,6 +97,10 @@ export class RawProviderStats {
   missingFiles: number = 0;
   /** 因子订阅已无节点（例如订阅被删）而跳过的数量 */
   orphaned: number = 0;
+  /** 因跨订阅节点重名而退回静态发射的数量（provider 里节点名由内核逐字采用，不能改名） */
+  nameConflicts: number = 0;
+  /** 因「App 侧节点名与原文不一致」而退回静态发射的数量（含冷启动原文未就绪） */
+  nameMismatch: number = 0;
   /** path 模式（relative / absolute） */
   pathMode: string = '';
   /** 实际发出的 provider 名（逗号分隔，便于诊断） */
@@ -101,7 +108,8 @@ export class RawProviderStats {
 
   detail(): string {
     const base = `双轨 provider ${this.enabled ? '开' : '关'}：发出 ${this.emitted}/${this.candidates}`
-      + `（缺失文件 ${this.missingFiles}，无对应节点 ${this.orphaned}，path=${this.pathMode}）`;
+      + `（缺失文件 ${this.missingFiles}，无对应节点 ${this.orphaned}，`
+      + `重名回退 ${this.nameConflicts}，名字不一致回退 ${this.nameMismatch}，path=${this.pathMode}）`;
     if (this.missingFiles > 0) {
       // C30（冷启动兜底）：原文文件缺失通常是系统回收了 cacheDir。
       // 此时双轨 provider 会被跳过（配置里不写 use: 引用 → 内核不会因缺文件起不来），
@@ -177,10 +185,12 @@ export class RawSubscriptionStore {
   }
 
   /**
-   * 同步开关状态。关闭时（purgeOnDisable=true）删除全部落盘原文并清空登记表 ——
-   * 「一个开关可一键回退」的语义必须包含清理落盘凭据。返回删除的文件数。
+   * 同步开关状态。默认**不删文件**（purgeOnDisable=false 语义为常态）—— 落盘原文既是
+   * provider 的数据源，也是「节点定义原文透传」的数据源，关开关≠删数据。
+   * 只有显式清理入口（诊断面板 purgeRawProviders）才传 purgeOnDisable=true。
+   * 返回删除的文件数（常态为 0）。
    */
-  static setEnabled(value: boolean, purgeOnDisable: boolean = true): number {
+  static setEnabled(value: boolean, purgeOnDisable: boolean = false): number {
     RawSubscriptionStore.enabled = value;
     if (value || !purgeOnDisable) {
       AppLogger.info(TAG, `raw provider store ${value ? 'enabled' : 'disabled (keep files)'}`);

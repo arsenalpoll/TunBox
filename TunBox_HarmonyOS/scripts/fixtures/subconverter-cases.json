@@ -1,0 +1,301 @@
+[
+  {
+    "id": "empty",
+    "lines": [
+      ""
+    ]
+  },
+  {
+    "id": "junk",
+    "lines": [
+      "hello world",
+      "not-a-link",
+      "ss://!!!"
+    ]
+  },
+  {
+    "id": "ss-userinfo-b64-pad",
+    "lines": [
+      "ss://YWVzLTI1Ni1nY206cHcxMjM0NTY=@1.2.3.4:8388#SS-B64"
+    ]
+  },
+  {
+    "id": "ss-userinfo-b64-nopad",
+    "lines": [
+      "ss://YWVzLTEyOC1nY206cGFzcw@5.6.7.8:8388#SS-B64NP"
+    ]
+  },
+  {
+    "id": "ss-userinfo-plain",
+    "lines": [
+      "ss://aes-256-gcm:pw123456@5.6.7.8:8388#SS-Plain"
+    ]
+  },
+  {
+    "id": "ss-whole-b64",
+    "lines": [
+      "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwdzlAOS45LjkuOTo4NDQz#SS-Whole"
+    ]
+  },
+  {
+    "id": "ss-whole-b64-udp",
+    "lines": [
+      "ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206WVdKalpHVm1aMmhwYW10c2JXNXZjQT09QDkuOS45Ljk6ODQ0Mw#SS-2022"
+    ]
+  },
+  {
+    "id": "ss-plugin-obfs",
+    "lines": [
+      "ss://YWVzLTEyOC1nY206cHc=@h1.example.com:8388?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dbing.com&udp-over-tcp=true#SS-Obfs"
+    ]
+  },
+  {
+    "id": "ss-plugin-v2ray",
+    "lines": [
+      "ss://YWVzLTEyOC1nY206cHc=@h2.example.com:8389?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Bhost%3Dcdn.example.com%3Bpath%3D%2Fws%3Btls#SS-V2P"
+    ]
+  },
+  {
+    "id": "vmess-json-ws",
+    "lines": [
+      "vmess://eyJ2IjoiMiIsInBzIjoiVk0tV1MiLCJhZGQiOiJ2MS5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSIsImFpZCI6IjAiLCJuZXQiOiJ3cyIsInR5cGUiOiJub25lIiwiaG9zdCI6ImNkbi5leGFtcGxlLmNvbSIsInBhdGgiOiIvd3M/ZWQ9MjA0OCIsInRscyI6InRscyIsInNuaSI6InNuaS5leGFtcGxlLmNvbSIsImFscG4iOiJoMixodHRwLzEuMSIsInNjeSI6ImF1dG8ifQ=="
+    ]
+  },
+  {
+    "id": "vmess-json-h2",
+    "lines": [
+      "vmess://eyJ2IjoiMiIsInBzIjoiVk0tSDIiLCJhZGQiOiJ2Mi5leGFtcGxlLmNvbSIsInBvcnQiOjg0NDMsImlkIjoiYWFhYWFhYWEtYmJiYi00Y2NjLThkZGQtZWVlZWVlZWVlZWVlIiwibmV0IjoiaHR0cCIsInR5cGUiOiJub25lIiwiaG9zdCI6ImgyLmV4YW1wbGUuY29tIiwicGF0aCI6Ii9oMiIsInRscyI6InRscyIsInNjeSI6ImFlcy0xMjgtZ2NtIn0="
+    ]
+  },
+  {
+    "id": "vmess-json-grpc-aid",
+    "lines": [
+      "vmess://eyJ2IjoiMiIsInBzIjoiVk0tR1JQQyIsImFkZCI6InYzLmV4YW1wbGUuY29tIiwicG9ydCI6IjIwNTMiLCJpZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSIsImFpZCI6NCwibmV0IjoiZ3JwYyIsInBhdGgiOiJnc3ZjIiwidGxzIjoiIn0="
+    ]
+  },
+  {
+    "id": "vmess-json-httpupgrade",
+    "lines": [
+      "vmess://eyJ2IjoiMiIsInBzIjoiVk0tSFUiLCJhZGQiOiJ2NC5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSIsIm5ldCI6Imh0dHB1cGdyYWRlIiwiaG9zdCI6Imh1LmV4YW1wbGUuY29tIiwicGF0aCI6Ii9odT9lZD0xMDI0IiwidGxzIjoidGxzIiwiYWxwbiI6ImgyIn0="
+    ]
+  },
+  {
+    "id": "vmess-json-tcp",
+    "lines": [
+      "vmess://eyJ2IjoiMiIsInBzIjoiVk0tVENQIiwiYWRkIjoidjUuZXhhbXBsZS5jb20iLCJwb3J0IjoiODAiLCJpZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSIsIm5ldCI6InRjcCIsInR5cGUiOiJodHRwIiwiaG9zdCI6InRjcC5leGFtcGxlLmNvbSIsInBhdGgiOiIvdHAifQ=="
+    ]
+  },
+  {
+    "id": "vmess-json-nops",
+    "lines": [
+      "vmess://eyJ2IjoiMiIsImFkZCI6IngiLCJwb3J0IjoiMSIsImlkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1In0="
+    ]
+  },
+  {
+    "id": "vmess-aead",
+    "lines": [
+      "vmess://11111111-2222-4333-8444-555555555555@aead.example.com:443?encryption=auto&security=tls&sni=s.example.com&type=grpc&serviceName=gs&fp=chrome#VM-AEAD"
+    ]
+  },
+  {
+    "id": "vmess-aead-packet",
+    "lines": [
+      "vmess://11111111-2222-4333-8444-555555555555@aead2.example.com:443?security=tls&type=ws&path=%2Fws&host=h.example.com&packetEncoding=none#VM-AEAD2"
+    ]
+  },
+  {
+    "id": "vless-reality-ws",
+    "lines": [
+      "vless://11111111-2222-4333-8444-555555555555@r.example.com:443?encryption=none&security=reality&sni=sni.example.com&fp=chrome&pbk=jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0&sid=ab12&type=ws&host=hh.example.com&path=%2Fws&ed=2048#VL-R"
+    ]
+  },
+  {
+    "id": "vless-grpc-flow",
+    "lines": [
+      "vless://11111111-2222-4333-8444-555555555555@g.example.com:443?security=tls&flow=XTLS-RPRX-VISION&type=grpc&serviceName=gsvc&alpn=h2#VL-G"
+    ]
+  },
+  {
+    "id": "vless-tcp-http-header",
+    "lines": [
+      "vless://11111111-2222-4333-8444-555555555555@t.example.com:80?type=tcp&headerType=http&host=t.example.com&path=%2Ftp#VL-T"
+    ]
+  },
+  {
+    "id": "vless-xhttp",
+    "lines": [
+      "vless://11111111-2222-4333-8444-555555555555@x.example.com:443?security=tls&type=xhttp&path=%2Fx&host=x.example.com&mode=packet-up&extra=%7B%22xPaddingBytes%22%3A%22100-1000%22%2C%22noGRPCHeader%22%3Atrue%2C%22xmux%22%3A%7B%22maxConnections%22%3A4%2C%22hKeepAlivePeriod%22%3A30%7D%7D#VL-X"
+    ]
+  },
+  {
+    "id": "vless-noport",
+    "lines": [
+      "vless://11111111-2222-4333-8444-555555555555@noport.example.com?type=tcp#VL-NP"
+    ]
+  },
+  {
+    "id": "trojan-ws",
+    "lines": [
+      "trojan://pw123@t1.example.com:443?sni=s1.example.com&type=ws&path=%2Fws&host=h1.example.com&allowInsecure=1#TJ-WS"
+    ]
+  },
+  {
+    "id": "trojan-grpc",
+    "lines": [
+      "trojan://pw123@t2.example.com:8443?type=grpc&serviceName=gs&fp=firefox&pcs=3f7e5f2c1a9b8d6e4c2a1b0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d#TJ-G"
+    ]
+  },
+  {
+    "id": "trojan-plain",
+    "lines": [
+      "trojan://pw@t3.example.com:443#TJ-%E6%97%A5%E6%9C%AC%2001"
+    ]
+  },
+  {
+    "id": "hysteria",
+    "lines": [
+      "hysteria://hy.example.com:443?peer=p.example.com&obfs=xplus&alpn=h2,http%2F1.1&auth=abc&protocol=udp&up=100&down=200&insecure=1#HY"
+    ]
+  },
+  {
+    "id": "hysteria-mbps",
+    "lines": [
+      "hysteria://hy2.example.com:8443?upmbps=50&downmbps=80#HY-MB"
+    ]
+  },
+  {
+    "id": "hysteria2",
+    "lines": [
+      "hysteria2://authpw@h2.example.com:443?sni=s.example.com&obfs=salamander&obfs-password=op&alpn=h3&insecure=1&pinSHA256=3f7e5f2c1a9b8d6e4c2a1b0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d&up=10&down=20#HY2"
+    ]
+  },
+  {
+    "id": "hysteria2-ports",
+    "lines": [
+      "hy2://authpw@h3.example.com:443,8443-8445/?sni=s.example.com#HY2-PORTS"
+    ]
+  },
+  {
+    "id": "hysteria2-noport",
+    "lines": [
+      "hy2://authpw@h4.example.com?sni=s.example.com#HY2-NP"
+    ]
+  },
+  {
+    "id": "hysteria2-realm",
+    "lines": [
+      "hysteria2+realm://realm-token@r.example.com:443/realm-1?stun=stun1.example.com&stun=stun2.example.com&auth=pw&sni=s.example.com#HY2-R"
+    ]
+  },
+  {
+    "id": "tuic-v5",
+    "lines": [
+      "tuic://11111111-2222-4333-8444-555555555555:tpass@tu.example.com:443?congestion_control=bbr&alpn=h3&sni=s.example.com&disable_sni=1&udp_relay_mode=native#TU5"
+    ]
+  },
+  {
+    "id": "tuic-v4",
+    "lines": [
+      "tuic://tokentoken@tu2.example.com:443?sni=s.example.com#TU4"
+    ]
+  },
+  {
+    "id": "anytls",
+    "lines": [
+      "anytls://atuser:atpass@at.example.com:443?sni=s.example.com&insecure=1&hpkp=3f7e5f2c1a9b8d6e4c2a1b0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d#AT"
+    ]
+  },
+  {
+    "id": "anytls-nopw",
+    "lines": [
+      "anytls://onlyuser@at2.example.com:8443#AT2"
+    ]
+  },
+  {
+    "id": "mierus",
+    "lines": [
+      "mierus://muser:mpass@m.example.com?port=2090&protocol=TCP&port=9999&protocol=UDP&multiplexing=MULTIPLEXING_LOW&handshake-mode=HANDSHAKE_NO_WAIT&traffic-pattern=GgQIARAK&profile=mprof#M"
+    ]
+  },
+  {
+    "id": "mierus-range",
+    "lines": [
+      "mierus://muser:mpass@m2.example.com?port=2090-2099&protocol=TCP#M-R"
+    ]
+  },
+  {
+    "id": "ssr",
+    "lines": [
+      "ssr://c3NyLmV4YW1wbGUuY29tOjgzODg6YXV0aF9hZXMxMjhfbWQ1OmFlcy0yNTYtY2ZiOnRsczEuMl90aWNrZXRfYXV0aDpjM055Y0dGemN3Lz9vYmZzcGFyYW09YjJKbWN5NWxlR0Z0Y0d4bExtTnZiUSZwcm90b3BhcmFtPU16STZZV0pqJnJlbWFya3M9VTFOU0lPaUtndWVDdVEmZ3JvdXA9WjNKdw"
+    ]
+  },
+  {
+    "id": "socks-http",
+    "lines": [
+      "socks5://c3U6c3A=@sk.example.com:1080#SK",
+      "socks5h://sk2.example.com:1080#SK2",
+      "http://hu:hp@ht.example.com:8080#HT",
+      "https://hts.example.com:443#HTS",
+      "http://noport.example.com#HT-NP"
+    ]
+  },
+  {
+    "id": "dup-names",
+    "lines": [
+      "trojan://pw@d1.example.com:443#%E9%A6%99%E6%B8%AF%2001",
+      "trojan://pw@d2.example.com:443#%E9%A6%99%E6%B8%AF%2001",
+      "trojan://pw@d3.example.com:443#%E9%A6%99%E6%B8%AF%2001",
+      "trojan://pw@d4.example.com:443#%E9%A6%99%E6%B8%AF%2001"
+    ]
+  },
+  {
+    "id": "b64-list",
+    "encode": "base64",
+    "lines": [
+      "ss://YWVzLTI1Ni1nY206cHcx@1.1.1.1:8388#N1",
+      "",
+      "trojan://pw2@2.2.2.2:443#N2",
+      "vless://11111111-2222-4333-8444-555555555555@3.3.3.3:443?type=tcp#N3",
+      "hysteria2://pw3@4.4.4.4:443#N4"
+    ]
+  },
+  {
+    "id": "b64-list-raw",
+    "encode": "base64-raw",
+    "lines": [
+      "ss://aes-128-gcm:pw@5.5.5.5:8388#R1",
+      "anytls://u:p@6.6.6.6:443#R2"
+    ]
+  },
+  {
+    "id": "bad-port-and-escape",
+    "lines": [
+      "trojan://pw@a.example.com:abc#badport",
+      "trojan://pw@a.example.com:443#a%b",
+      "trojan://pw@ok.example.com:443#good"
+    ]
+  },
+  {
+    "id": "ss-partial-b64",
+    "lines": [
+      "ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206cGxhaW5wdw==@a.example.com:8388#ss-partial"
+    ]
+  },
+  {
+    "id": "crlf",
+    "lines": [
+      "trojan://pw@a.example.com:443#crlf1\r",
+      "ss://aes-128-gcm:pw@b.example.com:8388#crlf2\r"
+    ]
+  },
+  {
+    "id": "no-scheme-lines",
+    "lines": [
+      "  ",
+      "# comment",
+      "vmess://",
+      "unknown://foo:1#x",
+      "trojan://pw@ok.example.com:443#OK"
+    ]
+  }
+]

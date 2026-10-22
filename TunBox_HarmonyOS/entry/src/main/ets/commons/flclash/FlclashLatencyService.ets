@@ -1,0 +1,192 @@
+/**
+ * FlClash 等价测速服务（UI/后台的唯一测速入口）
+ *
+ * 职责：把 `FlclashDelayRun`（32 并发、逐节点 `/proxies/{name}/delay`、-1/-2 语义）
+ *       接到本仓库的展示层 `LatencyLiveView`，并提供与旧 `LatencyEngine` 同名的
+ *       会话 API（isRunning / cancel / progress），让页面改动最小。
+ *
+ * 来源（FlClash）：
+ *  - `lib/providers/actions/proxies.dart` `_runDelayTests` / `_runDelayTest`：
+ *    逐节点 getDelay，`null`（没排到槽 / 取消 / 守护到期）不写结论；
+ *    `CoreMethodException.isCoreUnavailable` ⇒ 整批取消。
+ *  - `lib/providers/actions/proxies.dart` `setDelay` + `renderThrottleDuration(300ms)`：
+ *    结果合批刷新 UI（本实现由 LatencyLiveView 内部 200ms 节流承担，语义等价）。
+ *  - 组测速 = 组内所有节点**逐个测**（`delayTest(group.all)`），
+ *    不是 `GET /group/{name}/delay`（规格 §4.2）。
+ *
+ * 明确没有（FlClash 也没有，规格 §4.4）：
+ *  离线 TCP/TLS 探活、DNS 预解析判定、core_not_ready 连击作废、批次硬截止、
+ *  5 分钟新鲜度跳过、后台静默自动测速。
+ */
+import { ClashApiService } from '../services/ClashApiService';
+import { AppLogger } from '../utils/AppLogger';
+import { LatencyRecord, LatencyState, LatencyChannel } from '../services/LatencyState';
+import { LatencyLiveView } from '../services/LatencyLiveView';
+import {
+  DelayResult, DelayTarget, FlclashDelayRun, FlclashDelaySummary,
+  FLCLASH_DELAY_TIMED_OUT, FLCLASH_DELAY_FAILED, FLCLASH_DELAY_URL, delayTestKey
+} from '../flclash/FlclashDelay';
+
+const TAG = 'FlclashLatencyService';
+
+/** 进度快照（UI 只读这几个数，字段语义与 FlClash summary 一致）。 */
+export class FlclashLatencyProgress {
+  total: number = 0;
+  started: number = 0;
+  measured: number = 0;
+  timeout: number = 0;
+  failed: number = 0;
+  cancelled: number = 0;
+  running: boolean = false;
+
+  done(): boolean {
+    return !this.running;
+  }
+}
+
+export class FlclashLatencySession {
+  private readonly api: ClashApiService;
+  private readonly run: FlclashDelayRun;
+  private readonly progress: FlclashLatencyProgress = new FlclashLatencyProgress();
+  private readonly source: string;
+  private finished: boolean = false;
+  /** 完成信号（供调用方 await；取消同样会兑现，避免永远挂住）。 */
+  private resolveDone: (progress: FlclashLatencyProgress) => void = (): void => {};
+  private readonly donePromise: Promise<FlclashLatencyProgress>;
+
+  constructor(api: ClashApiService, targets: DelayTarget[], source: string) {
+    this.api = api;
+    this.source = source;
+    this.run = new FlclashDelayRun(api.endpointBase(), api.endpointSecret());
+    this.donePromise = new Promise<FlclashLatencyProgress>((resolve) => {
+      this.resolveDone = resolve;
+    });
+    this.progress.total = targets.length;
+    this.progress.running = true;
+    this.run.start(targets,
+      (result: DelayResult): void => {
+        this.apply(result);
+      },
+      (summary: FlclashDelaySummary): void => {
+        this.progress.started = summary.started;
+        this.progress.measured = summary.measured;
+        this.progress.timeout = summary.timedOut;
+        this.progress.failed = summary.failed;
+        this.progress.cancelled = summary.cancelled;
+        this.progress.running = false;
+        this.finished = true;
+        LatencyLiveView.flushNow();
+        this.resolveDone(this.progress);
+        AppLogger.info(TAG, `delay batch done: total=${summary.total} measured=${summary.measured} `
+          + `timeout=${summary.timedOut} failed=${summary.failed} cancelled=${summary.cancelled}`);
+      });
+  }
+
+  private apply(result: DelayResult): void {
+    const now = Date.now();
+    const rec: LatencyRecord = result.value > 0
+      ? LatencyRecord.measured(result.proxyName, result.value, LatencyChannel.CORE, now)
+      : LatencyRecord.failed(result.proxyName,
+        result.value === FLCLASH_DELAY_TIMED_OUT ? LatencyState.TIMEOUT : LatencyState.FAILED,
+        now, LatencyChannel.CORE, result.value === FLCLASH_DELAY_TIMED_OUT ? 'timeout' : 'failed');
+    rec.source = this.source;
+    LatencyLiveView.setRecord(rec);
+    this.progress.started = this.progress.started + 1;
+    if (result.value > 0) {
+      this.progress.measured = this.progress.measured + 1;
+    } else if (result.value === FLCLASH_DELAY_TIMED_OUT) {
+      this.progress.timeout = this.progress.timeout + 1;
+    } else {
+      this.progress.failed = this.progress.failed + 1;
+    }
+  }
+
+  isRunning(): boolean {
+    return !this.finished && this.run.isRunning();
+  }
+
+  currentProgress(): FlclashLatencyProgress {
+    return this.progress;
+  }
+
+  /** 等本批结束（正常完成或取消都会兑现）。 */
+  wait(): Promise<FlclashLatencyProgress> {
+    return this.donePromise;
+  }
+
+  /** 取消：在途 abort、未开始跳过，一条结论都不写。 */
+  cancel(): void {
+    if (this.finished) {
+      return;
+    }
+    this.run.cancel();
+    this.progress.running = false;
+    this.finished = true;
+    this.resolveDone(this.progress);
+    AppLogger.info(TAG, `delay batch cancelled: ${this.progress.started}/${this.progress.total} started`);
+  }
+}
+
+export class FlclashLatencyService {
+  private static current: FlclashLatencySession | null = null;
+  /** 批次身份（写入 TESTING 记录，供旧批收尾时只收回自己打的标记）。 */
+  private static runIdSeq: number = 0;
+
+  /**
+   * 启动一批测速（新批会取消旧批，与 FlClash「一个 job 一个 cancel 标记」一致）。
+   *
+   * @param nodeNames 待测节点名（内核 `/proxies` 里的名字，**不是**本地节点表的名字）
+   * @param testUrl   全局测速 URL（默认 gstatic 204）
+   * @param perNodeUrl 可选：按节点给测速 URL（FlClash 组内 `url` 优先）
+   */
+  static start(api: ClashApiService, nodeNames: string[], testUrl: string,
+    source: string = 'manual',
+    perNodeUrl: Map<string, string> | null = null): FlclashLatencySession {
+    if (FlclashLatencyService.current !== null) {
+      FlclashLatencyService.current.cancel();
+    }
+    const effectiveUrl = testUrl.length > 0 ? testUrl : FLCLASH_DELAY_URL;
+    const seen: Set<string> = new Set<string>();
+    const targets: DelayTarget[] = [];
+    FlclashLatencyService.runIdSeq = FlclashLatencyService.runIdSeq + 1;
+    const runId = FlclashLatencyService.runIdSeq;
+    for (const name of nodeNames) {
+      if (name.length === 0 || seen.has(name)) {
+        continue;
+      }
+      seen.add(name);
+      const url = perNodeUrl !== null && perNodeUrl.has(name) ? perNodeUrl.get(name) as string : effectiveUrl;
+      targets.push(new DelayTarget(name, url.length > 0 ? url : effectiveUrl,
+        delayTestKey(url.length > 0 ? url : effectiveUrl, name)));
+      LatencyLiveView.markTesting(name, runId);
+    }
+    const session = new FlclashLatencySession(api, targets, source);
+    FlclashLatencyService.current = session;
+    AppLogger.info(TAG, `delay batch start: nodes=${targets.length} url=${effectiveUrl} source=${source}`);
+    return session;
+  }
+
+  static cancelCurrent(): void {
+    if (FlclashLatencyService.current !== null) {
+      FlclashLatencyService.current.cancel();
+      FlclashLatencyService.current = null;
+    }
+  }
+
+  static isRunning(): boolean {
+    return FlclashLatencyService.current !== null && FlclashLatencyService.current.isRunning();
+  }
+
+  static currentProgress(): FlclashLatencyProgress | null {
+    return FlclashLatencyService.current === null ? null : FlclashLatencyService.current.currentProgress();
+  }
+
+  /**
+   * 组测速（FlClash `delayTestPageGroup`）：组内所有节点逐个测。
+   * 返回被取消/未开始的节点数由 session 自己的 summary 负责。
+   */
+  static startGroup(api: ClashApiService, groupNodeNames: string[], testUrl: string,
+    source: string = 'manual'): FlclashLatencySession {
+    return FlclashLatencyService.start(api, groupNodeNames, testUrl, source, null);
+  }
+}

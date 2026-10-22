@@ -427,7 +427,7 @@ struct AppRoutingPage {
             if (this.rows.length === 0) {
               ListItem() { Text('没有匹配项，可手动添加鸿蒙包名。').fontSize(13).fontColor(TunBoxColors.textSecondary).padding(22) }
             }
-          }.width('100%').layoutWeight(1).scrollBar(BarState.Auto)
+          }.width('100%').layoutWeight(1).scrollBar(BarState.Auto) .edgeEffect(EdgeEffect.Spring)
           if (this.resultText.length > 0) { Text(this.resultText).fontSize(12).fontColor(TunBoxColors.primary).width('100%') }
         }.width('100%').layoutWeight(1).padding({
           left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8

@@ -123,10 +123,8 @@ class NodeSortShards {
 
 export class SettingsService {
   private static store: preferences.Preferences | null = null;
-  /** 本进程内「双轨 provider」开关的上一次生效值：用于识别 true → false 的关闭动作 */
+  /** 本进程内「双轨 provider」开关的上一次生效值：用于识别开关变化并同步落盘仓闸门 */
   private static lastRawProviderFlag: boolean = false;
-  /** 关闭状态下是否已清理过落盘原文（避免每次加载/保存都扫描目录） */
-  private static rawProviderPurgedWhileDisabled: boolean = false;
 
   static async init(context: Context): Promise<void> {
     SettingsService.store = await preferences.getPreferences(context, PREF_NAME);
@@ -505,26 +503,17 @@ export class SettingsService {
   }
 
   /**
-   * 闸门同步：开启时只设置标记（保留文件）；关闭时清理落盘原文（凭据不再需要即删干净），
-   * 且每个进程只在首次观察到「关闭」时清理一次，避免反复扫描目录。
+   * 闸门同步：开启/关闭都只设置标记，**任何分支都不删落盘原文**。
+   *
+   * 2026-10-22：原文文件同时是「节点定义原文透传」的数据源，与 provider 开关解耦。
+   * 之前关闭 provider 会 removeAll() ⇒ 每次冷启动白删一遍、随后又联网补拉，
+   * 离线/订阅过期时原文透传直接退化成解析发射（真机日志：
+   * `purged 4 raw subscription file(s): raw provider disabled` 之后紧接 backfill）。
+   * 要清磁盘只有两个显式入口：删除订阅（remove + drop）与诊断面板的 purgeRawProviders()。
    */
   private static syncRawProviderGate(enabled: boolean): void {
-    if (enabled) {
-      RawSubscriptionStore.setEnabled(true, false);
-      SettingsService.lastRawProviderFlag = true;
-      SettingsService.rawProviderPurgedWhileDisabled = false;
-      return;
-    }
-    RawSubscriptionStore.setEnabled(false, false);
-    SettingsService.lastRawProviderFlag = false;
-    if (SettingsService.rawProviderPurgedWhileDisabled || !RawSubscriptionStore.isReady()) {
-      return;
-    }
-    SettingsService.rawProviderPurgedWhileDisabled = true;
-    const removed = RawSubscriptionStore.removeAll();
-    if (removed > 0) {
-      AppLogger.info(TAG, `purged ${removed} raw subscription file(s): raw provider disabled`);
-    }
+    RawSubscriptionStore.setEnabled(enabled, false);
+    SettingsService.lastRawProviderFlag = enabled;
   }
 
   /** apiSecret 只允许存入系统加密 AssetStore，禁止降级到明文 Preferences。 */

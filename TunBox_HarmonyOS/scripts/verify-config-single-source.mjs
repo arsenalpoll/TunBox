@@ -315,9 +315,12 @@ transpile('commons/config/RuntimeConfigBuilder.ets', 'RuntimeConfigBuilder.ts', 
   '../models/ProxyNode': './ProxyNode.ts',
   '../models/ProxyGroup': './ProxyGroup.ts',
   '../models/AppSettings': './AppSettings.ts',
+  '../models/SubDnsUpstream': './SubDnsUpstream.ts',
   '../services/ClashConfigGenerator': './ClashConfigGenerator.ts',
   '../services/DoHResolver': './DoHResolver.ts',
   '../utils/AppLogger': './stubs.ts',
+  // 2026-10-22（FlClash 同构）：overlay + 订阅原文合并
+  '../flclash/ProfileConfigMerger': './ProfileConfigMerger.ts',
 });
 
 /** 临时副本的 stubs 补丁：harness 的 stubs.ts 未必覆盖后来新增的 @kit.* 具名导出。 */

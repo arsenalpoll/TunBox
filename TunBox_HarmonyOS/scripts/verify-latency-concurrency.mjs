@@ -157,11 +157,23 @@ export class ClashApiService {
   static calls = [];
   static maxInflight = 0;
   static _inflight = 0;
+  /** 通道健康探针桩：controller 是否还答 /version（过载鉴别，见 controllerAnswers） */
+  static controllerAlive = true;
+  static probeCalls = 0;
   static reset() {
     ClashApiService.handler = null;
     ClashApiService.calls = [];
     ClashApiService.maxInflight = 0;
     ClashApiService._inflight = 0;
+    ClashApiService.controllerAlive = true;
+    ClashApiService.probeCalls = 0;
+  }
+  async probeController(_timeoutMs = 1500) {
+    ClashApiService.probeCalls++;
+    return {
+      reachable: ClashApiService.controllerAlive,
+      secretAccepted: ClashApiService.controllerAlive,
+    };
   }
   async testLatencyDetailed(name, url, timeoutMs, lanes = 1) {
     const c = { name: name, url: url, timeoutMs: timeoutMs, lanes: lanes, start: Date.now(), end: 0 };
@@ -218,7 +230,7 @@ stageEngine(dirA);
 // B 组：排队上限 300ms + 在途数收窄到 8（确定性地触发排队超时）。
 // 在途数必须**显式调小**：worker 数与在途数同宽（都 50）时闸门永远不排队。
 const dirB = path.join(root, 'b');
-stageEngine(dirB, 300, 8);
+stageEngine(dirB, 300, 32);
 
 const A = await import(pathToFileURL(path.join(dirA, 'LatencyEngine.ts')).href);
 const AC = await import(pathToFileURL(path.join(dirA, 'ClashApiService.ts')).href);
@@ -246,18 +258,22 @@ function opts(over) {
 }
 
 // ── A1. 常量契约 ───────────────────────────────────────────────────────────
-check('常量契约：worker 并发=50、在途请求=50（无应用层排队）、排队上限=60s', () => {
+check('常量契约：worker 并发=50、在途请求=32（对齐 FlClash 客户端在途并发）、排队上限=60s', () => {
   eq(A.LATENCY_CONCURRENCY, 50, 'LATENCY_CONCURRENCY（worker 数 / 队列深度）');
-  eq(A.LATENCY_INFLIGHT, 50, 'LATENCY_INFLIGHT（同时在途的 HTTP 请求数）');
+  eq(A.LATENCY_INFLIGHT, 32, 'LATENCY_INFLIGHT（同时在途的 HTTP 请求数）');
   eq(A.LATENCY_QUEUE_WAIT_MAX_MS, 60000, 'LATENCY_QUEUE_WAIT_MAX_MS');
-  // 2026-10-20 用户拍板：在途数放开到与 worker 数同宽 ⇒ 不再有应用层排队，
-  // 每个节点的 elapsed 就是它自己那次 /delay 的真实耗时（口径更干净）。
-  ok(A.LATENCY_INFLIGHT === A.LATENCY_CONCURRENCY,
-    '在途数应与 worker 数同宽（放开并发，消除排队对读数的污染）');
+  // 2026-10-21 真机回退：在途数一度是 50（"与 worker 数同宽"），但 OHOS http 栈对**同一 host**
+  // 只有约 8 条连接 ⇒ 超出的请求在栈内部排队，排队时间被算进单请求预算 = 假超时；
+  // 假超时又被归为 core_not_ready ⇒ 6 连击作废整批（飞鸟云 31 节点批：后 24 个节点没测）。
+  // 现在在途数 = 连接池容量 ⇒ 排队发生在**应用层闸门**里，闸门等待不计预算（见 A4）。
+  ok(A.LATENCY_INFLIGHT === 32,
+    '在途数对齐 FlClash 客户端并发（32）');
+  ok(A.LATENCY_INFLIGHT <= A.LATENCY_CONCURRENCY,
+    '在途数不得超过 worker 数（worker 是队列深度上限）');
 });
 
-// ── A2. lanes 语义：传给 testLatencyDetailed 的是「在途数」= 50 ───────────
-await checkAsync('lanes 语义：传下去的是同时在途的 HTTP 请求数（50），不是 worker 数以外的口径', async () => {
+// ── A2. lanes 语义：传给 testLatencyDetailed 的是「在途数」= 8 ─────────────
+await checkAsync('lanes 语义：传下去的是同时在途的 HTTP 请求数（8），与常量同源', async () => {
   AC.ClashApiService.reset();
   ALC.LatencyLiveView.clearAll();
   AC.ClashApiService.handler = async () => AC.probeResult(120, '', 200);
@@ -266,12 +282,12 @@ await checkAsync('lanes 语义：传下去的是同时在途的 HTTP 请求数�
   A.LatencyEngine.release(run);
   ok(AC.ClashApiService.calls.length === 30, `每节点一次探测（got ${AC.ClashApiService.calls.length}）`);
   for (const c of AC.ClashApiService.calls) {
-    eq(c.lanes, 50, 'lanes 必须是在途数（= 50），不是旧的 8');
+    eq(c.lanes, 32, 'lanes 必须是在途数（= LATENCY_INFLIGHT = 32），不是 worker 数');
   }
 });
 
-// ── A3. 真跑一批：峰值在途 ≤ 50（且确实并行） ──────────────────────────────
-await checkAsync('在途上限：真跑 40 节点，峰值在途请求数 ≤ 50', async () => {
+// ── A3. 真跑一批：峰值在途 ≤ 8（且确实并行） ──────────────────────────────
+await checkAsync('在途上限：真跑 40 节点，峰值在途请求数 ≤ 32', async () => {
   AC.ClashApiService.reset();
   ALC.LatencyLiveView.clearAll();
   const perRequest = 250;
@@ -284,16 +300,17 @@ await checkAsync('在途上限：真跑 40 节点，峰值在途请求数 ≤ 50
   const p = await run.run();
   const elapsed = Date.now() - t0;
   A.LatencyEngine.release(run);
-  ok(AC.ClashApiService.maxInflight <= 50,
-    `峰值在途必须 ≤ 50（实得 ${AC.ClashApiService.maxInflight}）`);
+  ok(AC.ClashApiService.maxInflight <= 32,
+    `峰值在途必须 ≤ 32（实得 ${AC.ClashApiService.maxInflight}）`);
   ok(AC.ClashApiService.maxInflight >= 2,
     `必须真的并行（峰值 ${AC.ClashApiService.maxInflight}）`);
-  console.log(`  · 峰值在途请求数 = ${AC.ClashApiService.maxInflight}（上限 50）`);
-  // 40 节点全部一次放行（在途 50 > 40）⇒ 单波完成，整批约 250ms + 开销
-  ok(elapsed < 1200,
-    `在途 50 应把 40 节点压成 1 波（<1.2s），实得 ${elapsed}ms`);
+  console.log(`  · 峰值在途请求数 = ${AC.ClashApiService.maxInflight}（上限 8）`);
+  // 40 节点 / 8 路在途 = 5 波 × 250ms ≈ 1.25s（余量给调度抖动）
+  ok(elapsed < 3000,
+    `在途 8 应把 40 节点压成 5 波（<3s），实得 ${elapsed}ms`);
   eq(p.measured, 40, '全部测出');
   eq(p.failed, 0, '无失败');
+  eq(p.queueTimeout, 0, '排队上限 60s，5 波排队不该被判排队超时');
 });
 
 // ── A4. 排队等待不计入单请求网络超时 ─────────────────────────────────────
@@ -306,8 +323,8 @@ await checkAsync('排队等待不计入请求超时：排队后发起的请求�
     return AC.probeResult(120, '', 200);
   };
   const t0 = Date.now();
-  // 2026-10-20：在途数放开到 50 后，40 节点不再触发排队（40 < 50）。
-  // 必须用 **超过在途数** 的节点数，才能确定性地压出排队。
+  // 在途数 = 8 后，40 节点就会压出排队（40 > 8）；这里用 70 节点刻意压出 9 波排队，
+  // 确认「排队等待没有被算进任何单个请求的 5000ms 预算」（闸门等待发生在预算之外）。
   const run = A.LatencyEngine.start(new AC.ClashApiService(), nodes(70), URL_, opts());
   const p = await run.run();
   A.LatencyEngine.release(run);
@@ -328,9 +345,9 @@ await checkAsync('排队等待不计入请求超时：排队后发起的请求�
 await checkAsync('排队超时：节点被标为排队超时（queue_timeout），不是内核不可用', async () => {
   BC.ClashApiService.reset();
   BLC.LatencyLiveView.clearAll();
-  // B 组在途数被收窄到 8（见 stageEngine(dirB, 300, 8)）：8 个在途占满 1.2s，
+  // B 组在途数被收窄到 32（见 stageEngine(dirB, 300, 32)）：32 个在途占满 1.2s，
   // 其余节点只能排队；排队上限 300ms → 必然超时。节点数必须 > 在途数才可能排队。
-  const TOTAL = 20;
+  const TOTAL = 40;
   BC.ClashApiService.handler = async () => {
     await sleep(1200);
     return BC.probeResult(120, '', 200);
@@ -338,7 +355,7 @@ await checkAsync('排队超时：节点被标为排队超时（queue_timeout）�
   const run = B.LatencyEngine.start(new BC.ClashApiService(), nodes(TOTAL), URL_, opts());
   const p = await run.run();
   B.LatencyEngine.release(run);
-  ok(BC.ClashApiService.calls.length <= 8,
+  ok(BC.ClashApiService.calls.length <= 32,
     `名额满时不得再发请求（实发 ${BC.ClashApiService.calls.length}）`);
   ok(p.queueTimeout > 0, `必须有节点被判排队超时（实得 ${p.queueTimeout}）`);
   eq(p.queueTimeout, TOTAL - BC.ClashApiService.calls.length, '排队超时的节点数');
@@ -360,6 +377,71 @@ await checkAsync('排队超时：节点被标为排队超时（queue_timeout）�
     if (rec !== null && rec.failKind === 'queue_timeout') qt.push(n.name);
   }
   eq(qt.length, 0, '排队超时不得落成节点结论（非判定）');
+});
+
+// ── A6. 过载鉴别：controller 还活着 ⇒ 2300028 只算过载，严禁作废整批 ────────
+// 2026-10-21 真机根因（飞鸟云 31 节点批）：50 路在途把 controller 打满 ⇒ 一批客户端超时
+// （code=2300028）被 classify 归成 core_not_ready ⇒ 6 连击作废整批 ⇒ 后 24 个节点**一次
+// /delay 都没发**。契约：controller 仍能答 /version ⇒ 这是**过载**，必须把剩下的节点测完。
+await checkAsync('controller 仍能应答时，core_not_ready 过载不得作废整批、不得中途停测', async () => {
+  AC.ClashApiService.reset();
+  ALC.LatencyLiveView.clearAll();
+  AC.ClashApiService.controllerAlive = true;
+  AC.ClashApiService.handler = async () => AC.probeResult(-1, 'core_not_ready', 0);
+  const TOTAL = 20;
+  const run = A.LatencyEngine.start(new AC.ClashApiService(), nodes(TOTAL), URL_, opts());
+  const p = await run.run();
+  A.LatencyEngine.release(run);
+  eq(p.coreUnavailable, false, 'controller 活着 = 过载，绝不能作废整批');
+  eq(p.coreNotReady, 0, '过载不得计入「通道不可用」连击');
+  ok(p.coreOverloaded > 0, `过载次数必须留痕（got ${p.coreOverloaded}）`);
+  ok(AC.ClashApiService.probeCalls > 0, '鉴别必须靠真实健康检查（probeController）');
+  const attempted = new Set(AC.ClashApiService.calls.map((c) => c.name));
+  eq(attempted.size, TOTAL, '每个节点都必须真的发起过探测（不许测到一半停测）');
+  eq(p.finished, TOTAL, '整批必须跑完（finished=total），不许中途停测');
+  eq(p.timeout, 0, '过载绝不补「超时」章（真机缺陷：未测的 24 个节点被误标超时）');
+  for (const n of nodes(TOTAL)) {
+    // 收尾会把这些留过 TESTING 的节点收回「未测」（LatencyRecord.untested），
+    // 这是**非判定**占位：档位必须是 UNTESTED、且不得带任何 failKind。
+    eq(ALC.LatencyLiveView.stateFor(n.name), ALState.LatencyState.UNTESTED,
+      `${n.name} 过载后必须保持未测（不得写成超时/失败）`);
+    const rec = ALC.LatencyLiveView.recordFor(n.name);
+    if (rec !== null) {
+      eq(rec.failKind, '', `${n.name} 不得落任何判定分类（过载是非判定）`);
+      eq(rec.state, ALState.LatencyState.UNTESTED, `${n.name} 记录档位必须是未测`);
+    }
+  }
+});
+
+// ── A7. 通道真的没了（健康检查也失败）⇒ 原语义保留：仍作废整批 ──────────────
+await checkAsync('controller 不答时，core_not_ready 连击仍作废整批（通道真的没了）', async () => {
+  AC.ClashApiService.reset();
+  ALC.LatencyLiveView.clearAll();
+  AC.ClashApiService.controllerAlive = false;
+  AC.ClashApiService.handler = async () => AC.probeResult(-1, 'core_not_ready', 0);
+  const TOTAL = 30;
+  const run = A.LatencyEngine.start(new AC.ClashApiService(), nodes(TOTAL), URL_, opts());
+  const p = await run.run();
+  A.LatencyEngine.release(run);
+  eq(p.coreUnavailable, true, '连不上 controller = 通道不可用 ⇒ 作废整批（原语义保留）');
+  eq(p.coreOverloaded, 0, '健康检查失败时不得被当成过载');
+  ok(p.coreNotReady >= 6, `应累计到连击阈值（got ${p.coreNotReady}）`);
+  // ⚠ 不能用「节点名是否出现在 calls 里」判早停：worker 数 = LATENCY_CONCURRENCY(50)，
+  //   它们会先占住节点（TESTING）再到在途闸门上排队；闸门放行的快速失败请求会在
+  //   500ms 退避窗口内轮到几乎每个节点 ⇒ 名字覆盖全 ≠ 跑完整批。
+  //   早停的真实证据是**进度计数**（与 verify-latency-engine-runtime 的作废用例同构）：
+  //   跑完的节点远少于总数，且排队/在途中的探测被撤销（每节点要先耗尽 500ms 退避才计连击）。
+  ok(p.finished < TOTAL, `作废后只应有少数节点跑完（finished=${p.finished}/${TOTAL}）`);
+  ok(p.cancelled > 0, `作废必须撤销排队/在途中的探测（cancelled=${p.cancelled}）`);
+  let abortedFailed = 0;
+  let abortedTesting = 0;
+  for (let i = 0; i < TOTAL; i++) {
+    const st = ALC.LatencyLiveView.stateFor('node-' + i);
+    if (st === ALState.LatencyState.FAILED) abortedFailed++;
+    if (st === ALState.LatencyState.TESTING) abortedTesting++;
+  }
+  eq(abortedFailed, 0, '通道故障绝不得写成节点失败');
+  eq(abortedTesting, 0, '不得留下永久转圈的 TESTING 节点');
 });
 
 // ── B 组：真实 ClashApiService 的组测分类 ─────────────────────────────────

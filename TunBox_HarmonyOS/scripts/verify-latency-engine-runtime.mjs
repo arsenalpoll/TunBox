@@ -134,6 +134,20 @@ export class ClashApiService {
   }
   /** DNS 预检判 unresolved 的节点：内核**一次请求都不发**（见 LatencyProbe.probeOne） */
   static dnsShortCircuits = [];
+  /**
+   * 通道健康探针桩（见 LatencyEngine.controllerAnswers）：
+   * 默认 **不答**（= 通道真的没了）⇒ 连击/自愈/作废整批的原语义保持不变；
+   * 想测「过载不得作废整批」把它设成 true。
+   */
+  static controllerAlive = false;
+  static probeCalls = 0;
+  async probeController(_timeoutMs = 1500) {
+    ClashApiService.probeCalls++;
+    return {
+      reachable: ClashApiService.controllerAlive,
+      secretAccepted: ClashApiService.controllerAlive,
+    };
+  }
   async testLatencyDetailed(name, url, timeoutMs, lanes = 1, dns = null) {
     if (dns !== null && dns !== undefined && dns.status === 'unresolved') {
       // 忠实模拟内核行为：不记入 calls（= 没发 /delay），直接给结论

@@ -1358,7 +1358,7 @@ export struct HomePage {
             right: TunBoxGeometry.pagePadding,
             bottom: TunBoxGeometry.dockClearance
           })
-        }
+        }.edgeEffect(EdgeEffect.Spring)
         .width('100%')
         .layoutWeight(1)
         .scrollBar(BarState.Off)

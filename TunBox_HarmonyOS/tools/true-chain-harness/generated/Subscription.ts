@@ -26,6 +26,15 @@ export class Subscription {
   totalBytes: number = -1;
   expireAt: number = -1;
   enabled: boolean = true;
+  /**
+   * 旧格式订阅标记（2026-10-21「只支持 Clash 订阅」收口）。
+   *
+   * 判定依据是**下载到的内容**而不是链接：JSON / CONF / base64 节点串 / 纯链接列表都算旧格式。
+   * 策略：已解析的节点保留可用（不清空、不影响选点/测速/连接），只做三件事——
+   *   ① 停止自动更新（避免每天报错刷屏）；② 卡片显示「旧格式」角标；③ 提示换成 Clash 链接。
+   * 用户把订阅 URL 换成 Clash 订阅后，下一次刷新成功会自动清掉本标记。
+   */
+  legacyFormat: boolean = false;
   sortOrder: number = 0;
   /**
    * 双轨「原始订阅 provider」状态（持久化，供订阅卡/诊断并列展示）：
@@ -54,6 +63,27 @@ export class Subscription {
    * 与 subRules 配套：RULE-SET 引用的 provider 必须声明，二者缺一不可。
    */
   subRuleProviders: string = '';
+  /**
+   * 订阅 `dns.proxy-server-nameserver`：**解析代理服务器域名**用的上游
+   * （JSON 字符串数组，已去引号 / 去重 / 上限 8 条）。
+   *
+   * 为什么必须保留（2026-10-20 真机定案）：机场普遍只把「入口域名 → 真实入口 IP」
+   * 告诉自家私有 DoH（如 `https://ns1.pubdns.co/dns-hyy/…`），公共 DNS 解析出来的是
+   * Cloudflare / WAF 前置 IP —— 那些 IP 上代理端口要么不通、要么不提供协议服务。
+   * 丢掉这一路 ⇒ 该订阅所有域名节点必然超时。实测（真实内核单变量）：
+   * 订阅1 原样 20/23 通，**只删这一行**就变 7/23；订阅2 原样 30/36，删掉 policy 变 0/36。
+   *
+   * 非敏感（只是 DNS 上游 URL），随 preferences 正常持久化。
+   */
+  subDnsProxyServers: string = '';
+  /**
+   * 订阅 `dns.nameserver-policy` / `proxy-server-nameserver-policy` 的条目，
+   * 展平成 `[["+.入口域名", "私有 DoH"], …]` 的 JSON 二维数组。
+   *
+   * 生成配置时**只保留与节点 server 域名匹配的条目**（订阅自己的入口域名），
+   * 不会把机场针对其它域名的策略带进用户的 DNS 策略里。
+   */
+  subDnsPolicies: string = '';
 
   static newSubscription(id: string, name: string, url: string): Subscription {
     const s = new Subscription();
@@ -80,11 +110,14 @@ export class Subscription {
     j.expireAt = s.expireAt;
     j.enabled = s.enabled;
     j.sortOrder = s.sortOrder;
+    j.legacyFormat = s.legacyFormat;
     j.rawProviderState = s.rawProviderState;
     j.rawProviderNodeEstimate = s.rawProviderNodeEstimate;
     j.etag = s.etag;
     j.subRules = s.subRules;
     j.subRuleProviders = s.subRuleProviders;
+    j.subDnsProxyServers = s.subDnsProxyServers;
+    j.subDnsPolicies = s.subDnsPolicies;
     return j;
   }
 
@@ -105,6 +138,7 @@ export class Subscription {
     s.enabled = j.enabled;
     s.sortOrder = j.sortOrder;
     // 旧版本存储无这两个键（可选字段），缺失一律按「未尝试」处理
+    s.legacyFormat = j.legacyFormat === true;
     s.rawProviderState = j.rawProviderState ?? '';
     s.rawProviderNodeEstimate = j.rawProviderNodeEstimate ?? 0;
     // 同理：etag 是后加字段，旧存储没有 → 空串 = 下次做完整拉取
@@ -112,6 +146,9 @@ export class Subscription {
     // 订阅自带 rules/rule-providers 同为后加字段，旧存储没有 → 空串
     s.subRules = j.subRules ?? '';
     s.subRuleProviders = j.subRuleProviders ?? '';
+    // 订阅 dns 上游同为后加字段：旧存储没有 → 空串（生成时退回内置公共 DoT）
+    s.subDnsProxyServers = j.subDnsProxyServers ?? '';
+    s.subDnsPolicies = j.subDnsPolicies ?? '';
     return s;
   }
 }

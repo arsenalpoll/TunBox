@@ -161,7 +161,8 @@ function balancedReport() {
 // ── 区间锚点（2026-10-19 改版后的结构）──────────────────────────────────
 // 展开区操作行：用改版注释定位，再取其后第一个 Row() ——
 // 不用 `Row({ space: 16 })` 之类布局细节做锚点（间距实现换过一次就失效）。
-const ACTION_COMMENT = '// 2026-10-19 用户要求：操作行**整体靠右**';
+// 2026-10-21：改为稳定锚点标记，UI 文案/布局再改也不会把区间截空。
+const ACTION_COMMENT = '// [anchor] 订阅展开区操作行';
 const actionCommentIdx = src.indexOf(ACTION_COMMENT);
 const actionRowIdx = actionCommentIdx >= 0 ? src.indexOf('Row() {', actionCommentIdx) : -1;
 // 该行之后第一个 GridRow 即节点网格 —— 操作行区间右界
@@ -245,19 +246,36 @@ ok('闪电在编辑左边（用户明确要求）', boltA11y > 0 && boltA11y < e
   `bolt=${boltA11y} edit=${editA11y}`);
 ok('编辑在删除左边', editA11y > 0 && editA11y < delA11y, `edit=${editA11y} del=${delA11y}`);
 
-// 右对齐 + 严格等间距（2026-10-19 用户第二轮要求：
-// 「间隔不一样大…你把编辑和删除之间的间隔也调整的一样大的，现在都在左边，
-//   你改成全部放到右边」）
+// 分布：测速居左 / 编辑居中 / 删除居右（2026-10-21 用户要求：
+// 「测速放左边，编辑放中间，删除放右边」+ 字号加大一号 + 图标加大 + 补点击热区）
 const actionRegion = (actionRowIdx >= 0 && gridIdx > actionRowIdx)
   ? src.slice(actionRowIdx, gridIdx) : '';
 const blankPos = actionRegion.indexOf('Blank()');
 const boltInRow = actionRegion.indexOf(".accessibilityText('闪电测速')");
-ok('操作行整体靠右（Blank() 位于闪电之前，而非末尾）',
-  blankPos > 0 && boltInRow > 0 && blankPos < boltInRow, `blank=${blankPos} bolt=${boltInRow}`);
-ok('ACTION_GAP 常量已定义', /const ACTION_GAP = \d+;/.test(src));
-ok('编辑/删除共用同一 ACTION_GAP 左外边距（间距严格相等，与 Row space 无关）',
-  (actionRegion.match(/\.margin\(\{ left: ACTION_GAP \}\)/g) || []).length === 2,
-  `margins=${(actionRegion.match(/\.margin\(\{ left: ACTION_GAP \}\)/g) || []).length}`);
+const editInRow = actionRegion.indexOf(".accessibilityText('编辑订阅')");
+const delInRow = actionRegion.indexOf(".accessibilityText('删除订阅')");
+ok('测速在最左（第一次 Blank() 出现在测速之后）',
+  boltInRow > 0 && blankPos > boltInRow, `blank=${blankPos} bolt=${boltInRow}`);
+ok('编辑居中（测速与编辑之间、编辑与删除之间各有 Blank()）',
+  (actionRegion.match(/Blank\(\)/g) || []).length === 2
+    && editInRow > boltInRow && delInRow > editInRow,
+  `blanks=${(actionRegion.match(/Blank\(\)/g) || []).length}`);
+ok('三个入口字号统一为 13（原 12，用户要求加大一号）',
+  (actionRegion.match(/fontSize\(13\)/g) || []).length === 3,
+  `count=${(actionRegion.match(/fontSize\(13\)/g) || []).length}`);
+ok('三个入口图标统一 14（原 13；测速中的 LoadingProgress 也是 14）',
+  (actionRegion.match(/Image\(\$r\('app\.media\.ic_(bolt|tune|delete)'\)\)\.width\(14\)\.height\(14\)/g) || []).length === 3,
+  `count=${(actionRegion.match(/Image\(\$r\('app\.media\.ic_\w+'\)\)\.width\(14\)\.height\(14\)/g) || []).length}`);
+ok('每个入口都有上下内边距放大点击热区',
+  (actionRegion.match(/top: 6, bottom: 6/g) || []).length === 3,
+  `count=${(actionRegion.match(/top: 6, bottom: 6/g) || []).length}`);
+// 编辑图标曾经是坏的（ic_tune.svg 里 `<path d="<rect…` 让整个 SVG 解析失败 → 真机空白）
+const tuneSvg = fs.readFileSync(path.join(here, '..', 'entry/src/main/resources/base/media/ic_tune.svg'), 'utf8');
+ok('ic_tune.svg 是完整 SVG 文档（无被 <rect> 截断的 <path d="）',
+  tuneSvg.startsWith('<svg') && !tuneSvg.includes('<path d="<'), 'ic_tune.svg 结构损坏');
+ok('ic_tune.svg 含三条滑杆 + 三个旋钮',
+  (tuneSvg.match(/<rect /g) || []).length === 3 && (tuneSvg.match(/<circle /g) || []).length === 3,
+  `rect=${(tuneSvg.match(/<rect /g) || []).length} circle=${(tuneSvg.match(/<circle /g) || []).length}`);
 
 // ── 4. 行头瘦身（2026-10-19 新增负对照）──────────────────────────────
 //    用户报障「订阅名字会被遮住」：行头必须只剩刷新 + 展开箭头，

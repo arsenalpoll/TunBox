@@ -113,14 +113,29 @@ try {
   code = typeof e.status === 'number' ? e.status : 1;
   out = String(e.stdout || '') + String(e.stderr || '');
 }
-if (out.trim().length > 0) {
-  console.log(out.trim());
+// SDK 自带的 `*.d.ets`（如 @ohos.annotation.d.ets）用了 tsc 不认的 ArkTS 语法：
+// skipLibCheck 只跳过类型检查、不跳过解析，所以会稳定刷出 TS1128/TS1146 语法错。
+// 这些不是本工程的错，按文件路径过滤掉，只保留**工程内文件**的报错。
+const isSdkNoise = (line) => {
+  const t = line.trim();
+  return /DevEco Studio.*[\/]sdk[\/]/.test(t) && /\.d\.ets?\(/.test(t);
+};
+const NL = String.fromCharCode(10);
+const allErrors = out.split(NL).filter((l) => /error TS\d+/.test(l));
+const ownErrors = allErrors.filter((l) => !isSdkNoise(l));
+const sdkNoise = allErrors.length - ownErrors.length;
+if (ownErrors.length > 0) {
+  console.log(ownErrors.join(NL));
+} else if (out.trim().length > 0) {
+  console.log(`[A] 已忽略 ${sdkNoise} 条 SDK 自带声明文件的语法噪声（非本工程代码）`);
 }
-if (code === 0) {
+if (ownErrors.length === 0 && code !== 0) {
+  console.log('[A] PASS: 工程代码 0 type errors（strict；SDK 声明噪声已过滤）');
+} else if (ownErrors.length === 0) {
   console.log('[A] PASS: 0 type errors (strict mode, real HarmonyOS SDK declarations)');
 } else {
   failures = failures + 1;
-  console.log('[A] FAIL: tsc exit ' + code);
+  console.log('[A] FAIL: ' + ownErrors.length + ' 条工程代码类型错误（tsc exit ' + code + '）');
 }
 
 // ── B. LogicTest.ets：语法解析检查 ────────────────────────────────────

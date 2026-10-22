@@ -93,8 +93,15 @@ _audit/
 SSRVPN_HarmonyOS/tools/true-parser-harness/YamlMerger.ts
 SSRVPN_HarmonyOS/tools/true-parser-harness/YamlMerger.head.ets
 SSRVPN_HarmonyOS/tools/true-parser-harness/evidence-*.txt
-SSRVPN_HarmonyOS/tools/true-chain-harness/generated/
+**/tools/true-chain-harness/generated/
 SSRVPN_HarmonyOS/tools/true-parser-harness/*.ts
 
 # 例外：应用源码（不含任何凭据材料），Windows core.ignorecase 下被 *credential* 误捕而从未入库
 !TunBox_HarmonyOS/entry/src/main/ets/commons/services/CredentialStore.ets
+
+# Windows client: standalone FlClash-based repo (own .git, not tracked by this repo)
+TunBox-Windows/
+
+# 本地工具链 / 内核源码克隆（各带自己的 .git，不入本仓）
+.tooling/
+kernel/

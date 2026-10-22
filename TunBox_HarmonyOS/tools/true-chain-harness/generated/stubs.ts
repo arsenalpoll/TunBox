@@ -160,8 +160,17 @@ export class RawProviderStats {
   emitted: number = 0;
   missingFiles: number = 0;
   orphaned: number = 0;
+  /** 与真实实现保持同名同语义：生成器在差额 > 0 时会调 detail() 打诊断 */
+  nameConflicts: number = 0;
+  nameMismatch: number = 0;
   pathMode: string = '';
   providerNames: string = '';
+
+  detail(): string {
+    return `stub provider：发出 ${this.emitted}/${this.candidates}`
+      + `（缺失 ${this.missingFiles}，无节点 ${this.orphaned}，`
+      + `重名 ${this.nameConflicts}，名字不一致 ${this.nameMismatch}）`;
+  }
 }
 
 export class RawProviderPlan {
@@ -355,5 +364,38 @@ export class SubscriptionFetchError extends Error {
   constructor(kind: string, message: string) {
     super(message);
     this.kind = kind;
+  }
+}
+
+
+/**
+ * fileIo 替身（ProfileStore 的落盘分支在 Node 里不执行；单测只走纯逻辑）。
+ * `accessSync`/`statSync`/`openSync` 一律抛错 = 文件不存在，调用方按「无 profile」处理。
+ */
+export const fileIo = {
+  OpenMode: { READ_ONLY: 0, READ_WRITE: 1, CREATE: 2, TRUNC: 4 },
+  mkdirSync(_path: string, _recursive?: boolean): void {},
+  accessSync(_path: string): void { throw new Error('stub: not found'); },
+  statSync(_path: string): { size: number } { throw new Error('stub: not found'); },
+  openSync(_path: string, _mode: number): { fd: number } { throw new Error('stub: not found'); },
+  readSync(_fd: number, _buf: ArrayBuffer): number { return 0; },
+  writeSync(_fd: number, _text: string): number { return 0; },
+  closeSync(_file: unknown): void {},
+  unlinkSync(_path: string): void {},
+  renameSync(_from: string, _to: string): void {},
+};
+
+
+/** 内核目录服务替身（SubscriptionService 的节点回落路径；单测不触发）。 */
+export class CoreCatalogService {
+  static current(): { byName: Record<string, { name: string; type: string; isGroup: boolean }> } | null {
+    return null;
+  }
+}
+
+/** 内核节点影子桥替身。 */
+export class CoreNodeBridge {
+  static toProxyNode(_node: unknown): unknown {
+    return null;
   }
 }

@@ -20,8 +20,26 @@ import { LatencyStore, LatencyViewLevel } from '../commons/latency/LatencyStore'
  * 位移取屏宽 4%–8%；新页沿水平方向轻进入，旧页同步退出）。页签切换与路由推入式子页共用同一套。
  */
 export class TunBoxMotion {
-  /** 转场时长（ms） */
-  static readonly ms: number = 260;
+  /** 设计基线时长（ms）—— 手机档（<8.5 英寸）实测观感定版值 */
+  static readonly BASE_MS: number = 260;
+
+  /**
+   * 转场时长（ms）——按屏幕对角线英寸分档，且不低于设计基线。
+   *
+   * 华为应用市场上架规范：全屏页面转场（层级/新建/编辑/搜索等）
+   * · < 8.5 英寸 ≥ 200ms
+   * · 8.5 ~ 12 英寸 ≥ 250ms
+   * · > 12 英寸 ≥ 300ms
+   *
+   * 基线 260ms 已覆盖前两档，只有 12 英寸以上需要抬到 300；
+   * 档位由 EntryAbility.onCreate 按 display 实测尺寸写入 `tb_motion_required_ms`，
+   * 取 max(基线, 规范下限) —— 小屏保持既有观感，大屏自动合规。
+   */
+  static get ms(): number {
+    const required = AppStorage.get<number>('tb_motion_required_ms');
+    const floor = required !== undefined && required > 0 ? required : 0;
+    return floor > TunBoxMotion.BASE_MS ? floor : TunBoxMotion.BASE_MS;
+  }
   /** 转场位移：百分比字符串用于路由页（相对页宽），vp 数值用于页签（本机 800vp 宽 → 48vp ≈ 6%） */
   static readonly slidePercent: string = '6%';
   static readonly slideVp: number = 48;

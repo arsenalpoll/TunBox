@@ -113,15 +113,61 @@ const persistSrc = fs.readFileSync(
 ok('持久化转换优先使用 rec.failKind（不再从 state 重新盖章）',
   /toPersistRecord[\s\S]{0,600}?rec\.failKind\.length\s*>\s*0/.test(persistSrc));
 
-// ── 「测全部」走组测路径，组接口不返回状态码 → 必须靠内核代理表区分 ────
-// 契约：组测后用 proxyTableNames() 判断"节点在不在内核里"，
-// 不在 → switch_failed（未生效）；在 → 真超时。否则「测全部」看到的仍是全红。
-ok('组测路径用内核代理表区分「未生效」',
-  /proxyTableNames\(\)/.test(persistSrc));
-ok('组测路径把不在代理表的失败节点标为 switch_failed',
-  /notInCore[\s\S]{0,400}?LatencyProbeKind\.SWITCH_FAILED/.test(persistSrc));
+// ── 测速唯一入口 = LatencyEngine（2026-10-21 收敛，2026-10-22 补闸门）──────────
+// 契约：页面层不得再实现「内核侧组测速」（`GET /group/{name}/delay`）。
+// 历史形态：NodeSelectionPage 曾有一套 runGroupLatency，只有它自己用、且该页没有任何
+// 导航入口 → 死路径，还会与订阅页闪电测速形成两套口径（超时判定/失败分类不同源）。
+// 现在「测全部」与「单节点/单订阅测速」全部走同一个引擎。
+ok('页面层不再实现内核侧组测速（无 /group/ 端点、无 runGroupLatency）',
+  !/runGroupLatency/.test(persistSrc) && !/\/group\//.test(persistSrc));
+ok('「测全部」统一走 LatencyEngine',
+  /LatencyEngine\.start\(/.test(persistSrc));
 ok('测速完成提示单独报「未生效」计数',
   /未生效 \$\{progress\.failed\}/.test(persistSrc));
+
+// ── 「控制器过载」必须有界面出口（2026-10-22 迁到真实入口：订阅页闪电测速）────
+// 契约：过载路径下引擎**故意不给节点写结论**（保持未测）⇒ 用户看到「测速完成 + 一堆 --」。
+// 必须单独说明，且文案与「通道不可用」区分（通道是好的、可以重测）。
+// 本条曾锁在 NodeSelectionPage（死页），随该页的组测实现一起迁到 SubscriptionPage。
+const subPageSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/pages/SubscriptionPage.ets'), 'utf8');
+ok('过载数进入测速结论文案（不静默丢弃）',
+  /coreOverloaded\s*>\s*0/.test(subPageSrc) && /控制器过载/.test(subPageSrc));
+ok('过载文案与「通道不可用」区分（说明通道正常、可重测）',
+  /控制器过载[^`]{0,40}通道正常/.test(subPageSrc));
+ok('进度映射把 coreOverloaded 交给调用方（后台测速返回 progress）',
+  /Promise<LatencyProgress\s*\|\s*null>/.test(fs.readFileSync(
+    path.join(root, 'entry/src/main/ets/commons/services/BackgroundLatencyService.ets'), 'utf8'))
+  && /return progress;/.test(fs.readFileSync(
+    path.join(root, 'entry/src/main/ets/commons/services/BackgroundLatencyService.ets'), 'utf8')));
+
+// ── 内核组测速：唯一实现 = BackgroundLatencyService.runKernelGroupTest（2026-10-22）──
+// 订阅页行尾按钮 / 冷启动静默批 / 大订阅都调这一处，避免三套 504/通道/未生效判定。
+const bgSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/services/BackgroundLatencyService.ets'), 'utf8');
+// 2026-10-22（用户要求「测速完全按 FlClash」）：组测速 = 组内节点**逐个测**，
+// 不再调内核 `GET /group/{name}/delay`；唯一实现是 FlclashLatencyService.start。
+const flcSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/flclash/FlclashDelay.ets'), 'utf8');
+ok('组测唯一入口 = FlclashLatencyService（逐节点，不再调内核组接口）',
+  /FlclashLatencyService\.start\(/.test(bgSrc) && !/testGroupDetailedResult/.test(bgSrc));
+ok('组测入口是智能优选行内的纯图形按钮（不是独立卡片/文字标题）',
+  /accessibilityText\('内核组测速（一次测完所有节点）'\)/.test(subPageSrc)
+  && !/Text\('内核组测速'\)/.test(subPageSrc));
+ok('组测在途有防重入 + 转圈',
+  /if \(this\.groupTesting\) \{\s*return;/.test(subPageSrc)
+  && /@State groupTesting: boolean = false;/.test(subPageSrc));
+const flcServiceSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/flclash/FlclashLatencyService.ets'), 'utf8');
+ok('组测/批量结果有可检索的完成日志（total/measured/timeout/failed/cancelled）',
+  /delay batch done: total=\$\{summary\.total\} measured=\$\{summary\.measured\}/.test(flcServiceSrc)
+  && /cancelled=\$\{summary\.cancelled\}/.test(flcServiceSrc));
+ok('并发/超时/测速地址对齐 FlClash（32 / 5000ms / gstatic https）',
+  /FLCLASH_DELAY_CONCURRENCY: number = 32/.test(flcSrc)
+  && /FLCLASH_DELAY_TIMEOUT_MS: number = 5000/.test(flcSrc)
+  && /https:\/\/www\.gstatic\.com\/generate_204/.test(flcSrc));
+ok('大订阅与小订阅同一条路径（不存在「≥120 节点改内核组测」的分叉）',
+  !/KERNEL_GROUP_TEST_MIN_NODES/.test(bgSrc));
 
 const apiSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/services/ClashApiService.ets'), 'utf8');
@@ -140,19 +186,28 @@ ok('ClashApiService 提供 proxyTableNames（内核代理表全名）',
 // 2026-10-20（lead 拍板迁移）：超时数值真源搬到零 import 的
 // commons/latency/LatencyKinds.ets 的 LatencyTimeout；LatencyState.LatencyPolicy
 // 只剩转调 getter ⇒ 断言改判**真源**，并额外要求转调关系存在（不许留第二份字面量）。
+// 2026-10-21（真机回退）：在途并发由 50 收敛为 8 —— 50 路在途会把 controller 打满，
+//   客户端侧 2300028 被归成 core_not_ready ⇒ 6 连击作废整批（飞鸟云 31 节点批只测了 7 个）。
+//   8 = OHOS http 栈对同一 host 的连接池容量 ⇒ 排队改在应用层闸门里发生，不污染读数。
 const kindsSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/latency/LatencyKinds.ets'), 'utf8');
-ok('单节点测速超时为 3000ms（2026-10-20 用户要求 5s→3s；真源 LatencyTimeout.DEFAULT_TIMEOUT_MS）',
-  /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*3000/.test(kindsSrc));
+// 2026-10-21（用户对标三家）：超时由 3s 回到 **5s**（FlClash 8s / Verge 10s / CMFA 5s），
+// 在途并发由 50 收敛为 8 = OHOS http 栈对同一 host 的连接池容量（排队改在应用层闸门里发生）。
+ok('单节点测速超时为 5000ms（真源 LatencyTimeout.DEFAULT_TIMEOUT_MS，用户拍板对齐三家）',
+  /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*5000/.test(kindsSrc));
 ok('LatencyPolicy 的超时是转调真源（不留第二份字面量）',
   /return\s+LatencyTimeout\.DEFAULT_TIMEOUT_MS;/.test(stateSrc)
   && !/DEFAULT_TIMEOUT_MS:\s*number\s*=\s*\d+/.test(stateSrc));
 ok('并发测速数为 50（C8b：由 88 收敛，worker 口径）', /LATENCY_CONCURRENCY\s*=\s*50/.test(engineSrc));
-ok('在途并发上限为 50（2026-10-20 放开：与 worker 数同宽，无应用层排队）',
-  /LATENCY_INFLIGHT\s*=\s*50/.test(engineSrc));
-ok('组测每节点预算与单节点一致（3000ms）', /GROUP_TEST_TIMEOUT_MS\s*=\s*3000/.test(engineSrc));
-ok('内核延迟探测默认超时同步为 3000ms',
-  /testLatencyDetailed\(nodeName: string, testUrl: string,\s*\n?\s*(?:\/\/[^\n]*\n\s*)?timeoutMs: number = 3000/.test(apiSrc));
+// 2026-10-21：在途由 8 放开到 32（用户要求对齐 FlClash 客户端在途 32）。
+// ⚠ 断言必须打**声明行**：曾经写成 `LATENCY_INFLIGHT\s*=\s*8`，结果命中的是注释里
+// 那句「LATENCY_INFLIGHT=8」，代码改回 8→32 时闸门照样绿（假绿，2026-10-22 发现）。
+ok('在途并发上限为 32（对齐 FlClash 客户端在途；回退点依次 16 → 8）',
+  /export const LATENCY_INFLIGHT = 32;/.test(engineSrc));
+ok('组测每节点预算转调单节点真源（不留第二份字面量）',
+  /export const GROUP_TEST_TIMEOUT_MS = LatencyPolicy\.DEFAULT_TIMEOUT_MS;/.test(engineSrc));
+ok('内核延迟探测默认超时转调同一真源（不留 3000/5000 字面量）',
+  /timeoutMs: number = LatencyPolicy\.DEFAULT_TIMEOUT_MS/.test(apiSrc));
 // 离线探测器（DirectLatencyTester）已被测速内核（LP07）取代 —— 文件不在了就跳过这条，
 // 但**不许**因为文件缺失而整个闸门崩掉（那会让「文件已删」看起来像「契约破了」）。
 const directTesterPath = path.join(root, 'entry/src/main/ets/commons/services/DirectLatencyTester.ets');
@@ -162,8 +217,10 @@ if (fs.existsSync(directTesterPath)) {
 } else {
   ok('离线探测器已被测速内核取代（文件已删，跳过阶段预算断言）', true);
 }
-ok('批次硬截止可注入（回归测试不再依赖并发算术巧合）',
-  /batchDeadlineMs:\s*number\s*=\s*BATCH_DEADLINE_MS/.test(engineSrc));
+ok('批次硬截止可注入（0 = 自动，测试注入小值仍生效）',
+  /batchDeadlineMs: number = 0;/.test(engineSrc)
+  && /batchDeadlineMs > 0/.test(engineSrc)
+  && /static deadlineForBatch\(nodeCount: number\): number/.test(engineSrc));
 
 console.log(`\n延迟显示契约自检：${pass} 条通过，${fails.length} 条失败`);
 if (fails.length > 0) {

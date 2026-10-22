@@ -25,6 +25,15 @@ export class Subscription {
   totalBytes: number = -1;
   expireAt: number = -1;
   enabled: boolean = true;
+  /**
+   * 旧格式订阅标记（2026-10-21「只支持 Clash 订阅」收口）。
+   *
+   * 判定依据是**下载到的内容**而不是链接：JSON / CONF / base64 节点串 / 纯链接列表都算旧格式。
+   * 策略：已解析的节点保留可用（不清空、不影响选点/测速/连接），只做三件事——
+   *   ① 停止自动更新（避免每天报错刷屏）；② 卡片显示「旧格式」角标；③ 提示换成 Clash 链接。
+   * 用户把订阅 URL 换成 Clash 订阅后，下一次刷新成功会自动清掉本标记。
+   */
+  legacyFormat: boolean = false;
   sortOrder: number = 0;
   /**
    * 双轨「原始订阅 provider」状态（持久化，供订阅卡/诊断并列展示）：
@@ -100,6 +109,7 @@ export class Subscription {
     j.expireAt = s.expireAt;
     j.enabled = s.enabled;
     j.sortOrder = s.sortOrder;
+    j.legacyFormat = s.legacyFormat;
     j.rawProviderState = s.rawProviderState;
     j.rawProviderNodeEstimate = s.rawProviderNodeEstimate;
     j.etag = s.etag;
@@ -127,6 +137,7 @@ export class Subscription {
     s.enabled = j.enabled;
     s.sortOrder = j.sortOrder;
     // 旧版本存储无这两个键（可选字段），缺失一律按「未尝试」处理
+    s.legacyFormat = j.legacyFormat === true;
     s.rawProviderState = j.rawProviderState ?? '';
     s.rawProviderNodeEstimate = j.rawProviderNodeEstimate ?? 0;
     // 同理：etag 是后加字段，旧存储没有 → 空串 = 下次做完整拉取

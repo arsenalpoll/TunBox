@@ -132,14 +132,23 @@ console.log('\n[5] originalName 保持不变（proxy-groups 按面板原始名�
 console.log('\n[6] 源码契约：generate() 必须在写 proxies 之前调用唯一化');
 {
   const proxiesIdx = gen.indexOf("lines.push('proxies:')");
-  const callIdx = gen.indexOf('ClashConfigGenerator.ensureUniqueProxyNames(validNodes)');
+  // 2026-10-22：唯一化的入参从 validNodes 改为 staticNodes（provider 覆盖的节点不再改名），
+  // 断言跟着改为**语义**而不是字面：必须在 staticNodes 上调用，且早于任何 proxy 行输出。
+  const callIdx = gen.indexOf('ClashConfigGenerator.ensureUniqueProxyNames(staticNodes)');
   ok(proxiesIdx > 0, '找到 proxies: 输出点');
-  ok(callIdx > 0, '找到 ensureUniqueProxyNames 调用点');
-  ok(callIdx > proxiesIdx && callIdx < gen.indexOf('proxyYamlLine(n)', callIdx),
-    '调用发生在写 proxies 之前、且在写第一条 proxy 行之前');
-  // 改名前不能已经 emit 过任何 proxy 行，否则旧名字会先落盘
+  ok(callIdx > 0, '找到 ensureUniqueProxyNames(staticNodes) 调用点');
+  // 改名前不能已经 emit 过任何 proxy 行，否则旧名字会先落盘。
+  // 2026-10-22 订正断言方向：唯一化必须在**写 `proxies:` 段之前**完成（原断言要求
+  // 在 `lines.push('proxies:')` 之后，与代码形态相反，属于过期契约）。
   const emitIdx = gen.indexOf('lines.push(ClashConfigGenerator.proxyYamlLine(n))');
-  ok(callIdx < emitIdx, '唯一化先于任何 proxy 行输出');
+  ok(callIdx < proxiesIdx && callIdx < emitIdx, '唯一化早于 `proxies:` 段与任何 proxy 行输出');
+  // 2026-10-22 真实内核抓到的空洞：索引构建与发射曾合并成一趟，`subId.length === 0`
+  // 的 continue 把手工节点整条丢掉（proxies: 后为空 → 内核 proxy not found）。
+  // 契约：**发射循环**（含 proxyYamlLine 的那个 for）body 里不得有任何 continue。
+  const emitLoopStart = gen.lastIndexOf('for (const n of staticNodes) {', emitIdx);
+  const emitLoop = emitLoopStart >= 0 ? gen.slice(emitLoopStart, emitIdx) : '';
+  ok(emitLoopStart >= 0 && emitLoop.indexOf('continue') < 0,
+    '发射循环无 continue 跳过（否则节点会被静默丢弃）');
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -116,6 +116,10 @@ export struct CelestialPowerOrb {
     return ThemeService.isDark() ? '16, 185, 129' : '0, 186, 102';
   }
 
+  private tealRgb(): string {
+    return ThemeService.isDark() ? '94, 234, 212' : '45, 212, 191';
+  }
+
   private tealHex(): string {
     return ThemeService.isDark() ? '#5EEAD4' : '#2DD4BF';
   }
@@ -178,21 +182,31 @@ export struct CelestialPowerOrb {
     // 1. 弥散呼吸光晕：仅连接后显示（2026-10-17 用户要求「启动后才显示光晕，
     //    不启动不显示」），1.4s 呼吸、随连接态转翡翠绿
     if (this.isConnected) {
-      const breath: number = 0.10 + 0.045 * Math.sin(Date.now() / 1000 * 2 * Math.PI / BREATH_SEC);
+      // 2026-10-21 用户要求「光晕感再强一点」：呼吸基准与幅度同时抬高（0.10/0.045 → 0.17/0.06），
+      // 并新增一圈贴近盘面的内层辉光，让玻璃盘边缘有一层实打实的光。
+      const breath: number = 0.17 + 0.06 * Math.sin(Date.now() / 1000 * 2 * Math.PI / BREATH_SEC);
       const ambient = ctx.createRadialGradient(c, c, this.discSize * 0.1, c, c, c);
       ambient.addColorStop(0, `rgba(${glowRgb}, ${breath.toFixed(3)})`);
-      ambient.addColorStop(0.6, `rgba(${glowRgb}, ${(breath * 0.25).toFixed(3)})`);
+      ambient.addColorStop(0.55, `rgba(${glowRgb}, ${(breath * 0.42).toFixed(3)})`);
+      ambient.addColorStop(0.82, `rgba(${glowRgb}, ${(breath * 0.12).toFixed(3)})`);
       ambient.addColorStop(1.0, `rgba(${glowRgb}, 0)`);
       ctx.fillStyle = ambient;
+      ctx.fillRect(0, 0, this.glowSize, this.glowSize);
+      const core = ctx.createRadialGradient(c, c, this.discSize * 0.16, c, c, this.discSize * 0.62);
+      core.addColorStop(0, `rgba(${glowRgb}, ${(breath * 0.85).toFixed(3)})`);
+      core.addColorStop(0.62, `rgba(${glowRgb}, ${(breath * 0.30).toFixed(3)})`);
+      core.addColorStop(1.0, `rgba(${glowRgb}, 0)`);
+      ctx.fillStyle = core;
       ctx.fillRect(0, 0, this.glowSize, this.glowSize);
     }
 
     // 2. 外层点阵虚线轨道（280，dash 3:6）：已连接整圈转翡翠绿
     //    （2026-10-17 用户要求外圈作连接态指示；每帧按 isConnected 取色）
-    this.dashedCircle(ctx, c, this.trackSize / 2, 1.5,
+    //    2026-10-21：待命态压暗、连接态加粗提亮 —— 启动前后靠这一圈就能一眼分开。
+    this.dashedCircle(ctx, c, this.trackSize / 2, this.isConnected ? 2.0 : 1.5,
       this.isConnected
-        ? `rgba(${this.greenRgb()}, ${dark ? '0.55' : '0.85'})`
-        : (dark ? 'rgba(255, 255, 255, 0.16)' : 'rgba(209, 224, 247, 0.85)'));
+        ? `rgba(${this.greenRgb()}, ${dark ? '0.78' : '1.0'})`
+        : (dark ? 'rgba(255, 255, 255, 0.14)' : 'rgba(198, 215, 240, 0.55)'));
 
     // 3. 渐变轨环（260，蓝 0.40 → 蓝 0.08 → 绿 0.30）
     const rArc: number = this.arcRingSize / 2;
@@ -203,19 +217,64 @@ export struct CelestialPowerOrb {
     this.strokeArc(ctx, c, rArc, 2, ringGrad, 0, 360);
 
     // 4. 两条动态电平弧线（与卫星共用同一轨道相位 → 角间距恒定，永不相交）
-    this.gradientArc(ctx, c, ARC1.radius, 4.5, ARC1.startAt(this.spinDeg), ARC1.sweepDeg,
-      this.blueHex(), this.tealHex());
-    const greenArc = `rgba(${this.greenRgb()}, 0.9)`;
-    this.gradientArc(ctx, c, ARC2.radius, 4.5, ARC2.startAt(this.spinDeg), ARC2.sweepDeg,
-      greenArc, greenArc);
+    //    2026-10-21：待命态细+暗、连接态粗+亮，并在弧头补一颗「领头光点」——
+    //    转动方向与快慢因此一眼可辨（造型/半径/相位全不动，只改笔宽与亮度）。
+    const arcWidth: number = this.isConnected ? 5.5 : 3.2;
+    if (this.isConnected) {
+      this.gradientArc(ctx, c, ARC1.radius, arcWidth, ARC1.startAt(this.spinDeg), ARC1.sweepDeg,
+        this.blueHex(), this.tealHex());
+      const greenArcLit = `rgba(${this.greenRgb()}, 1)`;
+      this.gradientArc(ctx, c, ARC2.radius, arcWidth, ARC2.startAt(this.spinDeg), ARC2.sweepDeg,
+        greenArcLit, greenArcLit);
+    } else {
+      const idleBlue = `rgba(${this.blueRgb()}, ${dark ? '0.40' : '0.42'})`;
+      const idleTeal = `rgba(${this.tealRgb()}, ${dark ? '0.40' : '0.42'})`;
+      this.gradientArc(ctx, c, ARC1.radius, arcWidth, ARC1.startAt(this.spinDeg), ARC1.sweepDeg,
+        idleBlue, idleTeal);
+      const idleGreen = `rgba(${this.greenRgb()}, ${dark ? '0.26' : '0.30'})`;
+      this.gradientArc(ctx, c, ARC2.radius, arcWidth, ARC2.startAt(this.spinDeg), ARC2.sweepDeg,
+        idleGreen, idleGreen);
+    }
+    // 弧头光点：连接态白心大点（转速快、指向明确），待命态小暗点（只留一丝动感）
+    this.drawArcHead(ctx, c, ARC1.radius, ARC1.startAt(this.spinDeg),
+      this.isConnected ? this.tealRgb() : this.blueRgb(), this.isConnected);
+    this.drawArcHead(ctx, c, ARC2.radius, ARC2.startAt(this.spinDeg),
+      this.greenRgb(), this.isConnected);
 
     // 5. 卫星节点：主卫星（白心蓝晕）沿外轨，次卫星（绿）沿轨环 —— 同速、固定错位
+    //    连接态放大光晕与实心体，待命态收紧压暗（对比度来源之二）
     const sat1Rad: number = BALL1.startAt(this.spinDeg) * Math.PI / 180;
     this.drawSatellite(ctx, c + BALL1.radius * Math.cos(sat1Rad),
       c + BALL1.radius * Math.sin(sat1Rad), this.blueRgb(), this.blueHex());
     const sat2Rad: number = BALL2.startAt(this.spinDeg) * Math.PI / 180;
     this.drawSatellite(ctx, c + BALL2.radius * Math.cos(sat2Rad), c + BALL2.radius * Math.sin(sat2Rad),
-      this.greenRgb(), `rgba(${this.greenRgb()}, 0.9)`);
+      this.greenRgb(), `rgba(${this.greenRgb()}, ${this.isConnected ? '0.95' : '0.55'})`);
+  }
+
+  /** 弧头领头光点：光晕 + 实心体 + （连接态）白核，用来读转动方向与速度 */
+  private drawArcHead(ctx: CanvasRenderingContext2D, c: number, r: number,
+    startDeg: number, rgb: string, strong: boolean): void {
+    const rad: number = startDeg * Math.PI / 180;
+    const x: number = c + r * Math.cos(rad);
+    const y: number = c + r * Math.sin(rad);
+    const haloR: number = strong ? 9 : 6;
+    const halo = ctx.createRadialGradient(x, y, 0, x, y, haloR);
+    halo.addColorStop(0, `rgba(${rgb}, ${strong ? '0.60' : '0.22'})`);
+    halo.addColorStop(1.0, `rgba(${rgb}, 0)`);
+    ctx.fillStyle = halo;
+    ctx.beginPath();
+    ctx.arc(x, y, haloR, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.fillStyle = strong ? `rgba(${rgb}, 1)` : `rgba(${rgb}, 0.45)`;
+    ctx.beginPath();
+    ctx.arc(x, y, strong ? 3.4 : 2.2, 0, 2 * Math.PI);
+    ctx.fill();
+    if (strong) {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+      ctx.beginPath();
+      ctx.arc(x, y, 1.6, 0, 2 * Math.PI);
+      ctx.fill();
+    }
   }
 
   private strokeArc(ctx: CanvasRenderingContext2D, c: number, r: number, width: number,
@@ -259,23 +318,26 @@ export struct CelestialPowerOrb {
     }
   }
 
-  /** 微光卫星节点：径向渐变外晕（不用 shadowBlur，保持逐帧轻量）+ 实心体 + 白核 */
+  /** 微光卫星节点：径向渐变外晕（不用 shadowBlur，保持逐帧轻量）+ 实心体 + 白核
+   *  2026-10-21：连接态放大提亮、待命态收紧压暗，作为启动前后的主要对比来源之一。 */
   private drawSatellite(ctx: CanvasRenderingContext2D, x: number, y: number,
     haloRgb: string, bodyColor: string): void {
-    const halo = ctx.createRadialGradient(x, y, 0, x, y, 11);
-    halo.addColorStop(0, `rgba(${haloRgb}, 0.55)`);
+    const on: boolean = this.isConnected;
+    const haloR: number = on ? 14 : 9;
+    const halo = ctx.createRadialGradient(x, y, 0, x, y, haloR);
+    halo.addColorStop(0, `rgba(${haloRgb}, ${on ? '0.72' : '0.30'})`);
     halo.addColorStop(1.0, `rgba(${haloRgb}, 0)`);
     ctx.fillStyle = halo;
     ctx.beginPath();
-    ctx.arc(x, y, 11, 0, 2 * Math.PI);
+    ctx.arc(x, y, haloR, 0, 2 * Math.PI);
     ctx.fill();
     ctx.fillStyle = bodyColor;
     ctx.beginPath();
-    ctx.arc(x, y, 4.5, 0, 2 * Math.PI);
+    ctx.arc(x, y, on ? 5.2 : 3.9, 0, 2 * Math.PI);
     ctx.fill();
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+    ctx.fillStyle = on ? 'rgba(255, 255, 255, 0.95)' : 'rgba(255, 255, 255, 0.55)';
     ctx.beginPath();
-    ctx.arc(x, y, 2.2, 0, 2 * Math.PI);
+    ctx.arc(x, y, on ? 2.6 : 1.7, 0, 2 * Math.PI);
     ctx.fill();
   }
 
@@ -339,12 +401,14 @@ export struct CelestialPowerOrb {
           .borderRadius(this.discSize / 2)
           .backgroundEffect({
             radius: 40,
+            // 2026-10-21 二次收敛：绿色只留在**最内圈**（电源徽标小圆），
+            // 盘面保持原玻璃色，避免整个按钮泛绿。
             color: ThemeService.isDark() ? 'rgba(30, 41, 66, 0.55)' : 'rgba(255, 255, 255, 0.52)'
           })
           .shadow(this.isConnected
             ? {
-              radius: 24,
-              color: ThemeService.isDark() ? 'rgba(59, 130, 246, 0.30)' : 'rgba(10, 89, 247, 0.16)',
+              radius: 32,
+              color: ThemeService.isDark() ? 'rgba(59, 130, 246, 0.34)' : 'rgba(10, 89, 247, 0.18)',
               offsetY: 16
             }
             : { radius: 0, color: 'rgba(0, 0, 0, 0)', offsetY: 0 })
@@ -369,13 +433,21 @@ export struct CelestialPowerOrb {
             } else {
               Image($r('app.media.ic_power'))
                 .width(22).height(22)
-                .fillColor(this.accent())
+                // 深色连接态：小圆是实心绿，图标必须反白，否则绿压绿看不见
+                .fillColor(this.isConnected && ThemeService.isDark() ? '#04231A' : this.accent())
             }
           }
           .width(40)
           .height(40)
           .borderRadius(20)
-          .backgroundColor(ThemeService.isDark() ? 'rgba(59, 130, 246, 0.20)' : '#EFF5FF')
+          .backgroundColor(this.isConnected
+            ? (ThemeService.isDark() ? 'rgba(16, 211, 138, 0.92)' : 'rgba(0, 186, 102, 0.16)')
+            : (ThemeService.isDark() ? 'rgba(59, 130, 246, 0.20)' : '#EFF5FF'))
+          .border({
+            // 只给深色主题加描边：浅色主题已确认，保持原样不动
+            width: (this.isConnected && ThemeService.isDark()) ? 1 : 0,
+            color: 'rgba(52, 211, 153, 1.0)'
+          })
 
           Text(this.titleText())
             .fontSize(18)

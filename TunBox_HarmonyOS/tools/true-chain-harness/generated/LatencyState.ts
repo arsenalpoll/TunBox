@@ -1,3 +1,4 @@
+// [harness] generated from entry/src/main/ets/commons/services/LatencyState.ets — 仅 import 目标被重写
 /**
  * 节点延迟状态模型（延迟测试重做，5.6.0）
  *

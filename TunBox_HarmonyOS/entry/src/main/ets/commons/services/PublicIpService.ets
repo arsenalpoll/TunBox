@@ -25,6 +25,7 @@
  * 供用户反馈日志时定案。
  */
 import { http } from '@kit.NetworkKit';
+import { AppProxyRoute } from './AppProxyRoute';
 import { util } from '@kit.ArkTS';
 import { PublicIpInfo } from '../models/PublicIpInfo';
 import { AppLogger } from '../utils/AppLogger';
@@ -159,7 +160,9 @@ export class PublicIpService {
         method: http.RequestMethod.GET,
         connectTimeout: CONNECT_TIMEOUT_MS,
         readTimeout: READ_TIMEOUT_MS,
-        usingCache: false
+        usingCache: false,
+        // 出口 IP 必须经由隧道查询，否则拿到的是本机物理出口（或直接失败）
+        usingProxy: AppProxyRoute.activePort() > 0
       });
       result.elapsedMs = Date.now() - t0;
       if (resp.responseCode !== 200) {
@@ -227,7 +230,9 @@ export class PublicIpService {
         method: http.RequestMethod.GET,
         connectTimeout: CONNECT_TIMEOUT_MS,
         readTimeout: READ_TIMEOUT_MS,
-        usingCache: false
+        usingCache: false,
+        // 出口 IP 必须经由隧道查询，否则拿到的是本机物理出口（或直接失败）
+        usingProxy: AppProxyRoute.activePort() > 0
       });
       result.elapsedMs = Date.now() - t0;
       if (resp.responseCode !== 200) {

@@ -293,8 +293,8 @@ console.log('\n[8]（附加）组测契约对账：ClashApiService 的 GroupLate
     }
     ok(/delays:\s*Map<string,\s*number>/.test(clsBody), 'delays 是 Map<string, number>（ArkTS 显式泛型）');
   }
-  ok(/async testGroupDetailedResult\(groupName: string, testUrl: string,\s*\n?\s*timeoutMs: number\):\s*Promise<GroupLatencyResult>/
-    .test(apiSrc), 'testGroupDetailedResult 签名与我的调用点一致');
+  ok(/async testGroupDetailedResult\(groupName: string, testUrl: string,\s*\n?\s*timeoutMs: number,\s*expectedNodes: number = 0\):\s*Promise<GroupLatencyResult>/
+    .test(apiSrc), 'testGroupDetailedResult 签名与我的调用点一致（含 expectedNodes）');
   const i504 = apiSrc.indexOf('responseCode === 504');
   ok(i504 >= 0, '存在 504（all proxies timeout）分支');
   if (i504 >= 0) {

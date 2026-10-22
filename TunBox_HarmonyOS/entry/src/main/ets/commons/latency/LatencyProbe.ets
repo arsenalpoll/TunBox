@@ -74,10 +74,12 @@ const TAG: string = 'LatencyProbe';
  *    可能上百毫秒）。余量太小 → 客户端先超时 → 拿到的是传输层错误而不是内核明确的
  *    504 → 「真超时」被误分类成「通道坏了」。
  *  - `WORKERS` 50：worker 数 = 队列深度（对齐 FlClash 的 client concurrency 50）。
- *  - `MAX_INFLIGHT` 50：**同时在途的 HTTP 请求数**（2026-10-20 用户拍板放开，
- *    与 worker 数同宽 ⇒ 无应用层排队，elapsed 即节点自身 /delay 的真实耗时）。
- *    历史取值 8 的依据是「OHOS http 栈同 host 连接池约 8」；放开后若真机出现
- *    大量 `queueTimeout>0`，说明连接池确实压不住，回退到 24/32。
+ *  - `MAX_INFLIGHT` 8：**同时在途的 HTTP 请求数**（= 引擎在途闸门 `LATENCY_INFLIGHT`）。
+ *    2026-10-20 曾放开到 50（与 worker 同宽），2026-10-21 真机回退：OHOS http 栈对
+ *    **同一 host**（恒为 `127.0.0.1:9090`）只有约 8 条连接，超出部分会在栈内部排队、
+ *    排队时间被算进单请求预算 ⇒ 客户端侧 `2300028` ⇒ 被归成 `core_not_ready` ⇒
+ *    6 连击作废整批（飞鸟云 31 节点批：后 24 个一次 `/delay` 都没发）。
+ *    8 是**容量事实**而非保守取值：排队必须发生在应用层闸门里（等待不计预算）。
  *  - `QUEUE_WAIT_MAX_MS` 60000：排队等待上限。排队等待**不计入**节点的超时预算；
  *    超了就是「排队超时」（根本没拨号），归非判定。
  */
@@ -88,8 +90,8 @@ export class LatencyProbeLimits {
   static readonly OUTER_EXTRA_MS: number = 1200;
   /** worker 数 / 队列深度（对齐 FlClash 的 client concurrency 50） */
   static readonly WORKERS: number = 50;
-  /** 同时在途的 HTTP 请求数（2026-10-20 起与 WORKERS 同宽 = 50，无应用层排队） */
-  static readonly MAX_INFLIGHT: number = 50;
+  /** 同时在途的 HTTP 请求数（= 引擎在途闸门 LATENCY_INFLIGHT；2026-10-21 由 50 回退到 8） */
+  static readonly MAX_INFLIGHT: number = 8;
   /** 排队等待上限（超过 = 排队超时；等待时间不计入节点超时预算） */
   static readonly QUEUE_WAIT_MAX_MS: number = 60000;
   /** 取消后等待在途请求收尾的宽限期 */

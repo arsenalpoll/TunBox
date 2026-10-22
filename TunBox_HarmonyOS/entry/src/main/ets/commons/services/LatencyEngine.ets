@@ -78,20 +78,28 @@ const TAG = 'LatencyEngine';
  */
 export const LATENCY_CONCURRENCY = 50;
 /**
- * 同时在飞的 HTTP 请求数（2026-10-20 用户拍板：改为 **50 路**，与 worker 数同宽）。
+ * 同时在飞的 HTTP 请求数（**2026-10-21 晚：8 → 32**，对齐 FlClash 客户端在途 32）。
  *
- * 历史：这个值原为 8，依据是「OHOS http 栈对同一 host 的连接池约 8，超出即排队，
- * 排队时间被算进请求预算 → 假超时（2026-09-23 真机实证）」。
- * 现在按用户要求放开到 50：worker 数与在途数一致，**不再有应用层排队**，
- * 每个节点的 `elapsed` 就是它自己那次 /delay 的真实耗时（口径更干净）。
+ * 8 的来历（真机取证 192.168.10.5:39933，飞鸟云 31 节点批，14:32:46–14:35:10）：
+ *  · 50 路在途 = 50 个 `/delay` 同时打 `127.0.0.1:9090`，而 OHOS http 栈对同一 host
+ *    只有约 8 条连接（2026-09-23 已实测）⇒ 其余请求在 **HTTP 栈内部**排队，
+ *    排队时间被算进外层预算 ⇒ 一到点就抛 `code=2300028 Operation timeout`；
+ *  · 这些客户端超时被 `LatencyProbe.classify` 归为 `core_not_ready`（没拿到 HTTP 响应
+ *    = 通道问题）⇒ 6 连击撞上 `CORE_NOT_READY_ABORT_STREAK` ⇒ **整批作废**，剩下的
+ *    节点一次 `/delay` 都没发（日志 `notReady=6 unavailable=true`）—— 用户看到的就是
+ *    「测出一部分超时节点后，剩下的就不测了」。
  *
- * ⚠ 代价与验证要求（改这一行的人必须重跑真机验收）：
- *  - 若真机复现「测速卡住 / 大量假超时 / queueTimeout>0」，说明连接池确实压不住 50 路，
- *    应回退到 24 或 32（**不要直接退回 8**，那是性能问题）。
- *  - 判定看 `latency batch done ... timeout= queueTimeout=` 两个计数：
- *    timeout 高 = 节点真慢；queueTimeout 高 = 连接池排队。
+ * 现行 32（用户要求与 FlClash 客户端同口径）：**前提是排队发生在应用层闸门**
+ * （LatencyInflightGate）—— 闸门等待不计入单请求预算（见 gatedProbe 三条硬约束），
+ * 所以栈内排队不再污染读数。若真机再次出现成片假超时，回退顺序：32 → 16 → 8。
+ *
+ * ⚠ 改这个值必须同步：
+ *   ① `scripts/verify-latency-concurrency.mjs` 的字面数字（常量契约 / lanes / 峰值 /
+ *      名额满用例 / TOTAL 节点数）；
+ *   ② 「栈内排队是否仍被算进超时」这个前提（自建连接池或换传输层才谈得上再放大）。
+ *   判定看 `latency batch done ... timeout= queueTimeout= notReady= unavailable=` 四个计数。
  */
-export const LATENCY_INFLIGHT = 50;
+export const LATENCY_INFLIGHT = 32;
 /**
  * 信号量排队等待上限（毫秒）。
  *
@@ -107,8 +115,10 @@ export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
  * 预算才放弃，把整组拖长。3000ms：健康节点真机最高实测 ~522ms，5.7 倍余量，
  * 整组约 3 秒完成（用户要求）。
  * 2026-10-20 晚随单节点超时一起从 5s 改回 3s：组测里这个值是**每个节点**的拨号预算，
- * 与逐节点探测必须同尺，否则同一节点在「测全部」和「单节点测速」里结论相反。 */
-export const GROUP_TEST_TIMEOUT_MS = 3000;
+ * 与逐节点探测必须同尺，否则同一节点在「测全部」和「单节点测速」里结论相反。
+ * 2026-10-22：页面层的组测速实现已删除（死路径 + 与订阅页两套口径），本常量只为兼容
+ * 既有 import 保留，且改为**转调真源**（单节点 5s）—— 不许再留第二份字面量。 */
+export const GROUP_TEST_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
 /** 首批请求错峰抖动上限，避免整批同时撞内核（Clash Verge Rev 同款做法）。 */
 const STAGGER_MAX_MS = 200;
 /**
@@ -125,6 +135,18 @@ export const BATCH_DEADLINE_MS = 90000;
  * 整批结论作废。3 → 6：连击 6 次才作废整批。
  */
 const CORE_NOT_READY_ABORT_STREAK = 6;
+/**
+ * 大订阅（几百个节点）下的作废阈值：`max(6, ceil(N/64))`。
+ *
+ * 为什么必须随批次放大（2026-10-22 真机：导入 600 节点订阅后「测几个就不测了」）：
+ * 600 个节点里死节点占多数时，32 路在途会把 controller 的 /version 探针也压到超时 ——
+ * 客户端看到的是「连续 6 次没拿到响应」，但通道其实只是**忙**。按 64 节点一档放大后，
+ * 大订阅需要 ~10 次连续失联才作废，小订阅仍是 6（保持原有灵敏度）。
+ */
+function abortStreakFor(nodeCount: number): number {
+  const scaled = Math.ceil(Math.max(1, nodeCount) / 64);
+  return Math.max(CORE_NOT_READY_ABORT_STREAK, Math.min(scaled, 30));
+}
 /**
  * 连续「通道不可用」达到该次数即尝试一次**通道自愈**（重解析 endpoint/secret）。
  *
@@ -150,6 +172,17 @@ const CORE_NOT_READY_RECOVER_STREAK = 3;
  */
 const CORE_NOT_READY_RETRY_MAX = 1;
 const CORE_NOT_READY_RETRY_BACKOFF_MS = 500;
+/**
+ * 「controller 还活着吗」的探测预算与缓存窗口（见 `LatencyRun.controllerAnswers`）。
+ *
+ * 为什么需要它（2026-10-21 真机根因）：客户端侧 `2300028 Operation timeout` 有两种
+ * 完全相反的成因 ——（a）控制器被瞬时打满（并发拨号太多）；（b）内核真的没了 /
+ * secret 被换掉。只看错误文案分不开，旧实现一律按（b）累加连击 ⇒ 6 次就把整批作废。
+ * 800ms 是 `/version` 这种本地 GET 的宽松预算；缓存窗口同值，避免 8 个 worker
+ * 同时命中时打出 8 次健康检查（过载时再加负载只会更糟）。
+ */
+const CONTROLLER_PROBE_TIMEOUT_MS = 800;
+const CONTROLLER_ALIVE_CACHE_MS = 800;
 /** `force=false` 时，多久以内的实测结果视为新鲜、可跳过重测。 */
 export const FRESH_RESULT_MS = 5 * 60 * 1000;
 /**
@@ -339,6 +372,14 @@ export class LatencyProgress {
   /** 通道不可用（内核/凭证层面）的连续命中总数 */
   coreNotReady: number = 0;
   /**
+   * **过载**次数：controller 仍能答 `/version`，但这一发 `/delay` 在客户端侧超时
+   * （典型是 `2300028 Operation timeout`）。
+   *
+   * 与 `coreNotReady` 分开计：过载不是节点结论、也不是通道故障，**不参与连击/作废**；
+   * 但必须留痕，否则「整批跑完却一堆未测」在日志里看不出原因（2026-10-21 真机）。
+   */
+  coreOverloaded: number = 0;
+  /**
    * **域名无法解析**的节点数（2026-10-20 真机根因）。
    *
    * 这批节点**一次 /delay 都没发**（我们自己的 DoH 预解析已经判了）⇒
@@ -368,13 +409,11 @@ export class LatencyRunOptions {
   /** 结果来源：'auto'（静默批）| 'manual'（用户手点）；随记录落库供 UI 区分显示 */
   source: string = 'manual';
   /**
-   * 整批硬截止（毫秒）。默认 BATCH_DEADLINE_MS；**仅供回归测试注入小值** ——
-   * 引擎本身在「取下一个节点前」检查截止时间，测试要触发它就得真等 90s。
-   * 做成可注入后，回归套件能用毫秒级确定性地验证「超时的节点保持未测、
-   * 绝不写成失败」这条契约，不必把「并发数 × 节点数」的算术巧合当前提
-   * （改一次并发度就让门禁失效，是很脆的测试）。
+   * 整批硬截止（毫秒）。**0 = 按批大小自动计算**（2026-10-22 起默认）；
+   * 只有回归测试才注入小值 —— 它要在毫秒级确定性地验证「超时的节点保持未测、
+   * 绝不写成失败」这条契约，不必把「并发数 × 节点数」的算术巧合当前提。
    */
-  batchDeadlineMs: number = BATCH_DEADLINE_MS;
+  batchDeadlineMs: number = 0;
   onResult: LatencyResultSink | null = null;
   onProgress: LatencyProgressSink | null = null;
 }
@@ -419,6 +458,12 @@ export class LatencyRun {
   /** 本批是否已尝试过"重新解析通道凭证"（每批最多一次） */
   private channelRecoveryTried: boolean = false;
   /**
+   * controller 存活探测的缓存（见 `controllerAnswers`）：
+   * `channelAliveAtMs = 0` 表示本批还没探过。
+   */
+  private channelAliveAtMs: number = 0;
+  private channelAlive: boolean = false;
+  /**
    * 本批的 **DNS 预解析快照**（批次开始时取一次，不逐节点去问编排器）。
    *
    * 来源：编排器侧的 `ConnectionOrchestrator.instance().hostSnapshot()`
@@ -431,7 +476,7 @@ export class LatencyRun {
 
   constructor(api: ClashApiService | null, nodes: ProxyNode[], url: string, timeoutMs: number,
     force: boolean, onResult: LatencyResultSink | null, onProgress: LatencyProgressSink | null,
-    source: string = 'manual', batchDeadlineMs: number = BATCH_DEADLINE_MS) {
+    source: string = 'manual', batchDeadlineMs: number = 0) {
     this.api = api;
     this.nodes = nodes;
     this.url = url;
@@ -440,7 +485,9 @@ export class LatencyRun {
     this.source = source;
     this.onResult = onResult;
     this.onProgress = onProgress;
-    this.batchDeadlineMs = batchDeadlineMs;
+    // 0 = 按批大小自动算（大订阅不再被固定的 90s 砍掉队尾）；测试注入的小值照旧生效
+    this.batchDeadlineMs = batchDeadlineMs > 0
+      ? batchDeadlineMs : LatencyEngine.deadlineForBatch(nodes.length);
     this.progress.total = nodes.length;
     // ⚠ api === null ⇒ 没有内核通道 ⇒ 本批**不探测**（旧的离线直连兜底通道已下线：
     //   它测的是「服务器可达」而不是代理延迟，混进延迟列会把「服务器近」冒充
@@ -613,7 +660,8 @@ export class LatencyRun {
       + `dnsUnresolved=${this.progress.dnsUnresolved} `
       + `queueTimeout=${this.progress.queueTimeout} `
       + `cancelled=${this.progress.cancelled} skipped=${this.progress.skipped} `
-      + `notReady=${this.progress.coreNotReady} unavailable=${this.progress.coreUnavailable} `
+      + `notReady=${this.progress.coreNotReady} overloaded=${this.progress.coreOverloaded} `
+      + `unavailable=${this.progress.coreUnavailable} `
       + `elapsed=${Date.now() - startedAt}ms`);
     // 内核回收归引擎管：批次结束后挂一个**宽限**回收（而不是立刻停）。测速内核重建
     // 要经历 DoH + 停旧扩展 + 600ms 等待 + 启新扩展 + 健康轮询（秒级），用户来回切
@@ -799,6 +847,43 @@ export class LatencyRun {
    * 在**连续失联并且本批已经有实测结果**时触发一次，且同批最多救一次，避免
    * 内核真死时把时间浪费在反复读盘上。
    */
+  /**
+   * 「controller 还活着吗」—— 把**瞬时过载**与**通道真的没了**分开（2026-10-21 真机根因）。
+   *
+   * 真机取证（飞鸟云 31 节点批）：50 路在途把 `127.0.0.1:9090` 打满，客户端连续拿到
+   * `code=2300028 Operation timeout`，被 `LatencyProbe.classify` 归为 `core_not_ready`；
+   * 6 连击直接作废整批，剩下 24 个节点一次 `/delay` 都没发。可内核其实一直活着
+   * （同一批里前 5 个节点还正常回了 504），只是忙不过来。
+   *
+   * ⇒ 在把这次失败计入「通道故障连击」之前，先打一次 `GET /version`（本地、廉价）：
+   *   · 200 且 secret 通过 ⇒ 通道是好的 ⇒ 这次只是**过载**：不计连击、不中止，
+   *     本节点保持「未测」（非判定，绝不写成超时）；
+   *   · 连不上 / 非 200 ⇒ 才是通道故障，走原有的自愈 + 连击 + 作废路径。
+   *
+   * 结论缓存 `CONTROLLER_ALIVE_CACHE_MS`：多个 worker 同时命中时只探一次，
+   * 避免在已经过载的 controller 上再加一层健康检查流量。
+   */
+  private async controllerAnswers(): Promise<boolean> {
+    const now: number = Date.now();
+    if (this.channelAliveAtMs > 0 && now - this.channelAliveAtMs < CONTROLLER_ALIVE_CACHE_MS) {
+      return this.channelAlive;
+    }
+    let alive: boolean = false;
+    const api = this.api;
+    if (api !== null) {
+      try {
+        const probe = await api.probeController(CONTROLLER_PROBE_TIMEOUT_MS);
+        alive = probe.reachable && probe.secretAccepted;
+      } catch (e) {
+        AppLogger.warn(TAG, `latency controller probe error: ${AppLogger.errText(e)}`);
+        alive = false;
+      }
+    }
+    this.channelAliveAtMs = now;
+    this.channelAlive = alive;
+    return alive;
+  }
+
   private async tryRecoverChannel(): Promise<void> {
     if (this.channelRecoveryTried) {
       return;
@@ -943,6 +1028,17 @@ export class LatencyRun {
       return probe;
     }
     if (probe.failKind === LatencyProbeKind.CORE_NOT_READY) {
+      // ① 先鉴别「控制器过载」与「通道真的没了」（2026-10-21 真机根因）。
+      //    真机取证：飞鸟云 31 节点批，50 路在途把 controller 打满 → 一批 2300028 →
+      //    6 连击作废整批，后 24 个节点一次都没拨号（`notReady=6 unavailable=true`）。
+      //    能答 /version ⇒ 只是过载：**不计连击、不自愈、不中止**，本节点保持「未测」
+      //    （非判定，绝不写成超时）。只有健康检查也失败，才进下面的通道故障路径。
+      if (await this.controllerAnswers()) {
+        this.progress.coreOverloaded = this.progress.coreOverloaded + 1;
+        AppLogger.warn(TAG, `latency probe overloaded (controller alive): node=${node.name} `
+          + `http=${probe.httpCode} elapsed=${probe.elapsedMs}ms => 不计连击、不作废整批`);
+        return probe;
+      }
       // 通道问题，不是节点问题。两种成因必须分开处理：
       //  - 内核中途重启 / secret 被换掉（真机实测：106 节点批测进行中隧道重启，
       //    此后 49 个节点全部连接异常）→ 重新解析隧道 secret 还能救回来；
@@ -956,7 +1052,7 @@ export class LatencyRun {
       // 自愈已尝试过（或本轮不满足自愈条件）仍然连续失联 → 通道确实不可用。
       // 此时**作废整批**：剩余节点保持「未测」，页面提示"内核不可用，本轮未测"。
       // 绝不把通道故障写进任何节点的结论里 —— 这是旧实现"内核一抖半张列表变红"的根因。
-      if (this.coreNotReadyStreak >= CORE_NOT_READY_ABORT_STREAK) {
+      if (this.coreNotReadyStreak >= abortStreakFor(this.nodes.length)) {
         this.progress.coreUnavailable = true;
         AppLogger.warn(TAG, `latency batch aborted: core/channel unavailable `
           + `streak=${this.coreNotReadyStreak} measured=${this.progress.measured} `
@@ -1070,6 +1166,20 @@ export class LatencyRun {
  */
 export class LatencyEngine {
   private static current: LatencyRun | null = null;
+
+  /**
+   * 按批大小算整批硬截止（2026-10-22：「600 节点订阅测几个就不测了」的根因）。
+   *
+   * 旧实现是固定 90s。600 个节点 / 在途 32 ≈ 19 波，每波最坏 5s ⇒ ≈ 95s 就把队尾
+   * 全部留成「未测」——用户看到的就是「测了几个就不测了」。现在按波数估算并留 20s
+   * 余量，下限仍是 90s、上限 15 分钟（防呆：别让一个坏批次把界面卡半小时）。
+   */
+  static deadlineForBatch(nodeCount: number): number {
+    const inflight = Math.max(1, LATENCY_INFLIGHT);
+    const waves = Math.ceil(Math.max(1, nodeCount) / inflight);
+    const estimated = waves * (LatencyPolicy.DEFAULT_TIMEOUT_MS + 1200) + 20000;
+    return Math.max(BATCH_DEADLINE_MS, Math.min(estimated, 900000));
+  }
 
 
   /**

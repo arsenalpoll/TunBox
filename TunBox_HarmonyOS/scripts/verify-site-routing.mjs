@@ -244,7 +244,7 @@ for (const outcome of ['hot', 'reconnect', 'none', 'ad-unavailable', 'pending', 
     assert.deepEqual((await S.load()).forceProxySites, ['a.com']); assert.equal(p.busy, false);
     assert.match(p.notice, /全局模式/);
     assert.match(p.notice, outcome === 'hot' ? /热更新/ : outcome === 'reconnect' ? /重连/
-      : outcome === 'ad-unavailable' ? /广告规则下载失败/ : outcome === 'pending' ? /另一规则更新进行中/
+      : outcome === 'ad-unavailable' ? /广告规则尚未下载.*手动更新/ : outcome === 'pending' ? /另一规则更新进行中/
       : outcome === 'throw' ? /应用失败/ : /下次连接/);
   });
 }
@@ -279,7 +279,9 @@ await check('SOURCE hot reload attempted before reconnect fallback', () => {
   assert.match(method(orchestrator, 'applyRulesChanged'), /this\.applyRulesChangedNow\(reason, seq, generation\)/);
   const apply = method(orchestrator, 'applyRulesChangedNow');
   assert.ok(apply.indexOf('reloadRulesHot(reason)') < apply.indexOf('restartIfConnected(reason)'));
-  assert.match(apply, /if \(hot\) \{\s*return 'hot';/); assert.ok(apply.includes("'reconnect' : 'none'"));
+  assert.match(apply, /if \(hot\) \{\s*return adUnavailable \? 'ad-unavailable' : 'hot';/);
+  assert.ok(apply.indexOf('await this.reloadRulesHot(reason)') < apply.indexOf('await this.restartIfConnected(reason)'));
+  assert.ok(apply.includes("'reconnect' : 'none'"));
 });
 await check('SOURCE generator emits all three lists, direct before proxy, and suffix semantics', () => {
   assert.ok(generator.includes('normalizeDomains(settings.forceDirectSites)'));

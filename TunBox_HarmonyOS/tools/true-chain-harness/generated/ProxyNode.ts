@@ -343,16 +343,18 @@ export class ProxyNode {
 }
 
 /**
- * base64url 编解码工具（订阅正文、SSR 载荷共用）。
+ * base64url 编解码工具（订阅正文、链接列表、SSR 载荷共用）。
  *
  * 2026-10-20（B6 旧解析器退场）：旧解析器本体（parseSsr / parseSs /
  * ModernUriCodec.parse*）已**全部删除** —— 解析职责由 commons/subscription 的
  * 规范解析层（参数表 + UriNodeParser + ProxyNodeAdapter）唯一承担。
- * 本类只剩**纯编解码工具**（订阅正文/链接列表的 base64 解码）。
- * 名字沿用旧名是为了不动 tools/true-chain-harness/compare_forms.mjs 等调用方；
- * 若 lead 要改名，一并改调用方即可（只有一个 decodeBase64Url 在用）。
+ *
+ * 2026-10-20（lead 拍板改名）：原名 `SsrCodec` **名不副实** —— 它早已不含任何
+ * SSR 编解码逻辑，只剩**纯 base64url 工具**（订阅正文 / 链接列表的 base64 解码），
+ * 名字却让人以为还有 SSR 解析残留。改名为 `Base64Codec`，职责与名字对齐。
+ * 调用方仅三处（SubscriptionParser / SubscriptionService / compare_forms.mjs）。
  */
-export class SsrCodec {
+export class Base64Codec {
   private static b64 = new util.Base64Helper();
   private static decoder = util.TextDecoder.create('utf-8');
 
@@ -363,12 +365,12 @@ export class SsrCodec {
       s += '=';
     }
     try {
-      const bytes = SsrCodec.b64.decodeSync(s, util.Type.MIME);
-      return SsrCodec.decoder.decodeToString(bytes);
+      const bytes = Base64Codec.b64.decodeSync(s, util.Type.MIME);
+      return Base64Codec.decoder.decodeToString(bytes);
     } catch (e) {
       try {
-        const bytes = SsrCodec.b64.decodeSync(s, util.Type.BASIC);
-        return SsrCodec.decoder.decodeToString(bytes);
+        const bytes = Base64Codec.b64.decodeSync(s, util.Type.BASIC);
+        return Base64Codec.decoder.decodeToString(bytes);
       } catch (e2) {
         return '';
       }

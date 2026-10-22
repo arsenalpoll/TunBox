@@ -248,7 +248,7 @@ struct ConnectionsPage {
                 .borderColor(Ui.glassEdge)
               }
             }, (entry: ConnectionEntry) => entry.id)
-          }
+          }.edgeEffect(EdgeEffect.Spring)
           .width('100%').layoutWeight(1)
           .padding({ left: 18, right: 18, top: 10, bottom: 20 })
           .scrollBar(BarState.Auto)

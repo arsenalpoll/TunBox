@@ -182,7 +182,7 @@ struct SiteRoutingPage {
           const outcome = await this.orchestrator.applyRulesChanged('forceSitesChanged');
           this.notice = outcome === 'hot' ? '已保存并热更新规则，未重建 VPN。'
             : outcome === 'reconnect' ? '已保存并请求重连，请在主页确认连接状态。'
-            : outcome === 'ad-unavailable' ? '已保存，广告规则下载失败，请更新去广告规则集后重试。'
+            : outcome === 'ad-unavailable' ? '已保存，广告规则尚未下载，请到设置的数据与规则手动更新。'
             : outcome === 'pending' ? '已保存，另一规则更新进行中，请稍后重试立即应用。' : '已保存，下次连接生效。';
         } catch (e) { this.notice = '配置已保存，但立即应用失败，请到主页重新连接。'; }
       }
@@ -320,7 +320,7 @@ struct SiteRoutingPage {
             if (this.visible.length === 0) {
               ListItem() { Text('没有匹配的网站，可点击下方添加 / 导入。').fontSize(13).fontColor(TunBoxColors.textSecondary).padding(22) }
             }
-          }.layoutWeight(1).width('100%').enabled(this.ready && !this.busy)
+          }.layoutWeight(1).width('100%').enabled(this.ready && !this.busy) .edgeEffect(EdgeEffect.Spring)
           if (this.notice.length > 0) { Text(this.notice).fontSize(11).fontColor(TunBoxColors.primary).width('100%') }
         }.width('100%').layoutWeight(1).padding({
           left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8
