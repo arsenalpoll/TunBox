@@ -86,6 +86,7 @@ export class TaskProgressUpdater {
   private static lastNodeText: string = 'TunBox';
   private static lastSpeedLine: string = '隧道已连接 · 持续保护中';
   private static lastDurationText: string = '';
+  private static lastLivePayload: string = '';
 
   /**
    * 实况内容更新（连接期间由流量轮询每 2s 调用）：节点名进 title、速率+时长进
@@ -99,6 +100,9 @@ export class TaskProgressUpdater {
    * 速率/运行时长由应用自己的通知承载。
    */
   static updateLive(nodeText: string, speedLine: string, durationText: string): void {
+    const payload = JSON.stringify([TaskProgressUpdater.taskNotificationId, nodeText, speedLine, durationText]);
+    if (payload === TaskProgressUpdater.lastLivePayload) { return; }
+    TaskProgressUpdater.lastLivePayload = payload;
     TaskProgressUpdater.lastNodeText = nodeText.trim().length > 0 ? nodeText.trim() : 'TunBox';
     TaskProgressUpdater.lastSpeedLine = speedLine;
     TaskProgressUpdater.lastDurationText = durationText;
@@ -155,6 +159,7 @@ export class TaskProgressUpdater {
 
   /** 释放 / 断开 / 任务取消或被暂停时调用（幂等；两种长时任务类型都安全）。 */
   static detach(): void {
+    TaskProgressUpdater.lastLivePayload = '';
     if (TaskProgressUpdater.timer >= 0) {
       clearInterval(TaskProgressUpdater.timer);
       TaskProgressUpdater.timer = -1;

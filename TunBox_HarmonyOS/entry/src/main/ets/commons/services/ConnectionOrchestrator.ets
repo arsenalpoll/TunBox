@@ -209,6 +209,7 @@ const READINESS_INITIAL_DELAY_MS = 40;
 const READINESS_MAX_DELAY_MS = 300;
 /** Two-second traffic sampling reduces /connections allocations and UI redraws. */
 const TRAFFIC_POLL_INTERVAL_MS = 2000;
+const BACKGROUND_TRAFFIC_POLL_INTERVAL_MS = 10000;
 /** 测速内核停扩展的重试次数与间隔：停失败必须重试，或至少让下次启动能正确重建 */
 const TEST_CORE_STOP_ATTEMPTS = 2;
 const TEST_CORE_STOP_RETRY_DELAY_MS = 300;
@@ -354,6 +355,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private trafficTimer: number = -1;
   /** Prevent overlapping requests when a traffic poll is slow. */
   private trafficPollRunning: boolean = false;
+  private uiForeground: boolean = false;
+  private trafficPollGeneration: number = 0;
   private connectSeq: number = 0; // 进程内启动序列，仅用于取消同进程旧连接流程
   /**
    * 持久化 VPN 会话代次。每次用户连接或主动停止前递增并写入 ConnectionSnapshot；
@@ -4619,27 +4622,46 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `liveness probe failed: ${AppLogger.errText(e)}`);
       });
     }, CORE_LIVENESS_POLL_MS);
+    this.startTrafficPolling(false);
+  }
+
+  /** 仅调整统计刷新；会话计时、租约和故障检测保持原样。 */
+  setUiForeground(foreground: boolean): void {
+    if (this.uiForeground === foreground) { return; }
+    this.uiForeground = foreground;
+    if (this.state === ConnState.CONNECTED) { this.startTrafficPolling(foreground); }
+  }
+
+  private startTrafficPolling(immediate: boolean): void {
+    if (this.trafficTimer >= 0) { clearInterval(this.trafficTimer); this.trafficTimer = -1; }
+    const generation = ++this.trafficPollGeneration;
     this.trafficPollRunning = false;
-    this.trafficTimer = setInterval(() => {
-      if (this.trafficPollRunning || this.state !== ConnState.CONNECTED) {
-        return;
-      }
-      this.trafficPollRunning = true;
-      this.api.traffic().then((t: TrafficSnapshot) => {
-        this.traffic = t;
-        if (this.state === ConnState.CONNECTED) {
-          TaskProgressUpdater.updateLive(
-            this.notifyNodeText(this.lastNodeName.length > 0 ? this.lastNodeName : '已连接'),
-            // 2026-10-19：实况通知单行宽度有限，速率串用紧凑写法（去掉多余空格），
-            // 配合 TaskProgressUpdater 里「只放速率、不放时长」的改动，避免被截断。
-            `↓${this.formatSpeed(t.downloadSpeed)} ↑${this.formatSpeed(t.uploadSpeed)}`,
-            this.connDurationText());
-        }
-        this.notify();
-      }).finally(() => {
-        this.trafficPollRunning = false;
-      });
-    }, TRAFFIC_POLL_INTERVAL_MS);
+    if (this.state !== ConnState.CONNECTED || this.disconnectRequested) { return; }
+    const interval = this.uiForeground ? TRAFFIC_POLL_INTERVAL_MS : BACKGROUND_TRAFFIC_POLL_INTERVAL_MS;
+    this.trafficTimer = setInterval((): void => { this.pollTraffic(generation); }, interval);
+    if (immediate) { this.pollTraffic(generation); }
+  }
+
+  private async pollTraffic(generation: number): Promise<void> {
+    if (generation !== this.trafficPollGeneration || this.trafficPollRunning
+      || this.state !== ConnState.CONNECTED || this.disconnectRequested) { return; }
+    const seq = this.connectSeq;
+    const session = this.sessionGeneration;
+    this.trafficPollRunning = true;
+    try {
+      const t = await this.api.traffic();
+      if (generation !== this.trafficPollGeneration || !this.isRuleSessionCurrent(seq, session)) { return; }
+      this.traffic = t;
+      TaskProgressUpdater.updateLive(
+        this.notifyNodeText(this.lastNodeName.length > 0 ? this.lastNodeName : '已连接'),
+        `↓${this.formatSpeed(t.downloadSpeed)} ↑${this.formatSpeed(t.uploadSpeed)}`,
+        this.connDurationText());
+      this.notify();
+    } catch (e) {
+      AppLogger.warn(TAG, `traffic read failed: ${AppLogger.errText(e)}`);
+    } finally {
+      if (generation === this.trafficPollGeneration) { this.trafficPollRunning = false; }
+    }
   }
 
   /** 慢探针不得并发投票；旧监控/旧会话的晚到结果不得修复新会话。 */
@@ -4713,6 +4735,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   private stopMonitors(): void {
+    this.trafficPollGeneration++;
     this.monitorGeneration++;
     this.livenessPollRunning = false;
     this.resetCoreDeathConfirmation();

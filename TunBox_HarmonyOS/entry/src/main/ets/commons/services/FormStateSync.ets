@@ -21,7 +21,7 @@ const FORM_IDS_KEY = 'form_ids';
 const FORM_RECORDS_KEY = 'form_records';
 export const TOGGLE_FORM_NAME = 'SsrvpnToggleCard';
 export const INFO_FORM_NAME = 'SsrvpnInfoCard';
-const INFO_REFRESH_INTERVAL_MS = 3000;
+const INFO_REFRESH_INTERVAL_MS = 10000;
 /** 权威对账间隔：内核崩溃/心跳超时后最长 3s 内卡片即变为已断开 */
 const RECONCILE_INTERVAL_MS = 3000;
 

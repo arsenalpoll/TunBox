@@ -187,6 +187,9 @@ struct BackupPasswordDialog {
 
 @Component
 export struct HomePage {
+  @Prop @Watch('onRefreshVisibilityChanged') isActive: boolean = true;
+  @StorageLink('app_foreground') @Watch('onRefreshVisibilityChanged') appForeground: boolean = false;
+  private previewGeneration: number = 0;
   @State isConnected: boolean = false;
   @State isConnecting: boolean = false;
   /** 乐观反馈（2026-10-17 用户反馈「点启动 1 秒多按钮才动」）：点击瞬间点亮「正在连接」，
@@ -358,12 +361,27 @@ export struct HomePage {
     return this.subs.nodes.map((n: ProxyNode): string => n.name);
   }
 
+  private canRefreshPage(): boolean {
+    return this.isActive && this.appForeground && this.pageReady;
+  }
+
+  private onRefreshVisibilityChanged(): void {
+    if (!this.canRefreshPage()) {
+      this.stopConnectionTimer();
+      this.stopConnPreview();
+      return;
+    }
+    this.syncConnectionTimer();
+    if (this.connCardOpen) { this.startConnPreview(); }
+  }
+
   /** 连接卡展开期间的 2s 轮询：活跃连接前 5 条（对齐 ConnectionsPage 排序口径） */
   private async refreshConnPreview(): Promise<void> {
-    if (this.connPreviewBusy) {
+    if (!this.canRefreshPage() || this.connPreviewBusy) {
       return;
     }
     this.connPreviewBusy = true;
+    const generation = this.previewGeneration;
     try {
       if (!this.isConnected) {
         this.connPreview = [];
@@ -371,6 +389,7 @@ export struct HomePage {
         return;
       }
       const list = await this.orchestrator.api.listConnections(this.knownNodeNames());
+      if (generation !== this.previewGeneration || !this.canRefreshPage()) { return; }
       if (list === null) {
         this.connPreviewReachable = false;
         return;
@@ -387,6 +406,7 @@ export struct HomePage {
   }
 
   private startConnPreview(): void {
+    if (!this.canRefreshPage() || !this.connCardOpen) { return; }
     if (this.connPreviewTimer >= 0) {
       return;
     }
@@ -397,6 +417,7 @@ export struct HomePage {
   }
 
   private stopConnPreview(): void {
+    this.previewGeneration++;
     if (this.connPreviewTimer >= 0) {
       clearInterval(this.connPreviewTimer);
       this.connPreviewTimer = -1;
@@ -476,6 +497,7 @@ export struct HomePage {
   }
 
   private syncConnectionTimer(): void {
+    if (!this.canRefreshPage()) { this.stopConnectionTimer(); return; }
     if (this.orchestrator.state !== ConnState.CONNECTED || this.orchestrator.startedAt <= 0) {
       this.connectionDuration = 0;
       this.stopConnectionTimer();
@@ -487,6 +509,7 @@ export struct HomePage {
       return;
     }
     this.connectionTimer = setInterval(() => {
+      if (!this.canRefreshPage()) { this.stopConnectionTimer(); return; }
       if (this.orchestrator.state !== ConnState.CONNECTED || this.orchestrator.startedAt <= 0) {
         this.connectionDuration = 0;
         this.stopConnectionTimer();

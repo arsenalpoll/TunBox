@@ -30,7 +30,7 @@ export function deferred() {
   let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve };
 }
 export async function flush() { for (let i = 0; i < 120; i++) await Promise.resolve(); }
-export function harness() {
+export function harness(foreground = true) {
   let now = 1000000, timerId = 0;
   const timers = new Map(), logs = [], calls = [];
   const h = { heartbeat: now - 300000, controller: true, controllerGate: null,
@@ -90,6 +90,7 @@ export function harness() {
   const { ConnectionOrchestrator, ConnState } = load('commons/services/ConnectionOrchestrator.ets',
     '({ ConnectionOrchestrator, ConnState })', context);
   const orch = new ConnectionOrchestrator(); orch.init({ cacheDir: '/sandbox' });
+  orch.setUiForeground(foreground);
   orch.state = ConnState.CONNECTED; orch.startedAt = h.snapshot.startedAt; orch.sessionGeneration = 7;
   orch.api.setEndpoint(19090, h.storedSecret);
   orch.testCoreFlight = { isActive: () => false, async ensure() { h.testCoreStarts++; return true; } };

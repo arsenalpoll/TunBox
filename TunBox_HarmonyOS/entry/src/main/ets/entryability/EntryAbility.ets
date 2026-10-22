@@ -100,6 +100,8 @@ export default class EntryAbility extends UIAbility {
    * 只有磁盘上的用户意图 + 跨进程心跳租约还在 —— 自愈判定正是基于这两者。
    */
   onForeground(): void {
+    AppStorage.setOrCreate<boolean>('app_foreground', true);
+    ConnectionOrchestrator.instance().setUiForeground(true);
     this.publishPendingWant();
     // 订阅自动刷新的前台兜底（双轨触发之二，5 分钟节流）：
     // WorkScheduler 实际触发时机受系统调度影响，回前台立刻补一次过期检查。
@@ -108,6 +110,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   onBackground(): void {
+    AppStorage.setOrCreate<boolean>('app_foreground', false);
+    ConnectionOrchestrator.instance().setUiForeground(false);
     // 进后台时若隧道确实活着，补一次驻留凭证：UiGuardian.registered 是进程级静态
     // 布尔，进程重启后必然为 false，只有 HomePage 存在时才会被重新 engage ——
     // 卡片/快捷方式路径拉起的会话没有页面，这里兜住最后一环。

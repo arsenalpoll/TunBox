@@ -34,6 +34,7 @@ const TAB_SETTINGS = 2;
 @Entry
 @Component
 struct MainPage {
+  @State private routeVisible: boolean = true;
   @StorageLink('theme_revision') themeRevision: number = 0;
   /** 当前页签（AppStorage 真相源：外部入口可写 'tb_main_tab' 直接跳页签） */
   @StorageLink('tb_main_tab') @Watch('onTabChanged') activeIndex: number = TAB_HOME;
@@ -48,8 +49,13 @@ struct MainPage {
   private settingsBridge: TabLifecycleBridge = new TabLifecycleBridge();
 
   onPageShow(): void {
+    this.routeVisible = true;
     // 从推入式子页（节点 / 连接 / 应用分流 / 网站分流等）返回时刷新当前页签
     this.notifyTab(this.activeIndex);
+  }
+
+  onPageHide(): void {
+    this.routeVisible = false;
   }
 
   private onTabChanged(): void {
@@ -107,7 +113,7 @@ struct MainPage {
     Stack({ alignContent: Alignment.Bottom }) {
       Stack() {
         if (this.visited[TAB_HOME]) {
-          HomePage({ shownBridge: this.homeBridge })
+          HomePage({ shownBridge: this.homeBridge, isActive: this.activeIndex === TAB_HOME && this.routeVisible })
             .width('100%').height('100%')
             .visibility(this.activeIndex === TAB_HOME ? Visibility.Visible : Visibility.None)
             .transition(TransitionEffect.asymmetric(

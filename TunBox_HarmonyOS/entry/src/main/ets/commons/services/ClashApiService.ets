@@ -166,7 +166,74 @@ export class ControllerProbe {
   detail: string = '';
 }
 
+class ControllerConnectionsSnapshot {
+  root: Record<string, Object> = {};
+  bodyLength: number = 0;
+}
+
 export class ClashApiService {
+  private connectionsCache: ControllerConnectionsSnapshot | null = null;
+  private connectionsTask: Promise<ControllerConnectionsSnapshot | null> | null = null;
+  private connectionsCachedAt: number = 0;
+  private connectionsGeneration: number = 0;
+
+  private invalidateConnectionsSnapshot(): void {
+    this.connectionsGeneration++;
+    this.connectionsCache = null;
+    this.connectionsTask = null;
+    this.connectionsCachedAt = 0;
+  }
+
+  /** 统计、连接列表和出口节点共享一次读取；失败不缓存，旧 endpoint 的结果不接管新会话。 */
+  private async connectionsSnapshot(): Promise<ControllerConnectionsSnapshot | null> {
+    const age = Date.now() - this.connectionsCachedAt;
+    if (this.connectionsCache !== null && age >= 0 && age < 500) {
+      return this.connectionsCache;
+    }
+    if (this.connectionsTask !== null) { return this.connectionsTask; }
+    const generation = this.connectionsGeneration;
+    const task = this.readConnectionsSnapshot().then((snapshot: ControllerConnectionsSnapshot | null): ControllerConnectionsSnapshot | null => {
+      if (generation !== this.connectionsGeneration) { return null; }
+      if (snapshot !== null) {
+        this.connectionsCache = snapshot;
+        this.connectionsCachedAt = Date.now();
+      }
+      return snapshot;
+    });
+    this.connectionsTask = task;
+    try {
+      return await task;
+    } finally {
+      if (this.connectionsTask === task) { this.connectionsTask = null; }
+    }
+  }
+
+  private async readConnectionsSnapshot(): Promise<ControllerConnectionsSnapshot | null> {
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/connections`, {
+        method: http.RequestMethod.GET, header: this.authHeader(),
+        connectTimeout: 2000, readTimeout: 3000, usingCache: false
+      });
+      if (resp.responseCode !== 200) { return null; }
+      let body = '';
+      if (typeof resp.result === 'string') { body = resp.result as string; }
+      else if (resp.result instanceof ArrayBuffer) {
+        body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
+      }
+      if (body.length === 0) { return null; }
+      const root = JSON.parse(body) as Record<string, Object>;
+      if (root === null || Array.isArray(root) || typeof root !== 'object') { return null; }
+      const snapshot = new ControllerConnectionsSnapshot();
+      snapshot.root = root;
+      snapshot.bodyLength = body.length;
+      return snapshot;
+    } catch (e) {
+      return null;
+    } finally {
+      req.destroy();
+    }
+  }
   private apiPort: number = 9090;
   private secret: string = '';
 
@@ -204,6 +271,7 @@ export class ClashApiService {
   }
 
   setEndpoint(port: number, secret: string): void {
+    if (this.apiPort !== port || this.secret !== secret) { this.resetTrafficBaseline(); }
     this.apiPort = port;
     this.secret = secret;
   }
@@ -586,30 +654,12 @@ export class ClashApiService {
    * @returns null = 内核不可用（调用方必须当作"通道不可用"，不是"没有节点"）
    */
   async smartActiveNodes(groupName: string, knownNames: string[]): Promise<string[] | null> {
-    const req = http.createHttp();
     try {
-      const resp = await req.request(`${this.baseUrl()}/connections`, {
-        method: http.RequestMethod.GET,
-        header: this.authHeader(),
-        connectTimeout: 2500,
-        readTimeout: 6000,
-        usingCache: false
-      });
-      if (resp.responseCode !== 200) {
-        return null;
-      }
-      let body: string = '';
-      if (typeof resp.result === 'string') {
-        body = resp.result as string;
-      } else if (resp.result instanceof ArrayBuffer) {
-        body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
-      }
-      if (body.length === 0) {
-        return null;
-      }
-      const root = JSON.parse(body) as Record<string, Object>;
+      const snapshot = await this.connectionsSnapshot();
+      if (snapshot === null) { return null; }
+      const root = snapshot.root;
       const conns = root['connections'];
-      if (conns === undefined || conns === null) {
+      if (conns === undefined || conns === null || !Array.isArray(conns)) {
         // 无活动连接时该字段可能缺失 —— 这是"当前没有流量"，不是通道故障
         return [];
       }
@@ -648,8 +698,6 @@ export class ClashApiService {
     } catch (e) {
       AppLogger.warn(TAG, `smartActiveNodes failed: ${this.errText(e)}`);
       return null;
-    } finally {
-      req.destroy();
     }
   }
 
@@ -914,6 +962,7 @@ export class ClashApiService {
 
   /** 清空差值基线（连接/断开时调用, 避免跨会话算出假速率） */
   resetTrafficBaseline(): void {
+    this.invalidateConnectionsSnapshot();
     this.lastUploadTotal = -1;
     this.lastDownloadTotal = -1;
     this.lastPollAt = 0;
@@ -932,28 +981,13 @@ export class ClashApiService {
 
   async traffic(): Promise<TrafficSnapshot> {
     const empty: TrafficSnapshot = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
-    const req = http.createHttp();
     try {
-      const resp = await req.request(`${this.baseUrl()}/connections`, {
-        method: http.RequestMethod.GET,
-        header: this.authHeader(),
-        connectTimeout: 2000,
-        readTimeout: 2000,
-        usingCache: false
-      });
-      let body: string = '';
-      if (typeof resp.result === 'string') {
-        body = resp.result as string;
-      } else if (resp.result instanceof ArrayBuffer) {
-        body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
-      }
-      if (resp.responseCode !== 200 || body.length === 0) {
-        return empty;
-      }
-      const json = JSON.parse(body) as Record<string, number>;
-      const uploadBytes = json['uploadTotal'] !== undefined ? json['uploadTotal'] : 0;
-      const downloadBytes = json['downloadTotal'] !== undefined ? json['downloadTotal'] : 0;
-      this.logTrafficOnce(resp.responseCode, body.length, uploadBytes, downloadBytes);
+      const snapshot = await this.connectionsSnapshot();
+      if (snapshot === null) { return empty; }
+      const root = snapshot.root;
+      const uploadBytes = typeof root['uploadTotal'] === 'number' ? root['uploadTotal'] as number : 0;
+      const downloadBytes = typeof root['downloadTotal'] === 'number' ? root['downloadTotal'] as number : 0;
+      this.logTrafficOnce(200, snapshot.bodyLength, uploadBytes, downloadBytes);
       const now = Date.now();
       let uploadSpeed = 0;
       let downloadSpeed = 0;
@@ -984,8 +1018,6 @@ export class ClashApiService {
         AppLogger.info(TAG, `traffic diag: request failed ${AppLogger.errText(e)}`);
       }
       return empty;
-    } finally {
-      req.destroy();
     }
   }
 
@@ -995,28 +1027,10 @@ export class ClashApiService {
    * null 当"通道不可用"而不是"没有连接"）；connections 字段缺失 = 正常无连接。
    */
   async listConnections(knownNames: string[] = []): Promise<ConnectionEntry[] | null> {
-    const req = http.createHttp();
     try {
-      const resp = await req.request(`${this.baseUrl()}/connections`, {
-        method: http.RequestMethod.GET,
-        header: this.authHeader(),
-        connectTimeout: 2000,
-        readTimeout: 3000,
-        usingCache: false
-      });
-      if (resp.responseCode !== 200) {
-        return null;
-      }
-      let body: string = '';
-      if (typeof resp.result === 'string') {
-        body = resp.result as string;
-      } else if (resp.result instanceof ArrayBuffer) {
-        body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
-      }
-      if (body.length === 0) {
-        return null;
-      }
-      const root = JSON.parse(body) as Record<string, Object>;
+      const snapshot = await this.connectionsSnapshot();
+      if (snapshot === null) { return null; }
+      const root = snapshot.root;
       const conns = root['connections'];
       if (conns === undefined || conns === null || !Array.isArray(conns)) {
         // 无活动连接时该字段可能缺失 —— "当前没有流量"，不是通道故障
@@ -1064,8 +1078,6 @@ export class ClashApiService {
     } catch (e) {
       AppLogger.warn(TAG, `listConnections failed: ${this.errText(e)}`);
       return null;
-    } finally {
-      req.destroy();
     }
   }
 
@@ -1083,7 +1095,9 @@ export class ClashApiService {
         readTimeout: 2000,
         usingCache: false
       });
-      return resp.responseCode >= 200 && resp.responseCode < 300;
+      const ok = resp.responseCode >= 200 && resp.responseCode < 300;
+      if (ok) { this.invalidateConnectionsSnapshot(); }
+      return ok;
     } catch (e) {
       AppLogger.warn(TAG, `closeConnection failed: ${this.errText(e)}`);
       return false;
@@ -1103,7 +1117,9 @@ export class ClashApiService {
         readTimeout: 2000,
         usingCache: false
       });
-      return resp.responseCode >= 200 && resp.responseCode < 300;
+      const ok = resp.responseCode >= 200 && resp.responseCode < 300;
+      if (ok) { this.invalidateConnectionsSnapshot(); }
+      return ok;
     } catch (e) {
       AppLogger.warn(TAG, `closeAllConnections failed: ${this.errText(e)}`);
       return false;

@@ -21,6 +21,10 @@ const POLL_INTERVAL_MS = 2000;
 @Entry
 @Component
 struct ConnectionsPage {
+  @StorageLink('app_foreground') @Watch('onForegroundChanged') appForeground: boolean = false;
+  private pageShown: boolean = false;
+  private pollGeneration: number = 0;
+  private bootstrapTimer: number = -1;
   @StorageLink('theme_revision') themeRevision: number = 0;
   @State entries: ConnectionEntry[] = [];
   @State reachable: boolean = true;
@@ -32,24 +36,46 @@ struct ConnectionsPage {
   private pollTimer: number = -1;
 
   onPageShow(): void {
+    this.pageShown = true;
     // 入场转场期间不抢 UI 线程：首帧建表延到转场之后（2026-10-17 用户反馈进入页面卡顿）
-    setTimeout((): void => { this.bootstrap(); }, 240);
+    const generation = this.pollGeneration;
+    this.bootstrapTimer = setTimeout((): void => {
+      this.bootstrapTimer = -1;
+      if (generation === this.pollGeneration && this.canPoll()) { this.bootstrap(); }
+    }, 240);
+  }
+
+  onPageHide(): void {
+    this.pageShown = false;
+    this.stopPoll();
+  }
+
+  private canPoll(): boolean { return this.pageShown && this.appForeground; }
+
+  private onForegroundChanged(): void {
+    if (!this.canPoll()) { this.stopPoll(); return; }
+    this.bootstrap();
   }
 
   aboutToDisappear(): void {
+    this.pageShown = false;
     this.stopPoll();
   }
 
   private async bootstrap(): Promise<void> {
+    if (!this.canPoll()) { return; }
+    const generation = this.pollGeneration;
     const ctx = getContext(this) as Context;
     this.orchestrator.init(ctx);
     await this.subs.init(ctx);
+    if (generation !== this.pollGeneration || !this.canPoll()) { return; }
     this.knownNames = this.subs.nodes.map((n) => n.name);
     await this.refreshOnce();
-    this.startPoll();
+    if (generation === this.pollGeneration && this.canPoll()) { this.startPoll(); }
   }
 
   private startPoll(): void {
+    if (!this.canPoll()) { return; }
     if (this.pollTimer >= 0) {
       return;
     }
@@ -59,6 +85,8 @@ struct ConnectionsPage {
   }
 
   private stopPoll(): void {
+    this.pollGeneration++;
+    if (this.bootstrapTimer >= 0) { clearTimeout(this.bootstrapTimer); this.bootstrapTimer = -1; }
     if (this.pollTimer >= 0) {
       clearInterval(this.pollTimer);
       this.pollTimer = -1;
@@ -66,12 +94,14 @@ struct ConnectionsPage {
   }
 
   private async refreshOnce(): Promise<void> {
-    if (this.refreshing) {
+    if (!this.canPoll() || this.refreshing) {
       return;
     }
     this.refreshing = true;
+    const generation = this.pollGeneration;
     try {
       const list = await this.orchestrator.api.listConnections(this.knownNames);
+      if (generation !== this.pollGeneration || !this.canPoll()) { return; }
       if (list === null) {
         this.reachable = false;
       } else {
