@@ -318,7 +318,7 @@ struct SiteRoutingPage {
             if (this.visible.length === 0) {
               ListItem() { Text('没有匹配的网站，可点击下方添加 / 导入。').fontSize(13).fontColor(TunBoxColors.textSecondary).padding(22) }
             }
-          }.layoutWeight(1).width('100%').enabled(this.ready && !this.busy)
+          }.layoutWeight(1).width('100%').enabled(this.ready && !this.busy) .edgeEffect(EdgeEffect.Spring)
           if (this.notice.length > 0) { Text(this.notice).fontSize(11).fontColor(TunBoxColors.primary).width('100%') }
         }.width('100%').layoutWeight(1).padding({
           left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8

@@ -48,7 +48,12 @@ import { AppSettings, AutoSelectModes } from '../models/AppSettings';
 import { AppRoutingPolicy, AppRoutingRuntime } from './AppRoutingPolicy';
 import { ProxyNode } from '../models/ProxyNode';
 import { AppDiagnostics } from '../models/PublicIpInfo';
+import { AppProxyRoute } from './AppProxyRoute';
 import { AppLogger } from '../utils/AppLogger';
+// FlClash 同构：当前 Profile 原文（配置基底）
+import { ProfileStore } from '../flclash/ProfileStore';
+import { CoreCatalogService } from '../flclash/CoreCatalogService';
+import { CoreNodeBridge } from '../flclash/CoreNodeBridge';
 
 const TAG = 'ConnectionOrchestrator';
 const MIXED_PORT = 7890;
@@ -418,6 +423,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private dnsPort: number = DNS_LISTEN_PORT;
   /** 规则/站点等变更触发的热重载在途门控（防并发重载）。 */
   private reloading: boolean = false;
+  /**
+   * 最近一次**生成配置时**使用的 profile id（FlClash 的「已生效 profile」）。
+   *
+   * 内核只有一份配置；订阅切换/刷新后若这里与 `ProfileStore.currentId()` 不一致，
+   * 说明内核里还是旧订阅的节点 —— 此时`/proxies`读到的是旧集合，
+   * 测速就会出现「测的是 A 订阅、界面显示 B 订阅 → 全是 --」。
+   */
+  private appliedProfileId: string = '';
+  /** 最近一次**生成**配置用的 profile id（还没被内核确认）。 */
+  private pendingProfileId: string = '';
   private recoveryAttempts: number = 0; // 内核恢复退避计数（对应 core_recovery_policy）
   private lastNodeName: string = '';
 
@@ -962,6 +977,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const stagedPath = `${configPath}.next`;
       privateFs.writePrivate(stagedPath, safeYaml);
       const reloaded = await this.api.reloadFromPath(stagedPath);
+      if (reloaded) {
+        this.confirmProfileApplied('hot-reload');
+      }
       if (!reloaded) {
         try {
           fs.unlinkSync(stagedPath);
@@ -1034,6 +1052,55 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 应用排除/白名单（包名级）变更仍需重建 TUN，不走此路径。
    * @returns 'hot'=内核热重载未重建隧道；'reconnect'=已断开重连；'none'=未连接下次生效
    */
+  /**
+   * 确保「内核里的配置」就是 `ProfileStore.currentId()` 指向的那份。
+   *
+   * 订阅导入/切换后必须调一次再测速：否则内核仍是旧订阅的节点，
+   * `/proxies` 返回旧集合，测速结果对不上界面（用户报障：新订阅测速全是 `--`）。
+   * 已连接时走热重载（不断线）；未连接时下次起内核自然用新配置。
+   */
+  /** 当前**内核里真正生效**的 profile id（空串 = 还没生成过配置）。 */
+  appliedProfile(): string {
+    return this.appliedProfileId;
+  }
+
+  /**
+   * 内核确认配置生效时调用（connect readiness / reloadFromPath 成功 / 测速核 ready）。
+   *
+   * 为什么不能"生成即生效"：`buildRuntimeProfile` 只是产出文本，内核可能还在加载，
+   * 也可能整份拒载。提前把 applied 改掉，UI 就会用旧内核目录渲染新订阅
+   * （用户实锤：来回切订阅后节点串到别的订阅下面）。
+   */
+  private confirmProfileApplied(stage: string): void {
+    if (this.pendingProfileId.length === 0 || this.pendingProfileId === this.appliedProfileId) {
+      return;
+    }
+    AppLogger.info(TAG, `profile applied: ${this.appliedProfileId || '<none>'} -> ${this.pendingProfileId} (${stage})`);
+    this.appliedProfileId = this.pendingProfileId;
+  }
+
+  async ensureProfileApplied(reason: string): Promise<boolean> {
+    const current = ProfileStore.currentId();
+    if (current.length === 0 || !ProfileStore.exists(current)) {
+      return false;
+    }
+    if (this.appliedProfileId === current) {
+      return true;
+    }
+    if (this.state !== ConnState.CONNECTED && this.state !== ConnState.CONNECTING) {
+      // 未连接：没有真实隧道，但**测速核可能还在跑旧配置** —— 必须作废它，
+      // 否则 `/proxies` 还是旧订阅的节点（用户报障：新订阅测速后节点全是 `--`）。
+      await this.invalidateTestCoreForSubscriptionChange(`profile:${reason}`);
+      // 不在这里改 applied：等测速核/隧道真的按新 profile 起来后由 confirmProfileApplied 落定。
+      return true;
+    }
+    AppLogger.info(TAG, `profile changed (${this.appliedProfileId} -> ${current}); hot reload for ${reason}`);
+    const result = await this.applyRulesChanged(reason);
+    const ok = result.length === 0;
+    // applied 由 reloadFromPath 成功时的 confirmProfileApplied('hot-reload') 落定
+    return ok;
+  }
+
   async applyRulesChanged(reason: string): Promise<string> {
     const hot = await this.reloadRulesHot(reason);
     if (hot) {
@@ -1575,6 +1642,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     for (const n of subs.nodes) {
       if (n.name === name) {
         return n;
+      }
+    }
+    // FlClash 同构（2026-10-22）：节点名以内核为准。订阅原文里的节点可能不在
+    // App 解析表里（新协议 / 信息条目 / 被解析器丢弃）—— 此时用内核目录里的同名
+    // 节点构造一个只读影子（配置由原文决定，节点对象只提供名字与延迟）。
+    const model = CoreCatalogService.current();
+    if (model !== null) {
+      const entry = model.byName[name];
+      if (entry !== undefined && !entry.isGroup) {
+        return CoreNodeBridge.toProxyNode(entry);
       }
     }
     return subs.nodes.length > 0 ? subs.nodes[0] : null;
@@ -2692,6 +2769,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         }
         if (this.readStartOk() && await this.api.healthProbe()) {
           AppLogger.info(TAG, 'headless test core ready');
+          this.confirmProfileApplied('test-core');
           // 挂载内核日志流: 拨号失败的真实原因(DNS/握手/路由)只在内核日志里,
           // API 的 503 响应体是固定文案。转发进 AppLogger → hilog 可远程排查。
           this.startCoreLogStream(this.testCoreSecret);
@@ -2995,6 +3073,32 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     profile.geoipReady = geoipReady;
     profile.ruleProviderFileReady = ruleProviderFileReady;
     profile.proxyHosts = proxyHosts;
+    // ── FlClash 同构：当前 Profile 的订阅原文（配置基底）───────────────────
+    // 当前 profile 未设置时回落第一个启用订阅的 id（旧数据：升级后第一次连接也能用）。
+    // 原文缺失（未迁移/写盘失败）→ 空串 → builder 保持旧的 overlay 全量生成。
+    let profileId = ProfileStore.currentId();
+    if (profileId.length === 0 || !ProfileStore.exists(profileId)) {
+      // 回落顺序：当前 profile 失效 → 第一个**已落盘**的启用订阅（有 profile 文件才能当基底）
+      for (const candidate of subs.subscriptions) {
+        if (candidate.enabled && ProfileStore.exists(candidate.id)) {
+          profileId = candidate.id;
+          break;
+        }
+      }
+    }
+    if (profileId.length > 0) {
+      profile.profileYaml = ProfileStore.read(profileId);
+      if (profile.profileYaml.length === 0) {
+        // 文件读不出来（被删/写盘中断）：**不要**把它当配置基底，也不要把
+        // applied 记成它 —— 否则界面会认为内核里是这份 profile，
+        // 实际跑的是「全部订阅合并」的兜底配置（节点全串）。
+        AppLogger.warn(TAG, `profile ${profileId} exists but empty; falling back to full overlay`);
+        profileId = '';
+      }
+    }
+    this.pendingProfileId = profileId;
+    AppLogger.info(TAG, `profile base: id=${profileId.length > 0 ? profileId : '<none>'} `
+      + `bytes=${profile.profileYaml.length} exists=${profileId.length > 0 ? ProfileStore.exists(profileId) : false}`);
     return profile;
   }
 
@@ -3164,7 +3268,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 节点有效性检查：旧版本持久化的节点缺 rawYaml 且非 ss/ssr 字段不完整时无法生成配置。
       // 自动降级到第一个可用节点；全部无效时自动刷新一次订阅（修复升级后旧数据不可用）。
-      const isValidNode = (n: ProxyNode): boolean => ClashConfigGenerator.proxyYamlLine(n).length > 0;
+      // FlClash 同构（2026-10-22）：节点来自内核 `/proxies`（影子节点 `core:<name>`）时，
+      // 配置由订阅原文决定，App 侧不需要「能序列化成 YAML」——名字在内核里就是有效节点。
+      // 旧判据会把影子节点判成无效并回落到 subs.nodes[0]（真机实测：点了香港Z09、连的是 hy2台湾）。
+      const isValidNode = (n: ProxyNode): boolean =>
+        CoreNodeBridge.isShadow(n) || ClashConfigGenerator.proxyYamlLine(n).length > 0;
       let target: ProxyNode = node;
       if (!isValidNode(target)) {
         const firstValid = subs.nodes.find((n) => isValidNode(n)) ?? null;
@@ -3273,8 +3381,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const ruleProviderFileReady = this.isRuleProviderReady();
       if (adRulesOn && !ruleProviderFileReady) {
         AppLogger.info(TAG, 'ruleset/hyper_adrules_ads.mrs missing; generate config without RULE-SET');
-        // 与本次连接并行补齐（不阻塞连接路径）；落地后下次连接即启用去广告规则
-        this.downloadRuleProviderInBackground(settings.assetSource);
+        // 用户口径（2026-10-22）：去广告规则集与 smart 模型一样**不自动下载**，
+        // 需要用户自己到「设置 → 数据与规则」里点更新；成功后再连即生效。
+        // 理由：绝大多数用户不开去广告，自动拉 GitHub 既浪费流量又必然失败。
+        AppLogger.info(TAG, 'ruleset auto-download disabled by policy; update manually in settings');
       } else if (!adRulesOn) {
         AppLogger.info(TAG, 'ad-block rules disabled; skipping hyper-adrules ruleset provisioning');
       }
@@ -3366,7 +3476,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const autoMode = settings.autoSelectMode === AutoSelectModes.AUTO;
       const smartReady = (autoMode && this.seedSmartModelFromRawfile()) || this.isSmartModelReady();
       if (!smartReady) {
-        this.downloadSmartModelInBackground(settings.assetSource);
+        // 用户口径（2026-10-22）：**不再在连接/启动代理后自动下载 Model.bin**。
+        // 理由：模型 9.3MB，绝大多数用户用不到自动优选；后台下载既占流量，又让
+        // 「没模型时不显示自动选择」这条 UI 规则永远不成立（一连接就偷偷补上了）。
+        // 需要模型的用户在启动代理后由内核侧更新，UI 上已写明这句话。
+        AppLogger.info(TAG, 'smart model missing; auto-download disabled by policy');
       }
       // 保持字面量表达：架构自检（scripts/verify-vpn-architecture.mjs 的
       // orch.smart.gated-by-auto）就是靠这段文本锁定"smart 组只由 auto 模式启用"，
@@ -3581,6 +3695,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         throw new Error(errorText);
       }
       tReady = Date.now() - connectT0;
+      this.confirmProfileApplied('tunnel');
 
       // ── 节点钉选：**必须**在 state=CONNECTED 之前完成（2026-10-19 稳定性回退）──
       //
@@ -3679,6 +3794,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       SsrvpnNotifier.cancel().catch((): void => {});
       this.notify();
       AppLogger.info(TAG, `connected to node ${target.name}`);
+      // 隧道就绪：把 **App 自身** 的 HTTP 请求导到本地 mixed 端口。
+      // 否则出口 IP 查询（api64.ipify.org）与 geo/规则集/模型下载（GitHub 镜像）
+      // 都从物理网卡直连 —— 国内即表现为「节点能测速、出口 IP 获取失败、
+      // 数据与规则全部源下载失败」（2026-10-22 真机）。
+      AppProxyRoute.apply(this.mixedPort);
       // P0-2 订阅自救：连接成功 → 隧道已可用（拉订阅天然走 VPN 出网），
       // 把此前网络性拉取失败（被阻断面板）的订阅自动补拉一次。只记日志不弹 UI：
       // 这是无感修复，失败也不影响本次连接结果（advice 已在原失败时提示过用户）。
@@ -3836,6 +3956,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           method: http.RequestMethod.GET,
           expectDataType: http.HttpDataType.ARRAY_BUFFER,
           connectTimeout: 15000,
+          // geo/规则集/模型都托管在 GitHub：必须跟着隧道走，否则国内必失败
+          usingProxy: AppProxyRoute.activePort() > 0,
           readTimeout: what === 'Model.bin' ? 300000 : 90000,
           maxLimit: maxSize
         });
@@ -4084,6 +4206,17 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return this.seedSmartModelFromRawfile() || this.isSmartModelReady();
   }
 
+  /**
+   * 纯查询：内核 smart 选点模型是否已就位（`cacheDir/Model.bin` 非空且魔数正确）。
+   *
+   * 与 ensureSmartModelReady 的区别：**绝不播种、绝不下载、不碰网络**。
+   * 订阅页用它决定要不要渲染「自动选择 · 内核智能优选」入口 —— 用户明确要求
+   * 没有模型时把这块隐藏，所以这个判断必须是零副作用的。
+   */
+  isSmartModelAvailable(): boolean {
+    return this.isSmartModelReady();
+  }
+
   /** 后台下载 LightGBM 模型到内核 home（照搬 geoip 的多镜像 + 校验模式） */
   private smartModelDownloading: boolean = false;
 
@@ -4161,9 +4294,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     };
     out.push(item('geoip', 'GeoIP 数据库', 'GEOIP,CN 直连分流与 DNS fallback 依赖', geoip,
       this.isGeoipReady()));
-    out.push(item('model', 'Smart 选点模型', 'LightGBM 自动选点依赖（内置兜底）', model,
+    out.push(item('model', 'Smart 选点模型', 'LightGBM 自动选点依赖（需手动更新）', model,
       this.ensureSmartModelReady()));
-    out.push(item('ruleset', '去广告规则集', 'HyperADRules MRS（每日自动更新）', ruleset,
+    out.push(item('ruleset', '去广告规则集', 'HyperADRules MRS（需手动更新）', ruleset,
       this.isRuleProviderReady()));
     return out;
   }
@@ -4187,6 +4320,51 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return '未知的数据项';
     }
     return ok ? '' : '全部下载源均失败，请稍后重试或切换下载源';
+  }
+
+  /**
+   * 删除可按需重下的资产（**仅** Smart 选点模型与去广告规则集）。
+   *
+   * 用户口径（2026-10-22）：这两个都不是必需品，允许用户删掉腾空间；
+   * 删除后：
+   *  · 模型消失 → 订阅页/节点页的「自动选择」入口自动隐藏（见 smartModelSeq 信号）；
+   *  · 规则集消失 → 调用方触发一次代理重启，让内核换用不含 RULE-SET 的配置。
+   * GeoIP/GeoSite **不允许删**：内核缺它们会在 config.Parse 阶段直接退出。
+   *
+   * @returns '' = 成功；非空 = 用户可读的失败原因
+   */
+  deleteGeoAsset(id: string): string {
+    if (this.context === null) {
+      return '应用尚未初始化完成';
+    }
+    try {
+      if (id === 'model') {
+        const path = `${this.context.cacheDir}/Model.bin`;
+        try {
+          fs.unlinkSync(path);
+        } catch (e) {
+          // 文件本来就不存在：按成功处理
+        }
+        // 通知所有页面重算「自动选择」是否该显示
+        const seq = AppStorage.get<number>('smart_model_seq');
+        AppStorage.setOrCreate<number>('smart_model_seq', (seq === undefined ? 0 : seq) + 1);
+        AppLogger.info(TAG, 'smart model deleted; auto-select entry hidden');
+        return '';
+      }
+      if (id === 'ruleset') {
+        const path = `${this.context.cacheDir}/${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`;
+        try {
+          fs.unlinkSync(path);
+        } catch (e) {
+          // 同上
+        }
+        AppLogger.info(TAG, 'ad-block ruleset deleted; tunnel needs restart to drop RULE-SET');
+        return '';
+      }
+      return '该数据项不支持删除（删掉会导致内核无法启动）';
+    } catch (e) {
+      return `删除失败：${AppLogger.errText(e)}`;
+    }
   }
 
   /** 后台补齐去广告规则集；成功后再连即时生效（失败下次连接重试） */
@@ -4236,6 +4414,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private async disconnectInternal(expectedGeneration: number = 0): Promise<void> {
     this.invalidateStateProbeCache();
     this.stopMonitors();
+    // 隧道要没了：立刻撤销 App 级 HTTP 代理，否则后续请求全打到空端口
+    AppProxyRoute.clear();
     // 测速内核与真实隧道互斥：断开/回滚路径一并回收单航班状态机（含配置清理）
     if (this.testCoreFlight !== null) {
       try {

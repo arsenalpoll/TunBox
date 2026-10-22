@@ -9,6 +9,7 @@
  * 成功切换后异步刷新一次。日志中不记录 IP 地址或响应正文。
  */
 import hidebug from '@ohos.hidebug';
+import { AppProxyRoute } from './AppProxyRoute';
 import { preferences } from '@kit.ArkData';
 import { http } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
@@ -102,7 +103,8 @@ export class FormInfoMetrics {
         method: http.RequestMethod.GET,
         connectTimeout: REQUEST_TIMEOUT_MS,
         readTimeout: REQUEST_TIMEOUT_MS,
-        usingCache: false
+        usingCache: false,
+        usingProxy: AppProxyRoute.activePort() > 0
       });
       let body = '';
       if (typeof response.result === 'string') {

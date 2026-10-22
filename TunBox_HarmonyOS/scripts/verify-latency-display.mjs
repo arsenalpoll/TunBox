@@ -145,44 +145,29 @@ ok('进度映射把 coreOverloaded 交给调用方（后台测速返回 progress
 // 订阅页行尾按钮 / 冷启动静默批 / 大订阅都调这一处，避免三套 504/通道/未生效判定。
 const bgSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/services/BackgroundLatencyService.ets'), 'utf8');
-ok('组测实现只有一处，调内核组接口（testGroupDetailedResult，带 expectedNodes）',
-  /runKernelGroupTest\(/.test(bgSrc)
-  && /testGroupDetailedResult\('PROXY', url, GROUP_TEST_TIMEOUT_MS, nodes\.length\)/.test(bgSrc));
+// 2026-10-22（用户要求「测速完全按 FlClash」）：组测速 = 组内节点**逐个测**，
+// 不再调内核 `GET /group/{name}/delay`；唯一实现是 FlclashLatencyService.start。
+const flcSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/flclash/FlclashDelay.ets'), 'utf8');
+ok('组测唯一入口 = FlclashLatencyService（逐节点，不再调内核组接口）',
+  /FlclashLatencyService\.start\(/.test(bgSrc) && !/testGroupDetailedResult/.test(bgSrc));
 ok('组测入口是智能优选行内的纯图形按钮（不是独立卡片/文字标题）',
   /accessibilityText\('内核组测速（一次测完所有节点）'\)/.test(subPageSrc)
   && !/Text\('内核组测速'\)/.test(subPageSrc));
 ok('组测在途有防重入 + 转圈',
   /if \(this\.groupTesting\) \{\s*return;/.test(subPageSrc)
   && /@State groupTesting: boolean = false;/.test(subPageSrc));
-ok('504（allTimedOut）= 通道正常、全部超时，不得标成通道故障',
-  /res\.allTimedOut/.test(bgSrc) && /!res\.ok && !res\.allTimedOut/.test(bgSrc));
-ok('通道故障 → 节点恢复未测（绝不盖章成超时）',
-  /!res\.ok && !res\.allTimedOut[\s\S]{0,600}?LatencyRecord\.untested/.test(bgSrc));
-ok('不在内核代理表的失败节点标 switch_failed（未生效），不与真超时混为一谈',
-  /proxyTableNames\(\)/.test(bgSrc)
-  && /gone \? LatencyProbeKind\.SWITCH_FAILED : LatencyProbeKind\.TIMEOUT/.test(bgSrc));
-ok('组测结果有可检索的完成日志（total/measured/timeout/notInCore）',
-  /kernel group test done: total=\$\{nodes\.length\} measured=/.test(bgSrc));
-
-// ── 大订阅（几百节点）：不得再「测几个就不测了」（2026-10-22 真机 547/643 节点）──
-// ① 整批硬截止按批大小算，不能是固定 90s（600 节点 ≈ 19 波 × 5s ≈ 95s 会截断队尾）；
-// ② 作废阈值随批大小放大（32 路在途会把 /version 探针压到超时 → 误判通道不可用）；
-// ③ 节点数 ≥120 时改走内核组测（客户端 HTTP 栈扛不住）；
-// ④ 组测外层超时按 expectedNodes 估算（原实现恒为 timeoutMs + 5s = 10s）。
-ok('整批硬截止按批大小自动计算（deadlineForBatch）',
-  /static deadlineForBatch\(nodeCount: number\): number/.test(engineSrc)
-  && /LatencyEngine\.deadlineForBatch\(nodes\.length\)/.test(engineSrc));
-ok('作废阈值随批大小放大（abortStreakFor）',
-  /function abortStreakFor\(nodeCount: number\): number/.test(engineSrc)
-  && /abortStreakFor\(this\.nodes\.length\)/.test(engineSrc));
-ok('大订阅改走内核组测（阈值常量 + 分支）',
-  /KERNEL_GROUP_TEST_MIN_NODES = 120/.test(bgSrc)
-  && /nodes\.length >= KERNEL_GROUP_TEST_MIN_NODES/.test(bgSrc));
-ok('组测外层超时按节点数估算（expectedNodes）',
-  /expectedNodes: number = 0/.test(fs.readFileSync(
-    path.join(root, 'entry/src/main/ets/commons/services/ClashApiService.ets'), 'utf8'))
-  && /const waves = expectedNodes > 0 \? Math\.ceil\(expectedNodes \/ 50\) : 1;/.test(
-    fs.readFileSync(path.join(root, 'entry/src/main/ets/commons/services/ClashApiService.ets'), 'utf8')));
+const flcServiceSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/flclash/FlclashLatencyService.ets'), 'utf8');
+ok('组测/批量结果有可检索的完成日志（total/measured/timeout/failed/cancelled）',
+  /delay batch done: total=\$\{summary\.total\} measured=\$\{summary\.measured\}/.test(flcServiceSrc)
+  && /cancelled=\$\{summary\.cancelled\}/.test(flcServiceSrc));
+ok('并发/超时/测速地址对齐 FlClash（32 / 5000ms / gstatic https）',
+  /FLCLASH_DELAY_CONCURRENCY: number = 32/.test(flcSrc)
+  && /FLCLASH_DELAY_TIMEOUT_MS: number = 5000/.test(flcSrc)
+  && /https:\/\/www\.gstatic\.com\/generate_204/.test(flcSrc));
+ok('大订阅与小订阅同一条路径（不存在「≥120 节点改内核组测」的分叉）',
+  !/KERNEL_GROUP_TEST_MIN_NODES/.test(bgSrc));
 
 const apiSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/services/ClashApiService.ets'), 'utf8');

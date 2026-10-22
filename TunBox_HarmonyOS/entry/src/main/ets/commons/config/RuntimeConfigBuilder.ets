@@ -71,6 +71,8 @@ import { AppSettings, AutoSelectModes } from '../models/AppSettings';
 import { SubDnsUpstream } from '../models/SubDnsUpstream';
 import { ClashConfigGenerator } from '../services/ClashConfigGenerator';
 import { DoHResolver } from '../services/DoHResolver';
+// 订阅原文 → overlay 合并（FlClash mergeProfileBase 的等价实现）
+import { ProfileConfigMerger } from '../flclash/ProfileConfigMerger';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'RuntimeConfigBuilder';
@@ -159,6 +161,16 @@ export class RuntimeConfigProfile {
    * 两套结果互相补洞 = 两边结果可以不一致 = 分叉）。
    */
   proxyHosts: Record<string, string> = {};
+
+  /**
+   * 当前 Profile 的**订阅原文**（FlClash 的 profile yaml 基底）。
+   *
+   * 非空时 `buildRuntimeConfig` 会在生成 overlay 之后走
+   * `ProfileConfigMerger.merge(overlay, profile)`：原文的 proxies / proxy-groups /
+   * sub-rules / rules 整体接管，隧道与测速核用同一份 → 与 FlClash 同构。
+   * 空串 = 没有 profile（首次导入前/旧数据），保持旧的全量生成行为。
+   */
+  profileYaml: string = '';
 }
 
 /** 四个决策的结果（两种 mode 共享同一份）。 */
@@ -370,8 +382,24 @@ export class RuntimeConfigBuilder {
       // 机场入口域名的真实 IP 只有这些上游知道，不能丢（2026-10-20 全超时定案）。
       profile.subscriptionDnsUpstreams, profile.subscriptionDnsPolicies);
 
+    // ── FlClash 同构：订阅原文接管 proxies / proxy-groups / rules / dns ──────
+    // overlay（上面生成的 yaml）只保留运行期参数（端口 / secret / tun / mode 等），
+    // 原文段整体替换进来；原文 dns.enable=true 时整段 dns 用原文。
+    // 合并失败（原文为空或没有代理定义）→ 保持 overlay，不阻断连接。
+    let finalYaml = yaml;
+    if (profile.profileYaml.trim().length > 0) {
+      const merged = ProfileConfigMerger.merge(yaml, profile.profileYaml);
+      if (merged.ok) {
+        finalYaml = merged.yaml;
+        AppLogger.info(TAG, `profile merged: mode=${mode} applied=${merged.applied} `
+          + `items=${merged.profileProxyItems} bytes=${finalYaml.length}`);
+      } else {
+        AppLogger.warn(TAG, `profile merge skipped: ${merged.error}`);
+      }
+    }
+
     const result = new RuntimeConfigResult();
-    result.yaml = yaml;
+    result.yaml = finalYaml;
     result.mode = mode;
     result.mixedPort = profile.mixedPort;
     result.apiPort = profile.apiPort;
@@ -380,7 +408,7 @@ export class RuntimeConfigBuilder {
     result.tunEnabled = tunEnabled;
     result.hostsCount = Object.keys(hosts).length;
     result.options = options;
-    AppLogger.info(TAG, `runtime config built: mode=${mode} bytes=${yaml.length} `
+    AppLogger.info(TAG, `runtime config built: mode=${mode} bytes=${finalYaml.length} `
       + `hosts=${result.hostsCount} useSmart=${options.useSmart} `
       + `ruleProviderReady=${options.ruleProviderReady} useGeoip=${options.useGeoip} `
       + `ipv6=${ipv6Enabled} node="${options.selectedNodeName}"`);

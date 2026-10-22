@@ -564,7 +564,7 @@ export struct RulesView {
           .padding({
             left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8
           })
-        }.width('100%').layoutWeight(1).scrollBar(BarState.Off)
+        }.width('100%').layoutWeight(1).scrollBar(BarState.Off) .edgeEffect(EdgeEffect.Spring)
       }.width('100%').height('100%')
     }.width('100%').height('100%')
   }

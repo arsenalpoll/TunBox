@@ -260,8 +260,11 @@ ok('启动时读回单双列选择', /await SettingsService\.loadNodeColumns\(\)
 
 // ── 8. 协议口径：复用 NodeProtocolPolicy，不硬截断 ──────────────────────
 const codeOnly = stripComments(src);
+// 2026-10-22：protoOf 现在有「内核影子节点」前置分支（CoreNodeBridge.isShadow），
+// 所以不能再要求 return 紧贴函数头；只要函数体内**最终**落到
+// NodeProtocolPolicy.fromNode(node).display() 即可（口径仍单一）。
 ok('protoOf 复用 NodeProtocolPolicy',
-  /private protoOf\(node: ProxyNode\): string \{\s*\n\s*return NodeProtocolPolicy\.fromNode\(node\)\.display\(\);/.test(src));
+  /private protoOf\(node: ProxyNode\): string \{[\s\S]{0,400}?NodeProtocolPolicy\.fromNode\(node\)\.display\(\);/.test(src));
 ok('import NodeProtocolPolicy',
   /import \{ NodeProtocolPolicy \} from '\.\.\/commons\/services\/NodeSortPersistence';/.test(src));
 ok('代码中无 slice(0, 8) 硬截断', !/toUpperCase\(\)\.slice\(0, 8\)/.test(codeOnly));

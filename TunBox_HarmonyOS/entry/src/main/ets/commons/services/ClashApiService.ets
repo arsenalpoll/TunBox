@@ -230,6 +230,16 @@ export class ClashApiService {
     return `http://127.0.0.1:${this.apiPort}`;
   }
 
+  /** 内核 REST 基址（供 FlClash 等价测速引擎直连，`FlclashDelay` 需要裸 baseUrl）。 */
+  endpointBase(): string {
+    return this.baseUrl();
+  }
+
+  /** controller secret（可能为空串 = 无鉴权）。 */
+  endpointSecret(): string {
+    return this.secret;
+  }
+
   private authHeader(): Record<string, string> {
     const h: Record<string, string> = {};
     if (this.secret.length > 0) {
@@ -285,6 +295,25 @@ export class ClashApiService {
    *  失败时重试一次：内核刚起时首个 PUT 偶发 400/超时，重试即可收敛。
    */
   async selectNode(nodeName: string): Promise<boolean> {
+    // ── FlClash 同构（2026-10-22）：组名不再假设是 `PROXY` ─────────────────
+    // 订阅原文接管 proxy-groups 后，组名由机场决定（「🔰 选择节点」「🚀 节点选择」…），
+    // 硬编码 PROXY 的 PUT 会 404 → 用户点节点「没反应」。改为：
+    //   ① 先试 PROXY（旧的 App 生成组，兼容）；
+    //   ② 再试 GLOBAL；
+    //   ③ 最后从 /proxies 里找**确实包含这个节点**的组逐个试。
+    const groups: string[] = await this.groupsContaining(nodeName);
+    for (const group of groups) {
+      if (await this.selectInGroup(group, nodeName)) {
+        if (group !== 'GLOBAL') {
+          if (!(await this.selectInGroup('GLOBAL', nodeName))) {
+            AppLogger.info(TAG, `selectInGroup(GLOBAL) not applied for ${nodeName} (group may be absent)`);
+          }
+        }
+        AppLogger.info(TAG, `selectNode(${nodeName}) applied in group ${group}`);
+        return true;
+      }
+    }
+    // 退回到「只试 PROXY」的老路径（部分内核/组不在快照里时仍能生效）
     for (let attempt = 0; attempt < 2; attempt++) {
       if (await this.selectInGroup('PROXY', nodeName)) {
         // GLOBAL 尽力而为，不参与返回值；失败只记 info，避免误判为整体失败
@@ -299,6 +328,66 @@ export class ClashApiService {
     }
     AppLogger.error(TAG, `selectNode(${nodeName}) failed after retry`);
     return false;
+  }
+
+  /**
+   * 从 `/proxies` 里找出**包含该节点**的组名，顺序：PROXY → 非 GLOBAL → GLOBAL。
+   * 返回空数组表示拿不到快照（调用方退回旧路径）。
+   */
+  private async groupsContaining(nodeName: string): Promise<string[]> {
+    const json = await this.proxiesJson();
+    if (json === null) {
+      return [];
+    }
+    const out: string[] = [];
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>;
+      const proxies = parsed['proxies'];
+      if (proxies === undefined || proxies === null) {
+        return [];
+      }
+      const table = proxies as Record<string, Object>;
+      const head: string[] = [];
+      const tail: string[] = [];
+      const names = Object.keys(table);
+      for (const name of names) {
+        const entry = table[name] as Record<string, Object>;
+        if (entry === null || entry === undefined) {
+          continue;
+        }
+        const all = entry['all'];
+        if (!Array.isArray(all)) {
+          continue;
+        }
+        const members = all as Object[];
+        let hit = false;
+        for (const member of members) {
+          if (typeof member === 'string' && member === nodeName) {
+            hit = true;
+            break;
+          }
+        }
+        if (!hit) {
+          continue;
+        }
+        if (name === 'PROXY') {
+          head.push(name);
+        } else if (name === 'GLOBAL') {
+          tail.push(name);
+        } else {
+          head.push(name);
+        }
+      }
+      for (const name of head) {
+        out.push(name);
+      }
+      for (const name of tail) {
+        out.push(name);
+      }
+    } catch (e) {
+      return [];
+    }
+    return out;
   }
 
   /**
@@ -330,6 +419,50 @@ export class ClashApiService {
     } finally {
       req.destroy();
     }
+  }
+
+  /**
+   * 原始 `GET /proxies` 响应（FlClash `core.getProxiesGroups` 的对等数据源）。
+   *
+   * FlClash 的节点/分组一律来自内核，App 不持有清单；TunBox 走同一份内核数据源，
+   * 由 `commons/flclash/CoreCatalog` 解析成组/节点模型。
+   *
+   * 返回 null = 通道不可用（连接被拒 / 401 / 传输失败），调用方按「目录不可用」处理，
+   * 绝不能当成「没有节点」。
+   */
+  async proxiesJson(): Promise<string | null> {
+    const req = http.createHttp();
+    this.inflight.add(req);
+    try {
+      const resp = await req.request(`${this.baseUrl()}/proxies`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: 2500,
+        readTimeout: 6000,
+        usingCache: false
+      });
+      if (resp.responseCode !== 200) {
+        return null;
+      }
+      if (typeof resp.result === 'string') {
+        return resp.result as string;
+      }
+      if (resp.result instanceof ArrayBuffer) {
+        return util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
+      }
+      return null;
+    } catch (e) {
+      AppLogger.warn(TAG, `proxiesJson failed: ${this.errText(e)}`);
+      return null;
+    } finally {
+      this.inflight.delete(req);
+      req.destroy();
+    }
+  }
+
+  /** 在指定组里选中节点（FlClash changeProxy 的对等实现，PUT /proxies/{group}）。 */
+  async selectProxyInGroup(group: string, nodeName: string): Promise<boolean> {
+    return await this.selectInGroup(group, nodeName);
   }
 
   /**

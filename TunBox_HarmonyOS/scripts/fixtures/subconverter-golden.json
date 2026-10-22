@@ -1,0 +1,1111 @@
+[
+  {
+    "id": "empty",
+    "ok": false,
+    "count": 0,
+    "error": "convert v2ray subscribe error: format invalid",
+    "proxies": null
+  },
+  {
+    "id": "junk",
+    "ok": false,
+    "count": 0,
+    "error": "convert v2ray subscribe error: format invalid",
+    "proxies": null
+  },
+  {
+    "id": "ss-userinfo-b64-pad",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "aes-256-gcm",
+        "name": "SS-B64",
+        "password": "pw123456",
+        "port": "8388",
+        "server": "1.2.3.4",
+        "type": "ss",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "ss-userinfo-b64-nopad",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "aes-128-gcm",
+        "name": "SS-B64NP",
+        "password": "pass",
+        "port": "8388",
+        "server": "5.6.7.8",
+        "type": "ss",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "ss-userinfo-plain",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "aes-256-gcm",
+        "name": "SS-Plain",
+        "password": "pw123456",
+        "port": "8388",
+        "server": "5.6.7.8",
+        "type": "ss",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "ss-whole-b64",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "chacha20-ietf-poly1305",
+        "name": "SS-Whole",
+        "password": "pw9",
+        "port": "8443",
+        "server": "9.9.9.9",
+        "type": "ss",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "ss-whole-b64-udp",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "2022-blake3-aes-128-gcm",
+        "name": "SS-2022",
+        "password": "YWJjZGVmZ2hpamtsbW5vcA==",
+        "port": "8443",
+        "server": "9.9.9.9",
+        "type": "ss",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "ss-plugin-obfs",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "aes-128-gcm",
+        "name": "SS-Obfs",
+        "password": "pw",
+        "plugin": "obfs",
+        "plugin-opts": {
+          "host": "bing.com",
+          "mode": "http"
+        },
+        "port": "8388",
+        "server": "h1.example.com",
+        "type": "ss",
+        "udp": true,
+        "udp-over-tcp": true
+      }
+    ]
+  },
+  {
+    "id": "ss-plugin-v2ray",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "aes-128-gcm",
+        "name": "SS-V2P",
+        "password": "pw",
+        "plugin": "v2ray-plugin",
+        "plugin-opts": {
+          "host": "cdn.example.com",
+          "mode": "websocket",
+          "path": "/ws",
+          "tls": true
+        },
+        "port": "8389",
+        "server": "h2.example.com",
+        "type": "ss",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "vmess-json-ws",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alpn": [
+          "h2",
+          "http/1.1"
+        ],
+        "alterId": "0",
+        "cipher": "auto",
+        "name": "VM-WS",
+        "network": "ws",
+        "port": "443",
+        "server": "v1.example.com",
+        "servername": "sni.example.com",
+        "skip-cert-verify": false,
+        "tls": true,
+        "type": "vmess",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "ws-opts": {
+          "early-data-header-name": "Sec-WebSocket-Protocol",
+          "headers": {
+            "Host": "cdn.example.com"
+          },
+          "max-early-data": 2048,
+          "path": "/ws"
+        },
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vmess-json-h2",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alterId": 0,
+        "cipher": "aes-128-gcm",
+        "h2-opts": {
+          "host": [
+            "h2.example.com"
+          ],
+          "path": "/h2"
+        },
+        "name": "VM-H2",
+        "network": "h2",
+        "port": 8443,
+        "server": "v2.example.com",
+        "skip-cert-verify": false,
+        "tls": true,
+        "type": "vmess",
+        "udp": true,
+        "uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vmess-json-grpc-aid",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alterId": 4,
+        "cipher": "auto",
+        "grpc-opts": {
+          "grpc-service-name": "gsvc"
+        },
+        "name": "VM-GRPC",
+        "network": "grpc",
+        "port": "2053",
+        "server": "v3.example.com",
+        "skip-cert-verify": false,
+        "tls": false,
+        "type": "vmess",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vmess-json-httpupgrade",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alpn": [
+          "h2"
+        ],
+        "alterId": 0,
+        "cipher": "auto",
+        "name": "VM-HU",
+        "network": "httpupgrade",
+        "port": "443",
+        "server": "v4.example.com",
+        "skip-cert-verify": false,
+        "tls": true,
+        "type": "vmess",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "ws-opts": {
+          "headers": {
+            "Host": "hu.example.com"
+          },
+          "path": "/hu",
+          "v2ray-http-upgrade-fast-open": true
+        },
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vmess-json-tcp",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alterId": 0,
+        "cipher": "auto",
+        "http-opts": {
+          "headers": {
+            "Host": [
+              "tcp.example.com"
+            ]
+          },
+          "path": [
+            "/tp"
+          ]
+        },
+        "name": "VM-TCP",
+        "network": "http",
+        "port": "80",
+        "server": "v5.example.com",
+        "skip-cert-verify": false,
+        "tls": false,
+        "type": "vmess",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vmess-json-nops",
+    "ok": false,
+    "count": 0,
+    "error": "convert v2ray subscribe error: format invalid",
+    "proxies": null
+  },
+  {
+    "id": "vmess-aead",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alterId": 0,
+        "cipher": "auto",
+        "client-fingerprint": "chrome",
+        "grpc-opts": {
+          "grpc-service-name": "gs"
+        },
+        "name": "VM-AEAD",
+        "network": "grpc",
+        "port": "443",
+        "server": "aead.example.com",
+        "servername": "s.example.com",
+        "tls": true,
+        "type": "vmess",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vmess-aead-packet",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alterId": 0,
+        "cipher": "auto",
+        "client-fingerprint": "chrome",
+        "name": "VM-AEAD2",
+        "network": "ws",
+        "port": "443",
+        "server": "aead2.example.com",
+        "tls": true,
+        "type": "vmess",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "ws-opts": {
+          "headers": {
+            "Host": "h.example.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36"
+          },
+          "path": "/ws"
+        }
+      }
+    ]
+  },
+  {
+    "id": "vless-reality-ws",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "client-fingerprint": "chrome",
+        "encryption": "none",
+        "name": "VL-R",
+        "network": "ws",
+        "port": "443",
+        "reality-opts": {
+          "public-key": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0",
+          "short-id": "ab12"
+        },
+        "server": "r.example.com",
+        "servername": "sni.example.com",
+        "tls": true,
+        "type": "vless",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "ws-opts": {
+          "early-data-header-name": "Sec-WebSocket-Protocol",
+          "headers": {
+            "Host": "hh.example.com",
+            "User-Agent": "Mozilla/5.0 (Unknown; Linux) AppleWebKit/538.1 (KHTML, like Gecko) Chrome/v1.0.0 Safari/538.1"
+          },
+          "max-early-data": 2048,
+          "path": "/ws"
+        },
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vless-grpc-flow",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alpn": [
+          "h2"
+        ],
+        "client-fingerprint": "chrome",
+        "flow": "xtls-rprx-vision",
+        "grpc-opts": {
+          "grpc-service-name": "gsvc"
+        },
+        "name": "VL-G",
+        "network": "grpc",
+        "port": "443",
+        "server": "g.example.com",
+        "tls": true,
+        "type": "vless",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vless-tcp-http-header",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "http-opts": {
+          "headers": {
+            "Host": [
+              "t.example.com"
+            ]
+          },
+          "path": [
+            "/tp"
+          ]
+        },
+        "name": "VL-T",
+        "network": "http",
+        "port": "80",
+        "server": "t.example.com",
+        "type": "vless",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vless-xhttp",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "client-fingerprint": "chrome",
+        "name": "VL-X",
+        "network": "xhttp",
+        "port": "443",
+        "server": "x.example.com",
+        "tls": true,
+        "type": "vless",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "xhttp-opts": {
+          "host": "x.example.com",
+          "mode": "packet-up",
+          "no-grpc-header": true,
+          "path": "/x",
+          "reuse-settings": {
+            "h-keep-alive-period": 30,
+            "max-connections": "4"
+          },
+          "x-padding-bytes": "100-1000"
+        },
+        "xudp": true
+      }
+    ]
+  },
+  {
+    "id": "vless-noport",
+    "ok": false,
+    "count": 0,
+    "error": "convert v2ray subscribe error: format invalid",
+    "proxies": null
+  },
+  {
+    "id": "trojan-ws",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "client-fingerprint": "chrome",
+        "name": "TJ-WS",
+        "network": "ws",
+        "password": "pw123",
+        "port": "443",
+        "server": "t1.example.com",
+        "skip-cert-verify": true,
+        "sni": "s1.example.com",
+        "type": "trojan",
+        "udp": true,
+        "ws-opts": {
+          "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3282.167 Safari/537.36"
+          },
+          "path": "/ws"
+        }
+      }
+    ]
+  },
+  {
+    "id": "trojan-grpc",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "client-fingerprint": "firefox",
+        "fingerprint": "3f7e5f2c1a9b8d6e4c2a1b0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d",
+        "grpc-opts": {
+          "grpc-service-name": "gs"
+        },
+        "name": "TJ-G",
+        "network": "grpc",
+        "password": "pw123",
+        "port": "8443",
+        "server": "t2.example.com",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "trojan-plain",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "client-fingerprint": "chrome",
+        "name": "TJ-日本 01",
+        "password": "pw",
+        "port": "443",
+        "server": "t3.example.com",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "hysteria",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alpn": [
+          "h2",
+          "http/1.1"
+        ],
+        "auth_str": "abc",
+        "down": "200",
+        "name": "HY",
+        "obfs": "xplus",
+        "port": "443",
+        "protocol": "udp",
+        "server": "hy.example.com",
+        "skip-cert-verify": true,
+        "sni": "p.example.com",
+        "type": "hysteria",
+        "up": "100"
+      }
+    ]
+  },
+  {
+    "id": "hysteria-mbps",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "auth_str": "",
+        "down": "80",
+        "name": "HY-MB",
+        "obfs": "",
+        "port": "8443",
+        "protocol": "",
+        "server": "hy2.example.com",
+        "skip-cert-verify": false,
+        "sni": "",
+        "type": "hysteria",
+        "up": "50"
+      }
+    ]
+  },
+  {
+    "id": "hysteria2",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alpn": [
+          "h3"
+        ],
+        "down": "20",
+        "fingerprint": "3f7e5f2c1a9b8d6e4c2a1b0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d",
+        "name": "HY2",
+        "obfs": "salamander",
+        "obfs-password": "op",
+        "password": "authpw",
+        "port": "443",
+        "server": "h2.example.com",
+        "skip-cert-verify": true,
+        "sni": "s.example.com",
+        "type": "hysteria2",
+        "up": "10"
+      }
+    ]
+  },
+  {
+    "id": "hysteria2-ports",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "down": "",
+        "fingerprint": "",
+        "name": "HY2-PORTS",
+        "obfs": "",
+        "obfs-password": "",
+        "password": "authpw",
+        "port": "443",
+        "ports": "443,8443-8445",
+        "server": "h3.example.com",
+        "skip-cert-verify": false,
+        "sni": "s.example.com",
+        "type": "hysteria2",
+        "up": ""
+      }
+    ]
+  },
+  {
+    "id": "hysteria2-noport",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "down": "",
+        "fingerprint": "",
+        "name": "HY2-NP",
+        "obfs": "",
+        "obfs-password": "",
+        "password": "authpw",
+        "port": "443",
+        "server": "h4.example.com",
+        "skip-cert-verify": false,
+        "sni": "s.example.com",
+        "type": "hysteria2",
+        "up": ""
+      }
+    ]
+  },
+  {
+    "id": "hysteria2-realm",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "down": "",
+        "fingerprint": "",
+        "name": "HY2-R",
+        "obfs": "",
+        "obfs-password": "",
+        "password": "pw",
+        "port": "443",
+        "realm-opts": {
+          "enable": true,
+          "realm-id": "realm-1",
+          "server-url": "https://r.example.com:443",
+          "stun-servers": [
+            "stun1.example.com",
+            "stun2.example.com"
+          ],
+          "token": "realm-token"
+        },
+        "server": "r.example.com",
+        "skip-cert-verify": false,
+        "sni": "s.example.com",
+        "type": "hysteria2",
+        "up": ""
+      }
+    ]
+  },
+  {
+    "id": "tuic-v5",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "alpn": [
+          "h3"
+        ],
+        "congestion-controller": "bbr",
+        "disable-sni": true,
+        "name": "TU5",
+        "password": "tpass",
+        "port": "443",
+        "server": "tu.example.com",
+        "sni": "s.example.com",
+        "type": "tuic",
+        "udp": true,
+        "udp-relay-mode": "native",
+        "uuid": "11111111-2222-4333-8444-555555555555"
+      }
+    ]
+  },
+  {
+    "id": "tuic-v4",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "name": "TU4",
+        "port": "443",
+        "server": "tu2.example.com",
+        "sni": "s.example.com",
+        "token": "tokentoken",
+        "type": "tuic",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "anytls",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "fingerprint": "3f7e5f2c1a9b8d6e4c2a1b0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d",
+        "name": "AT",
+        "password": "atpass",
+        "port": "443",
+        "server": "at.example.com",
+        "skip-cert-verify": true,
+        "sni": "s.example.com",
+        "type": "anytls",
+        "udp": true,
+        "username": "atuser"
+      }
+    ]
+  },
+  {
+    "id": "anytls-nopw",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "fingerprint": "",
+        "name": "AT2",
+        "password": "onlyuser",
+        "port": "8443",
+        "server": "at2.example.com",
+        "skip-cert-verify": false,
+        "sni": "",
+        "type": "anytls",
+        "udp": true,
+        "username": "onlyuser"
+      }
+    ]
+  },
+  {
+    "id": "mierus",
+    "ok": true,
+    "count": 2,
+    "error": "",
+    "proxies": [
+      {
+        "handshake-mode": "HANDSHAKE_NO_WAIT",
+        "multiplexing": "MULTIPLEXING_LOW",
+        "name": "M:2090/TCP",
+        "password": "mpass",
+        "port": 2090,
+        "server": "m.example.com",
+        "traffic-pattern": "GgQIARAK",
+        "transport": "TCP",
+        "type": "mieru",
+        "udp": true,
+        "username": "muser"
+      },
+      {
+        "handshake-mode": "HANDSHAKE_NO_WAIT",
+        "multiplexing": "MULTIPLEXING_LOW",
+        "name": "M:9999/UDP",
+        "password": "mpass",
+        "port": 9999,
+        "server": "m.example.com",
+        "traffic-pattern": "GgQIARAK",
+        "transport": "UDP",
+        "type": "mieru",
+        "udp": true,
+        "username": "muser"
+      }
+    ]
+  },
+  {
+    "id": "mierus-range",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "name": "M-R:2090-2099/TCP",
+        "password": "mpass",
+        "port-range": "2090-2099",
+        "server": "m2.example.com",
+        "transport": "TCP",
+        "type": "mieru",
+        "udp": true,
+        "username": "muser"
+      }
+    ]
+  },
+  {
+    "id": "ssr",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "aes-256-cfb",
+        "name": "SSR 节点",
+        "obfs": "tls1.2_ticket_auth",
+        "obfs-param": "obfs.example.com",
+        "password": "ssrpass",
+        "port": "8388",
+        "protocol": "auth_aes128_md5",
+        "protocol-param": "32:abc",
+        "server": "ssr.example.com",
+        "type": "ssr",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "socks-http",
+    "ok": true,
+    "count": 4,
+    "error": "",
+    "proxies": [
+      {
+        "name": "SK",
+        "password": "sp",
+        "port": "1080",
+        "server": "sk.example.com",
+        "skip-cert-verify": true,
+        "type": "socks5",
+        "username": "su"
+      },
+      {
+        "name": "SK2",
+        "password": "",
+        "port": "1080",
+        "server": "sk2.example.com",
+        "skip-cert-verify": true,
+        "type": "socks5",
+        "username": ""
+      },
+      {
+        "name": "HT",
+        "password": "hp",
+        "port": "8080",
+        "server": "ht.example.com",
+        "skip-cert-verify": true,
+        "type": "http",
+        "username": "hu"
+      },
+      {
+        "name": "HTS",
+        "password": "",
+        "port": "443",
+        "server": "hts.example.com",
+        "skip-cert-verify": true,
+        "tls": true,
+        "type": "http",
+        "username": ""
+      }
+    ]
+  },
+  {
+    "id": "dup-names",
+    "ok": true,
+    "count": 4,
+    "error": "",
+    "proxies": [
+      {
+        "client-fingerprint": "chrome",
+        "name": "香港 01",
+        "password": "pw",
+        "port": "443",
+        "server": "d1.example.com",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      },
+      {
+        "client-fingerprint": "chrome",
+        "name": "香港 01-01",
+        "password": "pw",
+        "port": "443",
+        "server": "d2.example.com",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      },
+      {
+        "client-fingerprint": "chrome",
+        "name": "香港 01-02",
+        "password": "pw",
+        "port": "443",
+        "server": "d3.example.com",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      },
+      {
+        "client-fingerprint": "chrome",
+        "name": "香港 01-03",
+        "password": "pw",
+        "port": "443",
+        "server": "d4.example.com",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "b64-list",
+    "ok": true,
+    "count": 4,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "aes-256-gcm",
+        "name": "N1",
+        "password": "pw1",
+        "port": "8388",
+        "server": "1.1.1.1",
+        "type": "ss",
+        "udp": true
+      },
+      {
+        "client-fingerprint": "chrome",
+        "name": "N2",
+        "password": "pw2",
+        "port": "443",
+        "server": "2.2.2.2",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      },
+      {
+        "name": "N3",
+        "network": "tcp",
+        "port": "443",
+        "server": "3.3.3.3",
+        "type": "vless",
+        "udp": true,
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "xudp": true
+      },
+      {
+        "down": "",
+        "fingerprint": "",
+        "name": "N4",
+        "obfs": "",
+        "obfs-password": "",
+        "password": "pw3",
+        "port": "443",
+        "server": "4.4.4.4",
+        "skip-cert-verify": false,
+        "sni": "",
+        "type": "hysteria2",
+        "up": ""
+      }
+    ]
+  },
+  {
+    "id": "b64-list-raw",
+    "ok": true,
+    "count": 2,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "aes-128-gcm",
+        "name": "R1",
+        "password": "pw",
+        "port": "8388",
+        "server": "5.5.5.5",
+        "type": "ss",
+        "udp": true
+      },
+      {
+        "fingerprint": "",
+        "name": "R2",
+        "password": "p",
+        "port": "443",
+        "server": "6.6.6.6",
+        "skip-cert-verify": false,
+        "sni": "",
+        "type": "anytls",
+        "udp": true,
+        "username": "u"
+      }
+    ]
+  },
+  {
+    "id": "bad-port-and-escape",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "client-fingerprint": "chrome",
+        "name": "good",
+        "password": "pw",
+        "port": "443",
+        "server": "ok.example.com",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "ss-partial-b64",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "cipher": "2022-blake3-aes-128-gcm",
+        "name": "ss-partial",
+        "password": "plainp",
+        "port": "8388",
+        "server": "a.example.com",
+        "type": "ss",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "crlf",
+    "ok": true,
+    "count": 2,
+    "error": "",
+    "proxies": [
+      {
+        "client-fingerprint": "chrome",
+        "name": "crlf1",
+        "password": "pw",
+        "port": "443",
+        "server": "a.example.com",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      },
+      {
+        "cipher": "aes-128-gcm",
+        "name": "crlf2",
+        "password": "pw",
+        "port": "8388",
+        "server": "b.example.com",
+        "type": "ss",
+        "udp": true
+      }
+    ]
+  },
+  {
+    "id": "no-scheme-lines",
+    "ok": true,
+    "count": 1,
+    "error": "",
+    "proxies": [
+      {
+        "client-fingerprint": "chrome",
+        "name": "OK",
+        "password": "pw",
+        "port": "443",
+        "server": "ok.example.com",
+        "skip-cert-verify": false,
+        "type": "trojan",
+        "udp": true
+      }
+    ]
+  }
+]

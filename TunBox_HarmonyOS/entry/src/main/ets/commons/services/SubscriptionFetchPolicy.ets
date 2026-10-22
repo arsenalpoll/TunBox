@@ -6,9 +6,11 @@
  * 每次降级重试都在 HTTP 403/406 或空结果时触发。
  */
 import { http, connection } from '@kit.NetworkKit';
+import { AppProxyRoute } from './AppProxyRoute';
 import { url, util } from '@kit.ArkTS';
 import { AppLogger } from '../utils/AppLogger';
 import { AppInfo } from '../utils/AppInfo';
+import { LocalSubConverter } from './LocalSubConverter';
 
 const TAG = 'SubscriptionFetchPolicy';
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -160,6 +162,20 @@ export class SubscriptionFetchPolicy {
    */
   static async fetch(urlStr: string, headerName: string, headerValue: string,
     allowInsecureHttp: boolean, etag: string = ''): Promise<SubscriptionFetchResult> {
+    // 本地转换订阅（`http://127.0.0.1:65530/localsub/<id>.yaml`）：由应用内渲染，
+    // **不联网、不占端口**。必须在地址校验之前分流 —— 它是 loopback，公网守卫会拒。
+    if (LocalSubConverter.isLocalUrl(urlStr)) {
+      const id = LocalSubConverter.idOf(urlStr);
+      const rendered = LocalSubConverter.render(id);
+      if (!rendered.ok) {
+        throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
+          `本地转换订阅不可用：${rendered.reason}`);
+      }
+      const local = new SubscriptionFetchResult();
+      local.body = rendered.yaml;
+      local.etag = '';
+      return local;
+    }
     if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr, allowInsecureHttp)) {
       // 明文 http 单独给可行动提示：它现在是「默认禁用」而不是「地址非法」。
       if (!allowInsecureHttp && urlStr.toLowerCase().startsWith('http://')) {
@@ -202,11 +218,21 @@ export class SubscriptionFetchPolicy {
           AppLogger.info(TAG, 'subscription not modified (304), reusing cached nodes');
           return result;
         }
-        if (result.body.length > 0) {
-          AppLogger.info(TAG, `subscription fetched (${result.body.length} bytes)`);
-          return result;
+        const trimmedLen = result.body.trim().length;
+        if (trimmedLen > 0) {
+          // 极短响应（<16 字节，典型是 `null` / `""` / `0`）说明面板按 UA 或
+          // 凭证回了拒绝体，不是订阅内容 —— 继续换下一个 UA，别把它当成功。
+          if (trimmedLen < 16) {
+            AppLogger.warn(TAG, `subscription body too short (${trimmedLen} bytes): `
+              + `${result.body.trim().substring(0, 32)} — trying next UA`);
+            attempts.push(`响应过短(${trimmedLen}字节)`);
+          } else {
+            AppLogger.info(TAG, `subscription fetched (${result.body.length} bytes)`);
+            return result;
+          }
+        } else {
+          attempts.push('响应为空');
         }
-        attempts.push('响应为空');
       } catch (e) {
         const msg = AppLogger.errText(e);
         AppLogger.warn(TAG, `subscription fetch attempt failed: ${msg}`);
@@ -380,6 +406,9 @@ export class SubscriptionFetchPolicy {
         connectTimeout: 15000,
         readTimeout: 20000,
         usingCache: false,
+        // 隧道已连接时走本地 mixed 端口（被墙面板/明文拦截才能刷新），
+        // 断开时 false → 忽略残留的应用级代理配置，直连
+        usingProxy: AppProxyRoute.activePort() > 0,
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
         maxRedirects: 0
       });
@@ -448,6 +477,10 @@ export class SubscriptionFetchPolicy {
   }
 
   private static async validateResolvedTarget(urlStr: string, allowInsecureHttp: boolean): Promise<void> {
+    if (LocalSubConverter.isLocalUrl(urlStr)) {
+      // 本地转换订阅不会走到这里（fetch() 已提前分流），保留分支只为防御未来新入口
+      return;
+    }
     if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr, allowInsecureHttp)) {
       throw new Error('订阅目标不是允许的公开地址');
     }
@@ -697,6 +730,10 @@ export class SubscriptionFetchPolicy {
 
   /** 订阅 URL 合法性：允许公开 HTTP/HTTPS 地址。 */
   static isValidSubscriptionUrl(urlStr: string, allowInsecureHttp: boolean = false): boolean {
+    // 本地转换订阅由应用内渲染（不发网络请求），不受「仅公开地址 / 明文 http 禁用」约束
+    if (LocalSubConverter.isLocalUrl(urlStr)) {
+      return LocalSubConverter.idOf(urlStr).length > 0;
+    }
     const lower = urlStr.toLowerCase();
     if (urlStr.length === 0 || urlStr.length > 8192
       || (!lower.startsWith('https://') && !(allowInsecureHttp && lower.startsWith('http://')))

@@ -491,9 +491,16 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
     };
     scan(join(etsRoot, 'pages'));
     ok('latency.group-endpoint-not-hand-built-in-pages', hits.length === 0, `hits=${JSON.stringify(hits)}`);
-    // 唯一实现 2026-10-22 收敛到 BackgroundLatencyService.runKernelGroupTest（订阅页/静默批/大订阅共用）
+    // 2026-10-22（用户要求「测速完全按 FlClash」）：组测速**不再**调
+    // `GET /group/{name}/delay`，改为组内节点**逐个**走 FlclashLatencyService（32 并发）。
+    // 唯一实现 = FlclashLatencyService.start（BackgroundLatencyService 只是薄适配层）。
     const bgSrc = readFileSync(join(svcDir, 'BackgroundLatencyService.ets'), 'utf8');
-    has('latency.group-test-single-entry', bgSrc, "testGroupDetailedResult('PROXY'");
+    has('latency.group-test-single-entry', bgSrc, 'FlclashLatencyService.start(');
+    notHas('latency.no-kernel-group-endpoint', bgSrc, 'testGroupDetailedResult(');
+    const flcDelay = readFileSync(join(etsRoot, 'commons/flclash/FlclashDelay.ets'), 'utf8');
+    has('latency.flclash-concurrency-32', flcDelay, 'FLCLASH_DELAY_CONCURRENCY: number = 32');
+    has('latency.flclash-timeout-5000', flcDelay, 'FLCLASH_DELAY_TIMEOUT_MS: number = 5000');
+    has('latency.flclash-url-gstatic', flcDelay, 'https://www.gstatic.com/generate_204');
     has('latency.group-test-from-page', readFileSync(join(etsRoot, 'pages/SubscriptionPage.ets'), 'utf8'),
       'BackgroundLatencyService.runKernelGroupTest(');
     const nodePage = readFileSync(join(etsRoot, 'pages/NodeSelectionPage.ets'), 'utf8');

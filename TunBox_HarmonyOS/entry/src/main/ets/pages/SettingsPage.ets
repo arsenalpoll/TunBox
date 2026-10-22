@@ -30,6 +30,13 @@ import { LatencyTestUrl } from '../commons/latency/LatencyProbe';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { GeoAssetStatus } from '../commons/services/ConnectionOrchestrator';
+import { LocalSubConverter } from '../commons/services/LocalSubConverter';
+// 订阅转换：URL 拉取 + 与订阅解析同一条转换实现（SubConverter = mihomo ConvertsV2Ray 移植）
+import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
+import { SubConverter } from '../commons/flclash/SubConverter';
+import { ProfileConfigMerger } from '../commons/flclash/ProfileConfigMerger';
+import { AppLogger } from '../commons/utils/AppLogger';
+import { picker, fileIo as fs } from '@kit.CoreFileKit';
 
 /**
  * 2026-10-17 用户要求：重连退避上限不再暴露三档时间选项 —— 固定为 8s
@@ -62,6 +69,11 @@ export struct SettingsView {
   @StorageLink('theme_revision') themeRevision: number = 0;
   /** 宿主（底部页签 MainPage / 路由包装页 SettingsPage）「重新展示」通知桥（替代 onPageShow 语义） */
   shownBridge?: TabLifecycleBridge;
+  /** 订阅转换弹窗（分享链接 → 本地 mihomo 订阅） */
+  private subConvertDialog: CustomDialogController = new CustomDialogController({
+    builder: SubConvertDialog({}),
+    autoCancel: true
+  });
   @State appRoutingSummary: string = '正在读取应用分流…';
   /** 广告拦截规则状态（原首页「规则模式」卡片迁入，语义与首页 rulesStatusText 一致） */
   @State adRulesSummary: string = '正在读取规则状态…';
@@ -80,8 +92,6 @@ export struct SettingsView {
   @State ipv6Enabled: boolean = true;
   /** 是否允许明文 HTTP 订阅（默认关闭；关闭时只接受 https） */
   @State allowInsecureSubscriptionHttp: boolean = false;
-  /** 订阅原文交给内核解析（provider 双轨）；关闭 = 全部由 App 内联发射 */
-  @State useRawProviderConfig: boolean = false;
   /**
    * 深浅色主题（2026-10-20 新增）：直接镜像 ThemeService 在 AppStorage 里的 theme_mode，
    * 因此主页太阳按钮改了它也会同步（StorageLink 双向）。
@@ -132,7 +142,6 @@ export struct SettingsView {
     this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
     this.ipv6Enabled = this.settings.ipv6Enabled;
     this.allowInsecureSubscriptionHttp = this.settings.allowInsecureSubscriptionHttp;
-    this.useRawProviderConfig = this.settings.useRawProviderConfig;
     this.assetSource = this.settings.assetSource;
     this.testLatencyUrl = this.settings.testLatencyUrl;
     this.refreshGeoStatuses();
@@ -213,28 +222,11 @@ export struct SettingsView {
   // ── 网络（IPv6 双栈）─────────────────────────────────────────────
 
   /**
-   * 「订阅原文交给内核解析」（provider 双轨）开关。
+   * 把转换出来的本地订阅链接交给订阅页导入。
    *
-   * 开启后：每份订阅原文作为 `type: file` provider 交给内核自己解析（与三家主流客户端同形），
-   * App 不再逐字段重发射该订阅的节点；跨订阅**重名**的订阅会自动退回内联发射（改名去重），
-   * 避免同一名字在延迟表/单节点测速里互相覆盖。
-   *
-   * 只写设置字段，不主动重连：下一次连接/测速重建配置时生效（与订阅操作不重连的定案一致）。
+   * 复用 `tunbox://import` 的同一条通道（`import_request_url` + `import_request_seq` + @Watch），
+   * 不另写一套导入逻辑：格式判定、去重、明文 http 闸门、失败提示仍由订阅页那一条链路负责。
    */
-  private setUseRawProviderConfig(v: boolean): void {
-    this.useRawProviderConfig = v;
-    this.settings.useRawProviderConfig = v;
-    SettingsService.patchSettings((s: AppSettings): void => {
-      s.useRawProviderConfig = v;
-    }).then((): void => {
-      promptAction.showToast({ message: v
-        ? '已开启：订阅原文交给内核解析，下次连接/测速生效'
-        : '已关闭：节点由应用侧生成，下次连接/测速生效' });
-    }).catch((): void => {
-      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
-    });
-  }
-
   /**
    * 是否允许明文 HTTP 订阅。只改写设置字段，不触发重连（只影响下一次拉订阅）。
    */
@@ -318,7 +310,11 @@ export struct SettingsView {
 
   private geoStatusText(asset: GeoAssetStatus): string {
     if (!asset.ready) {
-      return '未就绪（连接时会后台补齐）';
+      // 用户口径（2026-10-22）：Smart 选点模型不再随连接后台补齐，必须用户手动更新；
+      // 其余资产（GeoIP / 规则集）仍会在连接成功后自动补齐。
+      // 模型与去广告规则集都必须手动更新；只有 GeoIP 会在连接后台自动补齐
+      return (asset.id === 'model' || asset.id === 'ruleset')
+        ? '未就绪（需要手动更新）' : '未就绪（连接后自动补齐）';
     }
     let age = '';
     if (asset.mtimeMs > 0) {
@@ -326,6 +322,30 @@ export struct SettingsView {
       age = days <= 0 ? '今天更新' : `${days} 天前更新`;
     }
     return `就绪 · ${formatGeoSize(asset.sizeBytes)} · ${age}`;
+  }
+
+  /** 只有 Smart 模型与去广告规则集允许删除（GeoIP/GeoSite 删了内核会起不来） */
+  private canDeleteAsset(id: string): boolean {
+    return id === 'model' || id === 'ruleset';
+  }
+
+  /**
+   * 删除资产。规则集删除后**自动重启代理**（内核要用不含 RULE-SET 的新配置）；
+   * 模型删除后订阅页的「自动选择」入口会自动隐藏（走 smart_model_seq 信号）。
+   */
+  private async deleteAsset(id: string): Promise<void> {
+    const err = this.orchestrator.deleteGeoAsset(id);
+    if (err.length > 0) {
+      promptAction.showToast({ message: err });
+      return;
+    }
+    this.refreshGeoStatuses();
+    if (id === 'ruleset') {
+      promptAction.showToast({ message: '已删除去广告规则集，正在重启代理…' });
+      await this.orchestrator.restartIfConnected('ruleset-deleted');
+    } else {
+      promptAction.showToast({ message: '已删除选点模型，自动选择入口已隐藏' });
+    }
   }
 
   private async updateAsset(id: string): Promise<void> {
@@ -638,20 +658,28 @@ export struct SettingsView {
                   .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }.width('100%')
               Divider().color(TunBoxColors.cardBorder)
-              Column({ space: 4 }) {
-                Row() {
-                  Text('订阅原文交给内核解析')
-                    .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
-                  Toggle({ type: ToggleType.Switch, isOn: this.useRawProviderConfig })
-                    .selectedColor(TunBoxColors.primary)
-                    .onChange((v: boolean): void => this.setUseRawProviderConfig(v))
-                }.width('100%').alignItems(VerticalAlign.Center)
-                Text('开启后：订阅原文按订阅落盘，由内核自己解析节点（不经应用逐字段重写），'
-                  + '新协议/新字段不会因为应用不认识而丢失；跨订阅重名的订阅会自动退回内联方式，'
-                  + '保证同一名字不会在延迟和测速里互相覆盖。默认关闭（全部节点由应用侧生成，'
-                  + '同样保留订阅原文里的字段），需要尝鲜内核解析时可手动打开。')
-                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-              }.width('100%')
+            }
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+
+            // ── 订阅转换（2026-10-22 用户要求：非 Clash 订阅 → mihomo 订阅）──
+            Column({ space: 8 }) {
+              Row() {
+                Column({ space: 3 }) {
+                  Text('订阅转换').fontSize(14).fontWeight(FontWeight.Bold)
+                    .fontColor(TunBoxColors.textPrimary).width('100%')
+                  Text('粘贴分享链接（单条 / 一行一条 / 整体 base64），转换成 mihomo 配置并导出为 YAML 文件；'
+                    + '保存位置由你选择，内容不会上传。')
+                    .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                Text('打开').fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.primary)
+                  .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+                  .borderRadius(12)
+                  .backgroundColor(TunBoxColors.primaryLight)
+                  .onClick(() => { this.subConvertDialog.open(); })
+              }.width('100%').alignItems(VerticalAlign.Center)
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -674,6 +702,21 @@ export struct SettingsView {
                       .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
                       .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
                   }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                  if (this.canDeleteAsset(asset.id)) {
+                    Text('删除')
+                      .fontSize(13)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor(asset.ready ? TunBoxColors.danger : TunBoxColors.textMuted)
+                      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+                      .borderRadius(12)
+                      .backgroundColor(TunBoxColors.surfaceCard)
+                      .border({ width: 1, color: TunBoxColors.cardBorder })
+                      .onClick(() => {
+                        if (this.geoUpdatingId.length === 0) {
+                          this.deleteAsset(asset.id);
+                        }
+                      })
+                  }
                   Text(this.geoUpdatingId === asset.id ? '更新中…' : '更新')
                     .fontSize(13)
                     .fontWeight(FontWeight.Bold)
@@ -757,7 +800,7 @@ export struct SettingsView {
           .padding({
             left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 24
           })
-        }
+        }.edgeEffect(EdgeEffect.Spring)
         .width('100%').layoutWeight(1)
         .scrollBar(BarState.Off)
         .align(Alignment.Top)
@@ -784,6 +827,144 @@ export struct SettingsView {
  * 路由兼容入口（2026-10-17 UI 重构）：设置页内容已抽为 SettingsView，
  * 底部页签（MainPage）直接挂 SettingsView；外部深链仍走本 @Entry 页。
  */
+
+/**
+ * 订阅转换弹窗（2026-10-22 用户要求：**转换结果直接导出 YAML 文件**）。
+ *
+ * 只做两件事：① 把粘贴进来的分享链接（单条 / 多行 / 整体 base64）转成 mihomo YAML；
+ * ② 转换成功后立刻弹系统文件选择器，让用户自己选保存位置（与「导出备份」同一套交互）。
+ * 不再生成 `127.0.0.1` 的本地订阅链接 —— 用户要的是文件。
+ */
+@CustomDialog
+struct SubConvertDialog {
+  controller?: CustomDialogController;
+  @State input: string = '';
+  @State busy: boolean = false;
+  /** 转换成功后的提示（节点数 / 保存位置） */
+  @State summary: string = '';
+  @State errorText: string = '';
+
+  /**
+   * 输入解析：既可以是**订阅链接**（http/https，拉下来再转），也可以是
+   * **分享链接文本**（单条 / 多行 / 整体 base64）。返回可直接转换的正文。
+   *
+   * 走的是与「导入订阅」完全相同的拉取链路：UA 链、20s 超时、8MB 上限、
+   * 明文 http 闸门（设置页开关），没有第二套网络实现。
+   */
+  private async resolveSource(): Promise<string> {
+    const text = this.input.trim();
+    // 用 startsWith 而不是正则字面量：正则里的 `//` 会让逐字符配平检查（以及部分
+    // 语法高亮/静态检查）把后半行当成注释，出现过误报「括号不配平」。
+    const lower = text.toLowerCase();
+    const isHttpUrl = lower.startsWith('http://') || lower.startsWith('https://');
+    if (!isHttpUrl) {
+      return text;
+    }
+    const settings = await SettingsService.load();
+    const insecureAllowed: boolean = settings.allowInsecureSubscriptionHttp;
+    const fetched = await SubscriptionFetchPolicy.fetch(text, '', '', insecureAllowed, '');
+    return fetched.body;
+  }
+
+  /** 转换 → 系统文件选择器保存 → 写盘（用户取消就什么都不做） */
+  private async convertAndSave(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
+    this.busy = true;
+    this.errorText = '';
+    this.summary = '';
+    try {
+      const body = await this.resolveSource();
+      if (body.trim().length === 0) {
+        this.errorText = '没有拿到内容：请检查订阅链接是否可用，或直接粘贴分享链接';
+        return;
+      }
+      // 已经是 Clash 配置：原样导出（不重新序列化，字段一个不丢）
+      let yaml = body;
+      let count = 0;
+      let skipped = 0;
+      if (!ProfileConfigMerger.isKernelLoadableConfig(body)) {
+        // 非 Clash（base64 / 分享链接列表）→ 与订阅解析同一条转换实现
+        const converted = SubConverter.convert(body);
+        if (!converted.ok) {
+          this.errorText = '无法识别内容：既不是 Clash 配置，也解析不出节点链接';
+          return;
+        }
+        yaml = converted.proxiesYaml;
+        count = converted.count;
+      } else {
+        const merged = ProfileConfigMerger.merge('a: 1', body);
+        count = merged.profileProxyItems;
+      }
+      const stat = new Date();
+      const stamp = `${stat.getFullYear()}${String(stat.getMonth() + 1).padStart(2, '0')}`
+        + `${String(stat.getDate()).padStart(2, '0')}-${String(stat.getHours()).padStart(2, '0')}`
+        + `${String(stat.getMinutes()).padStart(2, '0')}`;
+      const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
+      const opts = new picker.DocumentSaveOptions();
+      opts.newFileNames = [`TunBox订阅-${stamp}.yaml`];
+      opts.fileSuffixChoices = ['YAML 文件|.yaml'];
+      const uris = await docPicker.save(opts);
+      if (uris.length === 0) {
+        this.summary = '已取消保存';
+        return;
+      }
+      const file = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(file.fd, yaml);
+      } finally {
+        fs.closeSync(file);
+      }
+      const slash = uris[0].lastIndexOf('/');
+      const savedName = slash >= 0 ? uris[0].substring(slash + 1) : 'YAML 文件';
+      this.summary = `✓ 已保存 ${count} 个节点到 ${savedName}`;
+      AppLogger.info('SubConvertDialog', `converted yaml saved: nodes=${count} uri=${uris[0]}`);
+    } catch (e) {
+      this.errorText = '转换失败，请重试';
+      AppLogger.warn('SubConvertDialog', `convert/save failed: ${AppLogger.errText(e)}`);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  build() {
+    Column({ space: 10 }) {
+      Text('订阅转换').fontSize(16).fontWeight(FontWeight.Bold)
+        .fontColor(TunBoxColors.textPrimary).width('100%')
+      Text('粘贴订阅链接（非 Clash 的 v2ray/base64 订阅也可以），或直接粘贴分享链接（一行一条、整体 base64 都行）；'
+        + '转换完弹保存位置，由你决定存在哪（不上传任何内容）。')
+        .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+      TextArea({ placeholder: 'https://… 订阅链接，或 vless://… / ss://…（一行一条）、整段 base64', text: this.input })
+        .onChange((v: string): void => { this.input = v; })
+        .height(132).borderRadius(8).fontSize(12)
+        .backgroundColor(TunBoxColors.surfaceSubtle)
+        .borderWidth(1).borderColor(TunBoxColors.cardBorder)
+        .fontColor(TunBoxColors.textPrimary)
+      if (this.summary.length > 0) {
+        Text(this.summary).fontSize(11).fontColor(TunBoxColors.success).width('100%')
+      }
+      if (this.errorText.length > 0) {
+        Text(this.errorText).fontSize(11).fontColor(TunBoxColors.warning).width('100%')
+      }
+      Row({ space: 8 }) {
+        Button('返回').layoutWeight(1).borderRadius(8)
+          .backgroundColor(TunBoxColors.surfaceSubtle).fontColor(TunBoxColors.textPrimary).fontSize(13)
+          .onClick(() => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+          })
+        Button(this.busy ? '转换中…' : '转换并保存').layoutWeight(1).borderRadius(8)
+          .backgroundColor(TunBoxColors.primary).fontColor(Color.White).fontSize(13)
+          .onClick(() => { this.convertAndSave(); })
+      }.width('100%').margin({ top: 2 })
+    }
+    .padding(20)
+    .borderRadius(20)
+  }
+}
+
 @Entry
 @Component
 struct SettingsPage {

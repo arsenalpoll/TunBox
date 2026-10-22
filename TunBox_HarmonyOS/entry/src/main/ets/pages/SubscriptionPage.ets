@@ -20,7 +20,11 @@ import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPo
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
+import { ClashApiService } from '../commons/services/ClashApiService';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { ProfileStore } from '../commons/flclash/ProfileStore';
+import { CoreCatalogService } from '../commons/flclash/CoreCatalogService';
+import { CoreNodeBridge } from '../commons/flclash/CoreNodeBridge';
 import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
 import { effectiveTestUrl } from '../commons/latency/LatencyProbe';
 
@@ -118,8 +122,10 @@ struct ImportDialog {
             })
         }.width('100%').margin({ top: 2 })
       } else if (this.mode === 'url') {
-        Text('输入 Clash 订阅链接，或单节点链接（一行一个可批量导入）：').fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
-        TextArea({ placeholder: 'https://... 或 vless://...（一行一个）', text: this.urlText })
+        // 用户口径（2026-10-22）：这个入口只收订阅链接，单节点链接不再从这里导入
+        // （单节点要走「设置 → 订阅转换」或节点编辑页），文案不要再提 vless/ss。
+        Text('输入 Clash 订阅链接：').fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
+        TextArea({ placeholder: 'https://...（Clash 订阅链接）', text: this.urlText })
           .onChange((v: string) => { this.urlText = v; })
           .height(88).borderRadius(8).fontSize(13)
           .backgroundColor(TunBoxColors.surfaceSubtle)
@@ -319,9 +325,32 @@ export struct SubscriptionPage {
   @State subs: Subscription[] = [];
   @State expandedIds: string[] = [];
   @State activeSubId: string = '';
+  /**
+   * 内核节点视图（FlClash 同构）：当前 Profile 的节点清单来自内核 `/proxies`，
+   * 而不是 App 侧解析表。为空时回落旧解析表（离线/内核未起）。
+   */
+  @State coreNodes: ProxyNode[] = [];
+  /** `coreNodes` 是哪份 profile 的目录（空 = 未知，不能用它算数量） */
+  private coreNodesProfileId: string = '';
+  /** 最近一次 activateProfile 的目标与时间（防抖用） */
+  private activatedId: string = '';
+  private activatedAt: number = 0;
   @State activeNodeId: string = '';
   /** 自动选点模式（manual 手动固定 / auto 内核 smart 优选），与设置页同一份持久化 */
   @State autoSelectMode: string = AutoSelectModes.MANUAL;
+  /**
+   * 内核 smart 选点模型（Model.bin）是否可用。
+   *
+   * 用户口径（2026-10-22）：模型**不随包内置、也不在启动代理后自动下载**；
+   * 没有模型时订阅页顶部的「自动选择 · 内核智能优选」整块隐藏 —— 大部分用户
+   * 用不到自动优选，留一个点不动的入口只会制造疑问。
+   */
+  @State smartModelReady: boolean = false;
+  /**
+   * 模型删除信号：设置页删除 Model.bin 后自增，这里跟着重算入口是否显示。
+   * （@State 不会被别的页面改动，必须靠 AppStorage 信号驱动重渲染。）
+   */
+  @StorageLink('smart_model_seq') smartModelSeq: number = 0;
   /** 节点排布列数（1=单列 2=双列），用户在订阅分组展开区手动切换，选择持久化 */
   @State nodeColumns: number = 1;
   @State latencyTick: number = 0;
@@ -441,9 +470,14 @@ export struct SubscriptionPage {
     await SettingsService.init(ctx);
     await this.service.init(ctx);
     this.settings = await SettingsService.load();
-    this.activeSubId = this.settings.preferredNodeSubscriptionId;
+    // 当前 Profile 是唯一真源（FlClash currentProfileId）；旧偏好只作回落。
+    const currentProfile = ProfileStore.currentId();
+    this.activeSubId = currentProfile.length > 0
+      ? currentProfile : this.settings.preferredNodeSubscriptionId;
     this.activeNodeId = this.settings.preferredNodeId;
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
+    // 只查模型是否已就位（本地文件判断，不播种、不下载、不联网）
+    this.smartModelReady = ConnectionOrchestrator.instance().isSmartModelAvailable();
     this.nodeColumns = await SettingsService.loadNodeColumns();
     this.reload();
     if (!this.latencyBound) {
@@ -453,7 +487,11 @@ export struct SubscriptionPage {
     // 预热测速通道（真机取证 2026-10-20）：「点了测速要等几秒才开始」的根因是
     // 测速通道的准备（未连接时要拉起 headless 测速内核）。进页面时后台把这段
     // 准备做完，用户点「测速」时通道已热 → 秒开。预热失败不影响任何功能。
-    BackgroundLatencyService.prewarmChannel(ctx).catch((): void => {});
+    // 先预热测速通道（必要时拉起无头内核），就绪后再拉内核节点目录：
+    // 目录是 `/proxies` 的实时数据，内核没起来时拉不到（FlClash 同样要求 core 在线）。
+    BackgroundLatencyService.prewarmChannel(ctx)
+      .then((): void => { this.refreshCoreNodes(); })
+      .catch((): void => {});
   }
 
   private expandedInitialized: boolean = false;
@@ -471,9 +509,12 @@ export struct SubscriptionPage {
         this.expandedIds = [first.id];
       }
     }
-    // 同步活动节点展示
+    // 同步活动节点展示。
+    // ⚠ 影子节点（core:<name>）在解析表里找不到是**正常**的（节点来自内核），
+    // 以前这里会回落到 nodes[0] 并把 activeSubId 覆盖成它的订阅 —— 于是「使用中」
+    // 徽标与展开的卡片跑到了别的订阅上（用户实锤：吹雪云卡片显示 oc2 的节点）。
     const node = this.service.findNode(this.activeNodeId);
-    if (node === null && this.service.nodes.length > 0) {
+    if (node === null && !this.activeNodeId.startsWith('core:') && this.service.nodes.length > 0) {
       this.activeNodeId = this.service.nodes[0].id;
       this.activeSubId = this.service.nodes[0].subscriptionId;
     }
@@ -646,13 +687,128 @@ export struct SubscriptionPage {
    * 聚合口径与结论文案都归测速内核（LatencyStore.summarize），
    * 这里只取结论那一行；节点页与订阅页共用同一句文案。
    */
+  /** 「自动选择」入口是否该显示：模型必须真的在盘上（删掉就隐藏，用户要求） */
+  private smartModelOn(): boolean {
+    return ConnectionOrchestrator.instance().isSmartModelAvailable();
+  }
+
+  private diagCache: Map<string, string> = new Map<string, string>();
+  private diagCacheTick: number = -1;
+
+  /**
+   * 组级诊断文案（带缓存）。
+   *
+   * build 里每张卡片会问两次（判空 + 取文本），而 groupDiagnosis 要遍历整份
+   * 测速结果表 —— 不缓存的话「展开一次」等于把全表扫两遍 × 卡片数。
+   * 缓存以 latencyTick 为版本：测速结果没变就直接吃缓存。
+   */
   private subDiagnosisText(subId: string): string {
+    if (this.diagCacheTick !== this.latencyTick) {
+      this.diagCache.clear();
+      this.diagCacheTick = this.latencyTick;
+    }
+    const cached = this.diagCache.get(subId);
+    if (cached !== undefined) {
+      return cached;
+    }
     const nodes: ProxyNode[] = this.service.nodesOf(subId);
     const names: string[] = [];
     for (const node of nodes) {
       names.push(node.name);
     }
-    return LatencyStoreBridge.groupDiagnosis(names);
+    const text = LatencyStoreBridge.groupDiagnosis(names);
+    this.diagCache.set(subId, text);
+    return text;
+  }
+
+  /**
+   * 订阅头部点击（FlClash 语义）：**切换当前 Profile** + 展开。
+   *
+   * 同一时刻只有一份 profile 生效（FlClash 的 currentProfileId），切换后按
+   * `applyProfileDebounce` 等价语义热重载内核配置（VPN 不断开）。
+   */
+  /**
+   * 把某订阅设为当前 Profile，并**等内核配置真的切过去**再返回。
+   *
+   * FlClash 的 profile 切换是原子的：App 侧 currentProfileId 改了、内核也换成新配置，
+   * 之后再读 `/proxies` 才是新订阅的节点。少了这一步就会出现
+   * 「界面显示 A 订阅的卡片、节点却是 B 订阅的」/「测速完成但全是 --」。
+   */
+  private async activateProfile(id: string): Promise<void> {
+    if (id.length === 0 || id === DIRECT_GROUP_ID) {
+      return;
+    }
+    // FlClash 语义：切 profile 的前提是这份 profile **已经有内容**（原文落盘）。
+    // 没落盘就切过去，内核拿不到基底会退回「全部订阅合并」的旧配置，
+    // 于是这个订阅里全是别人的节点（真机实锤：飞鸟云刷新超时后出现另外三个订阅的节点）。
+    if (!ProfileStore.exists(id)) {
+      // 没有原文：先自动拉一次（FlClash `checkAndUpdateAndCopy` 同语义），
+      // 拉不到就不切 —— 绝不能带着空基底切过去。
+      this.showToast('该订阅还没有内容，正在刷新…');
+      const refreshed = await this.service.refreshSubscription(id);
+      this.reload();
+      if (!ProfileStore.exists(id)) {
+        this.showToast(refreshed.status === SubscriptionRefreshStatus.OK
+          ? '刷新成功但没有解析出可用节点'
+          : '刷新失败，请开启代理再次刷新');
+        return;
+      }
+    }
+    // 防抖：同一 id 在 800ms 内重复调用（onPageShow + bootstrap + 点击 会同时触发）
+    // 会重复拉内核目录、甚至把 profile 又切回去，界面表现为节点一直闪。
+    const now = Date.now();
+    if (this.activatedId === id && now - this.activatedAt < 800) {
+      return;
+    }
+    this.activatedId = id;
+    this.activatedAt = now;
+    const previous = ProfileStore.currentId();
+    if (previous !== id) {
+      await ProfileStore.setCurrent(id);
+      this.activeSubId = id;
+      this.coreNodes = [];
+      this.coreNodesProfileId = '';
+      this.latencyTick = this.latencyTick + 1;
+    }
+    try {
+      await ConnectionOrchestrator.instance().ensureProfileApplied('subscription-page');
+    } catch (e) {
+      AppLogger.warn(TAG, `ensure profile applied failed: ${AppLogger.errText(e)}`);
+    }
+    // 配置就绪后再拉内核目录，保证显示的就是这份 profile 的节点
+    let api: ClashApiService | null = null;
+    try {
+      api = await ConnectionOrchestrator.instance().ensureLatencyApi();
+    } catch (e) {
+      api = null;
+    }
+    await CoreCatalogService.refresh(api, true);
+    const nodes = CoreCatalogService.flattenNodes(this.settings.proxyMode);
+    this.coreNodes = CoreNodeBridge.toProxyNodes(nodes);
+    // 只有内核确认已切到该 profile 时，这份目录才算它的
+    const appliedNow = ConnectionOrchestrator.instance().appliedProfile();
+    this.coreNodesProfileId = appliedNow === id ? id : '';
+    this.latencyTick = this.latencyTick + 1;
+    AppLogger.info(TAG, `profile activated: id=${id} coreNodes=${this.coreNodes.length} `
+      + `previous=${previous}`);
+  }
+
+  /**
+   * 订阅头部点击：**先展开/收起，再后台切 Profile**。
+   *
+   * 原来的写法把 toggleOpen 挂在 activateProfile().finally 上，等于「点一下要等
+   * 内核 reloadFromPath 跑完（实测 1~5s）才展开」，用户感知就是卡死几秒。
+   * 展开是纯 UI 操作，必须同步完成；切 profile 是后台副作用，失败只打日志。
+   * 另外点已经激活的订阅不该再重载内核（每次重载都会重连内核、清空目录）。
+   */
+  private useProfileAndToggle(id: string): void {
+    this.toggleOpen(id);
+    if (ProfileStore.currentId() === id) {
+      return;
+    }
+    this.activateProfile(id).catch((e: Object): void => {
+      AppLogger.warn(TAG, `activate profile failed: ${AppLogger.errText(e)}`);
+    });
   }
 
   private toggleOpen(id: string): void {
@@ -675,12 +831,45 @@ export struct SubscriptionPage {
     return this.service.findNode(this.activeNodeId);
   }
 
-  private totalNodes(): number {
-    let n = 0;
-    for (const s of this.subs) {
-      n += this.service.nodesOf(s.id).length;
+  /**
+   * 内核目录能否用来渲染**当前订阅**。
+   *
+   * 三个条件同时成立才算：内核生效的 profile == 当前 profile，目录非空，
+   * 且目录归属（若已知）也是这份 profile。任何一条不满足就回落解析表 ——
+   * 三处展示（概览候选数 / 卡片节点数 / 节点列表）必须用同一个判定，
+   * 否则会出现「卡片 24、候选 22」这种自相矛盾的数字。
+   */
+  private coreNodesUsable(): boolean {
+    const current = ProfileStore.currentId();
+    if (current.length === 0 || this.coreNodes.length === 0) {
+      return false;
     }
-    return n;
+    const applied = ConnectionOrchestrator.instance().appliedProfile();
+    if (applied !== current) {
+      return false;
+    }
+    return this.coreNodesProfileId.length === 0 || this.coreNodesProfileId === current;
+  }
+
+  private totalNodes(): number {
+    // FlClash 同构：只有当前 Profile 生效 ⇒ 候选数就是**当前订阅**的节点数。
+    // 绝不跨订阅求和（旧实现会回落到「所有订阅节点相加」，切换中出现怪数字）。
+    const current = ProfileStore.currentId();
+    if (current.length === 0) {
+      return 0;
+    }
+    if (this.coreNodesUsable()) {
+      return this.coreNodes.length;
+    }
+    return this.service.nodesOf(current).length;
+  }
+
+  /** 单个订阅卡片的节点数：当前 profile 用内核目录，其它用解析表。 */
+  private nodeCountOf(sub: Subscription): number {
+    if (sub.id === ProfileStore.currentId() && this.coreNodesUsable()) {
+      return this.coreNodes.length;
+    }
+    return this.service.nodesOf(sub.id).length;
   }
 
   /**
@@ -691,6 +880,9 @@ export struct SubscriptionPage {
    * 8 字符的土办法，看不出 REALITY，且未知协议直接显示空串。
    */
   private protoOf(node: ProxyNode): string {
+    if (CoreNodeBridge.isShadow(node)) {
+      return CoreNodeBridge.protocolLabel(node);
+    }
     return NodeProtocolPolicy.fromNode(node).display();
   }
 
@@ -710,14 +902,38 @@ export struct SubscriptionPage {
    * 合并通知）即重渲染重排，用户实时看到快节点「冒泡」到前面。
    */
   private nodesSortedByLatency(subId: string): ProxyNode[] {
-    const arr: ProxyNode[] = this.service.nodesOf(subId).slice();
-    const key = (node: ProxyNode): number => {
-      const v = LatencyStoreBridge.latencyFor(node.name);
-      return (v === null || v < 0) ? Number.MAX_SAFE_INTEGER : v;
-    };
-    // 稳定排序：ArkTS sort 对相同 key 保持插入序（ECMAScript 规范）
-    arr.sort((a: ProxyNode, b: ProxyNode): number => key(a) - key(b));
-    return arr;
+    // FlClash 同构：**只有内核里真正生效的那份 profile** 才用内核目录渲染。
+    // 用 currentId 判断会把「刚设成 current、但内核还没换过来」的订阅渲染成
+    // 上一份订阅的节点（用户实锤：吹雪云卡片里显示 oc2 的节点）。
+    // 三重一致才用内核目录：内核里生效的 profile == 当前 profile == 这张卡片。
+    // 任何一处不一致都回落该订阅自己的解析表 —— 宁可显示旧数据，也绝不把别人的节点画进来。
+    const source: ProxyNode[] = (subId === ProfileStore.currentId() && this.coreNodesUsable())
+      ? this.coreNodes : this.service.nodesOf(subId);
+    const arr: ProxyNode[] = source.slice();
+    return CoreNodeBridge.sortByDelay(arr, (name: string): number | null => {
+      return LatencyStoreBridge.latencyFor(name);
+    });
+  }
+
+  /** 从内核 `/proxies` 拉一次节点目录（只读渲染用；失败保留上一份）。 */
+  private refreshCoreNodes(): void {
+    const api = ConnectionOrchestrator.instance().api;
+    CoreCatalogService.refresh(api, false).then((model): void => {
+      if (model === null) {
+        return;
+      }
+      const nodes = CoreCatalogService.flattenNodes(this.settings.proxyMode);
+      this.coreNodes = CoreNodeBridge.toProxyNodes(nodes);
+      // 归属用**内核真正生效**的那份 profile（不是 current）：
+      // 切换过程中 current 已经变了、内核还是旧的，用 current 标归属会把旧节点
+      // 记到新订阅头上（界面上就是「当前订阅是 A、候选数却是 B 的」）。
+      this.coreNodesProfileId = ConnectionOrchestrator.instance().appliedProfile();
+      this.latencyTick = this.latencyTick + 1;
+      AppLogger.info(TAG, `core catalog nodes=${this.coreNodes.length} `
+        + `applied=${this.coreNodesProfileId} current=${ProfileStore.currentId()}`);
+    }).catch((e: Object): void => {
+      AppLogger.warn(TAG, `core catalog refresh failed: ${AppLogger.errText(e)}`);
+    });
   }
 
   private async selectNode(node: ProxyNode): Promise<void> {
@@ -729,10 +945,14 @@ export struct SubscriptionPage {
       AppLogger.info(TAG, `manual node pick (${node.name}); auto mode disabled`);
     }
     this.activeNodeId = node.id;
-    this.activeSubId = node.subscriptionId;
+    if (node.subscriptionId.length > 0) {
+      this.activeSubId = node.subscriptionId;
+    }
     this.settings.preferredNodeId = node.id;
-    this.settings.preferredNodeSubscriptionId = node.subscriptionId;
-    this.settings.selectedSubscriptionId = node.subscriptionId;
+    if (node.subscriptionId.length > 0) {
+      this.settings.preferredNodeSubscriptionId = node.subscriptionId;
+      this.settings.selectedSubscriptionId = node.subscriptionId;
+    }
     await SettingsService.save(this.settings);
     // 已连接时完整重连让新节点即时生效；未连接时仅保存选择。
     const didRestart = await ConnectionOrchestrator.instance()
@@ -796,12 +1016,19 @@ export struct SubscriptionPage {
       // 就绪、开始发探测了再切到「正在测速…」。旧实现只提示「正在测速…」，
       // 用户看到的是「点了没反应，过几秒才出结果」（真机取证 2026-10-20）。
       this.showToast('准备测速通道…');
+      // 先把该订阅设为当前并把内核切过去（FlClash：测速测的永远是当前 profile）
+      await this.activateProfile(subId);
       const progress = await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId,
         (): void => { this.showToast('正在测速…'); });
       // 控制器过载必须有界面出口：过载路径下引擎**故意不给节点写结论**（保持未测），
       // 用户看到的会是「测速完成 + 一堆 --」。不单独说明就等于「跑完了没解释」——
       // 正是 0.4.4 过载鉴别要消灭的现象。文案要与「通道不可用」区分：通道是好的。
-      if (progress !== null && progress.coreOverloaded > 0) {
+      if (progress !== null && progress.total === 0) {
+        // 0 个目标绝不能报「测速完成」——真机实证：测速内核被系统回收后
+        // `/proxies` 拿不到任何节点，批次 0 个目标立即结束，用户看到
+        // 「点一下就说测速完成、节点全是 --」，误以为功能坏了。
+        this.showToast('没有可测速的节点：测速内核未就绪或该订阅没有节点，请稍后重试');
+      } else if (progress !== null && progress.coreOverloaded > 0) {
         this.showToast(`✓ 测速完成（${progress.coreOverloaded} 个节点控制器过载未测，通道正常，可重测）`);
       } else {
         this.showToast('✓ 测速完成');
@@ -810,6 +1037,7 @@ export struct SubscriptionPage {
       this.showToast('测速失败，请重试');
     } finally {
       this.speedTestingIds = this.speedTestingIds.filter((x: string) => x !== subId);
+      this.refreshCoreNodes();
     }
   }
 
@@ -847,7 +1075,7 @@ export struct SubscriptionPage {
         this.showToast('通道不可用，本轮结果无效，节点已恢复未测');
         return;
       }
-      let msg = `内核组测完成：可用 ${progress.measured} / 超时 ${progress.timeout}`;
+      let msg = `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout}`;
       if (progress.failed > 0) {
         msg += ` / 未生效 ${progress.failed}`;
       }
@@ -858,6 +1086,7 @@ export struct SubscriptionPage {
     } finally {
       this.groupTesting = false;
       this.latencyTick = this.latencyTick + 1;
+      this.refreshCoreNodes();
     }
   }
 
@@ -877,7 +1106,14 @@ export struct SubscriptionPage {
       if (result.status === SubscriptionRefreshStatus.OK) {
         this.showToast(`✓ 已刷新「${sub.name}」及节点测速`);
       } else {
-        this.showToast(`${sub.name}：${result.userText('刷新失败')}`);
+        // 只有**网络类**失败才提示开代理；内容类失败（4 字节响应 / 非订阅地址 /
+        // 面板首页）必须说真实原因，否则用户开着代理刷十次也没用。
+        const networkLevel: boolean = result.status === SubscriptionRefreshStatus.NETWORK_ERROR
+          || result.status === SubscriptionRefreshStatus.HTTP_ERROR
+          || result.status === SubscriptionRefreshStatus.RATE_LIMITED;
+        this.showToast(networkLevel
+          ? '刷新失败，请开启代理再次刷新'
+          : (result.message.length > 0 ? result.message : '刷新失败，请检查订阅链接'));
       }
     } finally {
       this.refreshingIds = this.refreshingIds.filter((x) => x !== sub.id);
@@ -914,7 +1150,7 @@ export struct SubscriptionPage {
       } else if (summary.okCount > 0) {
         this.showToast(`部分刷新成功（${summary.okCount} 成功 / ${summary.failCount} 失败）`);
       } else {
-        this.showToast('刷新失败，请检查网络后重试');
+        this.showToast('刷新失败，请检查订阅链接或开启代理后重试');
       }
     } finally {
       this.refreshingIds = [];
@@ -972,7 +1208,9 @@ export struct SubscriptionPage {
       this.reload();
       this.showToast('已添加，正在获取节点…');
       const result = await this.service.refreshSubscription(sub.id);
-      if (result.status === SubscriptionRefreshStatus.OK && result.nodeCount > 0) {
+      if (result.status === SubscriptionRefreshStatus.OK) {
+        // 导入即激活（FlClash：新 profile 成为当前，内核配置跟着切）
+        await this.activateProfile(sub.id);
         const nodes = this.service.nodesOf(sub.id);
         if (nodes.length > 0) {
           await this.selectNode(nodes[0]);
@@ -980,7 +1218,7 @@ export struct SubscriptionPage {
       }
       this.reload();
       this.showToast(result.status === SubscriptionRefreshStatus.OK
-        ? `✓ 订阅成功，获取到 ${result.nodeCount} 个节点` : `已添加，但刷新失败：${result.userText('请稍后重试')}`);
+        ? `✓ 订阅成功，获取到 ${result.nodeCount} 个节点` : '刷新失败，请开启代理再次刷新');
     } catch (e) {
       promptAction.showToast({ message: '添加失败，请检查链接是否有效' });
     }
@@ -1412,6 +1650,7 @@ export struct SubscriptionPage {
 
               // ── 2. 内核智能优选条目（文档 §3.2 第 2 节，整行点击沿用既有切换逻辑）
               //      行尾多一个**内核组测速**按钮（2026-10-22 用户要求：放在智能优选后面）──
+              if (this.smartModelOn()) {
               Column({ space: 0 }) {
                 Row() {
                   // 左：整行可点（切换自动选择）。包一层 Row 而不是把 onClick 挂到外层，
@@ -1435,8 +1674,13 @@ export struct SubscriptionPage {
                             ? TunBoxColors.success : TunBoxColors.textMuted)
                           .margin({ left: 6 })
                       }
-                      Text(`跨订阅自动优选 · 故障毫秒切换 · ${this.totalNodes()} 个候选`)
+                      Text(`当前订阅内自动优选 · 内核 smart 组 · ${this.totalNodes()} 个候选`)
                         .fontSize(11).fontColor(TunBoxColors.textMuted)
+                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                      // 用户要求（2026-10-22）：选点模型不自动下载，必须在解释里说清
+                      // 「什么时候才会有模型」—— 启动代理后由内核更新，无需另找入口。
+                      Text('选点模型：启动代理后更新')
+                        .fontSize(10).fontColor(TunBoxColors.textMuted)
                         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                     }
                     .alignItems(HorizontalAlign.Start)
@@ -1490,6 +1734,7 @@ export struct SubscriptionPage {
               .backgroundColor(TunBoxColors.successTint)
               .border({ width: 1, color: TunBoxColors.successBorder })
               .clip(true)
+              }
 
               // ── 3. 折叠式订阅分组（保留既有展开/收起与行头全部按钮逻辑） ──
               ForEach(this.subs, (sub: Subscription) => {
@@ -1514,7 +1759,7 @@ export struct SubscriptionPage {
                           .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
                           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                           .layoutWeight(1)
-                        if (sub.id === this.activeSubId) {
+                        if (sub.id === ProfileStore.currentId()) {
                           Text('使用中')
                             .fontSize(10).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.success)
                             .padding({ left: 6, right: 6, top: 1, bottom: 1 })
@@ -1557,7 +1802,7 @@ export struct SubscriptionPage {
                             .borderWidth(1)
                             .borderColor(TunBoxColors.danger)
                         }
-                        Text(`${this.service.nodesOf(sub.id).length} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
+                        Text(`${this.nodeCountOf(sub)} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
                           .fontSize(11).fontColor(TunBoxColors.textMuted)
                           .layoutWeight(1)
                           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1591,7 +1836,7 @@ export struct SubscriptionPage {
                   }
                   .width('100%')
                   .padding(14)
-                  .onClick(() => this.toggleOpen(sub.id))
+                  .onClick(() => this.useProfileAndToggle(sub.id))
 
                   // 展开节点区
                   if (this.isOpen(sub.id)) {
@@ -1627,25 +1872,6 @@ export struct SubscriptionPage {
                           Text(this.incompleteHint(sub.id))
                             .fontSize(12)
                             .fontColor(TunBoxColors.textSecondary)
-                            .layoutWeight(1)
-                            .maxLines(4)
-                        }
-                        .width('100%')
-                        .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-                        .borderRadius(10)
-                        .backgroundColor(TunBoxColors.surfaceSubtle)
-                        .borderWidth(1)
-                        .borderColor(TunBoxColors.cardBorder)
-                      }
-                      // 「信息条目已跳过」单独一条（第三类，既不是缺参节点、也不是域名问题）：
-                      if (this.infoHint(sub.id).length > 0) {
-                        Row({ space: 8 }) {
-                          Image($r('app.media.ic_warning'))
-                            .width(15).height(15)
-                            .fillColor(TunBoxColors.textMuted)
-                          Text(this.infoHint(sub.id))
-                            .fontSize(12)
-                            .fontColor(TunBoxColors.textMuted)
                             .layoutWeight(1)
                             .maxLines(4)
                         }
@@ -1726,11 +1952,11 @@ export struct SubscriptionPage {
                 .borderRadius(TunBoxGeometry.cardRadius)
                 .backgroundColor(TunBoxColors.surfaceCard)
                 .border({
-                  width: sub.id === this.activeSubId ? 1.5 : 1,
-                  color: sub.id === this.activeSubId ? TunBoxColors.primary : TunBoxColors.cardBorder
+                  width: sub.id === ProfileStore.currentId() ? 1.5 : 1,
+                  color: sub.id === ProfileStore.currentId() ? TunBoxColors.primary : TunBoxColors.cardBorder
                 })
                 .clip(true)
-              }, (sub: Subscription) => `${sub.id}|${sub.name}|${this.service.nodesOf(sub.id).length}|${sub.lastFetchedAt}|${this.isOpen(sub.id) ? 1 : 0}|${sub.id === this.activeSubId ? 1 : 0}|${this.activeNodeId}|${this.latencyTick}`)
+              }, (sub: Subscription) => `${sub.id}|${sub.name}|${this.nodeCountOf(sub)}|${sub.lastFetchedAt}|${this.isOpen(sub.id) ? 1 : 0}|${sub.id === ProfileStore.currentId() ? 1 : 0}|${this.activeNodeId}`)
 
               if (this.subs.length === 0) {
                 Column({ space: 10 }) {
@@ -1751,7 +1977,7 @@ export struct SubscriptionPage {
             })
           }
           .width('100%')
-        }
+        }.edgeEffect(EdgeEffect.Spring)
         .width('100%').height('100%')
         .scrollBar(BarState.Off)
         .align(Alignment.Top)

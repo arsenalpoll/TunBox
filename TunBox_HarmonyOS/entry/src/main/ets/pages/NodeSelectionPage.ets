@@ -906,7 +906,7 @@ struct NodeSelectionPage {
         + `fail=${summary.failCount} nodes=${summary.nodeCount} lanes=${summary.lanes}`);
       promptAction.showToast({ message: message });
     } catch (e) {
-      promptAction.showToast({ message: '刷新失败，请检查网络' });
+      promptAction.showToast({ message: '刷新失败，请开启代理再次刷新' });
       AppLogger.warn(TAG, `refreshNodes failed: ${AppLogger.errText(e)}`);
     } finally {
       this.refreshing = false;
@@ -1385,6 +1385,11 @@ struct NodeSelectionPage {
     AppLogger.info(TAG, `latency batch done: total=${progress.total} measured=${progress.measured} `
       + `timeout=${progress.timeout} failed=${progress.failed} channel=${progress.channel}`);
     if (this.pageActive) {
+      // 0 个目标不叫「测速完成」：内核被回收/目录为空时批次立即结束。
+      if (progress.total === 0) {
+        promptAction.showToast({ message: '没有可测速的节点：测速内核未就绪，请稍后重试' });
+        return;
+      }
       let msg = `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout}`;
       if (progress.failed > 0) {
         msg += ` / 未生效 ${progress.failed}`;
@@ -1734,7 +1739,7 @@ struct NodeSelectionPage {
                   })
               }, (chip: SubChip) => chip.id + '#' + chip.name)
             }
-          }
+          }.edgeEffect(EdgeEffect.Spring)
           .scrollable(ScrollDirection.Horizontal)
           .scrollBar(BarState.Off)
           .width('100%')
@@ -1867,7 +1872,7 @@ struct NodeSelectionPage {
               }
             }, (groupRow: ProxyGroupRow) => this.groupKey(groupRow.group) + '#'
               + this.expandedGroupKeys.join('|') + '#' + this.latencyTick.toString() + '#' + this.testingName)
-          }
+          }.edgeEffect(EdgeEffect.Spring)
           .layoutWeight(1)
           .padding({ left: 18, right: 18, top: 8, bottom: 20 })
           .scrollBar(BarState.Off)
@@ -1893,7 +1898,7 @@ struct NodeSelectionPage {
                 this.enterSelectMode(row.node.id);
               }))
             }, (row: NodeRow) => row.node.id + '#' + this.latencyTick.toString() + '#' + this.testingName)
-          }
+          }.edgeEffect(EdgeEffect.Spring)
           .layoutWeight(1)
           .padding({ left: 18, right: 18, top: 8, bottom: 20 })
           .scrollBar(BarState.Off)

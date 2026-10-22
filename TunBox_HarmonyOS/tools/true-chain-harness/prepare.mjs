@@ -129,6 +129,7 @@ const FILES = [
   {
     src: 'commons/services/SubscriptionService.ets', out: 'SubscriptionService.ts', map: {
       './SubscriptionQuotaService': './SubscriptionQuotaService.ts',
+      './LocalSubConverter': './LocalSubConverter.ts',
       '@kit.ArkData': './stubs.ts',
       '@kit.AssetStoreKit': './stubs.ts',
       '@kit.ArkTS': './stubs.ts',
@@ -155,6 +156,11 @@ const FILES = [
       '../subscription/UnusableLedger': './UnusableLedger.ts',
       // 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退改走规范解析层
       '../subscription/UriNodeParser': './UriNodeParser.ts',
+      // 2026-10-22（FlClash 同构）：订阅原文落成 profile 文件
+      '../flclash/ProfileStore': './ProfileStore.ts',
+      '../flclash/SubConverter': './SubConverter.ts',
+      '../flclash/CoreCatalogService': './stubs.ts',
+      '../flclash/CoreNodeBridge': './stubs.ts',
     },
   },
   {
@@ -188,6 +194,37 @@ const FILES = [
       './RawProxyYaml': './RawProxyYaml.ts',
       // 2026-10-20（A12c）：测速地址唯一真源
       '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
+    },
+  },
+  // 2026-10-22：订阅转换（设置页把分享链接转成 mihomo 订阅）—— 纯逻辑，真源直跑
+  {
+    src: 'commons/services/LocalSubConverter.ets', out: 'LocalSubConverter.ts', map: {
+      '@kit.ArkData': './stubs.ts',
+      '@kit.ArkTS': './stubs.ts',
+      '../models/ProxyNode': './ProxyNode.ts',
+      './ClashConfigGenerator': './ClashConfigGenerator.ts',
+      '../subscription/UriNodeParser': './UriNodeParser.ts',
+      '../utils/AppLogger': './stubs.ts',
+    },
+  },
+  // ── 2026-10-22：FlClash 1:1 复刻（订阅原文 = profile；节点目录来自内核）──
+  {
+    src: 'commons/flclash/ProfileConfigMerger.ets', out: 'ProfileConfigMerger.ts', map: {
+      '../services/YamlMerger': './YamlMerger.ts',
+      '../utils/AppLogger': './stubs.ts',
+    },
+  },
+  // convertProxies（mihomo ConvertsV2Ray 的 ArkTS 移植；零 import）
+  { src: 'commons/flclash/SubConverter.ets', out: 'SubConverter.ts', map: {} },
+  // 内核目录解析（零 import，纯函数）
+  { src: 'commons/flclash/CoreCatalog.ets', out: 'CoreCatalog.ts', map: {} },
+  {
+    src: 'commons/flclash/ProfileStore.ets', out: 'ProfileStore.ts', map: {
+      '@kit.ArkData': './stubs.ts',
+      '@kit.CoreFileKit': './stubs.ts',
+      '@kit.ArkTS': './stubs.ts',
+      '../utils/AppLogger': './stubs.ts',
+      './ProfileConfigMerger': './ProfileConfigMerger.ts',
     },
   },
 ];

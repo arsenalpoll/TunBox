@@ -19,6 +19,12 @@
  *   任一步失败保留明文并记录，绝不丢数据。迁移幂等（重跑只重写加密层，不清明文）。
  */
 import { RawBodyCache } from './RawProxyYaml';
+// FlClash 同构：订阅原文 = profile 文件（App 侧不再把节点当作权威来源）
+import { ProfileStore } from '../flclash/ProfileStore';
+// convertProxies（mihomo convert.ConvertsV2Ray 的 ArkTS 移植）：base64 / URI 列表订阅
+import { SubConverter } from '../flclash/SubConverter';
+import { CoreCatalogService } from '../flclash/CoreCatalogService';
+import { CoreNodeBridge } from '../flclash/CoreNodeBridge';
 import { preferences } from '@kit.ArkData';
 import { asset } from '@kit.AssetStoreKit';
 import { util } from '@kit.ArkTS';
@@ -41,6 +47,7 @@ import { ProxyProviderEntry, ProxyProviderParser } from './ProxyProviderParser';
 import {
   RawProviderEntry, RawProviderStates, RawProviderStatus, RawSubscriptionStore, RawWriteResult
 } from './RawSubscriptionStore';
+import { LocalSubConverter } from './LocalSubConverter';
 import {
   CredentialStore, CredentialMigrationReport, NodeCredentialValues, SubscriptionCredentialSource,
   CRED_PREF_NAME, NODE_CRED_FIELDS, baseNodeName, nodeAlias, nodeCredentialId, setCredentialLogger, subAlias
@@ -343,6 +350,13 @@ export class SubscriptionService {
   private async doInit(context: Context): Promise<void> {
     // 双轨落盘仓先就位（cacheDir 与内核 HomeDir 一致，见 RawSubscriptionStore 顶部注释）
     RawSubscriptionStore.init(context.cacheDir);
+    // FlClash 同构：订阅原文落盘目录（filesDir/profiles/<id>.yaml）+ 当前 profile
+    await ProfileStore.init(context);
+    // convertProxies：非 YAML 订阅（整体 base64 / 逐行分享链接）转成 proxies 列表
+    ProfileStore.attachConverter((text: string): string => SubConverter.convert(text).proxiesYaml);
+    // 本地转换订阅（设置页「订阅转换」产出的伪链接由它渲染）：必须在任何 fetch 之前就绪，
+    // 否则首次刷新会读到空仓 → 被当成「一条不存在」的订阅
+    await LocalSubConverter.init(context);
     this.store = await preferences.getPreferences(context, PREF_NAME);
     this.subscriptions = [];
     this.nodes = [];
@@ -424,6 +438,26 @@ export class SubscriptionService {
     // 与三家一致：订阅原文（profile 文件）落在应用私有目录，冷启动直接读文件，
     // 不联网、不依赖用户先刷新一次。读失败就退回解析发射，不会让配置变坏。
     this.loadRawBodiesIntoCache();
+    // ── current profile 自愈（2026-10-22 真机）──────────────────────────
+    // 刷新失败/写盘中断会让 current 指向一个**没有 profile 文件**的订阅，
+    // 此时生成配置拿不到基底、回落到「全部订阅合并」，界面顶部却写着这个订阅名，
+    // 用户看到的就是「飞鸟云里全是另外三个订阅的节点」。
+    // 启动时校正一次：current 不可用 → 落到第一个「已落盘且启用」的订阅。
+    try {
+      const currentProfile = ProfileStore.currentId();
+      if (currentProfile.length === 0 || !ProfileStore.exists(currentProfile)) {
+        for (const candidate of this.subscriptions) {
+          if (candidate.id !== DIRECT_GROUP_ID && candidate.enabled
+            && ProfileStore.exists(candidate.id)) {
+            await ProfileStore.setCurrent(candidate.id);
+            AppLogger.info(TAG, `current profile self-healed: ${currentProfile || '<none>'} -> ${candidate.id}`);
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      AppLogger.warn(TAG, `current profile self-heal failed: ${AppLogger.errText(e)}`);
+    }
     AppLogger.info(TAG, `[perf] stage1 credentials deferred to background at +${Date.now() - t0}ms`);
 
     // 4) 明文清扫：加密层验证通过的记录删除 preferences 明文字段
@@ -1135,6 +1169,16 @@ export class SubscriptionService {
    * 返回是否发生了改名。
    */
   ensureUniqueNames(): boolean {
+    // ── FlClash 同构（2026-10-22）：**不改节点名** ─────────────────────────
+    // FlClash 从不重命名节点：内核加载的原文名就是 App 显示/选择/测速用的名字。
+    // 跨订阅去重改名会让「App 名字」与「内核名字」分叉，`PUT /proxies/{group}`
+    // 与 `GET /proxies/{name}/delay` 全部 404（真机表现为「点了没反应 / 全超时」）。
+    // 重名由订阅原文自身负责（内核会整份拒载，与 FlClash 行为一致）。
+    return false;
+  }
+
+  /** 旧实现（保留说明，勿恢复）：按列表顺序给重名节点追加 " (n)" 后缀。 */
+  private legacyEnsureUniqueNames(): boolean {
     const used = new Set<string>();
     let changed = false;
     for (const n of this.nodes) {
@@ -2082,6 +2126,10 @@ export class SubscriptionService {
     s.sortOrder = this.subscriptions.length;
     this.subscriptions.push(s);
     await this.persist();
+    // FlClash 同构：第一个订阅成为当前 Profile（同一时刻只有一份配置生效）
+    if (ProfileStore.currentId().length === 0) {
+      await ProfileStore.setCurrent(s.id);
+    }
     AppLogger.info(TAG, `subscription added: ${s.name}`);
     return s;
   }
@@ -2102,6 +2150,11 @@ export class SubscriptionService {
     // 「不再需要即删干净」：删订阅即删其 provider 落盘原文与登记项
     RawSubscriptionStore.remove(id);
     RawBodyCache.drop(id);
+    ProfileStore.remove(id);
+    if (ProfileStore.currentId() === id) {
+      const next = this.subscriptions.find((x) => x.enabled);
+      await ProfileStore.setCurrent(next !== undefined ? next.id : '');
+    }
     await this.persist();
     // 分阶段计时（真机排查用）：删除慢时据此区分"落盘"与"其余"
     AppLogger.info(TAG, `[perf] subscription removed at +${Date.now() - t0}ms`);
@@ -2117,6 +2170,13 @@ export class SubscriptionService {
     this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== snapshot.rawSubscriptionId)
       .concat(snapshot.proxyGroups);
     this.undoSnapshot = null;
+    // FlClash 同构：撤销删除时把 profile 文件一起写回（否则「恢复」后没有可运行配置）
+    if (snapshot.rawSubscriptionId.length > 0 && snapshot.rawBody.length > 0) {
+      ProfileStore.validateAndStore(snapshot.rawSubscriptionId, snapshot.rawBody);
+      if (ProfileStore.currentId().length === 0) {
+        await ProfileStore.setCurrent(snapshot.rawSubscriptionId);
+      }
+    }
     if (snapshot.rawSubscriptionId.length > 0 && snapshot.rawBody.length > 0
       && RawSubscriptionStore.enabled) {
       const restored = RawSubscriptionStore.writeRaw(snapshot.rawSubscriptionId, snapshot.rawBody);
@@ -2298,14 +2358,37 @@ export class SubscriptionService {
         AppLogger.warn(TAG, `raw profile write failed: ${rawWrite.reason}`);
       }
       RawBodyCache.put(sub.id, body);
-      if (!SubscriptionService.isClashBody(body)) {
+      // ── FlClash 同构（2026-10-22）：原文落成 profile 文件 ───────────────
+      // FlClash `CoreController.validateProfile`：Clash YAML 原样通过；不是 YAML
+      // 时用 convertProxies（base64 / URI 列表）转成 proxies 列表再通过；两者都失败才拒。
+      // 这里必须**先**判定，不能再用旧的 isClashBody 一刀切 —— 否则 base64 订阅会被
+      // 误判成「非 Clash」而 FlClash 是能导入的。
+      const profileValidation = ProfileStore.validateAndStore(sub.id, body);
+      // 首个成功落盘的订阅立刻成为当前 Profile（FlClash putProfile 语义），
+      // 必须在**生成配置之前**定下来，否则本次刷新生成的仍是旧的全量配置。
+      if (profileValidation.ok) {
+        const currentNow = ProfileStore.currentId();
+        if (currentNow.length === 0 || !ProfileStore.exists(currentNow)) {
+          await ProfileStore.setCurrent(sub.id);
+          AppLogger.info(TAG, `current profile initialized: ${sub.id}`);
+        }
+      }
+      if (!profileValidation.ok) {
         RawBodyCache.drop(sub.id);
-        // 对齐三家：非 Clash 内容直接拒（旧配置原样保留，不打冻结标记）
         sub.lastRefreshResult = SubscriptionRefreshStatus.PARSE_ERROR;
         await this.persist();
-        AppLogger.warn(TAG, `non-clash subscription body rejected: ${SubscriptionFetchPolicy.redactUrl(sub.url)}`);
-        const rejected = SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR,
-          `不是 Clash 配置：${SubscriptionFetchPolicy.redactUrl(sub.url)}`);
+        AppLogger.warn(TAG, `subscription profile rejected: ${SubscriptionFetchPolicy.redactUrl(sub.url)} `
+          + `reason=${profileValidation.message}`);
+        // 把**真实原因**带给用户（不要统一说成「请开启代理」）：
+        // 面板返回 4 字节、返回 JSON、返回 base64 都会走到这里，三者处理方式不同。
+        const bodyLen = body.trim().length;
+        // 真机实证：部分机场的链接在无效/过期时返回一个换行
+        // （HTTP body = `Cg==` → 4 字节 base64，trim 后 0 字节）。这不是网络问题，
+        // 也不是 UA 问题 —— 必须让用户看到「空内容」，而不是「请开启代理」。
+        const reason = bodyLen < 16
+          ? `订阅地址返回空内容（${bodyLen} 字节）：请重新从机场面板复制 Clash 订阅链接`
+          : profileValidation.message;
+        const rejected = SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR, reason);
         rejected.advice = SubscriptionService.NON_CLASH_ADVICE;
         return rejected;
       }
@@ -2449,7 +2532,10 @@ export class SubscriptionService {
         diagnostics.inputCount = diagnostics.inputCount + providerImported;
       }
 
-      if (parsed.length === 0) {
+      // FlClash 同构：profile 已落盘 ⇒ 节点由内核解析，App 侧解析出 0 条不是失败。
+      // （典型：订阅只有 proxy-providers 段，或含 App 解析器不认识的协议。）
+      const profileReady = ProfileStore.exists(sub.id);
+      if (parsed.length === 0 && !profileReady) {
         // HTTP 200 但 0 条目：与「响应为空」「内容无法识别」区分，且给出 provider 专用提示
         sub.lastRefreshResult = SubscriptionRefreshStatus.EMPTY_ENTRIES;
         let message = '内容未解析出节点（支持 ss/ssr/vless/vmess/trojan/hysteria2/tuic/hysteria '
@@ -2489,9 +2575,13 @@ export class SubscriptionService {
       // 动态分组物化（include-all/filter/exclude-filter → members），再整体替换该订阅的组
       SubscriptionParser.materializeDynamicGroups(parsedGroups, parsed);
       this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== id).concat(parsedGroups);
-      this.nodes = this.nodes.filter((n) => n.subscriptionId !== id).concat(parsed);
+      // 过渡期：profile 已落盘但 App 侧解析为 0 时**保留旧节点**（不清空 UI），
+      // 节点真源由内核 /proxies 提供（CoreCatalog）。待 UI 全面切到内核后删除此分支。
+      if (parsed.length > 0 || !profileReady) {
+        this.nodes = this.nodes.filter((n) => n.subscriptionId !== id).concat(parsed);
+      }
       this.ensureUniqueNames();
-      sub.nodeCount = parsed.length;
+      sub.nodeCount = parsed.length > 0 ? parsed.length : sub.nodeCount;
       sub.lastFetchedAt = Date.now();
       sub.lastRefreshResult = SubscriptionRefreshStatus.OK;
       diagnostics.addedCount = parsed.length;
@@ -2519,6 +2609,12 @@ export class SubscriptionService {
         .catch((quotaError: Object): void => {
           AppLogger.warn(TAG, `quota check failed: ${String(quotaError)}`);
         });
+      // current profile 失效（被删/写盘失败）时回落到本次刷新成功的订阅
+      const currentId = ProfileStore.currentId();
+      if (currentId.length === 0 || !ProfileStore.exists(currentId)) {
+        await ProfileStore.setCurrent(id);
+        AppLogger.info(TAG, `current profile set to ${id}`);
+      }
       return SubscriptionRefreshResult.ok(parsed.length, diagnostics);
     } catch (e) {
       const msg = AppLogger.errText(e);
@@ -2747,6 +2843,11 @@ export class SubscriptionService {
     const sub = Subscription.newSubscription(util.generateRandomUUID(),
       `本地:${base.length > 0 ? base : '订阅'}`, `local://${base}`);
     sub.sortOrder = this.subscriptions.length;
+    // FlClash 同构：本地文件同样落成 profile 文件（内核直接吃原文）
+    const localProfile = ProfileStore.validateAndStore(sub.id, content);
+    if (!localProfile.ok) {
+      throw new Error(localProfile.message);
+    }
     let parsed: ProxyNode[];
     let parsedGroups: ProxyGroup[] = [];
     /** 双轨：原文是否为 Clash YAML（决定能否作为内核 file provider 落盘） */
@@ -3202,7 +3303,21 @@ export class SubscriptionService {
 
   findNode(id: string): ProxyNode | null {
     const n = this.nodes.find((x) => x.id === id);
-    return n === undefined ? null : n;
+    if (n !== undefined) {
+      return n;
+    }
+    // 内核影子节点（`core:<name>`）：节点清单由内核 `/proxies` 提供（FlClash 同构）
+    if (id.startsWith('core:')) {
+      const name = id.substring('core:'.length);
+      const model = CoreCatalogService.current();
+      if (model !== null) {
+        const entry = model.byName[name];
+        if (entry !== undefined && !entry.isGroup) {
+          return CoreNodeBridge.toProxyNode(entry);
+        }
+      }
+    }
+    return null;
   }
 
   /** 节点直链导入（对应 upstream SubscriptionAddStatus.singleNodeImported） */

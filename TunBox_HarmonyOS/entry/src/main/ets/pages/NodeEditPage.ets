@@ -239,7 +239,7 @@ struct NodeEditPage {
           }
           .padding({ left: 18, right: 18, bottom: 40 })
           .width('100%')
-        }
+        }.edgeEffect(EdgeEffect.Spring)
         .layoutWeight(1)
         .scrollBar(BarState.Off)
         .align(Alignment.Top)
