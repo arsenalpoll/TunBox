@@ -1,6 +1,7 @@
 /**
  * SubscriptionPage —— 订阅与节点页（严格对齐《TunBox-UI重构笔记》§3.2）
- * 布局：TopNav(单列/双列切换 · 刷新全部 · 添加订阅) → 全局概览卡 → 内核智能优选条目
+ * 布局：TopNav(单列/双列切换 · 刷新全部 · 添加订阅) → 全局概览卡
+ *       → 内核智能优选条目（行尾带「内核组测速」按钮）
  *       → 折叠式订阅分组（展开后显示该订阅下的节点并单选；2026-10-17 用户要求去掉全量节点区）
  * 后端：复用 SubscriptionService / SettingsService / LatencyController / BackgroundLatencyService 全量逻辑。
  */
@@ -21,6 +22,11 @@ import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
+import { ClashApiService, GroupLatencyResult } from '../commons/services/ClashApiService';
+import { LatencyChannel, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
+import { LatencyProbeKind } from '../commons/latency/LatencyKinds';
+import { effectiveTestUrl } from '../commons/latency/LatencyProbe';
+import { GROUP_TEST_TIMEOUT_MS } from '../commons/services/LatencyEngine';
 
 
 import { UnusableRecord } from '../commons/subscription/UnusableLedger';
@@ -328,6 +334,8 @@ export struct SubscriptionPage {
   @State refreshingIds: string[] = [];
   /** 分组头闪电测速按钮的防重入（对齐 refreshingIds 语义） */
   @State speedTestingIds: string[] = [];
+  /** 内核组测速（整组）在途标记：一次请求、内核并发测完全部节点 */
+  @State groupTesting: boolean = false;
   @State isImporting: boolean = false;
   @State isScanning: boolean = false;
   @State toastMsg: string = '';
@@ -806,6 +814,120 @@ export struct SubscriptionPage {
       this.showToast('测速失败，请重试');
     } finally {
       this.speedTestingIds = this.speedTestingIds.filter((x: string) => x !== subId);
+    }
+  }
+
+  /**
+   * 内核组测速（整组）：一次 `GET /group/PROXY/delay`，让**内核自己并发测完**全部节点。
+   *
+   * 2026-10-22 用户要求「补一个组测真实入口，放在内核智能优选上面」——此前组测实现只挂在
+   * NodeSelectionPage（该页无任何导航入口 = 死路径），已随死页删除；这里是在**真实入口**
+   * 上把它恢复。与逐节点 REST 的差别：没有客户端 http 栈的同 host 连接池排队，
+   * 也没有应用层闸门，同样的节点数耗时约为逐节点的 1/5~1/3。
+   *
+   * ⚠ 失败分类不得丢失（C10/C10b，方案 §9.2 T5）：
+   *  · 504（all proxies timeout）= **通道正常、全部节点超时** → 有结论，可落库可排序；
+   *  · 401/403/404/传输异常 = **通道故障** → 本轮没有任何结论，节点保持「未测」，
+   *    绝不写成「超时」；
+   *  · 结果集里没有、且**不在内核代理表** → 「未生效」（节点没进内核配置），
+   *    与「在内核表里但拨不通」（真超时）必须分开落库。
+   */
+  private async runKernelGroupTest(): Promise<void> {
+    if (this.groupTesting) {
+      return;
+    }
+    const nodes: ProxyNode[] = this.service.nodes;
+    if (nodes.length === 0) {
+      this.showToast('没有可测速的节点');
+      return;
+    }
+    this.groupTesting = true;
+    try {
+      const api: ClashApiService | null = await ConnectionOrchestrator.instance().ensureLatencyApi();
+      if (api === null) {
+        this.showToast('内核不可用，已跳过（未写入超时）');
+        return;
+      }
+      for (const n of nodes) {
+        LatencyStoreBridge.markTesting(n.name);
+      }
+      this.latencyTick = this.latencyTick + 1;
+      const settings = await SettingsService.load();
+      const url: string = effectiveTestUrl(settings);
+      let res: GroupLatencyResult = new GroupLatencyResult();
+      try {
+        res = await api.testGroupDetailedResult('PROXY', url, GROUP_TEST_TIMEOUT_MS);
+      } catch (e) {
+        // 抛异常 = 传输层故障；res 保持默认 → 落到下面的通道故障分支
+        AppLogger.warn(TAG, `kernel group test transport error: ${AppLogger.errText(e)}`);
+      }
+      if (!res.ok && !res.allTimedOut) {
+        for (const n of nodes) {
+          if (LatencyStoreBridge.stateFor(n.name) === LatencyState.TESTING) {
+            LatencyStoreBridge.setRecord(LatencyRecord.untested(n.name));
+          }
+        }
+        LatencyStoreBridge.flushNow();
+        this.latencyTick = this.latencyTick + 1;
+        AppLogger.warn(TAG, `kernel group test channel failure: code=${res.httpCode} kind=${res.failKind}`);
+        this.showToast('通道不可用，本轮结果无效，节点已恢复未测');
+        return;
+      }
+      const delays: Map<string, number> = res.delays;
+      const failedNames: string[] = [];
+      for (const n of nodes) {
+        if (delays.get(n.name) === undefined) {
+          failedNames.push(n.name);
+        }
+      }
+      // 失败节点无法从组测响应里看出原因 → 用内核代理表区分「未生效」与「真超时」
+      let coreTable: Set<string> | null = null;
+      if (failedNames.length > 0) {
+        const names: string[] | null = await api.proxyTableNames();
+        coreTable = names === null ? null : new Set<string>(names);
+      }
+      let measured = 0;
+      let timeout = 0;
+      let notInCore = 0;
+      for (const n of nodes) {
+        const delay: number | undefined = delays.get(n.name);
+        if (delay !== undefined && delay > 0) {
+          LatencyStoreBridge.setRecord(
+            LatencyRecord.measured(n.name, delay, LatencyChannel.CORE, Date.now()));
+          measured = measured + 1;
+          continue;
+        }
+        const gone: boolean = coreTable !== null && !coreTable.has(n.name);
+        const rec: LatencyRecord = LatencyRecord.failed(n.name,
+          gone ? LatencyState.FAILED : LatencyState.TIMEOUT, Date.now(), LatencyChannel.CORE,
+          gone ? LatencyProbeKind.SWITCH_FAILED : LatencyProbeKind.TIMEOUT);
+        rec.source = 'manual';
+        rec.runId = 0;
+        LatencyStoreBridge.setRecord(rec);
+        if (gone) {
+          notInCore = notInCore + 1;
+        } else {
+          timeout = timeout + 1;
+        }
+      }
+      LatencyStoreBridge.flushNow();
+      this.latencyTick = this.latencyTick + 1;
+      let msg = `内核组测完成：可用 ${measured} / 超时 ${timeout}`;
+      if (notInCore > 0) {
+        msg += ` / 未生效 ${notInCore}`;
+      }
+      if (res.allTimedOut) {
+        msg = `全部节点超时：可用 0 / ${nodes.length}（通道正常，请检查节点或换订阅）`;
+      }
+      AppLogger.info(TAG, `kernel group test done: total=${nodes.length} measured=${measured} `
+        + `timeout=${timeout} notInCore=${notInCore} allTimedOut=${res.allTimedOut}`);
+      this.showToast(msg);
+    } catch (e) {
+      AppLogger.warn(TAG, `kernel group test failed: ${AppLogger.errText(e)}`);
+      this.showToast('组测速失败，请重试');
+    } finally {
+      this.groupTesting = false;
+      this.latencyTick = this.latencyTick + 1;
     }
   }
 
@@ -1358,56 +1480,80 @@ export struct SubscriptionPage {
               .borderRadius(TunBoxGeometry.cardRadiusSmall)
               .border({ width: 1, color: TunBoxColors.cardBorder })
 
-              // ── 2. 内核智能优选条目（文档 §3.2 第 2 节，整行点击沿用既有切换逻辑） ──
+              // ── 2. 内核智能优选条目（文档 §3.2 第 2 节，整行点击沿用既有切换逻辑）
+              //      行尾多一个**内核组测速**按钮（2026-10-22 用户要求：放在智能优选后面）──
               Column({ space: 0 }) {
                 Row() {
+                  // 左：整行可点（切换自动选择）。包一层 Row 而不是把 onClick 挂到外层，
+                  // 是为了让行尾的组测速按钮**不与切换动作争事件**（ArkUI 子节点点击会冒泡）。
                   Row() {
-                    Image($r('app.media.ic_radar')).width(24).height(24).fillColor(TunBoxColors.success)
-                  }
-                  .width(42).height(42)
-                  .borderRadius(12)
-                  .backgroundColor(TunBoxColors.successLight)
-                  .justifyContent(FlexAlign.Center)
-                  .margin({ right: 12 })
-                  Column({ space: 2 }) {
                     Row() {
-                      Text('自动选择 · 内核智能优选')
-                        .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                      Image($r('app.media.ic_radar')).width(24).height(24).fillColor(TunBoxColors.success)
+                    }
+                    .width(42).height(42)
+                    .borderRadius(12)
+                    .backgroundColor(TunBoxColors.successLight)
+                    .justifyContent(FlexAlign.Center)
+                    .margin({ right: 12 })
+                    Column({ space: 2 }) {
+                      Row() {
+                        Text('自动选择 · 内核智能优选')
+                          .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                        Circle({ width: 6, height: 6 })
+                          .fill(this.autoSelectMode === AutoSelectModes.AUTO
+                            ? TunBoxColors.success : TunBoxColors.textMuted)
+                          .margin({ left: 6 })
+                      }
+                      Text(`跨订阅自动优选 · 故障毫秒切换 · ${this.totalNodes()} 个候选`)
+                        .fontSize(11).fontColor(TunBoxColors.textMuted)
                         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                      Circle({ width: 6, height: 6 })
+                    }
+                    .alignItems(HorizontalAlign.Start)
+                    .layoutWeight(1)
+                    Blank()
+                    Stack({ alignContent: Alignment.Center }) {
+                      Circle({ width: 18, height: 18 })
                         .fill(this.autoSelectMode === AutoSelectModes.AUTO
+                          ? TunBoxColors.success : Color.Transparent)
+                        .stroke(this.autoSelectMode === AutoSelectModes.AUTO
                           ? TunBoxColors.success : TunBoxColors.textMuted)
-                        .margin({ left: 6 })
-                    }
-                    Text(`跨订阅自动优选 · 故障毫秒切换 · ${this.totalNodes()} 个候选`)
-                      .fontSize(11).fontColor(TunBoxColors.textMuted)
-                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                  }
-                  .alignItems(HorizontalAlign.Start)
-                  .layoutWeight(1)
-                  Blank()
-                  Stack({ alignContent: Alignment.Center }) {
-                    Circle({ width: 18, height: 18 })
-                      .fill(this.autoSelectMode === AutoSelectModes.AUTO
-                        ? TunBoxColors.success : Color.Transparent)
-                      .stroke(this.autoSelectMode === AutoSelectModes.AUTO
+                        .strokeWidth(1.6)
+                      if (this.autoSelectMode === AutoSelectModes.AUTO) {
+                        Circle({ width: 6, height: 6 }).fill(TunBoxColors.textOnPrimary)
+                      }
+                    }.width(18).height(18)
+                    Text(this.autoSelectMode === AutoSelectModes.AUTO ? '已启用' : '未启用')
+                      .fontSize(12)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor(this.autoSelectMode === AutoSelectModes.AUTO
                         ? TunBoxColors.success : TunBoxColors.textMuted)
-                      .strokeWidth(1.6)
-                    if (this.autoSelectMode === AutoSelectModes.AUTO) {
-                      Circle({ width: 6, height: 6 }).fill(TunBoxColors.textOnPrimary)
+                      .margin({ left: 6 })
+                  }
+                  .layoutWeight(1)
+                  .alignItems(VerticalAlign.Center)
+                  // 2026-10-17 用户要求：点整行即选中（不再展开子列表），语义等价原展开区里的 smart 行
+                  .onClick(() => this.enableAutoSelect())
+
+                  // 右：内核组测速（纯图形按钮，与顶部刷新按钮同款 36 圆；在途时转圈）
+                  Stack({ alignContent: Alignment.Center }) {
+                    if (this.groupTesting) {
+                      LoadingProgress().width(18).height(18).color(TunBoxColors.success)
+                    } else {
+                      Image($r('app.media.ic_bolt')).width(18).height(18)
+                        .fillColor(TunBoxColors.success)
                     }
-                  }.width(18).height(18)
-                  Text(this.autoSelectMode === AutoSelectModes.AUTO ? '已启用' : '未启用')
-                    .fontSize(12)
-                    .fontWeight(FontWeight.Medium)
-                    .fontColor(this.autoSelectMode === AutoSelectModes.AUTO
-                      ? TunBoxColors.success : TunBoxColors.textMuted)
-                    .margin({ left: 6 })
+                  }
+                  .width(34).height(34)
+                  .borderRadius(TunBoxGeometry.pillRadius)
+                  .backgroundColor(this.groupTesting ? TunBoxColors.chipBg : TunBoxColors.surfaceCard)
+                  .margin({ left: 10 })
+                  .accessibilityText('内核组测速（一次测完所有节点）')
+                  .onClick(() => { this.runKernelGroupTest(); })
                 }
                 .width('100%')
                 .padding(14)
-                // 2026-10-17 用户要求：点整行即选中（不再展开子列表），语义等价原展开区里的 smart 行
-                .onClick(() => this.enableAutoSelect())
+                .alignItems(VerticalAlign.Center)
               }
               .width('100%')
               .borderRadius(18)

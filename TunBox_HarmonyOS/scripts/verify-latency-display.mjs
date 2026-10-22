@@ -141,6 +141,26 @@ ok('进度映射把 coreOverloaded 交给调用方（后台测速返回 progress
   && /return progress;/.test(fs.readFileSync(
     path.join(root, 'entry/src/main/ets/commons/services/BackgroundLatencyService.ets'), 'utf8')));
 
+// ── 内核组测速：唯一真实入口 = 订阅页「内核智能优选」行尾按钮（2026-10-22 用户指定）──
+// 契约：一次 `GET /group/PROXY/delay` 由内核并发测完；失败**必须分类**，不许一律「超时」。
+ok('组测入口调用内核组接口（testGroupDetailedResult，一次性）',
+  /testGroupDetailedResult\('PROXY'/.test(subPageSrc));
+ok('组测入口是智能优选行内的纯图形按钮（不是独立卡片/文字标题）',
+  /accessibilityText\('内核组测速（一次测完所有节点）'\)/.test(subPageSrc)
+  && !/Text\('内核组测速'\)/.test(subPageSrc));
+ok('组测在途有防重入 + 转圈',
+  /if \(this\.groupTesting\) \{\s*return;/.test(subPageSrc)
+  && /@State groupTesting: boolean = false;/.test(subPageSrc));
+ok('504（allTimedOut）= 通道正常、全部超时，不得标成通道故障',
+  /res\.allTimedOut/.test(subPageSrc) && /通道正常，请检查节点或换订阅/.test(subPageSrc));
+ok('通道故障 → 节点恢复未测（绝不盖章成超时）',
+  /!res\.ok && !res\.allTimedOut[\s\S]{0,500}?LatencyRecord\.untested/.test(subPageSrc));
+ok('不在内核代理表的失败节点标 switch_failed（未生效），不与真超时混为一谈',
+  /proxyTableNames\(\)/.test(subPageSrc)
+  && /gone \? LatencyProbeKind\.SWITCH_FAILED : LatencyProbeKind\.TIMEOUT/.test(subPageSrc));
+ok('组测结果有可检索的完成日志（total/measured/timeout/notInCore）',
+  /kernel group test done: total=\$\{nodes\.length\} measured=/.test(subPageSrc));
+
 const apiSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/services/ClashApiService.ets'), 'utf8');
 ok('ClashApiService 提供 proxyTableNames（内核代理表全名）',

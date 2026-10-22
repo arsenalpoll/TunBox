@@ -463,9 +463,12 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   // 不能复用 filterSubId 表达自动选择视图：它是订阅 id，混用会让过滤分支误判合成行
   ok('page.smart.no-filterSubId-reuse',
     !pageSrc.includes('this.filterSubId = SMART_ROW_ID'));
-  // ── 死代码清场：内核侧组测速端点（一次调用测全组）已从页面移除 ──────────
-  // 它只实现在没有导航入口的 NodeSelectionPage，和订阅页闪电测速形成两套口径；
-  // 2026-10-21 起统一走 LatencyEngine 的逐节点探测。这里防止有人再把它悄悄塞回来。
+  // ── 内核组测速：唯一真实入口 = 订阅页「内核智能优选」行尾按钮（2026-10-22）──────
+  // 历史：组测只实现在没有导航入口的 NodeSelectionPage，与订阅页闪电测速形成两套口径，
+  // 2026-10-21 随死页删除；2026-10-22 用户要求「补一个组测真实入口，放在智能优选后面」
+  // ⇒ 在 SubscriptionPage 重新落地，走 ClashApiService.testGroupDetailedResult()。
+  // 本节锁两件事：① 页面层**不得直接拼** `/group/{x}/delay` URL（必须走客户端方法）；
+  //              ② 组测入口只有一个，且在订阅页。
   {
     const hits = [];
     const scan = (dir) => {
@@ -474,16 +477,24 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
         if (entry.isDirectory()) {
           scan(full);
         } else if (entry.name.endsWith('.ets')) {
-          if (/\/group\/[^"`\s]*\/delay/.test(readFileSync(full, 'utf8'))) {
+          // 只判**代码行**：注释里写 `/group/PROXY/delay` 是说明文字，
+          // 曾因为把注释算成调用点而误判（2026-10-22）。
+          const codeLines = readFileSync(full, 'utf8').split('\n').filter((l) => {
+            const t = l.trim();
+            return t.length > 0 && !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*');
+          });
+          if (codeLines.some((l) => /\/group\/[^"`\s]*\/delay/.test(l))) {
             hits.push(entry.name);
           }
         }
       }
     };
-    // 只扫页面层：ClashApiService 仍保留组测速客户端方法（未来若有真实入口可直接用），
-    // 但**页面里不得再出现组测速调用** —— 那正是这次清掉的死路径。
     scan(join(etsRoot, 'pages'));
-    ok('latency.no-group-endpoint-in-pages', hits.length === 0, `hits=${JSON.stringify(hits)}`);
+    ok('latency.group-endpoint-not-hand-built-in-pages', hits.length === 0, `hits=${JSON.stringify(hits)}`);
+    const subPage = readFileSync(join(etsRoot, 'pages/SubscriptionPage.ets'), 'utf8');
+    has('latency.group-test-single-entry', subPage, "testGroupDetailedResult('PROXY'");
+    const nodePage = readFileSync(join(etsRoot, 'pages/NodeSelectionPage.ets'), 'utf8');
+    notHas('latency.dead-page-no-group-test', nodePage, 'testGroupDetailedResult');
   }
   // ── 订阅只收 Clash（2026-10-21 用户定案）─────────────────────────────
   // 判「内容」不判「链接」：非 Clash ⇒ 保留已存节点 + 打旧格式标记 + 停自动更新 + 提示换链接。
