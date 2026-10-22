@@ -72,6 +72,8 @@ for (const [file, out] of [
   ['ProxyNode.ets', 'ProxyNode.ts'],
   ['ProxyGroup.ets', 'ProxyGroup.ts'],
   ['AppSettings.ets', 'AppSettings.ts'],
+  // 2026-10-21（DNS 按订阅分域）：生成器 import SubDnsUpstream / SubDnsUpstreamPolicy
+  ['SubDnsUpstream.ets', 'SubDnsUpstream.ts'],
 ]) {
   const p = path.join(models, file);
   if (!fs.existsSync(p)) { console.log(`缺模型 ${file}`); process.exit(1); }
@@ -149,6 +151,8 @@ const want = [
   ['RawSubscriptionStore.ets', 'RawSubscriptionStore.ts'],
   // RawSubscriptionStore 依赖配置校验闸门（C23/C26：落盘前 YAML 校验）→ 必须一并 stage
   ['ConfigValidator.ets', 'ConfigValidator.ts'],
+  // 2026-10-21（原文透传）：生成器从订阅原文切片节点定义 → 纯逻辑，stage 真源码
+  ['RawProxyYaml.ets', 'RawProxyYaml.ts'],
 ];
 for (const [file, out] of want) {
   const p = path.join(svc, file);
@@ -315,6 +319,7 @@ if (!kernel || !fs.existsSync(kernel)) {
   for (const [label, yaml] of [['smart', ySmart], ['plain', yPlain]]) {
     const f = path.join(kd, `${label}.yaml`);
     fs.writeFileSync(f, yaml, 'utf8');
+    if (process.env.TB_DUMP === '1') { console.log(`     ── ${label}.yaml ──\n${yaml}`); }
     const t0 = Date.now();
     let out = '', code = 0;
     try {
@@ -326,6 +331,11 @@ if (!kernel || !fs.existsSync(kernel)) {
     const secs = (Date.now() - t0) / 1000;
     ok(code === 0 && /test is successful/.test(out),
       `${label} 配置被内核接受（${secs.toFixed(1)}s）`);
+    // 内核拒载时把原始输出打出来 —— 只报 ❌ 而不给原因，排查一轮白跑
+    // （2026-10-22：本脚本红了一轮，实际问题在输出里，看不到就只能猜）。
+    if (code !== 0 || !/test is successful/.test(out)) {
+      console.log(`     内核输出（exit=${code}）: ${out.trim().split('\n').slice(0, 12).join('\n     ')}`);
+    }
     // 关键回归：绝不能出现 Model.bin 下载（说明 smart 组真的用了现成模型）
     ok(!/Can't find Model.bin/.test(out), `${label}: 未触发 Model.bin 下载`);
     ok(!/Can't find MMDB/.test(out), `${label}: 未触发 MMDB 下载`);

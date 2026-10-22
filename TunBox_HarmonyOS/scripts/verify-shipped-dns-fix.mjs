@@ -4,7 +4,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-const hap = process.argv[2];
+const DEFAULT_HAP = path.join(process.cwd(), 'entry', 'build', 'default', 'outputs', 'default',
+  'entry-default-signed.hap');
+const hap = process.argv[2] || DEFAULT_HAP;
+if (!fs.existsSync(hap)) {
+  console.error(`找不到 HAP：${hap}
+用法：node scripts/verify-shipped-dns-fix.mjs [entry-default-signed.hap]`
+    + '（先在 TunBox_HarmonyOS 下构建，或在仓库根显式传包路径）');
+  process.exit(1);
+}
 const tmp = path.join(process.env.TEMP, 'nxabc-' + Date.now());
 fs.mkdirSync(tmp, { recursive: true });
 try {

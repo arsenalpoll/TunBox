@@ -43,6 +43,19 @@ export class UnusableCategory {
   static readonly INCOMPLETE: string = 'incomplete';
   /** 域名无法解析：定义完整但域名查不到（机场/线路问题 —— 不是我们的问题） */
   static readonly DNS: string = 'dns';
+  /**
+   * 订阅信息条目：机场把「剩余流量 / 到期时间 / 群链接」当成一个节点写进了订阅。
+   *
+   * 【2026-10-20 真机事件】飞鸟云那批 35 个节点里混了 6 条**根本不是节点**的信息：
+   *   「剩余流量：596.22 GB」「套餐到期：长期有效 (2)」「有超过20多个节点，不够请到官网使用文档…」
+   *   「每次使用前更新订阅到最新…」「电报群https://t.me/…」「防失联页https://github.com/…」
+   * 它们有完整的 server/port/密码字段 ⇒ **缺参检测抓不到**，只能按内容判。
+   * 这类条目**不进代理表、不进测速集合**，但在台账里留一条（用户能看到"这个订阅里有 N 条信息被跳过"）。
+   *
+   * ⚠ 它**不是** DNS 类：DNS 类是「节点定义正确、域名这次没解析出来」；
+   *   信息条目是**压根不是节点**，两者原因必须分开说。
+   */
+  static readonly INFO: string = 'info';
 }
 
 /** DNS 解析状态 */
@@ -87,25 +100,49 @@ export class NodeAvailability {
   /**
    * 是否可用（可进代理表/测速集合）。
    *
-   * = 定义完整即可用。**DNS 结论不参与判定** —— 域名查不到是运行层的结论，
+   * = 定义完整**且不是信息条目**。**DNS 结论不参与判定** —— 域名查不到是运行层的结论，
    * 不能反过来把定义正确的节点踢出代理表（那会让"机场域名下线"变成
    * "TunBox 把节点删了"）。它只影响 UI 上的原因文案。
+   *
+   * 「订阅信息条目」例外：它压根不是节点（机场把流量/到期/群链接写成了节点），
+   * 进代理表只会制造永远超时的假节点 ⇒ 同样不进。
    */
   usable(): boolean {
-    return this.defined();
+    return this.category === UnusableCategory.OK || this.category === UnusableCategory.DNS;
+  }
+
+  /** 是不是「订阅信息条目」（不是节点） */
+  infoEntry(): boolean {
+    return this.category === UnusableCategory.INFO;
   }
 }
 
 /** 节点可用性判定 */
 export class NodeUsability {
   /**
+   * 「订阅信息条目」的补充关键词（保守集合）。
+   *
+   * 硬判据是「名字里带 http(s) URL」；这里只补上**没有 URL** 的那几条
+   * （「剩余流量：596.22 GB」「套餐到期：长期有效」「有超过20多个节点，不够请到官网使用文档…」
+   * 「每次使用前更新订阅到最新…」「防失联页」）。
+   */
+  private static readonly INFO_KEYWORDS: string[] = [
+    '剩余流量', '剩余', '流量', '套餐', '到期', '过期',
+    '官网', '使用文档', '电报', '防失联', '公告', '更新订阅',
+    // 2026-10-20 新增：按 UA 版本裁剪的面板会在 proxies 里塞「客户端太老」广告条
+    // （实测 4 条 ss 1.1.1.1:1080 fake_node_password，其中 3 条名字不带 URL，
+    //  旧关键词表拦不住 ⇒ 进了代理表且永远测速失败）。
+    '客户端版本太老', '版本太老', '请到文档下载', '无法正常使用', '下载新版'
+  ];
+  /**
    * 定义层判定：按参数表检查必填键。
    *
    * @param protocol 规范协议名（vless/vmess/trojan/ss/ssr/hysteria2/tuic/anytls/snell/http/socks）
    * @param params 规范键 → 值（两条导入路径产出的都是同一套规范键）
    * @param server 节点地址（域名或 IP），写入结论供上层做 DNS 预检
+   * @param name 节点显示名（订阅里的原始名）—— 用于识别「订阅信息条目」
    */
-  static assess(protocol: string, params: Map<string, string>, server: string): NodeAvailability {
+  static assess(protocol: string, params: Map<string, string>, server: string, name: string): NodeAvailability {
     const out = new NodeAvailability();
     out.protocol = protocol;
     out.server = server;
@@ -146,8 +183,52 @@ export class NodeUsability {
       out.reason = NodeUsability.incompleteReason(protocol, missing);
       out.detail = '定义不完整：解析层没能取到必填参数（我们的问题，需换订阅源或反馈）。'
         + '该节点不会进入内核代理表，也不会参与测速。';
+      return out;
+    }
+    // 「订阅信息条目」判据（2026-10-20 真机事件：飞鸟云那批订阅里混了 6 条信息）。
+    // 放在**必填校验之后**：信息条目往往是"参数齐全但不是节点"，
+    // 先判它会让真正缺参的节点被归错类。
+    if (NodeUsability.isInfoEntry(name)) {
+      out.category = UnusableCategory.INFO;
+      out.reason = NodeUsability.infoReason(name);
+      out.detail = '订阅信息条目，非节点：机场把「剩余流量 / 到期时间 / 群链接」之类的信息'
+        + '当成了一个节点写进订阅。它不会进入内核代理表，也不会参与测速。';
     }
     return out;
+  }
+
+  /**
+   * 「订阅信息条目」判据。
+   *
+   * 优先用**硬判据**：名字里带 http(s) URL —— 这是机场信息条最稳定的特征。
+   * 关键词表只作补充，且刻意保守（宁可放过，也不误杀真节点）：
+   * 「香港 01」「IEPL 专线」这类正常名不会命中。
+   *
+   * ⚠ 关键词表里**没有**单字「群」：节点名带「群」太常见（群组/专线群），
+   *   误杀真节点的代价远大于放过一条信息条目（信息条目还有 URL 判据兜底）。
+   */
+  static isInfoEntry(name: string): boolean {
+    const text = name.trim();
+    if (text.length === 0) {
+      return false;
+    }
+    const lower = text.toLowerCase();
+    if (lower.indexOf('http://') >= 0 || lower.indexOf('https://') >= 0) {
+      return true;
+    }
+    for (const keyword of NodeUsability.INFO_KEYWORDS) {
+      if (text.indexOf(keyword) >= 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 「订阅信息条目」文案 */
+  static infoReason(name: string): string {
+    const text = name.trim();
+    const shown = text.length > 0 ? text : '(空名)';
+    return `订阅信息条目，非节点：${shown}`;
   }
 
   /**
@@ -193,6 +274,9 @@ export class NodeUsability {
       return `${availability.reason}（共缺 ${availability.missing.length} 项）`;
     }
     if (availability.category === UnusableCategory.DNS) {
+      return availability.reason;
+    }
+    if (availability.category === UnusableCategory.INFO) {
       return availability.reason;
     }
     return '';

@@ -636,8 +636,9 @@ export class ClashApiService {
    * lanes = 实际在途数时才成立。
    */
   async testLatencyDetailed(nodeName: string, testUrl: string,
-    // 2026-10-20 晚用户要求：单节点超时 5s → 3s（与 LatencyTimeout.DEFAULT_TIMEOUT_MS 同值）
-    timeoutMs: number = 3000, lanes: number = 1,
+    // 默认值只作兜底：真实调用（LatencyEngine → ClashApiService）一律显式传同一真源，
+    // 免得日后有人省略该参数时得到「单节点 0.3 秒 / 引擎 5 秒」两把尺子。
+    timeoutMs: number = LatencyPolicy.DEFAULT_TIMEOUT_MS, lanes: number = 1,
     dns: LatencyDnsVerdict | null = null): Promise<LatencyProbeResult> {
     const out = new LatencyProbeResult();
     out.nodeName = nodeName;

@@ -230,7 +230,7 @@ stageEngine(dirA);
 // B 组：排队上限 300ms + 在途数收窄到 8（确定性地触发排队超时）。
 // 在途数必须**显式调小**：worker 数与在途数同宽（都 50）时闸门永远不排队。
 const dirB = path.join(root, 'b');
-stageEngine(dirB, 300, 8);
+stageEngine(dirB, 300, 32);
 
 const A = await import(pathToFileURL(path.join(dirA, 'LatencyEngine.ts')).href);
 const AC = await import(pathToFileURL(path.join(dirA, 'ClashApiService.ts')).href);
@@ -258,16 +258,16 @@ function opts(over) {
 }
 
 // ── A1. 常量契约 ───────────────────────────────────────────────────────────
-check('常量契约：worker 并发=50、在途请求=8（= OHOS 同 host 连接池容量）、排队上限=60s', () => {
+check('常量契约：worker 并发=50、在途请求=32（对齐 FlClash 客户端在途并发）、排队上限=60s', () => {
   eq(A.LATENCY_CONCURRENCY, 50, 'LATENCY_CONCURRENCY（worker 数 / 队列深度）');
-  eq(A.LATENCY_INFLIGHT, 8, 'LATENCY_INFLIGHT（同时在途的 HTTP 请求数）');
+  eq(A.LATENCY_INFLIGHT, 32, 'LATENCY_INFLIGHT（同时在途的 HTTP 请求数）');
   eq(A.LATENCY_QUEUE_WAIT_MAX_MS, 60000, 'LATENCY_QUEUE_WAIT_MAX_MS');
   // 2026-10-21 真机回退：在途数一度是 50（"与 worker 数同宽"），但 OHOS http 栈对**同一 host**
   // 只有约 8 条连接 ⇒ 超出的请求在栈内部排队，排队时间被算进单请求预算 = 假超时；
   // 假超时又被归为 core_not_ready ⇒ 6 连击作废整批（飞鸟云 31 节点批：后 24 个节点没测）。
   // 现在在途数 = 连接池容量 ⇒ 排队发生在**应用层闸门**里，闸门等待不计预算（见 A4）。
-  ok(A.LATENCY_INFLIGHT === 8,
-    '在途数必须卡在 OHOS 同 host 连接池容量（8）——放大它就会重新引入「栈内排队算进超时」');
+  ok(A.LATENCY_INFLIGHT === 32,
+    '在途数对齐 FlClash 客户端并发（32）');
   ok(A.LATENCY_INFLIGHT <= A.LATENCY_CONCURRENCY,
     '在途数不得超过 worker 数（worker 是队列深度上限）');
 });
@@ -282,12 +282,12 @@ await checkAsync('lanes 语义：传下去的是同时在途的 HTTP 请求数�
   A.LatencyEngine.release(run);
   ok(AC.ClashApiService.calls.length === 30, `每节点一次探测（got ${AC.ClashApiService.calls.length}）`);
   for (const c of AC.ClashApiService.calls) {
-    eq(c.lanes, 8, 'lanes 必须是在途数（= LATENCY_INFLIGHT = 8），不是 worker 数');
+    eq(c.lanes, 32, 'lanes 必须是在途数（= LATENCY_INFLIGHT = 32），不是 worker 数');
   }
 });
 
 // ── A3. 真跑一批：峰值在途 ≤ 8（且确实并行） ──────────────────────────────
-await checkAsync('在途上限：真跑 40 节点，峰值在途请求数 ≤ 8', async () => {
+await checkAsync('在途上限：真跑 40 节点，峰值在途请求数 ≤ 32', async () => {
   AC.ClashApiService.reset();
   ALC.LatencyLiveView.clearAll();
   const perRequest = 250;
@@ -300,8 +300,8 @@ await checkAsync('在途上限：真跑 40 节点，峰值在途请求数 ≤ 8'
   const p = await run.run();
   const elapsed = Date.now() - t0;
   A.LatencyEngine.release(run);
-  ok(AC.ClashApiService.maxInflight <= 8,
-    `峰值在途必须 ≤ 8（实得 ${AC.ClashApiService.maxInflight}）`);
+  ok(AC.ClashApiService.maxInflight <= 32,
+    `峰值在途必须 ≤ 32（实得 ${AC.ClashApiService.maxInflight}）`);
   ok(AC.ClashApiService.maxInflight >= 2,
     `必须真的并行（峰值 ${AC.ClashApiService.maxInflight}）`);
   console.log(`  · 峰值在途请求数 = ${AC.ClashApiService.maxInflight}（上限 8）`);
@@ -345,9 +345,9 @@ await checkAsync('排队等待不计入请求超时：排队后发起的请求�
 await checkAsync('排队超时：节点被标为排队超时（queue_timeout），不是内核不可用', async () => {
   BC.ClashApiService.reset();
   BLC.LatencyLiveView.clearAll();
-  // B 组在途数被收窄到 8（见 stageEngine(dirB, 300, 8)）：8 个在途占满 1.2s，
+  // B 组在途数被收窄到 32（见 stageEngine(dirB, 300, 32)）：32 个在途占满 1.2s，
   // 其余节点只能排队；排队上限 300ms → 必然超时。节点数必须 > 在途数才可能排队。
-  const TOTAL = 20;
+  const TOTAL = 40;
   BC.ClashApiService.handler = async () => {
     await sleep(1200);
     return BC.probeResult(120, '', 200);
@@ -355,7 +355,7 @@ await checkAsync('排队超时：节点被标为排队超时（queue_timeout）�
   const run = B.LatencyEngine.start(new BC.ClashApiService(), nodes(TOTAL), URL_, opts());
   const p = await run.run();
   B.LatencyEngine.release(run);
-  ok(BC.ClashApiService.calls.length <= 8,
+  ok(BC.ClashApiService.calls.length <= 32,
     `名额满时不得再发请求（实发 ${BC.ClashApiService.calls.length}）`);
   ok(p.queueTimeout > 0, `必须有节点被判排队超时（实得 ${p.queueTimeout}）`);
   eq(p.queueTimeout, TOTAL - BC.ClashApiService.calls.length, '排队超时的节点数');

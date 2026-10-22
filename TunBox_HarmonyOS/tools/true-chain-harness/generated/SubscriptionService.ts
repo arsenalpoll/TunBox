@@ -19,20 +19,23 @@
  * - 一次性迁移：把历史明文 preferences 中的凭据写入 Asset 并回读校验，成功后才删除明文；
  *   任一步失败保留明文并记录，绝不丢数据。迁移幂等（重跑只重写加密层，不清明文）。
  */
+import { RawBodyCache } from './RawProxyYaml.ts';
 import { preferences } from './stubs.ts';
 import { asset } from './stubs.ts';
 import { util } from './stubs.ts';
 import {
   Subscription, SubscriptionImportDiagnostics, SubscriptionRefreshResult, SubscriptionRefreshStatus
 } from './Subscription.ts';
-import { ProxyNode, ProxyNodeType, SsrCodec } from './ProxyNode.ts';
+import { ProxyNode, ProxyNodeType, Base64Codec } from './ProxyNode.ts';
 import { ProxyGroup } from './ProxyGroup.ts';
 import { AppSettings } from './AppSettings.ts';
+import { SubDnsUpstream } from './SubDnsUpstream.ts';
 import { SubscriptionParseResult, SubscriptionParser } from './SubscriptionParser.ts';
 import {
   SubscriptionFetchPolicy, SubscriptionFetchError, SubscriptionFetchErrorKind, SubscriptionFetchResult
 } from './stubs.ts';
 import { SubscriptionQuotaService } from './SubscriptionQuotaService.ts';
+import { SettingsService } from './stubs.ts';
 import { YamlMerger, MergedProxy, YamlMergeError, YamlNodeError } from './YamlMerger.ts';
 import { ClashConfigGenerator, ProxyDropStats } from './ClashConfigGenerator.ts';
 import { ProxyProviderEntry, ProxyProviderParser } from './ProxyProviderParser.ts';
@@ -412,16 +415,20 @@ export class SubscriptionService {
     // 这里把"当前还活着的节点 + 手工节点 + 当前订阅"的候选别名交给凭据层，
     // 回填只真读这一部分；作用域外的孤儿别名不会被读、更不会被删（用到时逐条兜底）。
     SubscriptionService.applyHydrateScope(this.subscriptions, this.nodes);
-    // 1) 一次性凭据迁移（必须在任何 persist 之前，避免明文被再次写回）
-    await this.runCredentialMigrationOnce();
-    AppLogger.info(TAG, `[perf] stage1 migration done at +${Date.now() - t0}ms`);
-    // 2) 从加密层回填订阅凭据（headerValue 从不落 preferences）
-    await this.hydrateSubscriptionCredentials();
-    // 3) 节点凭据回填（Asset 缺失时用一次性 rawUri 解析兜底）
-    await this.initNodes(this.nodes);
-    AppLogger.info(TAG, `[perf] stage2 hydrate done at +${Date.now() - t0}ms`);
+    // ── 凭据引导（2026-10-21 冷启动优化）─────────────────────────────
+    // 真机实测：stage1 的凭据迁移/回填占冷启动 ~1.36s（Asset 批量查询不可用的固件
+    // 只能逐条 IPC），而列表渲染根本不需要凭据 —— 只有「生成配置/测速」才需要。
+    // 所以这里**不 await**，把三件事合并成一条后台引导链；
+    // 任何需要凭据的入口（ConnectionOrchestrator.hydrateAndBuildProfile）先 await ensureCredentials()。
+    this.startCredentialBootstrap();
+    // ── 原文透传：把已落盘的订阅原文装进进程内缓存 ────────────────────
+    // 与三家一致：订阅原文（profile 文件）落在应用私有目录，冷启动直接读文件，
+    // 不联网、不依赖用户先刷新一次。读失败就退回解析发射，不会让配置变坏。
+    this.loadRawBodiesIntoCache();
+    AppLogger.info(TAG, `[perf] stage1 credentials deferred to background at +${Date.now() - t0}ms`);
 
     // 4) 明文清扫：加密层验证通过的记录删除 preferences 明文字段
+    //    （上面的凭据引导会在后台完成，这里只做不依赖凭据的结构性工作）
     // 历史数据可能存在重名节点(内核会拒绝启动), 加载时即去重并落库
     const renamed = this.ensureUniqueNames();
 
@@ -576,6 +583,33 @@ export class SubscriptionService {
     sub.subRuleProviders = sections.providers;
   }
 
+  /**
+   * 订阅原文 → 该订阅的 **dns 上游**落账（2026-10-20「测速全超时」定案）。
+   *
+   * 机场把「入口域名 → 真实入口 IP」只告诉自家私有 DoH；公共 DNS 给出的是
+   * Cloudflare / 阿里 WAF 前置 IP，那些 IP 上代理端口不通或不提供协议服务。
+   * 因此 `dns.proxy-server-nameserver` 与 `dns.nameserver-policy` 必须带进运行配置：
+   * 真实内核单变量实验里，订阅1 只删 `proxy-server-nameserver` 就从 20/23 掉到 7/23，
+   * 订阅2 只删 `nameserver-policy` 就从 30/36 掉到 0/36。
+   *
+   * 任何异常都按「订阅未提供 dns 上游」处理（退回内置公共 DoT），绝不影响节点导入。
+   */
+  private static applyDnsSections(sub: Subscription, body: string): void {
+    let servers: string[] = [];
+    let pairs: string[][] = [];
+    try {
+      const dnsText = YamlMerger.extractSection(body, 'dns');
+      if (dnsText.trim().length > 0) {
+        servers = YamlMerger.extractDnsProxyServers(dnsText);
+        pairs = YamlMerger.extractDnsPolicyPairs(dnsText);
+      }
+    } catch (e) {
+      // 提取失败 = 无 dns 上游（生成时走内置公共 DoT）
+    }
+    sub.subDnsProxyServers = servers.length > 0 ? JSON.stringify(servers) : '';
+    sub.subDnsPolicies = pairs.length > 0 ? JSON.stringify(pairs) : '';
+  }
+
   /** 登记 provider（生成器 planRawProviders 只认登记表 + 文件存在性） */
   private registerRawProvider(subscriptionId: string, nodeEstimate: number): void {
     const entry = new RawProviderEntry();
@@ -621,6 +655,91 @@ export class SubscriptionService {
       }
     }
     CredentialStore.setHydrateScope(Array.from(scope));
+  }
+
+  /** 把私有目录里已落盘的订阅原文读进内存缓存（冷启动用；失败静默跳过）。 */
+  private loadRawBodiesIntoCache(): void {
+    let loaded = 0;
+    for (const s of this.subscriptions) {
+      if (s.id.length === 0) {
+        continue;
+      }
+      const body = RawSubscriptionStore.readRaw(s.id);
+      if (body.length > 0) {
+        RawBodyCache.put(s.id, body);
+        loaded++;
+      }
+    }
+    if (loaded > 0) {
+      AppLogger.info(TAG, `[perf] raw bodies cached: ${loaded}/${this.subscriptions.length}`);
+    }
+    // 缺原文的订阅：后台补拉一次（三家都是「导入即落盘」，用户不该为此手动刷新）。
+    // 只在启动后跑一次、串行、失败静默；不影响首屏，也不触发重连。
+    if (loaded < this.subscriptions.length && !SubscriptionService.rawBackfillDone) {
+      SubscriptionService.rawBackfillDone = true;
+      const missing: string[] = [];
+      for (const s of this.subscriptions) {
+        if (s.id.length > 0 && !s.legacyFormat && RawBodyCache.get(s.id).length === 0) {
+          missing.push(s.id);
+        }
+      }
+      if (missing.length > 0) {
+        AppLogger.info(TAG, `[perf] raw backfill scheduled: ${missing.length} subscription(s)`);
+        setTimeout((): void => {
+          SubscriptionService.backfillRawBodies(this, missing);
+        }, 2500);
+      }
+    }
+  }
+
+  private static rawBackfillDone: boolean = false;
+
+  /** 串行补拉缺失原文（失败静默；只落盘，不改用户当前连接） */
+  private static backfillRawBodies(svc: SubscriptionService, ids: string[]): void {
+    const run = async (): Promise<void> => {
+      for (const id of ids) {
+        try {
+          await svc.refreshSubscription(id);
+        } catch (e) {
+          AppLogger.warn(TAG, `raw backfill failed for ${id}: ${AppLogger.errText(e)}`);
+        }
+      }
+      AppLogger.info(TAG, `[perf] raw backfill done (${ids.length})`);
+    };
+    run();
+  }
+
+  /** 凭据引导链（一次性）：迁移 → 订阅 header 回填 → 节点凭据回填。 */
+  private credentialBootstrap: Promise<void> | null = null;
+
+  /**
+   * 启动后台凭据引导（幂等）。失败不抛给调用方：引导链自己 warn 并继续，
+   * 真正需要凭据的地方还有 pickOrRead 逐条兜底。
+   */
+  private startCredentialBootstrap(): Promise<void> {
+    if (this.credentialBootstrap === null) {
+      const t = Date.now();
+      this.credentialBootstrap = (async (): Promise<void> => {
+        // 1) 一次性凭据迁移（必须在任何 persist 之前，避免明文被再次写回）
+        await this.runCredentialMigrationOnce();
+        // 2) 从加密层回填订阅凭据（headerValue 从不落 preferences）
+        await this.hydrateSubscriptionCredentials();
+        // 3) 节点凭据回填（Asset 缺失时用一次性 rawUri 解析兜底）
+        await this.initNodes(this.nodes);
+        AppLogger.info(TAG, `[perf] credentials ready (background) at +${Date.now() - t}ms`);
+      })().catch((e: Error): void => {
+        AppLogger.warn(TAG, `credential bootstrap failed: ${AppLogger.errText(e)}`);
+      });
+    }
+    return this.credentialBootstrap;
+  }
+
+  /**
+   * 等凭据就绪。**所有需要节点凭据的路径都必须先调它**（生成配置、测速核）。
+   * 冷启动时它通常已跑完（后台），用户点连接时不会有额外等待。
+   */
+  async ensureCredentials(): Promise<void> {
+    await this.startCredentialBootstrap();
   }
 
   /**
@@ -1147,6 +1266,13 @@ export class SubscriptionService {
       if (typeof j.subRuleProviders !== 'string' || j.subRuleProviders.length > 256 * 1024) {
         j.subRuleProviders = '';
       }
+      // 订阅 dns 上游：非法值就地归一（旧存储无这些键），绝不丢订阅
+      if (typeof j.subDnsProxyServers !== 'string' || j.subDnsProxyServers.length > 8 * 1024) {
+        j.subDnsProxyServers = '';
+      }
+      if (typeof j.subDnsPolicies !== 'string' || j.subDnsPolicies.length > 64 * 1024) {
+        j.subDnsPolicies = '';
+      }
       out.push(Subscription.fromPersistJson(j));
     }
     if (skipped > 0) {
@@ -1358,6 +1484,19 @@ export class SubscriptionService {
   }
 
   /**
+   * 明文 HTTP 订阅是否被用户显式允许（默认拒绝，对齐 FlClash / Verge / CMFA）。
+   * 读设置失败一律按「不允许」处理 —— 安全开关的失败方向必须朝严格一侧。
+   */
+  private static async insecureSubscriptionHttpAllowed(): Promise<boolean> {
+    try {
+      const settings = await SettingsService.load();
+      return settings.allowInsecureSubscriptionHttp;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
    * 双轨诊断汇总（「解析到 N / provider 读到 M」+ 生成配置时实际发出的 provider 条数）。
    * 「配置内 provider 条数」直接复用 ClashConfigGenerator.planRawProviders，与真正写进配置
    * 的逻辑同源，避免诊断与实际不一致。
@@ -1384,10 +1523,14 @@ export class SubscriptionService {
 
   /**
    * 双轨开关切换（设置/诊断面板调用）：写盘由调用方（SettingsService）负责，
-   * 这里负责落盘仓闸门 + 每订阅状态 + 文案。关闭时清理全部落盘原文并返回删除数。
+   * 这里负责落盘仓闸门 + 每订阅状态 + 文案。
+   *
+   * 2026-10-22：**关闭双轨不再删除落盘原文**。原文现在是「节点定义原文透传」的数据源，
+   * 与 provider 开关解耦 —— 删掉会让下一次冷启动只能重新联网补拉，离线或订阅过期时
+   * 直接退化成解析发射（丢字段/丢新协议）。要清磁盘请走 `purgeRawProviders()`。
    */
   async setRawProviderEnabled(enabled: boolean): Promise<number> {
-    const removed = RawSubscriptionStore.setEnabled(enabled);
+    RawSubscriptionStore.setEnabled(enabled, false);
     let changed = false;
     for (const s of this.subscriptions) {
       if (s.id === DIRECT_GROUP_ID) {
@@ -1405,9 +1548,9 @@ export class SubscriptionService {
       s.rawProviderNodeEstimate = estimate;
       if (exists) {
         this.registerRawProvider(s.id, estimate);
-      } else {
-        RawSubscriptionStore.drop(s.id);
       }
+      // 注意：这里**不再** RawSubscriptionStore.drop(s.id) —— 关闭 provider 只是不使用它，
+      // 原文文件要留着给原文透传用（见方法头注释）。
     }
     if (changed) {
       try {
@@ -1418,10 +1561,10 @@ export class SubscriptionService {
     }
     this.lastRawProviderSummary = enabled
       ? '双轨 provider 已开启：下次刷新/连接起生效（原文按订阅 id 落盘，由内核自行解析）'
-      : `双轨 provider 已关闭，已清理 ${removed} 个落盘文件（回到解析链单轨）`;
+      : '双轨 provider 已关闭（落盘原文保留，原文透传仍用它）';
     this.lastRawProviderMessage = this.lastRawProviderSummary;
     AppLogger.info(TAG, this.lastRawProviderSummary);
-    return removed;
+    return 0;
   }
 
   /** 手动清理落盘原文（诊断面板入口）；节点列表不受影响 */
@@ -1916,6 +2059,23 @@ export class SubscriptionService {
     return out;
   }
 
+  /**
+   * 只认 Clash 配置：判定依据是**内容**（顶层 proxies / proxy-providers / proxy-groups），
+   * 不是链接。JSON / CONF / base64 节点串 / 纯链接列表一律判为非 Clash。
+   * 与 BodyDispatch 共用同一套分类，避免"这里说是 YAML、那里又当链接"两套口径。
+   */
+  static isClashBody(body: string): boolean {
+    if (body.length === 0) {
+      return false;
+    }
+    return BodyDispatch.classify(body).kind === BodyKind.YAML;
+  }
+
+  /** 非 Clash 订阅的统一用户文案（刷新、文件导入、扫码共用，避免三处话术不一致） */
+  static readonly NON_CLASH_ADVICE: string =
+    '该订阅返回的不是 Clash 配置（可能是 base64 节点串 / JSON / 明文链接列表）。'
+      + '请向机场索取 Clash 订阅链接后，点「编辑」替换地址；现有节点仍可正常使用，不会丢失。';
+
   async addSubscription(name: string, url: string, headerName: string, headerValue: string): Promise<Subscription> {
     const s = Subscription.newSubscription(util.generateRandomUUID(), name, url);
     s.headerName = headerName;
@@ -1942,6 +2102,7 @@ export class SubscriptionService {
     this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== id);
     // 「不再需要即删干净」：删订阅即删其 provider 落盘原文与登记项
     RawSubscriptionStore.remove(id);
+    RawBodyCache.drop(id);
     await this.persist();
     // 分阶段计时（真机排查用）：删除慢时据此区分"落盘"与"其余"
     AppLogger.info(TAG, `[perf] subscription removed at +${Date.now() - t0}ms`);
@@ -1993,13 +2154,17 @@ export class SubscriptionService {
       // 本地 YAML 伪订阅没有网络源：串行阶段按既有语义以现有节点数报成功，这里不预取
       return RefreshPrepOutcome.skipped(id);
     }
-    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(sub.url, true)) {
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(sub.url,
+      await SubscriptionService.insecureSubscriptionHttpAllowed())) {
       // 地址非法交给串行阶段按原样报错（提示文案与单条刷新逐字一致），这里不预取
       return RefreshPrepOutcome.skipped(id);
     }
     try {
+      // 明文 http 是否放行先取好再进实参：设置读取塞进实参既难读，
+      // 也会被静态检查的调用点参数扫描误判（嵌套括号会截断参数列表）。
+      const insecureAllowed: boolean = await SubscriptionService.insecureSubscriptionHttpAllowed();
       const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue,
-        true, sub.etag);
+        insecureAllowed, sub.etag);
       this.prefetchCache.set(id,
         PrefetchedSubscription.body(sub.url, sub.headerName, sub.headerValue, fetched));
       return RefreshPrepOutcome.prefetched(id);
@@ -2096,9 +2261,11 @@ export class SubscriptionService {
       if (prefetched.hit && prefetched.hasError) {
         throw prefetched.error;
       }
+      const insecureAllowed: boolean = await SubscriptionService.insecureSubscriptionHttpAllowed();
       const fetched: SubscriptionFetchResult = prefetched.hit
         ? prefetched.fetched
-        : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue, true, sub.etag);
+        : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue,
+          insecureAllowed, sub.etag);
       // 304：面板确认内容未变。直接按「未变更」返回，沿用已落盘节点，
       // **不重新解析**（没有响应体可解析），也绝不把空体会当成 EMPTY_RESPONSE 报错。
       if (fetched.notModified) {
@@ -2122,6 +2289,28 @@ export class SubscriptionService {
         return SubscriptionRefreshResult.ok(sub.nodeCount, diagnostics);
       }
       const body = fetched.body;
+      // ── 只支持 Clash 订阅（2026-10-21）────────────────────────────
+      // 判内容不判链接：非 Clash ⇒ 保留已存节点、打旧格式标记、停自动更新、给可执行提示。
+      // 原文落盘 + 进进程内缓存：生成运行配置时原样透传。
+      // 与 FlClash/Verge/CMFA 同形——订阅原文作为 profile 文件存在私有目录，
+      // 内核/生成器直接吃原文，App 不重写节点定义。
+      const rawWrite = RawSubscriptionStore.writeRaw(sub.id, body);
+      if (!rawWrite.ok) {
+        AppLogger.warn(TAG, `raw profile write failed: ${rawWrite.reason}`);
+      }
+      RawBodyCache.put(sub.id, body);
+      if (!SubscriptionService.isClashBody(body)) {
+        RawBodyCache.drop(sub.id);
+        // 对齐三家：非 Clash 内容直接拒（旧配置原样保留，不打冻结标记）
+        sub.lastRefreshResult = SubscriptionRefreshStatus.PARSE_ERROR;
+        await this.persist();
+        AppLogger.warn(TAG, `non-clash subscription body rejected: ${SubscriptionFetchPolicy.redactUrl(sub.url)}`);
+        const rejected = SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR,
+          `不是 Clash 配置：${SubscriptionFetchPolicy.redactUrl(sub.url)}`);
+        rejected.advice = SubscriptionService.NON_CLASH_ADVICE;
+        return rejected;
+      }
+      sub.legacyFormat = false;
       // 记住 ETag 供下次条件请求（服务端没给就保持空串 = 下次完整拉取）
       if (fetched.etag.length > 0) {
         sub.etag = fetched.etag;
@@ -2178,6 +2367,8 @@ export class SubscriptionService {
         parsedGroups = SubscriptionParser.parseProxyGroups(dispatch.body, sub.id);
         // 订阅自带 rules/rule-providers 段落账（无规则段时清空旧值）
         SubscriptionService.applyRulesSections(sub, dispatch.body);
+        // 订阅自带 dns 上游（proxy-server-nameserver / nameserver-policy）落账
+        SubscriptionService.applyDnsSections(sub, dispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -2232,8 +2423,10 @@ export class SubscriptionService {
           const entry = fetchable[pi];
           try {
             // 与主订阅完全相同的 UA 降级链 / 重定向校验 / 大小上限
+            const providerInsecureAllowed: boolean =
+              await SubscriptionService.insecureSubscriptionHttpAllowed();
             const providerFetched = await SubscriptionFetchPolicy.fetch(
-              entry.url, sub.headerName, sub.headerValue);
+              entry.url, sub.headerName, sub.headerValue, providerInsecureAllowed);
             const providerNodes = SubscriptionService.parseProviderBody(providerFetched.body, sub.id,
               entry.name, diagnostics);
             // 节点来源标注为 provider（id 前缀 -p 与主订阅条目区分，避免 id 冲突）
@@ -2392,7 +2585,10 @@ export class SubscriptionService {
     for (let pi = 0; pi < fetchable.length; pi++) {
       const entry = fetchable[pi];
       try {
-        const providerFetched = await SubscriptionFetchPolicy.fetch(entry.url, headerName, headerValue);
+        const providerInsecureAllowed: boolean =
+          await SubscriptionService.insecureSubscriptionHttpAllowed();
+        const providerFetched = await SubscriptionFetchPolicy.fetch(entry.url, headerName, headerValue,
+          providerInsecureAllowed);
         const providerNodes = SubscriptionService.parseProviderBody(providerFetched.body, subscriptionId,
           entry.name, diagnostics);
         for (let ni = 0; ni < providerNodes.length; ni++) {
@@ -2440,6 +2636,14 @@ export class SubscriptionService {
       diagnostics.configMissingCredentialCount = this.credentialMissingCount;
       return SubscriptionRefreshResult.ok(localCount, diagnostics);
     }
+    // 旧格式（JSON / CONF / 链接列表）的文件导入：保留现有节点，不再尝试重解析
+    if (!SubscriptionService.isClashBody(body)) {
+      // 对齐三家：直接拒，不写任何冻结标记
+      const rejected = SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR,
+        `不是 Clash 配置：${sub.name}`);
+      rejected.advice = SubscriptionService.NON_CLASH_ADVICE;
+      return rejected;
+    }
     try {
       YamlMerger.resetSkipStats();
       let parsed: ProxyNode[];
@@ -2455,6 +2659,8 @@ export class SubscriptionService {
         parsedGroups = SubscriptionParser.parseProxyGroups(dispatch.body, id);
         // 本地伪订阅刷新：自带 rules/rule-providers 段同样重新落账（原文可能已变化）
         SubscriptionService.applyRulesSections(sub, dispatch.body);
+        // dns 上游同理（本地文件可能换了订阅源）
+        SubscriptionService.applyDnsSections(sub, dispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length
           + diagnostics.invalidCount + diagnostics.unsupportedCount;
       } else {
@@ -2524,6 +2730,12 @@ export class SubscriptionService {
   }
 
   async addLocalYaml(fileName: string, content: string): Promise<number> {
+    // 只接受 Clash 配置：JSON / CONF / 节点链接列表在入口就拦掉，
+    // 不要先建订阅再在刷新时失败（会留下一条永远刷不动的卡）。
+    if (!SubscriptionService.isClashBody(content)) {
+      throw new Error('请提供 YAML 订阅文件（Clash 配置）');
+    }
+
     // 三入口统一诊断：本地 YAML 与 URL 订阅 / 链接文本展示同一组指标
     const diagnostics = new SubscriptionImportDiagnostics();
     this.lastImportDiagnostics = diagnostics;
@@ -2551,6 +2763,8 @@ export class SubscriptionService {
         parsedGroups = SubscriptionParser.parseProxyGroups(localDispatch.body, sub.id);
         // 本地 YAML 导入：自带 rules/rule-providers 段随订阅一并落账
         SubscriptionService.applyRulesSections(sub, localDispatch.body);
+        // 本地 YAML 导入同样保留 dns 上游
+        SubscriptionService.applyDnsSections(sub, localDispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
         if (this.store !== null) {
@@ -2675,6 +2889,89 @@ export class SubscriptionService {
         }
         seen.add(t);
         out.push(t);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 全部启用订阅的 **dns 上游**，**按订阅分组返回**（不再是扁平并集）。
+   *
+   * 为什么必须按订阅分组（2026-10-21 根因收口）：内核的 `proxy-server-nameserver`
+   * 是全局单值，专用解析器只认 `proxy-server-nameserver-policy`、不查
+   * `nameserver-policy`。把多份订阅的上游并成一个全局列表，会让公共 DNS 在
+   * batchExchange（dns/resolver.go:227，并发取首个应答）里抢跑私有 DoH，
+   * 把别的订阅的入口域名解析到 WAF/CDN 诱饵 IP → 那份订阅全部超时。
+   *
+   * 返回 `SubDnsUpstream[]`：调用方（生成器）按 `ProxyNode.subscriptionId`
+   * 把每个上游绑定到它自己的节点域名后缀，等价于「一份订阅一份配置」。
+   */
+  subscriptionDnsUpstreams(): SubDnsUpstream[] {
+    const out: SubDnsUpstream[] = [];
+    for (const s of this.subscriptions) {
+      if (!s.enabled || s.id === DIRECT_GROUP_ID || s.subDnsProxyServers.length === 0) {
+        continue;
+      }
+      let list: string[] = [];
+      try {
+        list = JSON.parse(s.subDnsProxyServers) as string[];
+      } catch (e) {
+        list = [];
+      }
+      const servers: string[] = [];
+      const seen: Set<string> = new Set<string>();
+      for (const raw of list) {
+        const value = raw.trim();
+        if (value.length === 0 || seen.has(value) || servers.length >= 8) {
+          continue;
+        }
+        seen.add(value);
+        servers.push(value);
+      }
+      if (servers.length > 0) {
+        out.push(SubDnsUpstream.of(s.id, servers));
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 全部启用订阅的 `nameserver-policy` 条目（[后缀, 上游] 对，去重、上限 64 对）。
+   *
+   * 生成器只保留**后缀命中节点域名**的条目 —— 订阅2（pronetwork）就是靠
+   * `+.jushuitan.com → 私有 DoH` 这一条把入口解析对，删掉即 0/36 全灭。
+   */
+  subscriptionDnsPolicies(): string[][] {
+    const out: string[][] = [];
+    const seen: Set<string> = new Set<string>();
+    for (const s of this.subscriptions) {
+      if (!s.enabled || s.id === DIRECT_GROUP_ID || s.subDnsPolicies.length === 0) {
+        continue;
+      }
+      let pairs: string[][] = [];
+      try {
+        pairs = JSON.parse(s.subDnsPolicies) as string[][];
+      } catch (e) {
+        pairs = [];
+      }
+      for (const pair of pairs) {
+        if (pair.length < 2) {
+          continue;
+        }
+        const suffix = pair[0].trim();
+        const server = pair[1].trim();
+        if (suffix.length === 0 || server.length === 0) {
+          continue;
+        }
+        const id = `${suffix}\u0000${server}`;
+        if (seen.has(id)) {
+          continue;
+        }
+        if (out.length >= 64) {
+          return out;
+        }
+        seen.add(id);
+        out.push([suffix, server]);
       }
     }
     return out;
@@ -3089,7 +3386,7 @@ export class SubscriptionService {
     try {
       const cleaned = body.replace(/\s+/g, '');
       if (!/[:{]/.test(cleaned.substring(0, 200)) && /^[A-Za-z0-9+/=_-]+$/.test(cleaned)) {
-        const decoded = SsrCodec.decodeBase64Url(cleaned);
+        const decoded = Base64Codec.decodeBase64Url(cleaned);
         if (decoded.length > 0) {
           text = decoded;
         }
@@ -3351,6 +3648,8 @@ export class SubscriptionJson {
   enabled: boolean = true;
   sortOrder: number = 0;
   /** 双轨 provider 状态（见 Subscription.rawProviderState；旧存储无此键，读取端 ?? '' 兜底） */
+  /** 旧格式（非 Clash）标记：停止刷新但节点仍可用 */
+  legacyFormat: boolean = false;
   rawProviderState?: string;
   /** 双轨 provider 落盘原文条目估算（旧存储无此键，读取端 ?? 0 兜底） */
   rawProviderNodeEstimate?: number;
@@ -3360,4 +3659,8 @@ export class SubscriptionJson {
   subRules?: string;
   /** 订阅 yaml 自带 rule-providers 段（后加字段，旧存储无此键，读取端 ?? '' 兜底） */
   subRuleProviders?: string;
+  /** 订阅 dns.proxy-server-nameserver 上游（JSON 字符串数组；后加字段，?? '' 兜底） */
+  subDnsProxyServers?: string;
+  /** 订阅 dns nameserver-policy 条目（JSON 二维数组；后加字段，?? '' 兜底） */
+  subDnsPolicies?: string;
 }

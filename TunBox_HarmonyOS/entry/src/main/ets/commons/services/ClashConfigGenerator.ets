@@ -12,7 +12,9 @@
  * - TUN 通过 VpnExtensionAbility 的 fd 注入，配置仅声明 tun.enable
  * - 国内直连规则 + 强制代理站点规则
  */
+import { RawProxyItem, RawBodyCache, RawProxyYaml } from './RawProxyYaml';
 import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
+import { SubDnsUpstream, SubDnsUpstreamPolicy } from '../models/SubDnsUpstream';
 import { ProxyGroup } from '../models/ProxyGroup';
 import { AppSettings, AutoSelectModes, CustomRuleSet } from '../models/AppSettings';
 // 测速地址的**单一真源**（零 import ⇒ 不会形成循环依赖）。
@@ -151,6 +153,21 @@ export class ClashConfigGenerator {
   /** 最近一次生成的「订阅/覆盖层规则跳过」计数（策略目标或 provider 未声明的行） */
   static lastSkippedUserRules: number = 0;
   /** 最近一次生成的「双轨 provider」账本（开关关闭时 enabled=false 且 emitted=0） */
+  /** 在原文索引里按「去重后缀」找原名（xxx (2) → xxx） */
+  static rawNameIndex(index: Map<string, string>, node: ProxyNode): string {
+    const suffix = node.name.lastIndexOf(' (');
+    if (suffix <= 0) {
+      return '';
+    }
+    const base = node.name.substring(0, suffix);
+    return index.has(base) ? base : '';
+  }
+
+  /** 本次生成里「原文透传」的节点数（诊断/自检用） */
+  static rawPassthroughCount: number = 0;
+  /** 原文透传总开关（true=透传，false=退回解析发射）。急停时置 false。 */
+  static rawPassthroughEnabled: boolean = true;
+
   static lastProviderStats: RawProviderStats = new RawProviderStats();
   /** 丢弃告警回调：UI 侧注册后，连接/测速生成配置时的丢弃会以提示形式触达用户 */
   private static dropReporter: ((text: string) => void) | null = null;
@@ -182,7 +199,7 @@ export class ClashConfigGenerator {
     ruleProviderReady: boolean = true, useSmart: boolean = false,
     subscriptionRules: string[] = [], subscriptionRuleProviders: string = '',
     smartTestUrl: string = '',
-    subscriptionDnsProxyServers: string[] = [], subscriptionDnsPolicies: string[][] = []): string {
+    subscriptionDnsUpstreams: SubDnsUpstream[] = [], subscriptionDnsPolicies: string[][] = []): string {
     const lines: string[] = [];
 
     lines.push('mixed-port: ' + mixedPort);
@@ -271,10 +288,13 @@ export class ClashConfigGenerator {
     // 订阅 dns 原样进内核）；订阅没给才回落到内置公共 DoT。
     // policy 只保留后缀命中**本份配置的节点域名**的条目，不把机场针对其它域名的
     // 策略带进用户的 DNS 策略里。
-    const subDnsServers = ClashConfigGenerator.normalizeNameservers(subscriptionDnsProxyServers);
+    // 上游按**订阅**绑定（不再是全局并集）：每个订阅自己的入口域名 → 它自己的上游。
+    // 等价于「一份订阅一份配置」——Clash Verge Rev / CMFA / FlClash 都是单订阅运行，
+    // 这里把那个不变量在多订阅合并下还原出来。
+    const subDnsUpstreamPolicies = ClashConfigGenerator.normalizeDnsUpstreams(subscriptionDnsUpstreams, allNodes);
     const subDnsPolicies = ClashConfigGenerator.normalizeDnsPolicies(subscriptionDnsPolicies, allNodes);
     ClashConfigGenerator.pushDnsSection(lines, settings, dnsPort, useGeoip, ipv6Enabled, blockSites,
-      subDnsServers, subDnsPolicies);
+      subDnsUpstreamPolicies, subDnsPolicies);
     // ── 域名嗅探（对齐 Clash Verge / FlClash 默认开启的 sniffer）──────────────
     // ── 澄清：redir-host（2026-10-21 起）下内核拿到的是**真实**目标 IP，
     // DOMAIN 类规则靠 redir-host 映射（dns/middleware.go:99 withMapping 记录 IP→域名）
@@ -327,6 +347,29 @@ export class ClashConfigGenerator {
       if (host.length === 0 || !ClashConfigGenerator.isValidIpAddress(address)) {
         continue;
       }
+      // 订阅用私有 DoH 指定了入口域名上游时**不许 pin**：`hosts:` 是永久覆盖
+      // （内核日志显示 expire at 2162），会把拨号锁死在 UI 进程用公共 DoH 解出来的
+      // 诱饵 IP（阿里 WAF / Cloudflare）上，订阅的私有 DoH 再也问不到 → 全部超时。
+      // 与上面 proxy-server-nameserver-policy 镜像同一个根因，两条路径都要堵。
+      let coveredByPolicy = false;
+      for (const pair of subDnsPolicies) {
+        if (ClashConfigGenerator.policyMatchesAny(pair[0], [host])) {
+          coveredByPolicy = true;
+          break;
+        }
+      }
+      if (!coveredByPolicy) {
+        // 按订阅分域的上游条目同样受保护（它们也是订阅指定的私有 DoH）。
+        for (const up of subDnsUpstreamPolicies) {
+          if (ClashConfigGenerator.policyMatchesAny(up.suffix, [host])) {
+            coveredByPolicy = true;
+            break;
+          }
+        }
+      }
+      if (coveredByPolicy) {
+        continue;
+      }
       normalizedHosts.set(host, address.toLowerCase());
     }
     if (normalizedHosts.size > 0) {
@@ -336,7 +379,8 @@ export class ClashConfigGenerator {
       }
       lines.push('');
     }
-    lines.push('proxies:');
+    // （`proxies:` 键在下面按「静态节点是否为空」二选一发射：空列表必须写成 `proxies: []`，
+    //   否则会与这里再发一次同名键 → 内核 uniqueKeys 直接整份拒载。）
     // 只从白名单结构化字段生成合法配置，任何协议均不透传 rawYaml。
     // 同时把不可写入的节点按原因计数（漏洞 A：此前 validNodes 过滤是静默的，
     // 列表显示 N 个而内核只有 0 个，界面无任何提示）。
@@ -373,18 +417,84 @@ export class ClashConfigGenerator {
     //   proxies[i].name、proxy-groups 的 proxies 成员、PROXY 组的内容全部按名字引用，
     //   只改其中一处会造成悬空引用（组里引用了一个不存在的名字）。
     // 一起改完，后续所有引用自然指向新名字。
-    ClashConfigGenerator.ensureUniqueProxyNames(validNodes);
-    // 用户在 UI 里选中的那个节点必须跟着改名，否则 PROXY 组首个成员会引用旧名字
-    // （validNodes.includes 是对象身份比较，所以改名前取到的引用仍然有效）。
+    // （去重改名移到 staticNodes 计算之后：provider 覆盖的节点不参与改名，见下）
+    // ── 双轨 provider 计划（先算，供下面的节点发射分流）─────────────────
+    // 开关开启时：已落盘的订阅原文作为 `type: file` provider 交给内核自行解析，
+    // 该订阅的节点**不再由 App 重发射**（避免 App 解析丢字段/丢新协议，与 CMFA/FlClash 同形）。
+    // 本机 mihomo -t 实测：静态节点与 provider 内同名节点并存不会被拒载，所以这里
+    // 主动排除静态副本，名字所有权只留给 provider 文件。
+    const providerPlan: RawProviderPlan = ClashConfigGenerator.planRawProviders(settings, allNodes);
+    ClashConfigGenerator.lastProviderStats = providerPlan.stats;
+    ClashConfigGenerator.rawPassthroughCount = 0;
+    const coveredSubIds = new Set<string>();
+    for (const entry of providerPlan.entries) {
+      coveredSubIds.add(entry.subscriptionId);
+    }
+    const staticNodes: ProxyNode[] = [];
     for (const n of validNodes) {
-      lines.push(ClashConfigGenerator.proxyYamlLine(n));
+      const fromProvider = n.subscriptionId.length > 0 && coveredSubIds.has(n.subscriptionId);
+      if (!fromProvider) {
+        staticNodes.push(n);
+      }
+    }
+    // 只对「静态发射」的节点做去重改名：provider 覆盖的节点把自己的名字留在 provider 文件里，
+    // App 侧再改名就会让订阅自带的 proxy-groups 成员（按原名引用）指向不存在的节点 →
+    // 内核 `proxy not found` 整份拒载。跨 provider 的同名节点内核允许共存
+    // （本机实测：两个 file provider 各有一个「香港01」，启动正常、无 duplicate 报错）。
+    ClashConfigGenerator.ensureUniqueProxyNames(staticNodes);
+    if (staticNodes.length === 0) {
+      // 全部节点都由 provider 提供时必须写成空序列，`proxies:` 后面什么都没有会被解析成 null。
+      lines.push('proxies: []');
+    } else {
+      lines.push('proxies:');
+      // ── 原文透传（2026-10-21）────────────────────────────────────
+      // 有该订阅原文（本次进程内刷新过）→ 直接发机场写的那段 YAML，
+      // App 不再重发射（不丢字段、不丢新协议，与三家的「原文交给内核」同效）。
+      // 名字对不上（重名被改名）或没原文 → 单节点退回解析发射，输出仍是合法 YAML。
+      const rawBySub: Map<string, Map<string, string>> = new Map<string, Map<string, string>>();
+      // 索引构建与发射**必须分两趟**：合并成一趟时，`subId.length === 0` 的 continue
+      // 会把「没有订阅归属」的节点（手工导入 / 本地分组）整条丢掉，`proxies:` 后面
+      // 变空 → 内核报 `proxy group[0]: PROXY: 'xxx' not found` 整份拒载。
+      // 2026-10-22 由本机真实内核 `-t` 抓到（生成器单测全是字符串断言，看不出这种空洞）。
+      for (const n of staticNodes) {
+        const subId = n.subscriptionId;
+        if (subId.length === 0 || rawBySub.has(subId)) {
+          continue;
+        }
+        // 急停开关（rawPassthroughEnabled=false ⇒ 全部退回解析发射）
+        const body = ClashConfigGenerator.rawPassthroughEnabled ? RawBodyCache.get(subId) : '';
+        const index = new Map<string, string>();
+        if (body.length > 0) {
+          const items: RawProxyItem[] = RawProxyYaml.extractProxies(body);
+          for (const it of items) {
+            index.set(it.name, it.text);
+          }
+        }
+        rawBySub.set(subId, index);
+      }
+      for (const n of staticNodes) {
+        const index = rawBySub.get(n.subscriptionId);
+        let rawText = index === undefined ? undefined : index.get(n.name);
+        if (rawText === undefined && index !== undefined) {
+          // 名字被去重改过（如「香港01」→「香港01 (2)」）：按原名找到原文，只改 name 字段
+          const renamed = ClashConfigGenerator.rawNameIndex(index, n);
+          if (renamed.length > 0) {
+            rawText = RawProxyYaml.renameItem(index.get(renamed)!, n.name);
+          }
+        }
+        if (rawText !== undefined) {
+          // 原文缩进归一：各机场不统一（4 空格 / 2 空格），混进同一列表即非法 YAML
+          lines.push(RawProxyYaml.reindent(rawText));
+          ClashConfigGenerator.rawPassthroughCount++;
+        } else {
+          lines.push(ClashConfigGenerator.proxyYamlLine(n));
+        }
+      }
     }
     // ── 双轨（settings.useRawProviderConfig，默认关闭）────────────────────
     // 开关关闭：计划为空、不追加任何一行 → 输出与现状（HEAD）完全一致。
     // 开关开启：每个已落盘的订阅原文作为 `type: file` provider 交给内核自行解析，
     // 与 Mihomo/Clash Verge 对齐；文件缺失的 provider 绝不写入（避免 use: 悬空引用）。
-    const providerPlan: RawProviderPlan = ClashConfigGenerator.planRawProviders(settings, allNodes);
-    ClashConfigGenerator.lastProviderStats = providerPlan.stats;
     if (providerPlan.entries.length > 0) {
       lines.push('');
       lines.push('proxy-providers:');
@@ -400,6 +510,9 @@ export class ClashConfigGenerator {
           lines.push(`      interval: ${RAW_PROVIDER_HEALTH_CHECK_INTERVAL}`);
         }
       }
+    }
+    if (ClashConfigGenerator.rawPassthroughCount > 0) {
+      AppLogger.info(TAG, `raw passthrough: ${ClashConfigGenerator.rawPassthroughCount}/${staticNodes.length} node(s) emitted from subscription body verbatim`);
     }
     const groupSelected: ProxyNode = validNodes.includes(selectedNode) ? selectedNode : validNodes[0];
     // ── YAML 覆盖层自定义 proxy-groups 聚合 ──────────────────────────────
@@ -439,24 +552,38 @@ export class ClashConfigGenerator {
     lines.push('proxy-groups:');
     lines.push('  - name: "PROXY"');
     lines.push('    type: select');
-    lines.push('    proxies:');
+    // 成员先算后发：provider 提供的节点只通过 `use:` 进入组，绝不按名字写进 proxies。
+    // 原因：App 侧会对重名节点改名（ensureUniqueProxyNames），而 provider 文件里是原文名，
+    // 按名字引用会指向不存在的节点 → 内核报 proxy not found 整份拒载。
+    const proxyMembers: string[] = [];
+    const selectedFromProvider = !staticNodes.includes(groupSelected);
     if (emitSmart) {
       // 自动模式下 PROXY 默认指向 smart 组：内核按每条连接的目标特征（ASN/GeoIP/
       // 端口/域名类型）在组内动态选点，而不是整条隧道钉死在一个节点上。
-      const smartFirst = settings.autoSelectMode === AutoSelectModes.AUTO;
-      lines.push(`      - "${smartFirst ? SMART_GROUP_NAME : ClashConfigGenerator.escapeYaml(groupSelected.name)}"`);
+      // 选中节点来自 provider 时同样直接指向 smart 组（它的名字不能按名引用）。
+      const smartFirst = settings.autoSelectMode === AutoSelectModes.AUTO || selectedFromProvider;
+      proxyMembers.push(smartFirst ? SMART_GROUP_NAME : groupSelected.name);
       if (!smartFirst) {
-        lines.push(`      - "${SMART_GROUP_NAME}"`);
+        proxyMembers.push(SMART_GROUP_NAME);
       }
-    } else {
-      lines.push(`      - "${ClashConfigGenerator.escapeYaml(groupSelected.name)}"`);
+    } else if (!selectedFromProvider) {
+      proxyMembers.push(groupSelected.name);
     }
     for (const group of emittedGroups) {
-      lines.push(`      - "${ClashConfigGenerator.escapeYaml(group.name)}"`);
+      proxyMembers.push(group.name);
     }
-    for (const n of validNodes) {
+    for (const n of staticNodes) {
       if (n.id !== groupSelected.id) {
-        lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
+        proxyMembers.push(n.name);
+      }
+    }
+    if (proxyMembers.length === 0) {
+      // 全组都由 provider 提供时必须是空序列（`proxies:` 后空着会被解析成 null）。
+      lines.push('    proxies: []');
+    } else {
+      lines.push('    proxies:');
+      for (const m of proxyMembers) {
+        lines.push(`      - "${ClashConfigGenerator.escapeYaml(m)}"`);
       }
     }
     // 代理组通过 use: 引用原始订阅 provider：解析链节点 + provider 节点同时可用，
@@ -535,8 +662,16 @@ export class ClashConfigGenerator {
         lines.push(`    policy-priority: "${ClashConfigGenerator.escapeYaml(priority)}"`);
       }
       lines.push('    proxies:');
-      for (const n of validNodes) {
+      for (const n of staticNodes) {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
+      }
+      // smart 组同样要 `use:` provider：provider 提供的节点不在静态列表里，
+      // 少了这一段自动选点会看不到这些节点。
+      if (providerPlan.entries.length > 0) {
+        lines.push('    use:');
+        for (const entry of providerPlan.entries) {
+          lines.push(`      - "${ClashConfigGenerator.escapeYaml(entry.providerName)}"`);
+        }
       }
     }
     // ── YAML 覆盖层的 rules/rule-providers 预解析 ─────────────────────────
@@ -908,7 +1043,7 @@ export class ClashConfigGenerator {
    */
   private static pushDnsSection(lines: string[], settings: AppSettings, dnsPort: number,
     useGeoip: boolean, ipv6Enabled: boolean, blockSites: string[],
-    subDnsServers: string[] = [], subDnsPolicies: string[][] = []): void {
+    subDnsUpstreams: SubDnsUpstreamPolicy[] = [], subDnsPolicies: string[][] = []): void {
     lines.push('dns:');
     lines.push('  enable: true');
     lines.push(`  listen: 127.0.0.1:${dnsPort}`);
@@ -1031,27 +1166,12 @@ export class ClashConfigGenerator {
     // ⚠ 与 DoHResolver 的 pin 策略是**同一件事的两面**：如果将来恢复「短 TTL 也 pin」，
     //    这里才可以考虑退回明文（但没必要——加密只多几毫秒握手，且有缓存）。
     lines.push('  proxy-server-nameserver:');
-    if (subDnsServers.length > 0) {
-      // 订阅自带的上游优先：机场把入口域名的真实 IP 只告诉自家私有 DoH，
-      // 用公共 DNS 解析出来的是 Cloudflare / WAF 前置 IP（代理端口不通）。
-      // 这里**整段替换**而不是与公共 DoT 混排 —— mihomo 对同一层多个上游是
-      // 并发取首个成功应答，混进公共 DNS 会让错答案抢跑（等于没修）。
-      for (const server of subDnsServers) {
-        lines.push(`    - "${ClashConfigGenerator.escapeYaml(server)}"`);
-      }
-    } else if (subDnsPolicies.length > 0) {
-      // ⚠ 订阅只给了 `nameserver-policy`（pronetwork 系面板）、没给
-      // `proxy-server-nameserver` 时，这里**必须写空列表** —— 不能回落到公共 DoT。
-      // 原因是 mihomo 的解析器选择逻辑（hub/executor/executor.go:304-307）：
-      // `proxy-server-nameserver` 非空 ⇒ 代理服务器域名走**专用解析器**，而专用解析器
-      // **不查 nameserver-policy**；为空 ⇒ 退回主解析器，`nameserver-policy` 才会生效。
-      // 订阅2 实测：保留 DoT 时 `31se.jushuitan.com` 被解析成阿里 WAF 60.205.172.133
-      // （全部超时）；删掉这行后主解析器按 policy 走私有 DoH，30/36 恢复。
-      lines.push('    # 订阅用 DNS 策略指定入口域名上游；此处留空让 policy 生效');
-    } else {
-      lines.push('    - tls://223.5.5.5:853');
-      lines.push('    - tls://1.12.12.12:853');
-    }
+    // 2026-10-21 起：这里**只写中性 DoT 默认，不再并入订阅上游**。
+    // 订阅的上游一律按「订阅自己的入口域名后缀」写进 `proxy-server-nameserver-policy`
+    // （见下方），因为全局列表一旦混入多份订阅的上游，命令内核 batchExchange
+    // 并发取首个应答时公共 DNS 会抢跑私有 DoH，等于没修。
+    lines.push('    - tls://223.5.5.5:853');
+    lines.push('    - tls://1.12.12.12:853');
     // ── 国内域名显式钉到国内加密 DoT ──
     // direct-nameserver 已覆盖 DIRECT 分支，这里再加一层是为了让意图可审计、
     // 且不依赖内核对 direct-nameserver 的适用面判断。
@@ -1098,6 +1218,26 @@ export class ClashConfigGenerator {
     // YAML 键 + 多值列表（重复键会被内核整份拒载，绝不能逐条 push 同名键）。
     const policyServers: Map<string, string[]> = new Map<string, string[]>();
     const policyOrder: string[] = [];
+    // ① 订阅自己的**代理域名上游**（`dns.proxy-server-nameserver`）→ 按该订阅节点
+    // 域名后缀绑定。先于 nameserver-policy 入表：同一后缀两边都有时以「拨号入口专用
+    // 上游」为准（它本来就是为拨代理服务器准备的）。
+    for (const up of subDnsUpstreams) {
+      if (up.suffix.length === 0 || up.servers.length === 0 || usedPolicySuffixes.has(up.suffix)) {
+        continue;
+      }
+      let list = policyServers.get(up.suffix);
+      if (list === undefined) {
+        list = [];
+        policyServers.set(up.suffix, list);
+        policyOrder.push(up.suffix);
+      }
+      for (const server of up.servers) {
+        if (!list.includes(server) && list.length < 4) {
+          list.push(server);
+        }
+      }
+    }
+    // ② 订阅 `nameserver-policy` / `proxy-server-nameserver-policy` 声明的条目。
     for (const pair of subDnsPolicies) {
       const suffix = pair[0];
       const server = pair[1];
@@ -1123,6 +1263,27 @@ export class ClashConfigGenerator {
       lines.push(`    "${ClashConfigGenerator.escapeYaml(suffix)}":`);
       for (const server of list) {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(server)}"`);
+      }
+    }
+    // ── 按订阅分域的 `proxy-server-nameserver-policy`（2026-10-21 根因收口）──
+    // mihomo 的解析器选择是**全局单值**：`proxy-server-nameserver` 非空时，所有代理
+    // 服务器域名走专用解析器，而专用解析器只认 `proxy-server-nameserver-policy`，
+    // **不查** `nameserver-policy`（dns/resolver.go makePolicy(ProxyServerPolicy)）。
+    // 所以上面全局只留中性 DoT，每个订阅自己的上游一律在这里按**它自己的入口域名
+    // 后缀**声明 —— 等价于「一份订阅一份配置」，任何订阅组合都不会互相抢答。
+    // 内核要求二者同在（config.go:1458 拒绝「有 policy 但 proxy-server-nameserver 为空」），
+    // 上面已恒写 DoT，故此处只要有条目就发射。
+    if (policyOrder.length > 0) {
+      lines.push('  proxy-server-nameserver-policy:');
+      for (const suffix of policyOrder) {
+        const list = policyServers.get(suffix);
+        if (list === undefined || list.length === 0) {
+          continue;
+        }
+        lines.push(`    "${ClashConfigGenerator.escapeYaml(suffix)}":`);
+        for (const server of list) {
+          lines.push(`      - "${ClashConfigGenerator.escapeYaml(server)}"`);
+        }
       }
     }
     // fake-ip 过滤：局域网/系统/直连目标必须拿**真实**地址 —— 给假地址会让
@@ -2683,6 +2844,99 @@ export class ClashConfigGenerator {
       return value;
     }
     return '';
+  }
+
+  /**
+   * 把「按订阅的代理域名上游」归一化成 `[后缀 → 上游]` 条目。
+   *
+   * 后缀来自**该订阅自己的节点 `server`**（`ProxyNode.subscriptionId` 归属），
+   * 因此上游只会作用于产生它的那份订阅 —— 这是多订阅合并下还原
+   * 「一份订阅一份配置」的关键（三家主流客户端都靠单订阅运行天然满足）。
+   */
+  static normalizeDnsUpstreams(upstreams: SubDnsUpstream[], nodes: ProxyNode[]): SubDnsUpstreamPolicy[] {
+    const out: SubDnsUpstreamPolicy[] = [];
+    const seenSuffix: Set<string> = new Set<string>();
+    for (const up of upstreams) {
+      if (up.subId.length === 0 || up.servers.length === 0) {
+        continue;
+      }
+      const servers: string[] = [];
+      for (const raw of up.servers) {
+        const value = ClashConfigGenerator.normalizeNameserver(raw);
+        if (value.length === 0 || servers.includes(value) || servers.length >= 4) {
+          continue;
+        }
+        servers.push(value);
+      }
+      if (servers.length === 0) {
+        continue;
+      }
+      const suffixes: string[] = [];
+      for (const node of nodes) {
+        if (node.subscriptionId !== up.subId) {
+          continue;
+        }
+        const suffix = ClashConfigGenerator.entryDomainSuffix(node.server);
+        if (suffix.length === 0 || suffixes.includes(suffix)) {
+          continue;
+        }
+        suffixes.push(suffix);
+        if (suffixes.length >= 16) {
+          break;
+        }
+      }
+      for (const suffix of suffixes) {
+        if (seenSuffix.has(suffix)) {
+          // 同一后缀被两个订阅声明 → 先声明者优先，后到的丢弃（不静默混排上游）。
+          AppLogger.warn(TAG, `dns upstream: suffix ${suffix} already bound, drop duplicate`);
+          continue;
+        }
+        seenSuffix.add(suffix);
+        const p = new SubDnsUpstreamPolicy();
+        p.suffix = suffix;
+        p.servers = servers;
+        out.push(p);
+      }
+    }
+    return out;
+  }
+
+  /** 双段公共后缀：这些 TLD 下要再上一级才算「一个站点」。 */
+  private static readonly TWO_LABEL_SUFFIXES: string[] = [
+    'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'ac.cn',
+    'co.uk', 'org.uk', 'ac.uk',
+    'com.tw', 'org.tw', 'com.hk', 'com.sg',
+    'co.jp', 'co.kr', 'com.au', 'co.nz', 'com.br'
+  ];
+
+  /**
+   * 从节点 `server` 推导「入口域名策略后缀」。
+   *
+   * - 纯 IP / IPv6 字面量 → 空串（不需要解析，不入策略）
+   * - 两段域名 `example.com` → 精确域名（避免 `+.com` 这种过宽匹配）
+   * - 三段及以上 `a.example.com` → `+.example.com`
+   * - 落在双段公共后缀下 `a.b.com.cn` → `+.b.com.cn`
+   */
+  private static entryDomainSuffix(server: string): string {
+    const host = ClashConfigGenerator.normalizeDomain(server);
+    if (host.length === 0 || host.indexOf(':') >= 0) {
+      return '';
+    }
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+      return '';
+    }
+    const parts = host.split('.');
+    if (parts.length < 2) {
+      return '';
+    }
+    if (parts.length === 2) {
+      return host;
+    }
+    const last2 = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+    if (ClashConfigGenerator.TWO_LABEL_SUFFIXES.includes(last2)) {
+      return parts.length >= 3 ? `+.${parts.slice(parts.length - 3).join('.')}` : host;
+    }
+    return `+.${last2}`;
   }
 
   /**

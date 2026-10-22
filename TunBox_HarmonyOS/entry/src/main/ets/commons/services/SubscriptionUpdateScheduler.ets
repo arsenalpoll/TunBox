@@ -165,6 +165,11 @@ export class SubscriptionUpdateScheduler {
       if (s.url.startsWith('local://')) {
         continue; // 本地 YAML 伪订阅无远端可更新
       }
+      if (s.legacyFormat) {
+        // 旧格式（非 Clash）订阅已停止刷新：节点照常可用，但不再自动拉取，
+        // 否则每次扫描都会重新报一次「不是 Clash 配置」。
+        continue;
+      }
       total = total + 1;
       // 易变域名订阅（加固③）：节点 server 命中 trycloudflare 等临时隧道域名时，
       // 隧道域名轮换后旧节点全部超时，刷新间隔压到 6h（EPHEMERAL_SUBSCRIPTION_REFRESH_MS，

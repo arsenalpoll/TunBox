@@ -78,6 +78,8 @@ export struct SettingsView {
   @State quotaNotifyEnabled: boolean = true;
   // ── 网络（IPv6 双栈，产品默认开）──
   @State ipv6Enabled: boolean = true;
+  /** 是否允许明文 HTTP 订阅（默认关闭；关闭时只接受 https） */
+  @State allowInsecureSubscriptionHttp: boolean = false;
   /**
    * 深浅色主题（2026-10-20 新增）：直接镜像 ThemeService 在 AppStorage 里的 theme_mode，
    * 因此主页太阳按钮改了它也会同步（StorageLink 双向）。
@@ -127,6 +129,7 @@ export struct SettingsView {
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
     this.ipv6Enabled = this.settings.ipv6Enabled;
+    this.allowInsecureSubscriptionHttp = this.settings.allowInsecureSubscriptionHttp;
     this.assetSource = this.settings.assetSource;
     this.testLatencyUrl = this.settings.testLatencyUrl;
     this.refreshGeoStatuses();
@@ -205,6 +208,20 @@ export struct SettingsView {
   }
 
   // ── 网络（IPv6 双栈）─────────────────────────────────────────────
+
+  /**
+   * 是否允许明文 HTTP 订阅。只改写设置字段，不触发重连（只影响下一次拉订阅）。
+   */
+  private setAllowInsecureSubscriptionHttp(v: boolean): void {
+    this.allowInsecureSubscriptionHttp = v;
+    this.settings.allowInsecureSubscriptionHttp = v;
+    // 字段级写：只改这一个字段（整单覆盖会把别的写者刚写的值盖回旧值）
+    SettingsService.patchSettings((s: AppSettings): void => {
+      s.allowInsecureSubscriptionHttp = v;
+    }).catch((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
+  }
 
   /**
    * IPv6 双栈开关。
@@ -578,6 +595,20 @@ export struct SettingsView {
                     .onChange((v: boolean): void => this.setQuotaNotify(v))
                 }.width('100%').alignItems(VerticalAlign.Center)
                 Text('订阅流量剩余不足 10% 或 3 天内到期时发送系统通知（每次刷新订阅后检查，每天最多提醒一次）')
+                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+              }.width('100%')
+              Divider().color(TunBoxColors.cardBorder)
+              Column({ space: 4 }) {
+                Row() {
+                  Text('允许明文 HTTP 订阅')
+                    .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                  Toggle({ type: ToggleType.Switch, isOn: this.allowInsecureSubscriptionHttp })
+                    .selectedColor(TunBoxColors.primary)
+                    .onChange((v: boolean): void => this.setAllowInsecureSubscriptionHttp(v))
+                }.width('100%').alignItems(VerticalAlign.Center)
+                Text('默认关闭：只接受 https 订阅链接。明文 http 既无加密也不防篡改——'
+                  + '面板被劫持或被中间人替换时，返回的节点表可以把你的流量导向任意服务器。'
+                  + '仅在自建面板确实没有证书时临时开启，用完建议关掉。')
                   .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }.width('100%')
             }

@@ -26,6 +26,9 @@ const FILES = [
     },
   },
   { src: 'commons/models/ProxyGroup.ets', out: 'ProxyGroup.ts', map: {} },
+  // 2026-10-21：按订阅绑定的 DNS 上游载体（纯数据类，无依赖，不走桩）
+  { src: 'commons/models/SubDnsUpstream.ets', out: 'SubDnsUpstream.ts', map: {} },
+  { src: 'commons/services/RawProxyYaml.ets', out: 'RawProxyYaml.ts', map: {} },
   // ── 订阅解析内核化（2026-10-20）：规范解析层是真源，不能打桩 ──
   { src: 'commons/subscription/ProtocolParamTable.ets', out: 'ProtocolParamTable.ts', map: {} },
   {
@@ -75,6 +78,7 @@ const FILES = [
     src: 'commons/services/SubscriptionParser.ets', out: 'SubscriptionParser.ts', map: {
       '../models/ProxyNode': './ProxyNode.ts',
       '../models/ProxyGroup': './ProxyGroup.ts',
+      '../models/SubDnsUpstream': './SubDnsUpstream.ts',
       './YamlMerger': './YamlMerger.ts',
       '../utils/AppLogger': './stubs.ts',
       // 2026-10-20（B6 旧解析器退场）：链接列表改走规范解析层
@@ -132,12 +136,15 @@ const FILES = [
       '../models/ProxyNode': './ProxyNode.ts',
       '../models/ProxyGroup': './ProxyGroup.ts',
       '../models/AppSettings': './AppSettings.ts',
+      '../models/SubDnsUpstream': './SubDnsUpstream.ts',
       './SubscriptionParser': './SubscriptionParser.ts',
       './SubscriptionFetchPolicy': './stubs.ts',
+      './SettingsService': './stubs.ts',
       './YamlMerger': './YamlMerger.ts',
       './ClashConfigGenerator': './ClashConfigGenerator.ts',
       './ProxyProviderParser': './ProxyProviderParser.ts',
       './RawSubscriptionStore': './stubs.ts',
+      './RawProxyYaml': './RawProxyYaml.ts',
       './CredentialStore': './stubs.ts',
       '../utils/AppLogger': './stubs.ts',
       './ConcurrentRefresh': './ConcurrentRefresh.ts',
@@ -174,9 +181,11 @@ const FILES = [
       '../models/ProxyNode': './ProxyNode.ts',
       '../models/ProxyGroup': './ProxyGroup.ts',
       '../models/AppSettings': './AppSettings.ts',
+      '../models/SubDnsUpstream': './SubDnsUpstream.ts',
       './YamlMerger': './YamlMerger.ts',
       '../utils/AppLogger': './stubs.ts',
       './RawSubscriptionStore': './stubs.ts',
+      './RawProxyYaml': './RawProxyYaml.ts',
       // 2026-10-20（A12c）：测速地址唯一真源
       '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
     },

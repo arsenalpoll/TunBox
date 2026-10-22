@@ -113,15 +113,33 @@ const persistSrc = fs.readFileSync(
 ok('持久化转换优先使用 rec.failKind（不再从 state 重新盖章）',
   /toPersistRecord[\s\S]{0,600}?rec\.failKind\.length\s*>\s*0/.test(persistSrc));
 
-// ── 「测全部」走组测路径，组接口不返回状态码 → 必须靠内核代理表区分 ────
-// 契约：组测后用 proxyTableNames() 判断"节点在不在内核里"，
-// 不在 → switch_failed（未生效）；在 → 真超时。否则「测全部」看到的仍是全红。
-ok('组测路径用内核代理表区分「未生效」',
-  /proxyTableNames\(\)/.test(persistSrc));
-ok('组测路径把不在代理表的失败节点标为 switch_failed',
-  /notInCore[\s\S]{0,400}?LatencyProbeKind\.SWITCH_FAILED/.test(persistSrc));
+// ── 测速唯一入口 = LatencyEngine（2026-10-21 收敛，2026-10-22 补闸门）──────────
+// 契约：页面层不得再实现「内核侧组测速」（`GET /group/{name}/delay`）。
+// 历史形态：NodeSelectionPage 曾有一套 runGroupLatency，只有它自己用、且该页没有任何
+// 导航入口 → 死路径，还会与订阅页闪电测速形成两套口径（超时判定/失败分类不同源）。
+// 现在「测全部」与「单节点/单订阅测速」全部走同一个引擎。
+ok('页面层不再实现内核侧组测速（无 /group/ 端点、无 runGroupLatency）',
+  !/runGroupLatency/.test(persistSrc) && !/\/group\//.test(persistSrc));
+ok('「测全部」统一走 LatencyEngine',
+  /LatencyEngine\.start\(/.test(persistSrc));
 ok('测速完成提示单独报「未生效」计数',
   /未生效 \$\{progress\.failed\}/.test(persistSrc));
+
+// ── 「控制器过载」必须有界面出口（2026-10-22 迁到真实入口：订阅页闪电测速）────
+// 契约：过载路径下引擎**故意不给节点写结论**（保持未测）⇒ 用户看到「测速完成 + 一堆 --」。
+// 必须单独说明，且文案与「通道不可用」区分（通道是好的、可以重测）。
+// 本条曾锁在 NodeSelectionPage（死页），随该页的组测实现一起迁到 SubscriptionPage。
+const subPageSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/pages/SubscriptionPage.ets'), 'utf8');
+ok('过载数进入测速结论文案（不静默丢弃）',
+  /coreOverloaded\s*>\s*0/.test(subPageSrc) && /控制器过载/.test(subPageSrc));
+ok('过载文案与「通道不可用」区分（说明通道正常、可重测）',
+  /控制器过载[^`]{0,40}通道正常/.test(subPageSrc));
+ok('进度映射把 coreOverloaded 交给调用方（后台测速返回 progress）',
+  /Promise<LatencyProgress\s*\|\s*null>/.test(fs.readFileSync(
+    path.join(root, 'entry/src/main/ets/commons/services/BackgroundLatencyService.ets'), 'utf8'))
+  && /return progress;/.test(fs.readFileSync(
+    path.join(root, 'entry/src/main/ets/commons/services/BackgroundLatencyService.ets'), 'utf8')));
 
 const apiSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/services/ClashApiService.ets'), 'utf8');
@@ -145,17 +163,23 @@ ok('ClashApiService 提供 proxyTableNames（内核代理表全名）',
 //   8 = OHOS http 栈对同一 host 的连接池容量 ⇒ 排队改在应用层闸门里发生，不污染读数。
 const kindsSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/latency/LatencyKinds.ets'), 'utf8');
-ok('单节点测速超时为 3000ms（2026-10-20 用户要求 5s→3s；真源 LatencyTimeout.DEFAULT_TIMEOUT_MS）',
-  /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*3000/.test(kindsSrc));
+// 2026-10-21（用户对标三家）：超时由 3s 回到 **5s**（FlClash 8s / Verge 10s / CMFA 5s），
+// 在途并发由 50 收敛为 8 = OHOS http 栈对同一 host 的连接池容量（排队改在应用层闸门里发生）。
+ok('单节点测速超时为 5000ms（真源 LatencyTimeout.DEFAULT_TIMEOUT_MS，用户拍板对齐三家）',
+  /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*5000/.test(kindsSrc));
 ok('LatencyPolicy 的超时是转调真源（不留第二份字面量）',
   /return\s+LatencyTimeout\.DEFAULT_TIMEOUT_MS;/.test(stateSrc)
   && !/DEFAULT_TIMEOUT_MS:\s*number\s*=\s*\d+/.test(stateSrc));
 ok('并发测速数为 50（C8b：由 88 收敛，worker 口径）', /LATENCY_CONCURRENCY\s*=\s*50/.test(engineSrc));
-ok('在途并发上限为 8（2026-10-21 真机回退：= OHOS 同 host 连接池容量）',
-  /LATENCY_INFLIGHT\s*=\s*8/.test(engineSrc));
-ok('组测每节点预算与单节点一致（3000ms）', /GROUP_TEST_TIMEOUT_MS\s*=\s*3000/.test(engineSrc));
-ok('内核延迟探测默认超时同步为 3000ms',
-  /testLatencyDetailed\(nodeName: string, testUrl: string,\s*\n?\s*(?:\/\/[^\n]*\n\s*)?timeoutMs: number = 3000/.test(apiSrc));
+// 2026-10-21：在途由 8 放开到 32（用户要求对齐 FlClash 客户端在途 32）。
+// ⚠ 断言必须打**声明行**：曾经写成 `LATENCY_INFLIGHT\s*=\s*8`，结果命中的是注释里
+// 那句「LATENCY_INFLIGHT=8」，代码改回 8→32 时闸门照样绿（假绿，2026-10-22 发现）。
+ok('在途并发上限为 32（对齐 FlClash 客户端在途；回退点依次 16 → 8）',
+  /export const LATENCY_INFLIGHT = 32;/.test(engineSrc));
+ok('组测每节点预算转调单节点真源（不留第二份字面量）',
+  /export const GROUP_TEST_TIMEOUT_MS = LatencyPolicy\.DEFAULT_TIMEOUT_MS;/.test(engineSrc));
+ok('内核延迟探测默认超时转调同一真源（不留 3000/5000 字面量）',
+  /timeoutMs: number = LatencyPolicy\.DEFAULT_TIMEOUT_MS/.test(apiSrc));
 // 离线探测器（DirectLatencyTester）已被测速内核（LP07）取代 —— 文件不在了就跳过这条，
 // 但**不许**因为文件缺失而整个闸门崩掉（那会让「文件已删」看起来像「契约破了」）。
 const directTesterPath = path.join(root, 'entry/src/main/ets/commons/services/DirectLatencyTester.ets');

@@ -159,8 +159,14 @@ export class SubscriptionFetchPolicy {
    *   的增量刷新语义）。
    */
   static async fetch(urlStr: string, headerName: string, headerValue: string,
-    allowInsecureHttp: boolean = true, etag: string = ''): Promise<SubscriptionFetchResult> {
+    allowInsecureHttp: boolean, etag: string = ''): Promise<SubscriptionFetchResult> {
     if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr, allowInsecureHttp)) {
+      // 明文 http 单独给可行动提示：它现在是「默认禁用」而不是「地址非法」。
+      if (!allowInsecureHttp && urlStr.toLowerCase().startsWith('http://')) {
+        throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
+          '该订阅是明文 HTTP 链接：默认已禁用。请改用机场提供的 https 链接，'
+            + '或在「设置 → 允许明文 HTTP 订阅」中显式打开');
+      }
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
         '订阅地址无效：仅允许公开 HTTP/HTTPS 地址');
     }
@@ -690,7 +696,7 @@ export class SubscriptionFetchPolicy {
   }
 
   /** 订阅 URL 合法性：允许公开 HTTP/HTTPS 地址。 */
-  static isValidSubscriptionUrl(urlStr: string, allowInsecureHttp: boolean = true): boolean {
+  static isValidSubscriptionUrl(urlStr: string, allowInsecureHttp: boolean = false): boolean {
     const lower = urlStr.toLowerCase();
     if (urlStr.length === 0 || urlStr.length > 8192
       || (!lower.startsWith('https://') && !(allowInsecureHttp && lower.startsWith('http://')))

@@ -27,7 +27,7 @@
 import { AppLogger } from '../utils/AppLogger';
 import { ConnectionOrchestrator } from './ConnectionOrchestrator';
 import { LatencyLiveView } from './LatencyLiveView';
-import { LatencyEngine, LatencyRunOptions, LATENCY_TIMEOUT_MS } from './LatencyEngine';
+import { LatencyEngine, LatencyProgress, LatencyRunOptions, LATENCY_TIMEOUT_MS } from './LatencyEngine';
 import { AppSettings } from '../models/AppSettings';
 import { ProxyNode } from '../models/ProxyNode';
 import { SettingsService } from './SettingsService';
@@ -64,13 +64,13 @@ export class BackgroundLatencyService {
     await BackgroundLatencyService.execute(context, null);
   }
 
-  /** 订阅导入/刷新成功后只测该订阅的节点 */
+  /** 订阅导入/刷新成功后只测该订阅的节点；返回本轮进度（调用方可据此说明「过载未测」） */
   static async testSubscription(context: Context, subscriptionId: string,
-    onChannelReady: (() => void) | null = null): Promise<void> {
+    onChannelReady: (() => void) | null = null): Promise<LatencyProgress | null> {
     if (subscriptionId.length === 0) {
-      return;
+      return null;
     }
-    await BackgroundLatencyService.execute(context, subscriptionId, onChannelReady);
+    return await BackgroundLatencyService.execute(context, subscriptionId, onChannelReady);
   }
 
   /**
@@ -143,11 +143,11 @@ export class BackgroundLatencyService {
    *        「准备测速通道…」与「正在测速…」两个阶段
    */
   private static async execute(context: Context, subscriptionId: string | null,
-    onChannelReady: (() => void) | null = null): Promise<void> {
+    onChannelReady: (() => void) | null = null): Promise<LatencyProgress | null> {
     if (BackgroundLatencyService.running || LatencyEngine.isRunning()) {
       // 单航班：已有批次（不论来自页面还是后台）在跑就不叠加
       AppLogger.info(TAG, 'silent batch skipped: a latency run is already in flight');
-      return;
+      return null;
     }
     BackgroundLatencyService.running = true;
     try {
@@ -164,7 +164,7 @@ export class BackgroundLatencyService {
         }
       }
       if (nodes.length === 0) {
-        return;
+        return null;
       }
 
       // 通道：已连接复用隧道 controller；未连接尝试无头内核；都不可用则 null
@@ -191,9 +191,11 @@ export class BackgroundLatencyService {
       AppLogger.info(TAG, `silent batch done nodes=${nodes.length} `
         + `channel=${progress.channel} measured=${progress.measured} timeout=${progress.timeout} `
         + `failed=${progress.failed} skipped=${progress.skipped} `
-        + `coreUnavailable=${progress.coreUnavailable}`);
+        + `coreUnavailable=${progress.coreUnavailable} overloaded=${progress.coreOverloaded}`);
+      return progress;
     } catch (e) {
       AppLogger.warn(TAG, `silent batch failed: ${AppLogger.errText(e)}`);
+      return null;
     } finally {
       BackgroundLatencyService.running = false;
     }

@@ -34,14 +34,6 @@ import {
 } from '../commons/services/ConcurrentRefresh';
 
 const TAG = 'SubscriptionPage';
-/**
- * 订阅展开区操作行（测速 / 编辑 / 删除）之间的固定间距。
- *
- * 2026-10-19 用户要求：三个入口整体靠右，且**两两间距严格相等**。
- * 用 Row({ space }) 时条目间距会被条件块与子结构带偏（真机截图里
- * 「测速↔编辑」明显比「编辑↔删除」宽），故改为显式左外边距，值即此常量。
- */
-const ACTION_GAP = 28;
 
 /** “+”导入三选一弹窗（扫描 / URL / 文件），对齐 HTML import-overlay */
 @CustomDialog
@@ -97,9 +89,9 @@ struct ImportDialog {
       if (this.mode === 'main') {
         this.OptionBtn('☷', '扫描', '扫描屏幕或纸质二维码导入订阅',
           TunBoxColors.successLight, TunBoxColors.success, 'scan')
-        this.OptionBtn('🔗', 'URL', '输入或粘贴订阅链接一键解析',
+        this.OptionBtn('🔗', 'URL', '仅支持 Clash 订阅链接或单节点链接',
           TunBoxColors.primaryLight, TunBoxColors.primary, 'url')
-        this.OptionBtn('📄', '文件', '选择本地 .yaml / .json / .conf 配置文件',
+        this.OptionBtn('📄', '文件', '仅支持本地 Clash 配置文件（.yaml / .yml）',
           'rgba(245, 158, 11, 0.12)', TunBoxColors.warning, 'file')
       } else if (this.mode === 'scan') {
         Column() {
@@ -124,7 +116,7 @@ struct ImportDialog {
             })
         }.width('100%').margin({ top: 2 })
       } else if (this.mode === 'url') {
-        Text('输入订阅链接（节点链接可一行一个批量导入）：').fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
+        Text('输入 Clash 订阅链接，或单节点链接（一行一个可批量导入）：').fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
         TextArea({ placeholder: 'https://... 或 vless://...（一行一个）', text: this.urlText })
           .onChange((v: string) => { this.urlText = v; })
           .height(88).borderRadius(8).fontSize(13)
@@ -146,9 +138,9 @@ struct ImportDialog {
         }.width('100%').margin({ top: 2 })
       } else {
         Column({ space: 2 }) {
-          Text('选择本地 Clash / V2Ray 配置文件').fontSize(13).fontWeight(FontWeight.Bold)
+          Text('选择本地 Clash 配置文件（.yaml / .yml）').fontSize(13).fontWeight(FontWeight.Bold)
             .fontColor(TunBoxColors.textPrimary).width('100%').textAlign(TextAlign.Center)
-          Text('支持 .yaml、.json、.conf 格式').fontSize(11).fontColor(TunBoxColors.textMuted)
+          Text('支持 .yaml / .yml（Clash 配置）').fontSize(11).fontColor(TunBoxColors.textMuted)
             .width('100%').textAlign(TextAlign.Center)
         }.width('100%').padding(16).borderRadius(8)
         .borderWidth(1.5).borderColor(TunBoxColors.cardBorder)
@@ -800,9 +792,16 @@ export struct SubscriptionPage {
       // 就绪、开始发探测了再切到「正在测速…」。旧实现只提示「正在测速…」，
       // 用户看到的是「点了没反应，过几秒才出结果」（真机取证 2026-10-20）。
       this.showToast('准备测速通道…');
-      await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId,
+      const progress = await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId,
         (): void => { this.showToast('正在测速…'); });
-      this.showToast('✓ 测速完成');
+      // 控制器过载必须有界面出口：过载路径下引擎**故意不给节点写结论**（保持未测），
+      // 用户看到的会是「测速完成 + 一堆 --」。不单独说明就等于「跑完了没解释」——
+      // 正是 0.4.4 过载鉴别要消灭的现象。文案要与「通道不可用」区分：通道是好的。
+      if (progress !== null && progress.coreOverloaded > 0) {
+        this.showToast(`✓ 测速完成（${progress.coreOverloaded} 个节点控制器过载未测，通道正常，可重测）`);
+      } else {
+        this.showToast('✓ 测速完成');
+      }
     } catch (e) {
       this.showToast('测速失败，请重试');
     } finally {
@@ -895,8 +894,11 @@ export struct SubscriptionPage {
       await this.importNodeUris(raw);
       return;
     }
-    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(raw)) {
-      promptAction.showToast({ message: '请输入有效的URL地址' });
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(raw, this.settings.allowInsecureSubscriptionHttp)) {
+      promptAction.showToast({ message: raw.trim().toLowerCase().startsWith('http://')
+        && !this.settings.allowInsecureSubscriptionHttp
+        ? '明文 HTTP 订阅已默认禁用：请改用机场的 https 链接，或在设置里打开「允许明文 HTTP 订阅」'
+        : '请输入有效的URL地址' });
       return;
     }
     const dupe = this.subs.find((s) => s.url === raw);
@@ -980,14 +982,15 @@ export struct SubscriptionPage {
         this.showToast('二维码内容为空');
         return;
       }
+      // 2026-10-21：二维码只支持 Clash 订阅，扫到单节点链接不再导入
       if (SubscriptionService.isNodeUri(raw)) {
-        await this.importNodeUris(raw);
+        this.showToast('扫码只支持 Clash 订阅二维码，单节点请在「+ → URL」里粘贴');
         return;
       }
       const lower = raw.toLowerCase();
       if (!(lower.startsWith('https://') || lower.startsWith('http://'))
-        || !SubscriptionFetchPolicy.isValidSubscriptionUrl(raw, true)) {
-        this.showToast('二维码不是有效的 HTTP 或 HTTPS 订阅链接');
+        || !SubscriptionFetchPolicy.isValidSubscriptionUrl(raw, this.settings.allowInsecureSubscriptionHttp)) {
+        this.showToast('请提供 Clash 订阅二维码（二维码里应是 Clash 订阅链接）');
         return;
       }
       await this.importFromUrl(raw);
@@ -1014,7 +1017,8 @@ export struct SubscriptionPage {
       const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
       const opts = new picker.DocumentSelectOptions();
       opts.maxSelectNumber = 1;
-      opts.fileSuffixFilters = ['.yaml', '.yml', '.txt', '.json', '.conf'];
+      // 2026-10-21：只接受 Clash 配置；JSON / CONF / TXT 不再支持
+      opts.fileSuffixFilters = ['.yaml', '.yml'];
       const uris = await docPicker.select(opts);
       if (uris.length === 0) {
         return;
@@ -1043,18 +1047,22 @@ export struct SubscriptionPage {
           this.showToast(`文件导入成功，解析出 ${count} 个节点`);
           this.reload();
         } else {
-          this.showToast('文件未解析出节点（支持 Clash YAML 与 ss/vless/vmess/trojan 链接）');
+          this.showToast('文件里没有可用的 Clash 节点，请提供 YAML 订阅文件（Clash 配置）');
         }
       } finally {
         fs.closeSync(file);
       }
     } catch (e) {
       AppLogger.warn(TAG, `yaml file import failed: ${AppLogger.errText(e)}`);
-      this.showToast('导入失败，请重试');
+      const msg = AppLogger.errText(e);
+      this.showToast(msg.indexOf('请提供 YAML') >= 0
+        ? '请提供 YAML 订阅文件（Clash 配置）'
+        : '导入失败，请重试');
     } finally {
       this.isImporting = false;
     }
   }
+
 
   private async doDelete(id: string): Promise<void> {
     if (id === DIRECT_GROUP_ID) {
@@ -1212,8 +1220,11 @@ export struct SubscriptionPage {
     }
     // 本地导入允许改名；http/https 走完整 URL 校验
     if (target.id !== DIRECT_GROUP_ID && !isLocal && !url.trim().startsWith('local://')
-      && !SubscriptionFetchPolicy.isValidSubscriptionUrl(url.trim())) {
-      this.showToast('请输入有效的订阅链接');
+      && !SubscriptionFetchPolicy.isValidSubscriptionUrl(url.trim(), this.settings.allowInsecureSubscriptionHttp)) {
+      this.showToast(url.trim().toLowerCase().startsWith('http://')
+        && !this.settings.allowInsecureSubscriptionHttp
+        ? '明文 HTTP 订阅已默认禁用：请改用 https 链接，或先在设置里打开对应开关'
+        : '请输入有效的订阅链接');
       return;
     }
     const dupe = target.id === DIRECT_GROUP_ID ? undefined
@@ -1459,9 +1470,22 @@ export struct SubscriptionPage {
                         // —— 与上面同一条理由：卡片不重复节点级结论；信息条目在展开区
                         // 的说明里能看到（那里才是它的位置）。
                       }.width('100%')
-                      Text(`${this.service.nodesOf(sub.id).length} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
-                        .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                      Row({ space: 6 }) {
+                        // 旧格式角标：非 Clash 内容已被停止刷新，但节点仍可用（策略 2）
+                        if (sub.legacyFormat) {
+                          Text('旧格式·不可刷新')
+                            .fontSize(10).fontColor(TunBoxColors.danger)
+                            .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                            .borderRadius(6)
+                            .backgroundColor(TunBoxColors.surfaceSubtle)
+                            .borderWidth(1)
+                            .borderColor(TunBoxColors.danger)
+                        }
+                        Text(`${this.service.nodesOf(sub.id).length} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
+                          .fontSize(11).fontColor(TunBoxColors.textMuted)
+                          .layoutWeight(1)
+                          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                      }.width('100%').alignItems(VerticalAlign.Center)
                     }.layoutWeight(1).alignItems(HorizontalAlign.Start)
                     // 2026-10-19 用户要求（订阅卡片改版）：行头**只保留刷新**，
                     // 闪电测速 / 编辑 / 删除 全部下移到展开区操作行。
@@ -1560,41 +1584,42 @@ export struct SubscriptionPage {
                       // 点行头闪电图标测速」提示行**去掉**，这一行改放操作按钮：
                       // 闪电测速 / 编辑 / 删除（闪电在编辑左边）。
                       // 原来在节点下方的「编辑 / 删除」行同步删除，避免重复入口。
-                      // 2026-10-19 用户要求：操作行**整体靠右**，且三个入口间距严格相等。
-                      // 不用 Row({ space })：实测条目间距会被条件块/不同子结构带偏
-                      // （用户截图里「测速↔编辑」比「编辑↔删除」宽）。改用显式左外边距，
-                      // 每个后续入口固定 ACTION_GAP，间距必然一致。
+                      // [anchor] 订阅展开区操作行（测速 / 编辑 / 删除）
+                      // 2026-10-21 用户要求：三个入口横向铺开 —— 测速居左、编辑居中、删除居右；
+                      // 字号 +1、图标 +1，并给每个入口补上下内边距放大点击热区。
+                      // 用 Blank() 撑开三段（而不是 Row({ space })），间距天然均分且不随条件块漂移。
                       Row() {
-                        // Blank 放在最前 → 整组被推到右侧（用户要求「全部放到右边」）
-                        Blank()
-                        // 闪电测速
+                        // 闪电测速（左）
                         Row({ space: 4 }) {
                           if (this.speedTestingIds.includes(sub.id)) {
-                            LoadingProgress().width(13).height(13).color(TunBoxColors.primary)
+                            LoadingProgress().width(14).height(14).color(TunBoxColors.primary)
                           } else {
-                            Image($r('app.media.ic_bolt')).width(13).height(13)
+                            Image($r('app.media.ic_bolt')).width(14).height(14)
                               .fillColor(TunBoxColors.primary)
                           }
-                          Text('测速').fontSize(12).fontColor(TunBoxColors.primary)
+                          Text('测速').fontSize(13).fontColor(TunBoxColors.primary)
                         }
+                        .padding({ left: 2, right: 8, top: 6, bottom: 6 })
                         .accessibilityText('闪电测速')
                         .onClick(() => this.speedTestSub(sub.id))
+                        Blank()
                         // 手工导入分组（DIRECT_GROUP_ID）没有可编辑/可删除的订阅实体
                         if (sub.id !== DIRECT_GROUP_ID) {
                           Row({ space: 4 }) {
-                            Image($r('app.media.ic_tune')).width(13).height(13)
+                            Image($r('app.media.ic_tune')).width(14).height(14)
                               .fillColor(TunBoxColors.textMuted)
-                            Text('编辑').fontSize(12).fontColor(TunBoxColors.textMuted)
+                            Text('编辑').fontSize(13).fontColor(TunBoxColors.textMuted)
                           }
-                          .margin({ left: ACTION_GAP })
+                          .padding({ left: 8, right: 8, top: 6, bottom: 6 })
                           .accessibilityText('编辑订阅')
                           .onClick(() => this.openEdit(sub))
+                          Blank()
                           Row({ space: 4 }) {
-                            Image($r('app.media.ic_delete')).width(13).height(13)
+                            Image($r('app.media.ic_delete')).width(14).height(14)
                               .fillColor(TunBoxColors.danger)
-                            Text('删除').fontSize(12).fontColor(TunBoxColors.danger)
+                            Text('删除').fontSize(13).fontColor(TunBoxColors.danger)
                           }
-                          .margin({ left: ACTION_GAP })
+                          .padding({ left: 8, right: 2, top: 6, bottom: 6 })
                           .accessibilityText('删除订阅')
                           .onClick(() => {
                             this.deleteTargetId = sub.id;

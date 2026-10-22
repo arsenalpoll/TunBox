@@ -107,6 +107,15 @@ export class AppSettingsJson {
   healthCheckEnabled: boolean = true;
   /** 自检后最多执行的修复步数（0..3） */
   healthRepairMaxSteps: number = 2;
+  /**
+   * 是否允许用明文 HTTP 拉取订阅/规则集。
+   *
+   * **默认 false** —— 与 FlClash / Clash Verge Rev / CMFA 一致，三家都只接受 https。
+   * 明文订阅在本机与机场之间没有任何机密性/完整性保护：面板被劫持或 DNS 被污染时，
+   * 返回的节点表可以指向任意服务器，而这份配置最终承载用户的全部流量。
+   * 确有 http 需求的用户可在设置页显式打开。
+   */
+  allowInsecureSubscriptionHttp: boolean = false;
   rulesEnabled: boolean = true;
   /**
    * HyperADRules 去广告规则集开关。**默认关闭**，由用户在「规则」页自行打开。
@@ -135,8 +144,21 @@ export class AppSettingsJson {
    * true = 除解析链外，另把每个订阅的**原文**落盘并在生成的 Mihomo 配置里以
    * `proxy-providers: {type: file}` 交给内核自己解析；false = 行为与现状完全一致。
    * 旧版本配置缺此字段时取默认 false。
+   *
+   * **默认 true（2026-10-21）**：被 provider 覆盖的订阅不再由 App 重发射节点，名字所有权
+   * 交给 provider 文件（App 侧也不再对这些节点做去重改名），组内只通过 `use:` 引用 ——
+   * 与 FlClash / Clash Verge Rev / CMFA 同形：节点定义由内核解析，App 不再逐字段搬运。
+   * **2026-10-21 20:58 回退为默认 false**：真机实测开起来后配置里被覆盖订阅的节点
+   * 不再写进 `proxies:`，而测速/选点全部按名字调 `/proxies/{name}/delay` → 名字对不上，
+   * 表现为「点测速毫无反应」。要重新启用，必须先解决「App 侧节点名 ↔ provider 节点名」
+   * 一致性并把组内成员改成按名引用，不能只翻这个开关。
    */
   useRawProviderConfig: boolean = false;
+  /**
+   * 「provider 默认已关闭」的一次性回退标记（2026-10-21 20:58）。
+   * 上一版曾把它默认置 true，已写进部分用户配置；靠这个标记把存量配置强制关回并只关一次。
+   */
+  providerOffV3: boolean = true;
   /** 内核 smart 组 policy-priority（见 AppSettings.smartPolicyPriority）；旧配置缺失时为空串。 */
   smartPolicyPriority: string = '';
   /**
@@ -248,6 +270,8 @@ export class AppSettings {
   healthCheckEnabled: boolean = true;
   /** 自检后最多执行的修复步数，范围 0..3，默认 2 */
   healthRepairMaxSteps: number = 2;
+  /** 是否允许明文 HTTP 订阅（默认 false；三家主流客户端都只接受 https） */
+  allowInsecureSubscriptionHttp: boolean = false;
   /** 是否启用规则功能；关闭后不生成广告规则和自定义规则。 */
   rulesEnabled: boolean = true;
   /**
@@ -266,6 +290,8 @@ export class AppSettings {
   yamlOverride: string = '';
   /** 双轨原始订阅 provider 开关（默认关闭；见 AppSettings.useRawProviderConfig） */
   useRawProviderConfig: boolean = false;
+  /** 一次性回退标记：provider 默认值已强制关回 false（见 AppSettings.providerOffV3） */
+  providerOffV3: boolean = true;
   /** 各订阅代理组当前策略选择（JSON 对象：稳定组键 -> 成员名）。 */
   proxyGroupSelections: string = '';
   /**
@@ -326,12 +352,14 @@ export class AppSettings {
     j.autoSelectMode = this.autoSelectMode;
     j.healthCheckEnabled = this.healthCheckEnabled;
     j.healthRepairMaxSteps = this.healthRepairMaxSteps;
+    j.allowInsecureSubscriptionHttp = this.allowInsecureSubscriptionHttp;
     j.rulesEnabled = this.rulesEnabled;
     j.hyperAdRulesEnabled = this.hyperAdRulesEnabled;
     j.customRules = this.customRules;
     j.customRuleSets = this.customRuleSets;
     j.yamlOverride = this.yamlOverride;
     j.useRawProviderConfig = this.useRawProviderConfig;
+    j.providerOffV3 = this.providerOffV3;
     j.smartPolicyPriority = this.smartPolicyPriority;
     j.sniffingEnabled = this.sniffingEnabled;
     j.coreLogLevel = this.coreLogLevel;
@@ -455,6 +483,8 @@ export class AppSettings {
     s.autoSelectMode = AutoSelectModes.normalize(j.autoSelectMode);
     s.healthCheckEnabled = typeof j.healthCheckEnabled === 'boolean' ? j.healthCheckEnabled : true;
     s.healthRepairMaxSteps = clampInt(j.healthRepairMaxSteps, 2, 0, 3);
+    // 明文订阅默认拒绝：字段缺失（用户从未设置过）→ false，只认显式 true。
+    s.allowInsecureSubscriptionHttp = j.allowInsecureSubscriptionHttp === true;
     s.rulesEnabled = typeof j.rulesEnabled === 'boolean' ? j.rulesEnabled : true;
     // 去广告规则默认关闭：字段缺失（用户从未设置过）→ false。
     // 老用户显式存过的 true/false 原样恢复，不会被这次改默认值覆盖。
@@ -468,8 +498,14 @@ export class AppSettings {
     // YAML 覆盖层（P2）：缺字段/非字符串回落空串；上限 8KB，合法性（顶层键白名单）
     // 在生成器 validateYamlOverride 判定，不合法的覆盖层不追加（行为与旧版一致）。
     s.yamlOverride = typeof j.yamlOverride === 'string' ? j.yamlOverride.slice(0, 8192) : '';
-    // 双轨 provider 开关：缺字段/脏值一律回落 false（默认关闭 = 可一键回退的安全默认）
+    // 双轨 provider 开关：缺字段/脏值一律回落 false（默认关闭 = 全内联，测速按名可用）
     s.useRawProviderConfig = typeof j.useRawProviderConfig === 'boolean' ? j.useRawProviderConfig : false;
+    // 一次性回退（2026-10-21 20:58）：上一版把这个开关默认置 true 并已写进用户配置，
+    // 真机上表现为「测速全部没反应」。凡是没被 providerOffV3 标记过的配置，一律强制关回。
+    if (j.providerOffV3 !== true) {
+      s.useRawProviderConfig = false;
+      s.providerOffV3 = true;
+    }
     // policy-priority：缺字段/非字符串回落空串（=不生成该键，行为与旧版一致）。
     // 长度上限防止脏配置把生成的 YAML 撑爆；合法性（pattern:factor）交给内核判定，
     // 内核遇到非法规则只告警跳过，不会启动失败。

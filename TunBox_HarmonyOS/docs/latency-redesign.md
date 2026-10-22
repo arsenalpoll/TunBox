@@ -435,3 +435,57 @@ LatencyEngine: latency batch done nodes=31 channel=core measured=0 timeout=27 fa
 的独立 localhost 端口），否则放大在途数只会重新引入同一个缺陷。判定看四个计数：
 `timeout=`（节点真慢）、`queueTimeout=`（应用层排队超限）、`overloaded=`（controller 忙）、
 `unavailable=`（通道真的不可用）。
+
+## 十四、2026-10-22 指纹变更说明（原文透传发射循环修正：修「节点被静默丢弃」）
+
+`scripts/latency-gen-fingerprint.json` 的 `sha256_16` 由 `cdb37524fb1b89f8` 更新为
+`6183fd516f78623c` —— 原因是**原文透传（2026-10-21 引入）的发射循环写错了结构**，
+与测速引擎 / 延迟口径无关。
+
+### 事故形态（真实内核抓到，不是推断）
+
+原文透传把「按订阅建原文索引」和「逐节点发射」写成了**同一趟 for 循环**：
+
+```ts
+for (const n of staticNodes) {
+  const subId = n.subscriptionId;
+  if (subId.length === 0) { continue; }   // ← 手工节点在这里被整条吞掉
+  ...建索引...
+  lines.push(rawText ?? proxyYamlLine(n));
+}
+```
+
+`subId` 为空的节点（手工导入 / 本地分组的节点）连发射都被跳过 ⇒ `proxies:` 后面空着
+⇒ 内核报 `proxy group[0]: PROXY: '香港 01' not found` **整份拒载**。本机真实内核复现：
+
+```
+verify-smart-e2e → smart 配置被内核接受 ❌  (proxy group[0]: ♻️ 自动选择: '香港 01' not found)
+```
+
+### 修法
+
+拆成两趟循环：**先**按订阅 ID 建原文索引（这一趟可以有 `continue`），**再**无条件遍历
+`staticNodes` 发射（这一趟任何节点都不得被跳过）。行为不变：有原文且同名 → 发原文片段；
+名字被去重改过 → `renameItem` 后再发；没有原文 → 退回 `proxyYamlLine()`。
+
+### 新增/订正的门禁
+
+| 脚本 | 断言 |
+|---|---|
+| `scripts/verify-config-generation-integrity.mjs` | **新增场景 16**：同一份配置里混入「有原文且同名 / 有原文但名字对不上 / 完全没有订阅归属」三种节点，三条都必须出现在 `proxies:` 段，且由**真实内核** `mihomo -t` 判定（123 passed） |
+| `scripts/verify-proxy-name-uniqueness.mjs` | 唯一化入参断言改为 `staticNodes`（provider 覆盖的节点不再改名）；**新增**「发射循环 body 内不得有 continue」源码契约；订正「唯一化早于 `proxies:` 段」的断言方向（原断言要求晚于，与代码形态相反） |
+| `scripts/verify-smart-e2e.mjs` | 补齐 stage（`RawProxyYaml` / `SubDnsUpstream`）；内核拒载时打印原始输出（原来只报 ❌，排查只能猜） |
+| `scripts/verify-credential-isolation.mjs` | 补 `RawProxyYaml` 桩（`SubscriptionService` 新 import，缺桩会 `ERR_MODULE_NOT_FOUND`） |
+
+### 同批订正的过期契约（不是放宽，而是改成当前口径）
+
+- 单节点超时断言 3000 → **5000**（2026-10-21 用户拍板对齐三家）；
+  `GROUP_TEST_TIMEOUT_MS` 与 `ClashApiService.testLatencyDetailed` 的默认值改为**转调**
+  `LatencyPolicy.DEFAULT_TIMEOUT_MS`，不再留第二份字面量。
+- 在途并发断言改为打**声明行**（`export const LATENCY_INFLIGHT = 32;`）。旧断言
+  `LATENCY_INFLIGHT\s*=\s*8` 命中的是注释里的那行文字 —— 代码已是 32，闸门却照样绿。
+- 组测速相关断言（`proxyTableNames` / `notInCore` / `latencyGroupDiagnosis`）随页面层
+  组测实现一并退场，改锁「页面层无 `/group/` 端点、测速唯一入口是 LatencyEngine」。
+- 过载 UI 出口从死页（`NodeSelectionPage`）迁到**真实入口**（订阅页闪电测速）：
+  `BackgroundLatencyService.testSubscription()` 返回 `LatencyProgress`，过载数 > 0 时
+  提示「N 个节点控制器过载未测，通道正常，可重测」。

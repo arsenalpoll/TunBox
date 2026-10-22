@@ -33,7 +33,7 @@ import {
   MAX_STATE_FILE_BYTES, PRIVATE_TEST_CONFIG_FILE,
   SyncReadResult, clearPrivateArtifacts, heartbeatAgeFromText
 } from './RuntimeFilePolicy';
-import { ensurePrivateDir, privateFs } from './PrivateFileStore';
+import { chmodPrivate, ensurePrivateDir, privateFs } from './PrivateFileStore';
 import { SingleFlightTestCore, TestCoreStatus } from './TestCoreFlight';
 import { NetworkStateWatcher, NetworkStateListener, NetTypes } from './NetworkStateWatcher';
 import {
@@ -65,6 +65,15 @@ const PORT_CANDIDATE_SETS: number[][] = [
   [29090, 27890, 21053]
 ];
 const CONFIG_FILE = 'mihomo_config.yaml';
+/**
+ * 最后一份「内核真的连上过」的配置快照。
+ *
+ * 设备侧没有可以单独跑 `-t` 的内核（core 只对外暴露 controller 通道），
+ * 所以冷启动**无法**在写盘前预校验。冷启动改用等价保证：
+ *   连上成功 → 快照；下次被内核拒载（parse config）→ 自动回滚到快照。
+ * 效果与 FlClash 的「校验通过才替换」一致：坏配置永不永久顶掉能用的配置。
+ */
+const LAST_GOOD_CONFIG_FILE = 'mihomo_config.lastgood.yaml';
 /** 内核 home 下的规则集子目录（config 里写作 ./ruleset/xxx.mrs） */
 const RULESET_SUBDIR = 'ruleset';
 /** 去广告规则集（rule-providers: hyper-adrules, type: http） */
@@ -837,6 +846,85 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /**
+   * 记下最后一份「内核接受并成功连上」的配置。
+   *
+   * 冷启动路径没有可用的预校验通道（设备侧 core 只有 controller 接口，没有 `-t` CLI），
+   * 所以改用「成功即快照、被拒载即回滚」来达成与 FlClash 相同的保证：
+   * 磁盘上永远留着至少一份真正连上过的配置。
+   */
+  private snapshotLastGoodConfig(): void {
+    if (this.context === null) {
+      return;
+    }
+    try {
+      const src = `${this.context.cacheDir}/${CONFIG_FILE}`;
+      if (!privateFs.exists(src)) {
+        return;
+      }
+      const dst = `${this.context.cacheDir}/${LAST_GOOD_CONFIG_FILE}`;
+      fs.copyFileSync(src, dst);
+      chmodPrivate(dst, 0o600);
+    } catch (e) {
+      AppLogger.warn(TAG, `last-good snapshot failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /**
+   * 内核已接受暂存配置 → 把**这份字节**原子替换到正式配置路径。
+   *
+   * 2026-10-22（用户要求「冷启动也走临时文件 → 内核校验 → 成功才替换」，对齐 FlClash）：
+   * 设备侧 core 没有 `-t` CLI，所以校验器就是扩展自己 —— 暂存路径交给它拉起，
+   * readiness 通过（controller 真的答了）才调本方法。拒载路径不会走到这里，
+   * 正式配置因此永远保持上一份「内核真的加载过」的字节。
+   *
+   * 原子性：先写 `${target}.tmp` 再同目录 rename（rename 在 POSIX 语义下原子），
+   * 任何时刻磁盘上都有一份完整文件；写完再收权限 0600（含 API secret 与节点口令）。
+   *
+   * @param staged 扩展实际加载的暂存文件（保留不删：扩展后续可能再读它）
+   * @param target 正式配置路径（下一轮冷启动 / 热重载的基准）
+   * @param content 已过写盘闸门的配置文本（不回读暂存文件，避免并发改写）
+   */
+  private acceptStagedConfig(staged: string, target: string, content: string): void {
+    try {
+      if (content.length === 0) {
+        AppLogger.warn(TAG, 'staged config promote skipped: empty content');
+        return;
+      }
+      const tmp = `${target}.tmp`;
+      privateFs.writePrivate(tmp, content);
+      fs.renameSync(tmp, target);
+      chmodPrivate(target, 0o600);
+      AppLogger.info(TAG, `config promoted: kernel accepted ${staged} → ${CONFIG_FILE} (${content.length} bytes)`);
+    } catch (e) {
+      // 提升失败不撤销已建立的连接：隧道用的是暂存文件，功能不受影响；
+      // 代价只是「下次冷启动的基准配置」仍是旧的一份（并且 last-good 会照常更新）。
+      AppLogger.warn(TAG, `staged config promote failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /**
+   * 内核拒载（parse config）时把最后一份能连上的配置写回去，供用户下一次连接直接起。
+   * @returns 是否真的回滚成功（false = 没有快照或回滚失败，调用方按原错误上报）
+   */
+  private restoreLastGoodConfig(): boolean {
+    if (this.context === null) {
+      return false;
+    }
+    try {
+      const snapshot = `${this.context.cacheDir}/${LAST_GOOD_CONFIG_FILE}`;
+      if (!privateFs.exists(snapshot)) {
+        return false;
+      }
+      fs.copyFileSync(snapshot, `${this.context.cacheDir}/${CONFIG_FILE}`);
+      AppLogger.warn(TAG, 'kernel rejected generated config; restored last-good snapshot');
+      return true;
+    } catch (e) {
+      AppLogger.warn(TAG, `last-good restore failed: ${AppLogger.errText(e)}`);
+      return false;
+    }
+  }
+
+  /**
    * 规则/强制站点/DNS 等变更的热重载：重写当前节点的 YAML 到同一配置路径，
    * 通过 Mihomo controller 的 PUT /configs?path= 在内核内重建规则链，保持 VPN/TUN
    * 与既有连接不被拆除（对应文档"减少 TUN/Core 重建"）。仅当内核可控时生效；
@@ -868,11 +956,27 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const safeYaml = this.prepareConfigYaml(yaml, 'hot-reload');
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       ensurePrivateDir(this.context.cacheDir);
-      privateFs.writePrivate(configPath, safeYaml);
-      const reloaded = await this.api.reloadFromPath(configPath);
+      // 两步落盘（对齐 FlClash：临时文件 → 内核校验 → 成功才替换）：
+      // 先把新配置写成 .next 暂存文件，让内核加载校验；只有内核接受才原子替换正式配置。
+      // 内核拒载时磁盘上那份「上次能用的配置」保持原样 —— 否则一次坏规则就是重启即整份拒载。
+      const stagedPath = `${configPath}.next`;
+      privateFs.writePrivate(stagedPath, safeYaml);
+      const reloaded = await this.api.reloadFromPath(stagedPath);
       if (!reloaded) {
-        AppLogger.warn(TAG, `[hot-reload] controller reload failed; caller will fallback (${reason})`);
+        try {
+          fs.unlinkSync(stagedPath);
+        } catch (cleanupError) {
+          // 暂存文件已不存在属正常
+        }
+        AppLogger.warn(TAG, `[hot-reload] kernel rejected staged config; previous config kept (${reason})`);
         return false;
+      }
+      // 内核已接受暂存配置 → 原子替换正式配置（同目录 rename）。
+      // 即便这一步失败，内核已按暂存文件生效，本轮功能不受影响，只是下次连接会重写。
+      try {
+        fs.renameSync(stagedPath, configPath);
+      } catch (promoteError) {
+        AppLogger.warn(TAG, `[hot-reload] staged config accepted but promote failed: ${AppLogger.errText(promoteError)}`);
       }
       // 隧道配置已按当前节点集重写 → 登记新指纹（测速前的过期判定用）
       this.tunnelConfigFingerprint = SubscriptionService.nodeSetFingerprint(subs.nodes);
@@ -2861,6 +2965,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     selectedNodeName: string, ports: RuntimePorts, secret: string,
     proxyHosts: Record<string, string>, smartModelReady: boolean,
     geoipReady: boolean, ruleProviderFileReady: boolean): Promise<RuntimeConfigProfile> {
+    // 冷启动时凭据引导在后台跑（列表先上屏）；这里把它等齐再生成配置 ——
+    // 生成配置/测速是唯一真正需要凭据的入口。
+    await subs.ensureCredentials();
     await this.hydrateNodeCredentials(subs);
     return this.buildRuntimeProfile(subs, settings, selectedNodeName, ports, secret,
       proxyHosts, smartModelReady, geoipReady, ruleProviderFileReady);
@@ -2877,7 +2984,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     profile.subscriptionRuleProviders = subs.subscriptionRuleProvidersBlock();
     // 订阅自带 DNS 上游：机场入口域名的真实 IP 只在自家私有 DoH 里，
     // 丢掉 → 公共 DNS 给出 CF/WAF 前置 IP → 该订阅节点全部超时（2026-10-20 定案）。
-    profile.subscriptionDnsProxyServers = subs.subscriptionDnsProxyServers();
+    profile.subscriptionDnsUpstreams = subs.subscriptionDnsUpstreams();
     profile.subscriptionDnsPolicies = subs.subscriptionDnsPolicies();
     profile.selectedNodeName = selectedNodeName;
     profile.mixedPort = ports.mixedPort;
@@ -3294,16 +3401,24 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
       // 含 API secret 与节点口令：最小权限目录(0700) + 文件(0600)，fd 由 writePrivate 兜底关闭
       ensurePrivateDir(this.context.cacheDir);
-      // 写盘前闸门（C23）：内核对 yaml 重复键是**整份拒载**，
-      // 坏配置一旦落盘就是「整个 VPN 起不来」。校验不通过时**不覆盖旧配置**，
-      // 直接中止本次连接并给出可行动提示。
-      privateFs.writePrivate(configPath, this.prepareConfigYaml(yaml, 'main'));
-      AppLogger.info(TAG, `config written: ${configPath} (${yaml.length} bytes)`);
+      // ── 冷启动也「写暂存 → 内核校验 → 成功才替换」（2026-10-22，对齐 FlClash）──
+      // 设备侧 core 没有 `-t` CLI，但**扩展自己就是校验器**：把暂存路径交给它拉起，
+      // 内核能加载（readiness 通过）才把这份字节原子替换到正式配置路径。
+      // 这样「拿最后一份能用的配置去赌」的窗口消失：拒载时正式配置一个字节都没动。
+      // 写盘前闸门（C23）仍在前面：内核对 yaml 重复键是整份拒载，能拦就早拦，
+      // 不通过 → 不写任何文件、直接中止本次连接并给可行动提示。
+      const stagedConfigPath = `${configPath}.next`;
+      // 闸门产物（可能已按受控降级修过）留在变量里：内核确认接受后要原样提升为正式配置，
+      // 重新读盘既多一次 IO 也可能读到被并发改写的版本。
+      const preparedConfig = this.prepareConfigYaml(yaml, 'main');
+      privateFs.writePrivate(stagedConfigPath, preparedConfig);
+      AppLogger.info(TAG, `config staged: ${stagedConfigPath} (${yaml.length} bytes)`);
       this.clearStartError();
       // want 可能被系统丢弃（新装首连授权弹窗链路，真机实证 2026-09-19）——
       // 把本次分流三元组同步落盘，扩展侧丢参时按 configPath+新鲜度回退读取。
+      // 这里必须记**暂存路径**：那才是扩展实际加载的文件。
       const packagesJson = JSON.stringify(appRouting.packages);
-      this.writeStartParamsFile(configPath, appRouting.mode, appRouting.needsReview, packagesJson);
+      this.writeStartParamsFile(stagedConfigPath, appRouting.mode, appRouting.needsReview, packagesJson);
       // 再落一份到 preferences：cacheDir 那份只认 3 分钟内，进程被回收后由系统
       // 重新拉起扩展时几乎必然过期 → 扩展硬拒绝恢复，隧道再也起不来。
       // preferences 与扩展进程同沙箱同库，这条是不限时长的恢复来源。
@@ -3311,7 +3426,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       routingSnap.appRoutingMode = appRouting.mode;
       routingSnap.appRoutingPackagesJson = packagesJson;
       routingSnap.appRoutingNeedsReview = appRouting.needsReview;
-      routingSnap.configPath = configPath;
+      routingSnap.configPath = stagedConfigPath;
       routingSnap.ts = Date.now();
       SettingsService.saveAppRoutingSnapshot(routingSnap).catch((e: Error): void => {
         AppLogger.warn(TAG, `app routing snapshot persist failed: ${AppLogger.errText(e)}`);
@@ -3325,7 +3440,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // DNS 恒接管，不需要任何开关下发（生成器恒写 enable/dns-hijack）。
       // 传明确模式及单一激活名单；JSON 保留包名边界，不再通过 CSV 猜测模式。
       const vpnParams: Record<string, string | number | boolean> = {};
-      vpnParams['configPath'] = configPath;
+      vpnParams['configPath'] = stagedConfigPath;
       vpnParams['appRoutingMode'] = appRouting.mode;
       vpnParams['appRoutingNeedsReview'] = appRouting.needsReview;
       vpnParams['appRoutingPackagesJson'] = packagesJson;
@@ -3384,6 +3499,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       let apiReady = false;
       let readinessDelayMs = 0;
       let launchRetryDone = false;
+      try {
       while (Date.now() < deadline) {
         if (seq !== this.connectSeq) {
           await this.disconnectInternal(intentGeneration);
@@ -3408,7 +3524,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
               // 扩展未运行时停止报错属正常
             }
             await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
-            this.writeStartParamsFile(configPath, appRouting.mode, appRouting.needsReview, packagesJson);
+            this.writeStartParamsFile(stagedConfigPath, appRouting.mode, appRouting.needsReview, packagesJson);
             this.clearStartError();
             await Promise.race([
               vpnExtension.startVpnExtensionAbility(want),
@@ -3451,6 +3567,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           throw new Error(`内核已启动但 API 探测失败（端口 ${this.apiPort} 跨进程不可达），请反馈日志`);
         }
         throw new Error('Clash API 未就绪（30s 超时）：VPN 扩展未上报启动结果，请重试或反馈日志');
+      }
+      } catch (startError) {
+        // 内核拒载（parse config / unmarshal）⇒ 落盘这份配置是坏的。
+        // 回滚到最后一份真正连上过的配置，用户下一次点连接就能起来，
+        // 而不是每次都被同一份坏配置挡住（内核对坏配置是整份拒载）。
+        const errorText = AppLogger.errText(startError);
+        if (errorText.indexOf('parse config') >= 0 || errorText.indexOf('unmarshal') >= 0) {
+          if (this.restoreLastGoodConfig()) {
+            throw new Error(`${errorText}\n已自动回滚到上一份可用配置，再点一次连接即可。`);
+          }
+        }
+        throw new Error(errorText);
       }
       tReady = Date.now() - connectT0;
 
@@ -3519,6 +3647,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.recoveryAttempts = 0;
       this.startMonitors();
       this.clearStartError(); // 连接成功，清掉启动标记文件
+      // 内核已接受本次配置 ⇒ 才把暂存文件提升为**正式配置**（2026-10-22 冷启动口径）：
+      // 写 `${configPath}.tmp` 再 rename（同目录 rename 原子），任何时刻磁盘上都有一份完整文件；
+      // 拒载路径从来不走到这里 ⇒ 正式配置保持上一份能用的字节。
+      this.acceptStagedConfig(stagedConfigPath, configPath, preparedConfig);
+      // 本次配置已被内核接受并真的连上 → 留作 last-good，供未来拒载时回滚。
+      this.snapshotLastGoodConfig();
       // 重连成功 → 取消挂起的退避定时器并复位尝试计数（禁止重连风暴）
       this.reconnectAttempts = 0;
       this.cancelReconnect('connected');

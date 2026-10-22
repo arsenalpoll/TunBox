@@ -177,10 +177,12 @@ export class RawSubscriptionStore {
   }
 
   /**
-   * 同步开关状态。关闭时（purgeOnDisable=true）删除全部落盘原文并清空登记表 ——
-   * 「一个开关可一键回退」的语义必须包含清理落盘凭据。返回删除的文件数。
+   * 同步开关状态。默认**不删文件**（purgeOnDisable=false 语义为常态）—— 落盘原文既是
+   * provider 的数据源，也是「节点定义原文透传」的数据源，关开关≠删数据。
+   * 只有显式清理入口（诊断面板 purgeRawProviders）才传 purgeOnDisable=true。
+   * 返回删除的文件数（常态为 0）。
    */
-  static setEnabled(value: boolean, purgeOnDisable: boolean = true): number {
+  static setEnabled(value: boolean, purgeOnDisable: boolean = false): number {
     RawSubscriptionStore.enabled = value;
     if (value || !purgeOnDisable) {
       AppLogger.info(TAG, `raw provider store ${value ? 'enabled' : 'disabled (keep files)'}`);

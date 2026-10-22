@@ -146,7 +146,9 @@ export class YamlNodeAdapter {
     }
 
     // 5) 必填校验（与 URI 路径同一张表、同一套口径）
-    out.availability = NodeUsability.assess(protocol, out.params, merged.server);
+    //    name 一起传：机场的「订阅信息条目」（剩余流量/到期/群链接）就是靠**名字内容**识别的，
+    //    它们参数齐全 ⇒ 缺参检测抓不到（2026-10-20 真机：35 个节点里混了 6 条信息）。
+    out.availability = NodeUsability.assess(protocol, out.params, merged.server, merged.name);
     return out;
   }
 

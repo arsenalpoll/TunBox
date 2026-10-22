@@ -114,6 +114,358 @@ export class YamlMerger {
     return lines.join('\n');
   }
 
+  // ─────────────────── 订阅 dns 段提取（2026-10-20 全超时定案） ───────────────────
+  //
+  // 机场把「入口域名 → 真实入口 IP」只告诉自家私有 DoH，公共 DNS 给出的是
+  // Cloudflare / WAF 前置 IP（那些 IP 上代理端口不通或不提供协议服务）。
+  // 因此 `dns.proxy-server-nameserver` / `dns.nameserver-policy` 必须原样保留到
+  // 运行配置里 —— 否则订阅里所有域名节点必然超时（真机与真实内核双重取证）。
+  //
+  // 这里只做「取值」，不做协议判定与安全校验：上游字符串的白名单/上限在
+  // ClashConfigGenerator 写入 YAML 前统一做（单一真源，避免两处口径不一致）。
+
+  /**
+   * 取 `dns.proxy-server-nameserver` 的上游列表（去引号 / 去重 / 上限 8 条）。
+   *
+   * 支持三种写法：行内流式序列 `[a, b]`、块式序列（`- a` 逐行）、单标量。
+   */
+  static extractDnsProxyServers(dnsText: string): string[] {
+    const out: string[] = [];
+    const seen: Set<string> = new Set<string>();
+    const values = YamlMerger.dnsScalarValues(dnsText, 'proxy-server-nameserver');
+    for (const raw of values) {
+      const v = YamlMerger.unquoteYamlScalar(raw);
+      if (v.length === 0 || v.length > 512 || seen.has(v)) {
+        continue;
+      }
+      if (out.length >= 8) {
+        break;
+      }
+      seen.add(v);
+      out.push(v);
+    }
+    return out;
+  }
+
+  /**
+   * 取 `dns.nameserver-policy` 与 `dns.proxy-server-nameserver-policy` 的条目，
+   * 展平为 `[[后缀, 上游], …]`（一个后缀多个上游 = 多行；去重 / 上限 64 对）。
+   *
+   * 调用方（生成器）只保留后缀命中**节点域名**的条目，不会把机场针对其它域名的
+   * 策略带进用户的 DNS 策略里。
+   */
+  static extractDnsPolicyPairs(dnsText: string): string[][] {
+    const out: string[][] = [];
+    const seen: Set<string> = new Set<string>();
+    const keys: string[] = ['nameserver-policy', 'proxy-server-nameserver-policy'];
+    for (const key of keys) {
+      for (const pair of YamlMerger.dnsPolicyEntries(dnsText, key)) {
+        const suffix = YamlMerger.unquoteYamlScalar(pair[0]).trim();
+        const server = YamlMerger.unquoteYamlScalar(pair[1]).trim();
+        if (suffix.length === 0 || suffix.length > 253 || server.length === 0
+          || server.length > 512) {
+          continue;
+        }
+        const id = `${suffix}\u0000${server}`;
+        if (seen.has(id)) {
+          continue;
+        }
+        if (out.length >= 64) {
+          return out;
+        }
+        seen.add(id);
+        out.push([suffix, server]);
+      }
+    }
+    return out;
+  }
+
+  /** 去掉一层匹配的引号（'…' / "…"）；DNS 上游与后缀里不会出现转义引号。 */
+  private static unquoteYamlScalar(raw: string): string {
+    let v = raw.trim();
+    if (v.length >= 2) {
+      const first = v.charAt(0);
+      const last = v.charAt(v.length - 1);
+      const quoted = (first === '\'' && last === '\'') || (first === '"' && last === '"');
+      if (quoted) {
+        v = v.substring(1, v.length - 1);
+      }
+    }
+    return v;
+  }
+
+  /** 行首缩进宽度（空格/Tab 都计数，dns 段里两者不会混用） */
+  private static indentOf(line: string): number {
+    let n = 0;
+    while (n < line.length) {
+      const ch = line.charAt(n);
+      if (ch !== ' ' && ch !== '\t') {
+        break;
+      }
+      n++;
+    }
+    return n;
+  }
+
+  /** 找到 `  <key>:` 这一行（要求缩进 ≥ 2 且 key 后紧跟空白或行尾） */
+  private static dnsKeyIndex(lines: string[], key: string): number {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const indent = YamlMerger.indentOf(line);
+      if (indent < 2) {
+        continue;
+      }
+      const text = line.substring(indent);
+      if (!text.startsWith(`${key}:`)) {
+        continue;
+      }
+      const rest = text.substring(key.length + 1);
+      if (rest.length > 0) {
+        const ch = rest.charAt(0);
+        if (ch !== ' ' && ch !== '\t') {
+          continue; // `nameserver-policy-extra:` 之类的近名键
+        }
+      }
+      return i;
+    }
+    return -1;
+  }
+
+  /** 从 openIdx 处的 `[`/`{` 找到配对的闭括号下标（找不到返回文本末尾） */
+  private static matchClose(text: string, openIdx: number): number {
+    let depth = 0;
+    let quote = '';
+    for (let i = openIdx; i < text.length; i++) {
+      const ch = text.charAt(i);
+      if (quote.length > 0) {
+        if (ch === quote) {
+          quote = '';
+        }
+        continue;
+      }
+      if (ch === '\'' || ch === '"') {
+        quote = ch;
+        continue;
+      }
+      if (ch === '[' || ch === '{') {
+        depth++;
+        continue;
+      }
+      if (ch === ']' || ch === '}') {
+        depth--;
+        if (depth === 0) {
+          return i;
+        }
+      }
+    }
+    return text.length;
+  }
+
+  /** 按顶层逗号切分（跳过引号内与括号内的逗号） */
+  private static splitFlow(text: string): string[] {
+    const out: string[] = [];
+    let depth = 0;
+    let quote = '';
+    let start = 0;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text.charAt(i);
+      if (quote.length > 0) {
+        if (ch === quote) {
+          quote = '';
+        }
+        continue;
+      }
+      if (ch === '\'' || ch === '"') {
+        quote = ch;
+        continue;
+      }
+      if (ch === '[' || ch === '{') {
+        depth++;
+        continue;
+      }
+      if (ch === ']' || ch === '}') {
+        depth--;
+        continue;
+      }
+      if (ch === ',' && depth === 0) {
+        const piece = text.substring(start, i).trim();
+        if (piece.length > 0) {
+          out.push(piece);
+        }
+        start = i + 1;
+      }
+    }
+    const tail = text.substring(start).trim();
+    if (tail.length > 0) {
+      out.push(tail);
+    }
+    return out;
+  }
+
+  /** 按**第一个**顶层冒号切 `key: value`（返回 [key, value]，无冒号时 value 为空） */
+  private static splitMapEntry(entry: string): string[] {
+    let depth = 0;
+    let quote = '';
+    for (let i = 0; i < entry.length; i++) {
+      const ch = entry.charAt(i);
+      if (quote.length > 0) {
+        if (ch === quote) {
+          quote = '';
+        }
+        continue;
+      }
+      if (ch === '\'' || ch === '"') {
+        quote = ch;
+        continue;
+      }
+      if (ch === '[' || ch === '{') {
+        depth++;
+        continue;
+      }
+      if (ch === ']' || ch === '}') {
+        depth--;
+        continue;
+      }
+      if (ch === ':' && depth === 0) {
+        return [entry.substring(0, i).trim(), entry.substring(i + 1).trim()];
+      }
+    }
+    return [entry.trim(), ''];
+  }
+
+  /** 一个 `key:` 下的标量序列值（流式 `[…]` / 块式 `- x` / 单标量） */
+  private static dnsScalarValues(dnsText: string, key: string): string[] {
+    const out: string[] = [];
+    const lines = dnsText.split('\n');
+    const idx = YamlMerger.dnsKeyIndex(lines, key);
+    if (idx < 0) {
+      return out;
+    }
+    const line = lines[idx].replace(/\r$/, '');
+    const indent = YamlMerger.indentOf(line);
+    const rest = line.substring(indent + key.length + 1).trim();
+    if (rest.length > 0) {
+      if (rest.startsWith('[')) {
+        const close = YamlMerger.matchClose(rest, 0);
+        for (const item of YamlMerger.splitFlow(rest.substring(1, close))) {
+          out.push(item);
+        }
+        return out;
+      }
+      if (!rest.startsWith('{')) {
+        out.push(rest); // 单标量写法
+      }
+      return out;
+    }
+    // 块式序列：缩进更深的 `- x` 行
+    for (let i = idx + 1; i < lines.length; i++) {
+      const cur = lines[i].replace(/\r$/, '');
+      const trimmed = cur.trim();
+      if (trimmed.length === 0) {
+        continue;
+      }
+      const curIndent = YamlMerger.indentOf(cur);
+      if (curIndent <= indent) {
+        break;
+      }
+      if (trimmed.startsWith('#')) {
+        continue;
+      }
+      if (trimmed === '-') {
+        out.push('');
+        continue;
+      }
+      if (trimmed.startsWith('- ')) {
+        out.push(trimmed.substring(2).trim());
+        continue;
+      }
+      break;
+    }
+    return out;
+  }
+
+  /** 一个 `key:` 下的 mapping 条目 → 展平的 [后缀, 上游] 对（流式 `{…}` / 块式） */
+  private static dnsPolicyEntries(dnsText: string, key: string): string[][] {
+    const out: string[][] = [];
+    const lines = dnsText.split('\n');
+    const idx = YamlMerger.dnsKeyIndex(lines, key);
+    if (idx < 0) {
+      return out;
+    }
+    const line = lines[idx].replace(/\r$/, '');
+    const indent = YamlMerger.indentOf(line);
+    const rest = line.substring(indent + key.length + 1).trim();
+    if (rest.startsWith('{')) {
+      const close = YamlMerger.matchClose(rest, 0);
+      for (const entry of YamlMerger.splitFlow(rest.substring(1, close))) {
+        const pair = YamlMerger.splitMapEntry(entry);
+        if (pair[0].length === 0) {
+          continue;
+        }
+        YamlMerger.pushPolicyValues(out, pair[0], pair[1]);
+      }
+      return out;
+    }
+    // 块式 mapping：`    "+.x":` 后跟 `      - 上游`
+    let currentKey = '';
+    let keyIndent = -1;
+    for (let i = idx + 1; i < lines.length; i++) {
+      const cur = lines[i].replace(/\r$/, '');
+      const trimmed = cur.trim();
+      if (trimmed.length === 0 || trimmed.startsWith('#')) {
+        continue;
+      }
+      const curIndent = YamlMerger.indentOf(cur);
+      if (curIndent <= indent) {
+        break;
+      }
+      const isItem = trimmed.startsWith('- ') || trimmed === '-';
+      if (!isItem) {
+        if (keyIndent < 0) {
+          keyIndent = curIndent;
+        }
+        if (curIndent === keyIndent) {
+          const pair = YamlMerger.splitMapEntry(trimmed);
+          currentKey = pair[0];
+          if (pair[1].length > 0) {
+            YamlMerger.pushPolicyValues(out, currentKey, pair[1]);
+          }
+          continue;
+        }
+        break;
+      }
+      if (currentKey.length === 0) {
+        continue;
+      }
+      YamlMerger.pushPolicyValues(out, currentKey,
+        trimmed === '-' ? '' : trimmed.substring(2).trim());
+    }
+    return out;
+  }
+
+  /** 把 `后缀 → 值`（值是单标量或流式序列）展开成 [后缀, 上游] 对 */
+  private static pushPolicyValues(out: string[][], rawKey: string, rawValue: string): void {
+    const suffix = YamlMerger.unquoteYamlScalar(rawKey);
+    if (suffix.length === 0) {
+      return;
+    }
+    let value = rawValue.trim();
+    if (value.length === 0) {
+      return;
+    }
+    if (value.startsWith('[')) {
+      const close = YamlMerger.matchClose(value, 0);
+      for (const item of YamlMerger.splitFlow(value.substring(1, close))) {
+        out.push([suffix, item]);
+      }
+      return;
+    }
+    value = YamlMerger.unquoteYamlScalar(value);
+    if (value.length > 0) {
+      out.push([suffix, value]);
+    }
+  }
+
   /**
    * 删除指定顶层分节（其余内容原样保留，行序不变）。
    * 分节不存在时原样返回。供 YAML 覆盖层的 rules/rule-providers 段合并

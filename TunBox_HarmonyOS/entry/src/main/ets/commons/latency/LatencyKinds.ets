@@ -254,7 +254,7 @@ export class LatencyTimeout {
    * —— 3000 是「已验证能测出这批节点」的取值，不是拍脑袋。
    * 与 `LatencyProbeLimits.NODE_TIMEOUT_MS` 必须同值（闸门断言）。
    */
-  static readonly DEFAULT_TIMEOUT_MS: number = 3000;
+  static readonly DEFAULT_TIMEOUT_MS: number = 5000;
   /** mihomo 的 timeout 用 16 位整数解析，> 32767 直接 400。 */
   static readonly MAX_TIMEOUT_MS: number = 30000;
 }

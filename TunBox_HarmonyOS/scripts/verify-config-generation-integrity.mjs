@@ -160,6 +160,7 @@ patchTempStubs();
 const { ClashConfigGenerator } = await import(G('ClashConfigGenerator.ts'));
 const { AppSettings } = await import(G('AppSettings.ts'));
 const { ProxyNode } = await import(G('ProxyNode.ts'));
+const { ProxyGroup } = await import(G('ProxyGroup.ts'));
 const { YamlMerger } = await import(G('YamlMerger.ts'));
 const { SubscriptionService } = await import(G('SubscriptionService.ts'));
 
@@ -442,7 +443,7 @@ function generateConfig(opts) {
     o.subscriptionRules || [],
     o.subscriptionRuleProviders || '',
     o.smartTestUrl || '',
-    o.subscriptionDnsProxyServers || [],
+    o.subscriptionDnsUpstreams || [],
     o.subscriptionDnsPolicies || [],
   );
 }
@@ -818,28 +819,61 @@ section('[14] 订阅 dns 上游透传：proxy-server-nameserver / nameserver-pol
     ok(blk !== null && blk.includes('- tls://223.5.5.5:853'),
       '无订阅 dns：proxy-server-nameserver 回落到内置 DoT');
   }
-  // b) 订阅给了 proxy-server-nameserver → 整段替换（绝不能与公共 DoT 混排）
+  // b) 订阅给了 proxy-server-nameserver → 按订阅域名后缀写进 -policy 段，
+  //    全局仍只留中性 DoT（混排会让公共 DNS 在并发首答里抢跑私有 DoH）
   {
-    const blk = proxyNsBlock(generateConfig({
-      subscriptionDnsProxyServers: [
-        'https://ns1.pubdns.co/dns-hyy/abc',
-        'https://dnsdoh.trafficmanager.net/dns-hyy/abc',
-      ],
-    })) || '';
-    ok(blk.includes('https://ns1.pubdns.co/dns-hyy/abc'), '订阅上游写进 proxy-server-nameserver');
-    ok(!blk.includes('tls://223.5.5.5:853'), '有订阅上游时不得混入公共 DoT（并发首答会让错答案抢跑）');
+    const nodes = [makeNode('jp-1', { server: 'a.jushuitan.com' })];
+    const cfg = generateConfig({
+      nodes,
+      subscriptionDnsUpstreams: [{
+        subId: 'sub-1',
+        servers: [
+          'https://ns1.pubdns.co/dns-hyy/abc',
+          'https://dnsdoh.trafficmanager.net/dns-hyy/abc',
+        ],
+      }],
+    });
+    const blk = proxyNsBlock(cfg) || '';
+    ok(blk.includes('tls://223.5.5.5:853'), '全局 proxy-server-nameserver 恒为中性 DoT');
+    ok(!blk.includes('ns1.pubdns.co'), '订阅上游不再并进全局列表（防跨订阅抢答）');
+    ok(/proxy-server-nameserver-policy:/.test(cfg), '订阅上游写进 proxy-server-nameserver-policy');
+    ok(cfg.includes('"+.jushuitan.com":'), 'policy 后缀取自该订阅节点域名');
+    ok(cfg.includes('ns1.pubdns.co'), 'policy 段带上订阅私有 DoH');
   }
-  // c) 订阅只给 nameserver-policy → 该键必须留空，policy 才会被主解析器采纳
+  // c) 订阅只给 nameserver-policy → 同名后缀同时镜像进 -policy（否则专用解析器看不到）
   {
     const nodes = [makeNode('jp-1', { server: 'best.jushuitan.com' })];
     const cfg = generateConfig({
       nodes,
       subscriptionDnsPolicies: [['+.jushuitan.com', 'https://bvd-api.dohcore.com:2096/dns-query/x']],
     });
-    const blk = proxyNsBlock(cfg) || '';
-    ok(!blk.includes('tls://'), '只有 policy 时 proxy-server-nameserver 留空（非空会让 policy 失效）');
     ok(cfg.includes('"+.jushuitan.com":'), 'policy 后缀写进 nameserver-policy');
     ok(cfg.includes('bvd-api.dohcore.com'), 'policy 上游写进配置');
+    const idx = cfg.indexOf('proxy-server-nameserver-policy:');
+    ok(idx >= 0 && cfg.slice(idx).includes('bvd-api.dohcore.com'),
+      'policy 镜像进 proxy-server-nameserver-policy');
+  }
+  // f) 两份订阅各自的上游互不越界（本轮根因：跨订阅抢答）
+  {
+    const nodes = [
+      makeNode('a-1', { server: 'a.alpha.com', subscriptionId: 'sub-A' }),
+      makeNode('b-1', { server: 'b.beta.net', subscriptionId: 'sub-B' }),
+    ];
+    const cfg = generateConfig({
+      nodes,
+      subscriptionDnsUpstreams: [
+        { subId: 'sub-A', servers: ['https://private-a.example/dns'] },
+        { subId: 'sub-B', servers: ['1.2.3.4:53'] },
+      ],
+    });
+    const idx = cfg.indexOf('proxy-server-nameserver-policy:');
+    const blk = idx >= 0 ? cfg.slice(idx, cfg.indexOf('\n  fake-ip-filter', idx) + 1) : '';
+    ok(blk.includes('"+.alpha.com":'), 'A 订阅后缀入 policy');
+    ok(blk.includes('"+.beta.net":'), 'B 订阅后缀入 policy');
+    const aPart = blk.slice(blk.indexOf('"+.alpha.com":'), blk.indexOf('"+.beta.net":'));
+    const bPart = blk.slice(blk.indexOf('"+.beta.net":'));
+    ok(aPart.includes('private-a.example') && !aPart.includes('1.2.3.4:53'), 'A 后缀只绑 A 的上游');
+    ok(bPart.includes('1.2.3.4:53') && !bPart.includes('private-a.example'), 'B 后缀只绑 B 的上游');
   }
   // d) policy 与节点域名无关 → 不注入（不把机场其它域名的策略带进用户 DNS）
   {
@@ -851,11 +885,16 @@ section('[14] 订阅 dns 上游透传：proxy-server-nameserver / nameserver-pol
   }
   // e) 非法上游（空格/引号/未知 scheme）一律过滤，合法 IP:port 保留
   {
-    const blk = proxyNsBlock(generateConfig({
-      subscriptionDnsProxyServers: ['https://evil example.com/x', '"quoted"', 'bogus://x', '1.2.3.4:53'],
-    })) || '';
-    ok(blk.includes('1.2.3.4:53'), '合法的 IP:port 上游保留');
-    ok(!blk.includes('evil example.com') && !blk.includes('bogus://'), '非法/未知上游被过滤');
+    const nodes = [makeNode('n1', { server: 'n1.example.com' })];
+    const cfg = generateConfig({
+      nodes,
+      subscriptionDnsUpstreams: [{
+        subId: 'sub-1',
+        servers: ['https://evil example.com/x', '"quoted"', 'bogus://x', '1.2.3.4:53'],
+      }],
+    });
+    ok(cfg.includes('1.2.3.4:53'), '合法的 IP:port 上游保留');
+    ok(!cfg.includes('evil example.com') && !cfg.includes('bogus://'), '非法/未知上游被过滤');
   }
 }
 
@@ -895,6 +934,358 @@ section('[15] DNS 恒接管 + fake-ip：range6 落在 TUN 的 /64，AAAA 走隧�
   ok(!offBlk.includes('fake-ip-range6'), '关掉双栈 → 不下发 range6（否则假 v6 无路由）');
   kernelOk(cfg, '默认配置（fake-ip + range6 + dns-hijack 恒开）');
   kernelOk(cfg, '默认配置（fake-ip + range6 + dns-hijack 恒开）');
+}
+
+// ── 场景 16：proxies 段「节点数不得凭空变 0」（2026-10-21 新增）───────────
+//
+// 历史真因（docs/latency-redesign.md / LatencyProbe.ets 自述）：订阅导入后凭据被
+// **封存**（sealPlaintext 清空内存明文），而某条路径生成配置前**没回填凭据** ⇒
+// 生成器按「缺凭据」把每条节点整条跳过 ⇒ **测速核 YAML 里一个节点都没有** ⇒
+// 内核 /delay 秒回 503 ⇒ App 把它报成「网络不可达」，用户看到「全部节点失败」。
+//
+// 既有闸门只锁「回填调用点在生成之前」这一**顺序**（verify-latency-core-freshness），
+// 于是「调用点还在、但回填实际没生效」仍然全绿。这里补**行为**断言：
+// 有效节点进 generate() ⇒ 产物 proxies 段必须逐条落地。
+section('[16] proxies 段：有效节点必须逐条落地（不得静默变 0）');
+{
+  /** 取顶层段（indent 0 的 `key:` 到下个顶层键） */
+  const blockOf = (text, key) => {
+    const lines = text.split('\n');
+    const start = lines.findIndex((l) => l === `${key}:`);
+    if (start < 0) {
+      return '';
+    }
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (lines[i].length > 0 && !lines[i].startsWith(' ')) {
+        end = i;
+        break;
+      }
+    }
+    return lines.slice(start, end).join('\n');
+  };
+  /** 数 proxies 段里「- name:」条目数（块式节点各占一项） */
+  const countNodeEntries = (blk) => (blk.match(/^\s*-\s*\{?\s*name:/gm) || []).length;
+
+  // ① 基线：3 个有效节点 ⇒ 产物里必须有 3 条，且名字都在
+  {
+    const nodes = [makeNode('n-1'), makeNode('n-2'), makeNode('n-3')];
+    const cfg = generateConfig({ nodes });
+    const blk = blockOf(cfg, 'proxies');
+    ok(blk.length > 0, '① proxies 段存在');
+    const entries = countNodeEntries(blk);
+    ok(entries === 3, `① 3 个有效节点 ⇒ proxies 段 3 条（实际 ${entries}）`);
+    for (const n of nodes) {
+      ok(blk.includes(n.name), `① 节点 ${n.name} 出现在产物里`);
+    }
+  }
+
+  // ② 负对照：**全部节点都不可写**时生成器必须**响亮失败**（抛错），
+  //    绝不能产出一份「proxies 段为空」的配置 —— 那正是历史事故的形态
+  //    （测速核 YAML 里一个节点都没有 ⇒ 内核 /delay 全 503 ⇒ 被报成网络问题）。
+  {
+    const bad = makeNode('no-cred');
+    bad.uuid = '';
+    bad.protocolParam = '';
+    let threw = false;
+    let msg = '';
+    try {
+      generateConfig({ nodes: [bad] });
+    } catch (e) {
+      threw = true;
+      msg = String(e && e.message ? e.message : e);
+    }
+    ok(threw, '② 全部节点不可写 ⇒ 生成器抛错（不产出空 proxies 配置）',
+      threw ? '' : '没有抛错 = 危险：会产生 0 节点的配置');
+    if (threw) {
+      ok(msg.includes('没有可用的节点配置'),
+        '② 抛错文案指明「没有可用的节点配置」', msg.slice(0, 120));
+      ok(msg.includes('凭据'),
+        '② 抛错文案指明凭据回填问题（指向可行动的修法）', msg.slice(0, 160));
+    }
+    const stats = ClashConfigGenerator.countDroppedNodes([bad]);
+    ok(stats.missingCredential >= 1,
+      `② 缺凭据被记账：missingCredential=${stats.missingCredential}（>=1）`);
+  }
+
+  // ③ 混合：有效 + 缺凭据 ⇒ 产物条数 == 有效条数（不是 0，也不是总数）
+  {
+    const good = makeNode('ok-1');
+    const bad = makeNode('bad-1');
+    bad.uuid = '';
+    bad.protocolParam = '';
+    const cfg = generateConfig({ nodes: [good, bad] });
+    const blk = blockOf(cfg, 'proxies');
+    const entries = countNodeEntries(blk);
+    ok(entries === 1, `③ 1 有效 + 1 缺凭据 ⇒ proxies 段 1 条（实际 ${entries}）`);
+    ok(blk.includes('ok-1'), '③ 有效节点仍在产物里');
+  }
+}
+
+// ── 场景 17：代理组引用完整性（悬空引用会让内核**整份拒载**）─────────────
+//
+// ClashConfigGenerator 里有一整套「成员可解析性 + 迭代消除悬空引用 + 纯循环组丢弃」
+// 逻辑（先落地直接引用节点的组，再逐轮向外传播）。注释自述：内核 config.Parse 对
+// 「引用不存在的组/未声明 provider」会**拒载整份配置** ⇒ 一旦回归，全部节点消失。
+// 该逻辑此前**没有行为闸门**（grep「循环/悬空/落地」在 verify-*.mjs 无命中）。
+section('[17] 代理组引用完整性：无悬空引用、纯循环组被丢弃');
+{
+  /** 造一个真实的 ProxyGroup（成员显式声明） */
+  const makeGroup = (name, groupType, members) => {
+    const g = new ProxyGroup();
+    g.subscriptionId = 'sub-1';
+    g.name = name;
+    g.groupType = groupType;
+    g.members = members.slice();
+    return g;
+  };
+  const blockOf = (text, key) => {
+    const lines = text.split('\n');
+    const start = lines.findIndex((l) => l === `${key}:`);
+    if (start < 0) {
+      return '';
+    }
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (lines[i].length > 0 && !lines[i].startsWith(' ')) {
+        end = i;
+        break;
+      }
+    }
+    return lines.slice(start, end).join('\n');
+  };
+  /** 收集产物里所有「已声明名字」：节点名 + 组名 + 内置策略 */
+  const collectDeclared = (cfg, nodes) => {
+    const set = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'GLOBAL', 'PROXY']);
+    for (const n of nodes) {
+      set.add(n.name);
+    }
+    const gblk = blockOf(cfg, 'proxy-groups');
+    const re = /^\s*-\s*name:\s*"?([^"\n]+?)"?\s*$/gm;
+    let m = re.exec(gblk);
+    while (m !== null) {
+      set.add(m[1].trim());
+      m = re.exec(gblk);
+    }
+    return set;
+  };
+  /** 扫描 proxy-groups 各成员的引用目标（含嵌套组、含 use: 之外的 proxies 列表） */
+  const collectRefs = (cfg) => {
+    const gblk = blockOf(cfg, 'proxy-groups');
+    const refs = [];
+    const lines = gblk.split('\n');
+    let inProxies = false;
+    for (const line of lines) {
+      if (/^\s*proxies:\s*$/.test(line)) {
+        inProxies = true;
+        continue;
+      }
+      if (inProxies) {
+        const m = /^\s*-\s*"?([^"\n]+?)"?\s*$/.exec(line);
+        if (m) {
+          refs.push(m[1].trim());
+          continue;
+        }
+        if (line.trim().length > 0) {
+          inProxies = false;
+        }
+      }
+    }
+    return refs;
+  };
+
+  // ① 正常组引用节点
+  {
+    const nodes = [makeNode('a-1'), makeNode('a-2')];
+    const cfg = generateConfig({
+      nodes,
+      proxyGroups: [
+        makeGroup('AUTO', 'url-test', nodes.map((n) => n.name)),
+        makeGroup('FALLBACK', 'fallback', nodes.map((n) => n.name)),
+      ],
+    });
+    const declared = collectDeclared(cfg, nodes);
+    const refs = collectRefs(cfg);
+    const dangling = refs.filter((r) => !declared.has(r));
+    ok(dangling.length === 0,
+      `① 组内成员全部指向已声明名字（悬空 ${dangling.length} 个）`,
+      dangling.length > 0 ? `悬空：${JSON.stringify([...new Set(dangling)])}` : '');
+  }
+
+  // ② **悬空引用必须被消除**：组内成员写了一个不存在节点名 ⇒ 该成员不得出现在产物里
+  //    （内核 config.Parse 对引用不存在的名字会拒载整份配置）
+  {
+    const nodes = [makeNode('b-1'), makeNode('b-2')];
+    const cfg = generateConfig({
+      nodes,
+      proxyGroups: [makeGroup('DANGLING', 'url-test', ['b-1', 'ghost-node-xyz'])],
+    });
+    const declared = collectDeclared(cfg, nodes);
+    const refs = collectRefs(cfg);
+    const dangling = refs.filter((r) => !declared.has(r));
+    ok(!refs.includes('ghost-node-xyz'),
+      '② 指向不存在节点的成员被剔除（不写进产物）');
+    ok(dangling.length === 0,
+      `② 产物里 0 个悬空引用`,
+      dangling.length > 0 ? `悬空：${JSON.stringify([...new Set(dangling)])}` : '');
+    kernelOk(cfg, '② 含悬空成员的配置：真实内核仍接受（说明已消除）');
+  }
+
+  // ③ 组引用组：引用**不存在的组名**也必须被消除
+  {
+    const nodes = [makeNode('c-1')];
+    const inner = makeGroup('INNER', 'url-test', ['c-1']);
+    const outer = makeGroup('OUTER', 'select', ['INNER', 'no-such-group']);
+    const cfg = generateConfig({ nodes, proxyGroups: [inner, outer] });
+    const declared = collectDeclared(cfg, nodes);
+    const refs = collectRefs(cfg);
+    const dangling = refs.filter((r) => !declared.has(r));
+    ok(!refs.includes('no-such-group'), '③ 指向不存在组的成员被剔除');
+    ok(dangling.length === 0,
+      '③ 组引用组时也无悬空引用',
+      dangling.length > 0 ? `悬空：${JSON.stringify([...new Set(dangling)])}` : '');
+    kernelOk(cfg, '③ 组引用组的配置：真实内核接受');
+  }
+
+  // ④ 自环与纯循环：组引用自己 / 两个组互相引用且都没有节点出口
+  //    ⇒ 必须整组丢弃（否则内核报循环引用 / 该组永远无出口）
+  {
+    const nodes = [makeNode('d-1')];
+    const selfLoop = makeGroup('SELF', 'select', ['SELF']);
+    const cycA = makeGroup('CYC-A', 'select', ['CYC-B']);
+    const cycB = makeGroup('CYC-B', 'select', ['CYC-A']);
+    const cfg = generateConfig({ nodes, proxyGroups: [selfLoop, cycA, cycB] });
+    const refs = collectRefs(cfg);
+    ok(!refs.includes('SELF'), '④ 自环组成员被剔除（不引用自身）');
+    const declared = collectDeclared(cfg, nodes);
+    const dangling = refs.filter((r) => !declared.has(r));
+    ok(dangling.length === 0,
+      '④ 纯循环组不产生悬空引用',
+      dangling.length > 0 ? `悬空：${JSON.stringify([...new Set(dangling)])}` : '');
+    kernelOk(cfg, '④ 含自环/纯循环组的配置：真实内核接受（说明已被消除或丢弃）');
+  }
+}
+
+// ── 场景 15：provider 权威模式（useRawProviderConfig=true）────────────────
+// 三家主流客户端（FlClash / Verge / CMFA）都是「节点定义交给内核解析」，
+// App 不再逐字段搬运节点。这里锁住三件事：provider 段发射、节点不重复静态发射、
+// 组内不按名引用（只走 use:），保证不会出现「改名后引用悬空 → 整份拒载」。
+section('[15] provider 权威：被覆盖订阅不再重发射节点，组内只走 use:，无悬空引用');
+{
+  const { RawSubscriptionStore, RawProviderEntry } = await import(G('stubs.ts'));
+  const rawPath = path.join(os.tmpdir(), 'tunbox-provider-raw-verify.yaml');
+  fs.writeFileSync(rawPath, [
+    'proxies:',
+    '  - {name: "节点甲", type: trojan, server: 1.1.1.1, port: 443, password: pw1}',
+    '  - {name: "节点甲", type: trojan, server: 2.2.2.2, port: 443, password: pw2}',
+    ''
+  ].join('\n'), 'utf8');
+  const entry = new RawProviderEntry();
+  entry.subscriptionId = 'sub-1';
+  entry.providerName = 'sub-1';
+  entry.providerPath = rawPath;
+  entry.filePath = rawPath;
+  entry.bytes = 160;
+  entry.nodeEstimate = 2;
+  RawSubscriptionStore.upsert(entry);
+
+  const s = baseSettings();
+  s.useRawProviderConfig = true;
+  const nodes = [makeNode('节点甲'), makeNode('节点乙')];
+  const cfg = generateConfig({ settings: s, nodes });
+
+  ok(cfg.includes('proxy-providers:'), '⑮a provider 段已发射');
+  ok(cfg.includes('use:'), '⑮b 组内通过 use: 引用 provider');
+  ok(!cfg.includes('"节点甲"'), '⑮c 被覆盖订阅的节点不再静态重发射（避免两份同名副本）');
+  // 悬空引用自检（本块局部实现，避免依赖别的场景里的闭包）：
+  // 只扫 proxy-groups 的 proxies: 列表；`use:` 段是 provider 名，不算节点引用。
+  const gIdx = cfg.indexOf('proxy-groups:');
+  const gblk = gIdx < 0 ? '' : cfg.slice(gIdx);
+  const declared = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'GLOBAL', 'PROXY']);
+  for (const n of nodes) {
+    declared.add(n.name);
+  }
+  for (const m of gblk.matchAll(/^\s*-\s*name:\s*"([^"]+)"/gm)) {
+    declared.add(m[1]);
+  }
+  const refs = [];
+  let inProxies = false;
+  for (const line of gblk.split('\n')) {
+    if (/^\s*proxies:\s*$/.test(line)) {
+      inProxies = true;
+      continue;
+    }
+    if (inProxies) {
+      const m = /^\s*-\s*"([^"]+)"\s*$/.exec(line);
+      if (m !== null) {
+        refs.push(m[1]);
+        continue;
+      }
+      if (line.trim().length > 0) {
+        inProxies = false;
+      }
+    }
+  }
+  const dangling = refs.filter((r) => !declared.has(r));
+  ok(dangling.length === 0,
+    '⑮d 无悬空引用（组内不按名引用 provider 节点）',
+    dangling.length > 0 ? `悬空：${JSON.stringify([...new Set(dangling)])}` : '');
+  kernelOk(cfg, '⑮e provider 权威配置');
+
+  RawSubscriptionStore.drop('sub-1');
+  try {
+    fs.rmSync(rawPath, { force: true });
+  } catch (e) {
+    /* 清理失败不影响结论 */
+  }
+}
+
+// ── 场景 16：原文透传不得吞掉任何节点（2026-10-22 真实内核抓到的空洞）───────
+// 事故形态：原始实现把「建原文索引」和「发射节点」写成同一趟循环，`subId.length === 0`
+// 的 `continue` 让手工导入节点（无订阅归属）整条消失，`proxies:` 后面为空
+// → 内核 `proxy group[0]: PROXY: '香港 01' not found` 整份拒载。
+// 这里用真生成链覆盖三种节点：有原文且同名（走原文）、有原文但名字对不上（退回解析）、
+// 完全没有订阅归属（手工节点）。三条都必须出现在 `proxies:` 段里。
+section('[16] 原文透传：有/无原文、有无订阅归属的节点都不得被静默丢弃');
+{
+  const { RawBodyCache } = await import(G('RawProxyYaml.ts'));
+  const rawBody = [
+    'proxies:',
+    '  - name: "原文节点"',
+    '    type: trojan',
+    '    server: raw.invalid',
+    '    port: 443',
+    '    password: pw',
+    // 原文里带一个「解析发射不会产出」的字段 → 用它证明这一行确实来自原文
+    '    client-fingerprint: chrome',
+    '',
+    'proxy-groups: []',
+    'rules: []',
+  ].join('\n');
+  RawBodyCache.put('sub-raw', rawBody);
+
+  const nRaw = makeNode('原文节点', { subscriptionId: 'sub-raw', server: 'raw.invalid', proxyType: 'trojan', password: 'pw' });
+  const nMiss = makeNode('原文外节点', { subscriptionId: 'sub-raw' });
+  const nManual = makeNode('手工节点', { subscriptionId: '' });
+
+  // 保险起见把急停开关打开，并还原（避免污染后续/其它套件）
+  const prevFlag = ClashConfigGenerator.rawPassthroughEnabled;
+  ClashConfigGenerator.rawPassthroughEnabled = true;
+  const cfg = generateConfig({ nodes: [nRaw, nMiss, nManual] });
+  ClashConfigGenerator.rawPassthroughEnabled = prevFlag;
+  RawBodyCache.drop('sub-raw');
+
+  const pStart = cfg.indexOf('proxies:');
+  const pEnd = cfg.indexOf('proxy-groups:');
+  const pBlock = pStart >= 0 && pEnd > pStart ? cfg.slice(pStart, pEnd) : '';
+  for (const nm of ['原文节点', '原文外节点', '手工节点']) {
+    ok(pBlock.includes(`"${nm}"`), `⑯ ${nm} 出现在 proxies: 段`);
+  }
+  ok(pBlock.includes('client-fingerprint: chrome'), '⑯ 同名节点的定义来自订阅原文（非解析重发射）');
+  ok(pBlock.includes('reindent') === false, '⑯ 产物里没有残留的实现痕迹');
+  ok((pBlock.match(/^\s*-\s/gm) || []).length === 3,
+    `⑯ proxies: 段条目数 = 3（实际 ${(pBlock.match(/^\s*-\s/gm) || []).length}）`);
+  kernelOk(cfg, '⑯ 原文透传 + 手工节点混合的配置');
 }
 
 console.log(`\n${passed} passed, ${failed} failed, ${deferred} deferred`);

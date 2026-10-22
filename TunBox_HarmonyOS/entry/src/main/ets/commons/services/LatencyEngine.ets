@@ -78,26 +78,28 @@ const TAG = 'LatencyEngine';
  */
 export const LATENCY_CONCURRENCY = 50;
 /**
- * 同时在飞的 HTTP 请求数（**2026-10-21 真机回退：50 → 8**）。
+ * 同时在飞的 HTTP 请求数（**2026-10-21 晚：8 → 32**，对齐 FlClash 客户端在途 32）。
  *
- * 为什么退回 8（真机取证 192.168.10.5:39933，飞鸟云 31 节点批，14:32:46–14:35:10）：
+ * 8 的来历（真机取证 192.168.10.5:39933，飞鸟云 31 节点批，14:32:46–14:35:10）：
  *  · 50 路在途 = 50 个 `/delay` 同时打 `127.0.0.1:9090`，而 OHOS http 栈对同一 host
- *    只有约 8 条连接（2026-09-23 已实测）⇒ 其余 42 个请求在 **HTTP 栈内部**排队，
- *    排队时间被算进 4.2s 外层预算 ⇒ 一到点就抛 `code=2300028 Operation timeout`；
+ *    只有约 8 条连接（2026-09-23 已实测）⇒ 其余请求在 **HTTP 栈内部**排队，
+ *    排队时间被算进外层预算 ⇒ 一到点就抛 `code=2300028 Operation timeout`；
  *  · 这些客户端超时被 `LatencyProbe.classify` 归为 `core_not_ready`（没拿到 HTTP 响应
- *    = 通道问题）⇒ 6 连击撞上 `CORE_NOT_READY_ABORT_STREAK` ⇒ **整批作废**，剩下 24 个
+ *    = 通道问题）⇒ 6 连击撞上 `CORE_NOT_READY_ABORT_STREAK` ⇒ **整批作废**，剩下的
  *    节点一次 `/delay` 都没发（日志 `notReady=6 unavailable=true`）—— 用户看到的就是
  *    「测出一部分超时节点后，剩下的就不测了」。
  *
- * 8 = OHOS 同 host 连接池容量 ⇒ 排队改在**应用层闸门**（LatencyInflightGate）里发生，
- * 而闸门等待**不计入**单请求预算（见 gatedProbe 的三条硬约束）⇒ 读数仍是干净的 RTT。
- * 历史基线同样支持这个值：5.6.0 真机 59 节点 13.14s 跑通、`unavailable=false`。
+ * 现行 32（用户要求与 FlClash 客户端同口径）：**前提是排队发生在应用层闸门**
+ * （LatencyInflightGate）—— 闸门等待不计入单请求预算（见 gatedProbe 三条硬约束），
+ * 所以栈内排队不再污染读数。若真机再次出现成片假超时，回退顺序：32 → 16 → 8。
  *
- * ⚠ 想再放大必须先解决「栈内排队被算进超时」这个前提（自建连接池或换传输层），
- *   否则只是把「测速跑到一半整批作废」重新引入。判定看
- *   `latency batch done ... timeout= queueTimeout= notReady= unavailable=` 四个计数。
+ * ⚠ 改这个值必须同步：
+ *   ① `scripts/verify-latency-concurrency.mjs` 的字面数字（常量契约 / lanes / 峰值 /
+ *      名额满用例 / TOTAL 节点数）；
+ *   ② 「栈内排队是否仍被算进超时」这个前提（自建连接池或换传输层才谈得上再放大）。
+ *   判定看 `latency batch done ... timeout= queueTimeout= notReady= unavailable=` 四个计数。
  */
-export const LATENCY_INFLIGHT = 8;
+export const LATENCY_INFLIGHT = 32;
 /**
  * 信号量排队等待上限（毫秒）。
  *
@@ -113,8 +115,10 @@ export const LATENCY_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
  * 预算才放弃，把整组拖长。3000ms：健康节点真机最高实测 ~522ms，5.7 倍余量，
  * 整组约 3 秒完成（用户要求）。
  * 2026-10-20 晚随单节点超时一起从 5s 改回 3s：组测里这个值是**每个节点**的拨号预算，
- * 与逐节点探测必须同尺，否则同一节点在「测全部」和「单节点测速」里结论相反。 */
-export const GROUP_TEST_TIMEOUT_MS = 3000;
+ * 与逐节点探测必须同尺，否则同一节点在「测全部」和「单节点测速」里结论相反。
+ * 2026-10-22：页面层的组测速实现已删除（死路径 + 与订阅页两套口径），本常量只为兼容
+ * 既有 import 保留，且改为**转调真源**（单节点 5s）—— 不许再留第二份字面量。 */
+export const GROUP_TEST_TIMEOUT_MS = LatencyPolicy.DEFAULT_TIMEOUT_MS;
 /** 首批请求错峰抖动上限，避免整批同时撞内核（Clash Verge Rev 同款做法）。 */
 const STAGGER_MAX_MS = 200;
 /**

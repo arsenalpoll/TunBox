@@ -1342,12 +1342,12 @@ struct NodeSelectionPage {
   }
 
   /**
-   * 「测全部」—— **组测速（对齐主流客户端）**：一次 `GET /group/PROXY/delay`
-   * 让内核对组内全部节点并发测试（Go goroutine，无客户端 http 栈的同 host
-   * 并发连接限制——16/32 并发的连接池排队问题就此消失）。
-   * 内核源码实证：url 参数被使用；PROXY 组（select 类型）的用户固定选择不被
-   * ForceSet 清掉；返回 map 里只有成功的节点，失败的按「超时」落库。
-   * 单节点测速仍走 `/proxies/{name}/delay`（逐个）。取消 = abort 组测请求。
+   * 「测全部」—— 统一走 LatencyEngine（逐节点 `/proxies/{name}/delay`，客户端在途 8）。
+   *
+   * 2026-10-21：这里原本走内核侧组测速（一次调用由内核并发测全组）。
+   * 但该端点只在本页实现，而本页自 0.4.x 起没有任何导航入口（点不到）→ 死路径，
+   * 且会与订阅页闪电测速形成两套口径（超时判定 / 失败分类不同源）。
+   * 现已删除组测速实现，与主路径共用同一引擎。要恢复内核侧组测速，先给它一个真实入口。
    */
   private async testAll(): Promise<void> {
     if (this.batchTesting || LatencyEngine.isRunning()) {
@@ -1359,7 +1359,7 @@ struct NodeSelectionPage {
       promptAction.showToast({ message: '暂无可测速的节点' });
       return;
     }
-    const progress = await this.runGroupLatency(list, true, 'manual');
+    const progress = await this.runLatency(list, true, true);
     if (this.batchCancelled) {
       // 用户取消 / 离开页面：已落库的结果保持可见（不回滚）。
       return;
@@ -1373,34 +1373,18 @@ struct NodeSelectionPage {
     if (progress.coreUnavailable) {
       // 通道不可用批的结论无效：节点已恢复未测，不能报普通「测速完成」
       if (this.pageActive) {
-        promptAction.showToast({
-          message: '通道不可用，本轮测速结果无效，节点已恢复未测'
-        });
+        promptAction.showToast({ message: '通道不可用，本轮测速结果无效，节点已恢复未测' });
       }
-      AppLogger.warn(TAG, 'group latency batch aborted: core unavailable, results voided');
+      AppLogger.warn(TAG, 'latency batch aborted: core unavailable, results voided');
       return;
     }
     await this.commitLatencySnapshot(list);
     await this.persistSortState();
     // 组级诊断：整组同因全败 → 折叠成一条诊断条（不铺 N 条同色红条）
     this.latencyGroupDiagnosis = this.computeGroupDiagnosis(list);
-    AppLogger.info(TAG, `group latency batch done: total=${progress.total} measured=${progress.measured} `
+    AppLogger.info(TAG, `latency batch done: total=${progress.total} measured=${progress.measured} `
       + `timeout=${progress.timeout} failed=${progress.failed} channel=${progress.channel}`);
-    if (this.latencyAllTimedOut) {
-      // 504 = all proxies timeout：**通道正常，是所有节点都不通**。
-      // 与「内核不可用，本轮未测」严格区分：这一轮有结论（节点全超时），可落盘可排序。
-      if (this.pageActive) {
-        promptAction.showToast({
-          message: `全部节点超时：可用 0 / ${progress.total}（通道正常，请检查节点或换订阅）`
-        });
-      }
-      return;
-    }
     if (this.pageActive) {
-      // 「未生效」必须单独报出来：它不是节点连不上，而是**节点根本没进内核配置**
-      // （订阅解析/配置生成阶段丢了它）—— 指向配置/解析问题，不是节点质量。
-      // 混在「超时」里，用户只会以为节点坏了（真机 2026-10-19：36 个 anytls
-      // 被丢弃 → 内核 404 → 「超时 41」，节点实际可用）。
       let msg = `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout}`;
       if (progress.failed > 0) {
         msg += ` / 未生效 ${progress.failed}`;
@@ -1409,211 +1393,6 @@ struct NodeSelectionPage {
     }
   }
 
-  /**
-   * 组测速执行：markTesting 全部 → 一次组测请求 → 按结果逐节点落库。
-   *
-   * 结果里有的节点 = 内核实测成功（MEASURED）；没有的 = 内核侧超时/失败
-   * （内核源码 URLTest：err != nil 的节点不进结果集）——按用户要求
-   * 「要么超时要么延迟」，不留未测。
-   *
-   * ⚠ **失败分类不得丢失**（C10 / C10b，对应 §9.2 T5）：
-   *  - 内核返回 **504（all proxies timeout）** = **所有成员都超时**，但**通道是好的**
-   *    → 结论是「**全部节点超时**」，**不是**「内核不可用，本轮未测」；
-   *  - 只有真正的通道故障（401/403 secret 错配、404 组不存在、传输异常）
-   *    → 才标 `coreUnavailable`（本轮没有任何节点结论，保持未测）。
-   */
-  private async runGroupLatency(list: ProxyNode[], driveHeader: boolean,
-    source: string): Promise<LatencyProgress | null> {
-    if (list.length === 0) {
-      return null;
-    }
-    this.batchCancelled = false;
-    // 504 标记只属于本轮组测：每轮重置。
-    this.latencyAllTimedOut = false;
-    if (driveHeader) {
-      this.batchTesting = true;
-      this.latencyTotal = list.length;
-      this.latencyDone = 0;
-      this.latencyCoreUnavailable = false;
-    }
-    let api: ClashApiService | null = null;
-    this.latencyPreparing = true;
-    try {
-      api = await this.orchestrator.ensureLatencyApi();
-    } finally {
-      this.latencyPreparing = false;
-    }
-    if (this.batchCancelled) {
-      if (driveHeader) {
-        this.batchTesting = false;
-      }
-      return null;
-    }
-    if (api === null) {
-      if (driveHeader) {
-        this.batchTesting = false;
-      }
-      return null;
-    }
-    const progress = new LatencyProgress();
-    progress.total = list.length;
-    progress.running = true;
-    progress.channel = LatencyChannel.CORE;
-    this.applyProgress(progress, driveHeader);
-    // 先全部标记「测试中」（转圈），结果落地后逐个覆盖
-    for (const n of list) {
-      LatencyStoreBridge.markTesting(n.name);
-    }
-    this.groupTestApi = api;
-    // 组测用**带分类**的接口：只有它能区分 504（全部成员超时，通道正常）与
-    // 真正的通道故障（401/403 secret 错配、404 组不存在、传输异常）。
-    // 旧的 testGroupDetailed() 任何非 200 一律返回 null → 两者被混为一谈（T5）。
-    let groupRes: GroupLatencyResult = new GroupLatencyResult();
-    try {
-      groupRes = await api.testGroupDetailedResult('PROXY', this.testUrlForLatency(),
-        GROUP_TEST_TIMEOUT_MS);
-    } catch (e) {
-      // 抛异常 = 传输层故障；groupRes 保持默认（ok=false / allTimedOut=false）
-      // → 落到下面的「通道故障」分支。
-      AppLogger.warn(TAG, `group latency request error: ${AppLogger.errText(e)}`);
-    }
-    this.groupTestApi = null;
-    if (this.batchCancelled) {
-      // 用户取消：被中断的节点收回「未测」
-      for (const n of list) {
-        if (LatencyStoreBridge.stateFor(n.name) === LatencyState.TESTING) {
-          LatencyStoreBridge.setRecord(LatencyRecord.untested(n.name));
-        }
-      }
-      LatencyStoreBridge.flushNow();
-      if (driveHeader) {
-        this.batchTesting = false;
-      }
-      return null;
-    }
-    if (!groupRes.ok && !groupRes.allTimedOut) {
-      // 真正的**通道故障**（401/403 secret 错配、404 组不存在、传输异常）：
-      // 本轮没有任何节点结论 → 保持未测（TESTING 收回），不写成节点结论。
-      progress.coreUnavailable = true;
-      AppLogger.warn(TAG, `group latency channel failure: code=${groupRes.httpCode} `
-        + `kind=${groupRes.failKind} detail=${groupRes.detail}`);
-      for (const n of list) {
-        if (LatencyStoreBridge.stateFor(n.name) === LatencyState.TESTING) {
-          LatencyStoreBridge.setRecord(LatencyRecord.untested(n.name));
-        }
-      }
-      LatencyStoreBridge.flushNow();
-      if (driveHeader) {
-        this.batchTesting = false;
-      }
-      return progress;
-    }
-    if (groupRes.allTimedOut) {
-      // 504 = all proxies timeout：**通道正常，是「所有节点都不通」**。
-      // 绝不能标 coreUnavailable —— 那会把「节点全不通」说成「内核挂了，本轮未测」，
-      // 这正是用户报「测速全部失败」时无法定位的根因（§9.2 T5）。
-      this.latencyAllTimedOut = true;
-      AppLogger.warn(TAG, `group latency: all proxies timeout (504) nodes=${list.length} `
-        + `— channel ok, every node timed out`);
-    }
-    // 逐节点落库：结果里有 → 实测；结果里没有 → 内核侧未成功。
-    // 每条落库立即 flushNow：组测是一次请求拿到全部结果，落库循环毫秒级完成，
-    // 若只靠 200ms 合并通知会全部落完才排一次（表现为"边测边排序没生效"）。
-    // 逐条 flush 让 UI 逐节点看到排序冒泡（每次 O(N log N)，百节点可忽略）。
-    //
-    // 组测接口（/group/PROXY/delay）**只返回成功节点** —— 失败节点无法从响应里
-    // 区分原因。但内核代理表能回答「这个节点在不在内核里」：不在 = 节点根本没进配置
-    // （订阅解析/配置生成把它丢了），与「节点连不上」是两回事，必须分开落库，
-    // 否则用户看到的是"全红"，会以为节点坏了（真机 2026-10-19：36 个 anytls
-    // 被丢弃 → 内核 404 → 测速全红，节点实际可用、代理正常）。
-    // ⚠ 二者**不得**混为一谈（C10b）：
-    //   · 不在内核代理表 → LatencyProbeKind.SWITCH_FAILED（节点没进内核 = 未生效）
-    //   · 在内核表但本轮没测到 → LatencyProbeKind.TIMEOUT（真超时）
-    // 504（全部成员超时）时结果集为空，全部走失败分支：这些节点在内核表里
-    // （组存在才谈得上 504），因此判 TIMEOUT —— 结论与逐节点路径一致。
-    const delays: Map<string, number> = groupRes.delays;
-    const failedNames: string[] = [];
-    for (const n of list) {
-      if (delays.get(n.name) === undefined) {
-        failedNames.push(n.name);
-      }
-    }
-    let coreTable: Set<string> | null = null;
-    if (failedNames.length > 0) {
-      const names = await api.proxyTableNames();
-      coreTable = names === null ? null : new Set<string>(names);
-    }
-    for (const n of list) {
-      const delay = delays.get(n.name);
-      if (delay !== undefined && delay > 0) {
-        LatencyStoreBridge.setRecord(
-          LatencyRecord.measured(n.name, delay, LatencyChannel.CORE, Date.now()));
-        progress.measured = progress.measured + 1;
-      } else {
-        // 不在内核代理表里 → 节点没进配置（未生效）；在内核里却测不通 → 真超时/失败
-        let notInCore = false;
-        if (coreTable !== null) {
-          notInCore = !coreTable.has(n.name);
-        }
-        const failedRec = LatencyRecord.failed(n.name,
-          notInCore ? LatencyState.FAILED : LatencyState.TIMEOUT, Date.now(),
-          LatencyChannel.CORE,
-          notInCore ? LatencyProbeKind.SWITCH_FAILED : LatencyProbeKind.TIMEOUT);
-        failedRec.source = source;
-        failedRec.runId = 0;
-        LatencyStoreBridge.setRecord(failedRec);
-        if (notInCore) {
-          progress.failed = progress.failed + 1;
-        } else {
-          progress.timeout = progress.timeout + 1;
-        }
-      }
-      progress.finished = progress.finished + 1;
-      this.latencyDone = progress.finished;
-      this.applyProgress(progress, driveHeader);
-      LatencyStoreBridge.flushNow();
-    }
-    // 双保险：provider 节点等组内成员不在 App 表的，TESTING 残留统一收回
-    let testing = 0;
-    for (const n of list) {
-      if (LatencyStoreBridge.stateFor(n.name) === LatencyState.TESTING) {
-        const leftover = LatencyRecord.failed(n.name, LatencyState.TIMEOUT, Date.now(),
-          LatencyChannel.CORE);
-        leftover.source = source;
-        LatencyStoreBridge.setRecord(leftover);
-        testing = testing + 1;
-      }
-    }
-    if (testing > 0) {
-      progress.timeout = progress.timeout + testing;
-      progress.finished = progress.total;
-    }
-    progress.running = false;
-    LatencyStoreBridge.flushNow();
-    // **重建行数据**：页面行渲染的是 rebuildRows() 预构建的 status 字段，
-    // 只 bump 重绘信号（flushNow）不会更新行内容 —— 组测结束必须主动重建，
-    // 否则用户要返回主页再进才能看到延迟（手动刷新的旧观感）。
-    this.rebuildRows();
-    if (driveHeader) {
-      this.batchTesting = false;
-    }
-    return progress;
-  }
-
-  /**
-   * 顶栏「取消」：只取消引擎当前批次。
-   * 取消是幂等的（再点一次什么也不会发生），批次的进度回调/收尾会把 batchTesting 复位。
-   */
-  private cancelLatency(): void {
-    this.batchCancelled = true;
-    LatencyEngine.cancelCurrent();
-    // 组测速（单请求）也要能取消：abort 组测的 http 请求
-    if (this.groupTestApi !== null) {
-      this.groupTestApi.cancelInflight();
-    }
-  }
-
-  /** 选择 selector 直接引用的策略组，并持久化到稳定的父组键。 */
   private async selectStrategy(parent: ProxyGroup, strategy: ProxyGroup): Promise<void> {
     let selections: Record<string, string> = {};
     if (this.settings.proxyGroupSelections.length > 0) {
