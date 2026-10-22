@@ -489,3 +489,14 @@ verify-smart-e2e → smart 配置被内核接受 ❌  (proxy group[0]: ♻️ �
 - 过载 UI 出口从死页（`NodeSelectionPage`）迁到**真实入口**（订阅页闪电测速）：
   `BackgroundLatencyService.testSubscription()` 返回 `LatencyProgress`，过载数 > 0 时
   提示「N 个节点控制器过载未测，通道正常，可重测」。
+
+## 十五、2026-10-22 指纹变更说明（原文透传循环修正 + provider 生成侧两处硬伤 + 大订阅阈值）
+
+`sha256_16` 依次更新到 `06e3f8448db12d08`。三批改动，都是**生成侧/测速口径**，与延迟判定口径无关：
+
+| 批次 | 改动 | 为什么 |
+|---|---|---|
+| 原文透传 | 「建原文索引」与「发射节点」拆成两趟循环 | 合并成一趟时 `subId` 为空的节点被 `continue` 吞掉 → `proxies:` 空 → 内核 `proxy not found` 整份拒载（真实内核 `-t` 抓到） |
+| provider | `coveredNames` 过滤组内成员 + 补 `use:`；`planRawProviders` 新增「跨订阅重名 / 名字与原文不一致 → 回退内联」 | 订阅自带组按名引用已被 provider 覆盖的节点 ⇒ `proxy group[0]: ... not found` 整份拒载；名字不一致 ⇒ `/proxies/{name}/delay` 404 ⇒ 界面「未生效」 |
+| provider 默认值 | 回退 false（`providerOffV6` 一次性迁移） | 设备上 provider 载不出节点（桌面同文件正常），未定论前不让所有用户踩 |
+| 大订阅 | `deadlineForBatch` / `abortStreakFor` / `testGroupDetailedResult(expectedNodes)` / ≥120 节点走内核组测 | 547 节点真机 `measured=2 timeout=543` —— 四处算术/阈值把小批次的假设带进了大批次 |

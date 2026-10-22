@@ -80,6 +80,8 @@ export struct SettingsView {
   @State ipv6Enabled: boolean = true;
   /** 是否允许明文 HTTP 订阅（默认关闭；关闭时只接受 https） */
   @State allowInsecureSubscriptionHttp: boolean = false;
+  /** 订阅原文交给内核解析（provider 双轨）；关闭 = 全部由 App 内联发射 */
+  @State useRawProviderConfig: boolean = false;
   /**
    * 深浅色主题（2026-10-20 新增）：直接镜像 ThemeService 在 AppStorage 里的 theme_mode，
    * 因此主页太阳按钮改了它也会同步（StorageLink 双向）。
@@ -130,6 +132,7 @@ export struct SettingsView {
     this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
     this.ipv6Enabled = this.settings.ipv6Enabled;
     this.allowInsecureSubscriptionHttp = this.settings.allowInsecureSubscriptionHttp;
+    this.useRawProviderConfig = this.settings.useRawProviderConfig;
     this.assetSource = this.settings.assetSource;
     this.testLatencyUrl = this.settings.testLatencyUrl;
     this.refreshGeoStatuses();
@@ -208,6 +211,29 @@ export struct SettingsView {
   }
 
   // ── 网络（IPv6 双栈）─────────────────────────────────────────────
+
+  /**
+   * 「订阅原文交给内核解析」（provider 双轨）开关。
+   *
+   * 开启后：每份订阅原文作为 `type: file` provider 交给内核自己解析（与三家主流客户端同形），
+   * App 不再逐字段重发射该订阅的节点；跨订阅**重名**的订阅会自动退回内联发射（改名去重），
+   * 避免同一名字在延迟表/单节点测速里互相覆盖。
+   *
+   * 只写设置字段，不主动重连：下一次连接/测速重建配置时生效（与订阅操作不重连的定案一致）。
+   */
+  private setUseRawProviderConfig(v: boolean): void {
+    this.useRawProviderConfig = v;
+    this.settings.useRawProviderConfig = v;
+    SettingsService.patchSettings((s: AppSettings): void => {
+      s.useRawProviderConfig = v;
+    }).then((): void => {
+      promptAction.showToast({ message: v
+        ? '已开启：订阅原文交给内核解析，下次连接/测速生效'
+        : '已关闭：节点由应用侧生成，下次连接/测速生效' });
+    }).catch((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
+  }
 
   /**
    * 是否允许明文 HTTP 订阅。只改写设置字段，不触发重连（只影响下一次拉订阅）。
@@ -609,6 +635,21 @@ export struct SettingsView {
                 Text('默认关闭：只接受 https 订阅链接。明文 http 既无加密也不防篡改——'
                   + '面板被劫持或被中间人替换时，返回的节点表可以把你的流量导向任意服务器。'
                   + '仅在自建面板确实没有证书时临时开启，用完建议关掉。')
+                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+              }.width('100%')
+              Divider().color(TunBoxColors.cardBorder)
+              Column({ space: 4 }) {
+                Row() {
+                  Text('订阅原文交给内核解析')
+                    .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                  Toggle({ type: ToggleType.Switch, isOn: this.useRawProviderConfig })
+                    .selectedColor(TunBoxColors.primary)
+                    .onChange((v: boolean): void => this.setUseRawProviderConfig(v))
+                }.width('100%').alignItems(VerticalAlign.Center)
+                Text('开启后：订阅原文按订阅落盘，由内核自己解析节点（不经应用逐字段重写），'
+                  + '新协议/新字段不会因为应用不认识而丢失；跨订阅重名的订阅会自动退回内联方式，'
+                  + '保证同一名字不会在延迟和测速里互相覆盖。默认关闭（全部节点由应用侧生成，'
+                  + '同样保留订阅原文里的字段），需要尝鲜内核解析时可手动打开。')
                   .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }.width('100%')
             }

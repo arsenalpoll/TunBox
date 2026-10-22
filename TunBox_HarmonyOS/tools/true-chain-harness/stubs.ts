@@ -160,8 +160,17 @@ export class RawProviderStats {
   emitted: number = 0;
   missingFiles: number = 0;
   orphaned: number = 0;
+  /** 与真实实现保持同名同语义：生成器在差额 > 0 时会调 detail() 打诊断 */
+  nameConflicts: number = 0;
+  nameMismatch: number = 0;
   pathMode: string = '';
   providerNames: string = '';
+
+  detail(): string {
+    return `stub provider：发出 ${this.emitted}/${this.candidates}`
+      + `（缺失 ${this.missingFiles}，无节点 ${this.orphaned}，`
+      + `重名 ${this.nameConflicts}，名字不一致 ${this.nameMismatch}）`;
+  }
 }
 
 export class RawProviderPlan {

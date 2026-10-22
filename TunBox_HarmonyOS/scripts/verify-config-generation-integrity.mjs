@@ -1174,12 +1174,20 @@ section('[15] provider 权威：被覆盖订阅不再重发射节点，组内只
 {
   const { RawSubscriptionStore, RawProviderEntry } = await import(G('stubs.ts'));
   const rawPath = path.join(os.tmpdir(), 'tunbox-provider-raw-verify.yaml');
-  fs.writeFileSync(rawPath, [
+  const rawBody = [
     'proxies:',
     '  - {name: "节点甲", type: trojan, server: 1.1.1.1, port: 443, password: pw1}',
     '  - {name: "节点甲", type: trojan, server: 2.2.2.2, port: 443, password: pw2}',
+    // 必须覆盖「App 侧节点表里的每一个名字」，否则会触发名字一致性回退（见下）
+    '  - {name: "节点乙", type: trojan, server: 3.3.3.3, port: 443, password: pw3}',
     ''
-  ].join('\n'), 'utf8');
+  ].join('\n');
+  fs.writeFileSync(rawPath, rawBody, 'utf8');
+  // 2026-10-22：provider 计划新增「App 侧节点名必须与原文一致」的硬约束（名字对不上
+  // 会让 /proxies/{name}/delay 404 → 界面「未生效」）。所以这里必须把原文放进
+  // RawBodyCache —— 否则计划会判定「拿不到原文」而整体回退内联，场景就测不到 provider 路径。
+  const { RawBodyCache } = await import(G('RawProxyYaml.ts'));
+  RawBodyCache.put('sub-1', rawBody);
   const entry = new RawProviderEntry();
   entry.subscriptionId = 'sub-1';
   entry.providerName = 'sub-1';
@@ -1192,25 +1200,60 @@ section('[15] provider 权威：被覆盖订阅不再重发射节点，组内只
   const s = baseSettings();
   s.useRawProviderConfig = true;
   const nodes = [makeNode('节点甲'), makeNode('节点乙')];
-  const cfg = generateConfig({ settings: s, nodes });
+  // 订阅自带的组：成员是**节点名**。被 provider 覆盖后这些名字不在 `proxies:` 段里，
+  // 若原样发射就是内核 `proxy group[0]: ... not found` 整份拒载（2026-10-22 真机原样）。
+  const subGroup = new ProxyGroup();
+  subGroup.subscriptionId = 'sub-1';
+  subGroup.name = '🔰 选择节点';
+  subGroup.groupType = 'select';
+  subGroup.members = ['节点甲', '节点乙'];
+  const cfg = generateConfig({ settings: s, nodes, proxyGroups: [subGroup] });
 
   ok(cfg.includes('proxy-providers:'), '⑮a provider 段已发射');
   ok(cfg.includes('use:'), '⑮b 组内通过 use: 引用 provider');
   ok(!cfg.includes('"节点甲"'), '⑮c 被覆盖订阅的节点不再静态重发射（避免两份同名副本）');
+  // 订阅自带组必须被处理：成员按名引用的覆盖节点要被过滤，并补上 use:
+  {
+    const groupHeader = '  - name: "🔰 选择节点"';
+    const at = cfg.indexOf(groupHeader);
+    const next = cfg.indexOf('  - name: "', at + groupHeader.length);
+    const block = at < 0 ? '' : cfg.slice(at, next < 0 ? undefined : next);
+    ok(at >= 0, '⑮f 订阅自带组仍被发射（不整组丢弃）');
+    ok(block.includes('use:'), '⑮g 该组补上 use:（否则成员被过滤后无出口）');
+    ok(!block.includes('节点甲'), '⑮h 该组不再按名引用 provider 覆盖的节点');
+  }
   // 悬空引用自检（本块局部实现，避免依赖别的场景里的闭包）：
   // 只扫 proxy-groups 的 proxies: 列表；`use:` 段是 provider 名，不算节点引用。
+  // ⚠ 声明集合**必须只来自实际发射**（proxies: 段 + 组名 + 内置策略），
+  //   不能把「入参节点表」整表塞进来 —— 那样会把「节点根本没发射」掩盖成「无悬空」
+  //   （2026-10-22 这个掩盖让场景 15 在真机事故前一直是绿的）。
+  const pIdx15 = cfg.indexOf('proxies:');
+  const pEnd15 = cfg.indexOf('proxy-groups:');
+  const pblk = pIdx15 >= 0 && pEnd15 > pIdx15 ? cfg.slice(pIdx15, pEnd15) : '';
   const gIdx = cfg.indexOf('proxy-groups:');
   const gblk = gIdx < 0 ? '' : cfg.slice(gIdx);
   const declared = new Set(['DIRECT', 'REJECT', 'PASS', 'COMPATIBLE', 'GLOBAL', 'PROXY']);
-  for (const n of nodes) {
-    declared.add(n.name);
+  for (const m of pblk.matchAll(/^\s*-\s*name:\s*"([^"]+)"/gm)) {
+    declared.add(m[1]);
+  }
+  for (const m of pblk.matchAll(/^\s*-\s*\{name:\s*"([^"]+)"/gm)) {
+    declared.add(m[1]);
   }
   for (const m of gblk.matchAll(/^\s*-\s*name:\s*"([^"]+)"/gm)) {
     declared.add(m[1]);
   }
   const refs = [];
   let inProxies = false;
+  let groupHasUse = false;
   for (const line of gblk.split('\n')) {
+    if (/^\s*-\s*name:\s*"/.test(line)) {
+      groupHasUse = false;
+    }
+    if (/^\s*use:\s*$/.test(line)) {
+      groupHasUse = true;
+      inProxies = false;
+      continue;
+    }
     if (/^\s*proxies:\s*$/.test(line)) {
       inProxies = true;
       continue;
@@ -1218,7 +1261,10 @@ section('[15] provider 权威：被覆盖订阅不再重发射节点，组内只
     if (inProxies) {
       const m = /^\s*-\s*"([^"]+)"\s*$/.exec(line);
       if (m !== null) {
-        refs.push(m[1]);
+        // 带 use: 的组其成员可能来自 provider（名字查不到属正常）
+        if (!groupHasUse) {
+          refs.push(m[1]);
+        }
         continue;
       }
       if (line.trim().length > 0) {
@@ -1228,7 +1274,7 @@ section('[15] provider 权威：被覆盖订阅不再重发射节点，组内只
   }
   const dangling = refs.filter((r) => !declared.has(r));
   ok(dangling.length === 0,
-    '⑮d 无悬空引用（组内不按名引用 provider 节点）',
+    '⑮d 无悬空引用（组内不按名引用未发射的节点）',
     dangling.length > 0 ? `悬空：${JSON.stringify([...new Set(dangling)])}` : '');
   kernelOk(cfg, '⑮e provider 权威配置');
 

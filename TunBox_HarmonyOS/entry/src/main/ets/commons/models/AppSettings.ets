@@ -140,25 +140,29 @@ export class AppSettingsJson {
    */
   yamlOverride: string = '';
   /**
-   * 「双轨」原始订阅 provider（实验开关，默认关闭）：
-   * true = 除解析链外，另把每个订阅的**原文**落盘并在生成的 Mihomo 配置里以
-   * `proxy-providers: {type: file}` 交给内核自己解析；false = 行为与现状完全一致。
-   * 旧版本配置缺此字段时取默认 false。
+   * 订阅原文交给内核解析（provider 双轨）。
    *
-   * **默认 true（2026-10-21）**：被 provider 覆盖的订阅不再由 App 重发射节点，名字所有权
-   * 交给 provider 文件（App 侧也不再对这些节点做去重改名），组内只通过 `use:` 引用 ——
-   * 与 FlClash / Clash Verge Rev / CMFA 同形：节点定义由内核解析，App 不再逐字段搬运。
-   * **2026-10-21 20:58 回退为默认 false**：真机实测开起来后配置里被覆盖订阅的节点
-   * 不再写进 `proxies:`，而测速/选点全部按名字调 `/proxies/{name}/delay` → 名字对不上，
-   * 表现为「点测速毫无反应」。要重新启用，必须先解决「App 侧节点名 ↔ provider 节点名」
-   * 一致性并把组内成员改成按名引用，不能只翻这个开关。
+   * true = 每个订阅的**原文**落盘，并在生成的 Mihomo 配置里以 `proxy-providers: {type: file}`
+   * 交给内核自己解析（被覆盖的订阅不再由 App 重发射节点，组内只通过 `use:` 引用）；
+   * false = 全部节点由 App 内联发射（行为与旧版一致）。
+   *
+   * **默认 true（2026-10-22 定案）**：与 FlClash / Clash Verge Rev / CMFA 同形 ——
+   * 节点定义由内核解析，App 不再逐字段搬运。前两次失败的原因已逐条解决：
+   *  ① 2026-10-21 绝对路径 → 内核 `path is not subpath of home directory` 拒载；
+   *     现用相对路径 `raw_subscriptions/raw_<id>.yaml`；
+   *  ② 「双核 home 不同」的旧结论**是错的**：NAPI `SsrvpnInit` 的 homeDir 恒为
+   *     entry cache（隧道核与无头测速核同目录），本机真实内核与真机双双验证过；
+   *  ③ 跨订阅重名 → 该订阅整体退回内联发射（`planRawProviders` 的 nameConflicts），
+   *     名字不再二义，`/proxies/{name}/delay` 与延迟表按名索引才成立。
+   * 出问题可一键关回 false（设置页「订阅原文交给内核解析」）。
    */
   useRawProviderConfig: boolean = false;
   /**
-   * 「provider 默认已关闭」的一次性回退标记（2026-10-21 20:58）。
-   * 上一版曾把它默认置 true，已写进部分用户配置；靠这个标记把存量配置强制关回并只关一次。
+   * 「provider 已切回默认关」的一次性迁移标记（providerOffV6，2026-10-22 21:50）。
+   * 默认开的那一版在真机上出现「配置里 proxies: [] + provider 载不出节点」，
+   * 靠这个标记把存量配置强制关回一次，之后尊重用户在设置页的开关。
    */
-  providerOffV3: boolean = true;
+  providerOffV6: boolean = true;
   /** 内核 smart 组 policy-priority（见 AppSettings.smartPolicyPriority）；旧配置缺失时为空串。 */
   smartPolicyPriority: string = '';
   /**
@@ -288,10 +292,17 @@ export class AppSettings {
   customRuleSets: CustomRuleSet[] = [];
   /** YAML 覆盖层（P2）：追加在生成配置尾部的用户 YAML 片段（上限 8KB，白名单在生成器） */
   yamlOverride: string = '';
-  /** 双轨原始订阅 provider 开关（默认关闭；见 AppSettings.useRawProviderConfig） */
+  /**
+   * 订阅原文交给内核解析（provider 双轨）。
+   *
+   * **默认 false（2026-10-22 21:50 回退）**：默认开的那一版真机上出过「配置 `proxies: []` +
+   * provider 一个节点也没载出来」（/proxies 只剩组和内置策略），隧道连上却无可用节点。
+   * 关闭后全部节点由 App 内联发射（= 原文透传，字段同样不丢），行为可靠。
+   * 开关仍在设置页（「订阅原文交给内核解析」），供 verify 通过后再逐台打开验证。
+   */
   useRawProviderConfig: boolean = false;
-  /** 一次性回退标记：provider 默认值已强制关回 false（见 AppSettings.providerOffV3） */
-  providerOffV3: boolean = true;
+  /** 一次性迁移标记：provider 默认值已切回 false（providerOffV6，见 fromJson） */
+  providerOffV6: boolean = true;
   /** 各订阅代理组当前策略选择（JSON 对象：稳定组键 -> 成员名）。 */
   proxyGroupSelections: string = '';
   /**
@@ -359,7 +370,7 @@ export class AppSettings {
     j.customRuleSets = this.customRuleSets;
     j.yamlOverride = this.yamlOverride;
     j.useRawProviderConfig = this.useRawProviderConfig;
-    j.providerOffV3 = this.providerOffV3;
+    j.providerOffV6 = this.providerOffV6;
     j.smartPolicyPriority = this.smartPolicyPriority;
     j.sniffingEnabled = this.sniffingEnabled;
     j.coreLogLevel = this.coreLogLevel;
@@ -498,13 +509,13 @@ export class AppSettings {
     // YAML 覆盖层（P2）：缺字段/非字符串回落空串；上限 8KB，合法性（顶层键白名单）
     // 在生成器 validateYamlOverride 判定，不合法的覆盖层不追加（行为与旧版一致）。
     s.yamlOverride = typeof j.yamlOverride === 'string' ? j.yamlOverride.slice(0, 8192) : '';
-    // 双轨 provider 开关：缺字段/脏值一律回落 false（默认关闭 = 全内联，测速按名可用）
+    // 订阅原文交给内核解析（provider 双轨）：缺字段/脏值回落 **false**（默认关 = 全内联）
     s.useRawProviderConfig = typeof j.useRawProviderConfig === 'boolean' ? j.useRawProviderConfig : false;
-    // 一次性回退（2026-10-21 20:58）：上一版把这个开关默认置 true 并已写进用户配置，
-    // 真机上表现为「测速全部没反应」。凡是没被 providerOffV3 标记过的配置，一律强制关回。
-    if (j.providerOffV3 !== true) {
+    // 一次性迁移（2026-10-22 21:50）：默认开的那一版在真机上出现「proxies: [] + provider 空」
+    // ⇒ 存量配置统一强制关回一次并写新标记；此后尊重用户在设置页的开关。
+    if (j.providerOffV6 !== true) {
       s.useRawProviderConfig = false;
-      s.providerOffV3 = true;
+      s.providerOffV6 = true;
     }
     // policy-priority：缺字段/非字符串回落空串（=不生成该键，行为与旧版一致）。
     // 长度上限防止脏配置把生成的 YAML 撑爆；合法性（pattern:factor）交给内核判定，

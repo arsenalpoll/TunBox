@@ -22,11 +22,7 @@ import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
-import { ClashApiService, GroupLatencyResult } from '../commons/services/ClashApiService';
-import { LatencyChannel, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
-import { LatencyProbeKind } from '../commons/latency/LatencyKinds';
 import { effectiveTestUrl } from '../commons/latency/LatencyProbe';
-import { GROUP_TEST_TIMEOUT_MS } from '../commons/services/LatencyEngine';
 
 
 import { UnusableRecord } from '../commons/subscription/UnusableLedger';
@@ -818,19 +814,14 @@ export struct SubscriptionPage {
   }
 
   /**
-   * 内核组测速（整组）：一次 `GET /group/PROXY/delay`，让**内核自己并发测完**全部节点。
+   * 内核组测速（整组）：一次 `GET /group/PROXY/delay`，由**内核**并发测完全部节点。
    *
-   * 2026-10-22 用户要求「补一个组测真实入口，放在内核智能优选上面」——此前组测实现只挂在
-   * NodeSelectionPage（该页无任何导航入口 = 死路径），已随死页删除；这里是在**真实入口**
-   * 上把它恢复。与逐节点 REST 的差别：没有客户端 http 栈的同 host 连接池排队，
-   * 也没有应用层闸门，同样的节点数耗时约为逐节点的 1/5~1/3。
+   * 实现只有一处：`BackgroundLatencyService.runKernelGroupTest()`（订阅行闪电、冷启动静默批、
+   * 这里的「测全部」按钮共用同一套 504/通道故障/未生效 判定）。本方法只负责取通道与提示。
    *
-   * ⚠ 失败分类不得丢失（C10/C10b，方案 §9.2 T5）：
-   *  · 504（all proxies timeout）= **通道正常、全部节点超时** → 有结论，可落库可排序；
-   *  · 401/403/404/传输异常 = **通道故障** → 本轮没有任何结论，节点保持「未测」，
-   *    绝不写成「超时」；
-   *  · 结果集里没有、且**不在内核代理表** → 「未生效」（节点没进内核配置），
-   *    与「在内核表里但拨不通」（真超时）必须分开落库。
+   * 为什么大订阅必须走组测（2026-10-22 真机 547 节点）：逐节点 REST 会把 controller 压到
+   * /version 探针都超时 → 被判「通道不可用」→ 整批中止（measured=2）。核内并发（mBatch=50）
+   * 不经过客户端连接池，同样节点数耗时是逐节点路径的几分之一。
    */
   private async runKernelGroupTest(): Promise<void> {
     if (this.groupTesting) {
@@ -843,84 +834,23 @@ export struct SubscriptionPage {
     }
     this.groupTesting = true;
     try {
-      const api: ClashApiService | null = await ConnectionOrchestrator.instance().ensureLatencyApi();
+      const api = await ConnectionOrchestrator.instance().ensureLatencyApi();
       if (api === null) {
         this.showToast('内核不可用，已跳过（未写入超时）');
         return;
       }
-      for (const n of nodes) {
-        LatencyStoreBridge.markTesting(n.name);
-      }
-      this.latencyTick = this.latencyTick + 1;
       const settings = await SettingsService.load();
-      const url: string = effectiveTestUrl(settings);
-      let res: GroupLatencyResult = new GroupLatencyResult();
-      try {
-        res = await api.testGroupDetailedResult('PROXY', url, GROUP_TEST_TIMEOUT_MS);
-      } catch (e) {
-        // 抛异常 = 传输层故障；res 保持默认 → 落到下面的通道故障分支
-        AppLogger.warn(TAG, `kernel group test transport error: ${AppLogger.errText(e)}`);
-      }
-      if (!res.ok && !res.allTimedOut) {
-        for (const n of nodes) {
-          if (LatencyStoreBridge.stateFor(n.name) === LatencyState.TESTING) {
-            LatencyStoreBridge.setRecord(LatencyRecord.untested(n.name));
-          }
-        }
-        LatencyStoreBridge.flushNow();
-        this.latencyTick = this.latencyTick + 1;
-        AppLogger.warn(TAG, `kernel group test channel failure: code=${res.httpCode} kind=${res.failKind}`);
+      const progress = await BackgroundLatencyService.runKernelGroupTest(
+        api, nodes, effectiveTestUrl(settings), 'manual');
+      this.latencyTick = this.latencyTick + 1;
+      if (progress.coreUnavailable) {
         this.showToast('通道不可用，本轮结果无效，节点已恢复未测');
         return;
       }
-      const delays: Map<string, number> = res.delays;
-      const failedNames: string[] = [];
-      for (const n of nodes) {
-        if (delays.get(n.name) === undefined) {
-          failedNames.push(n.name);
-        }
+      let msg = `内核组测完成：可用 ${progress.measured} / 超时 ${progress.timeout}`;
+      if (progress.failed > 0) {
+        msg += ` / 未生效 ${progress.failed}`;
       }
-      // 失败节点无法从组测响应里看出原因 → 用内核代理表区分「未生效」与「真超时」
-      let coreTable: Set<string> | null = null;
-      if (failedNames.length > 0) {
-        const names: string[] | null = await api.proxyTableNames();
-        coreTable = names === null ? null : new Set<string>(names);
-      }
-      let measured = 0;
-      let timeout = 0;
-      let notInCore = 0;
-      for (const n of nodes) {
-        const delay: number | undefined = delays.get(n.name);
-        if (delay !== undefined && delay > 0) {
-          LatencyStoreBridge.setRecord(
-            LatencyRecord.measured(n.name, delay, LatencyChannel.CORE, Date.now()));
-          measured = measured + 1;
-          continue;
-        }
-        const gone: boolean = coreTable !== null && !coreTable.has(n.name);
-        const rec: LatencyRecord = LatencyRecord.failed(n.name,
-          gone ? LatencyState.FAILED : LatencyState.TIMEOUT, Date.now(), LatencyChannel.CORE,
-          gone ? LatencyProbeKind.SWITCH_FAILED : LatencyProbeKind.TIMEOUT);
-        rec.source = 'manual';
-        rec.runId = 0;
-        LatencyStoreBridge.setRecord(rec);
-        if (gone) {
-          notInCore = notInCore + 1;
-        } else {
-          timeout = timeout + 1;
-        }
-      }
-      LatencyStoreBridge.flushNow();
-      this.latencyTick = this.latencyTick + 1;
-      let msg = `内核组测完成：可用 ${measured} / 超时 ${timeout}`;
-      if (notInCore > 0) {
-        msg += ` / 未生效 ${notInCore}`;
-      }
-      if (res.allTimedOut) {
-        msg = `全部节点超时：可用 0 / ${nodes.length}（通道正常，请检查节点或换订阅）`;
-      }
-      AppLogger.info(TAG, `kernel group test done: total=${nodes.length} measured=${measured} `
-        + `timeout=${timeout} notInCore=${notInCore} allTimedOut=${res.allTimedOut}`);
       this.showToast(msg);
     } catch (e) {
       AppLogger.warn(TAG, `kernel group test failed: ${AppLogger.errText(e)}`);

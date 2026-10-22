@@ -136,6 +136,18 @@ export const BATCH_DEADLINE_MS = 90000;
  */
 const CORE_NOT_READY_ABORT_STREAK = 6;
 /**
+ * 大订阅（几百个节点）下的作废阈值：`max(6, ceil(N/64))`。
+ *
+ * 为什么必须随批次放大（2026-10-22 真机：导入 600 节点订阅后「测几个就不测了」）：
+ * 600 个节点里死节点占多数时，32 路在途会把 controller 的 /version 探针也压到超时 ——
+ * 客户端看到的是「连续 6 次没拿到响应」，但通道其实只是**忙**。按 64 节点一档放大后，
+ * 大订阅需要 ~10 次连续失联才作废，小订阅仍是 6（保持原有灵敏度）。
+ */
+function abortStreakFor(nodeCount: number): number {
+  const scaled = Math.ceil(Math.max(1, nodeCount) / 64);
+  return Math.max(CORE_NOT_READY_ABORT_STREAK, Math.min(scaled, 30));
+}
+/**
  * 连续「通道不可用」达到该次数即尝试一次**通道自愈**（重解析 endpoint/secret）。
  *
  * 为什么比「作废阈值」低：自愈是**廉价且每批只做一次**的动作（读一次配置、
@@ -397,13 +409,11 @@ export class LatencyRunOptions {
   /** 结果来源：'auto'（静默批）| 'manual'（用户手点）；随记录落库供 UI 区分显示 */
   source: string = 'manual';
   /**
-   * 整批硬截止（毫秒）。默认 BATCH_DEADLINE_MS；**仅供回归测试注入小值** ——
-   * 引擎本身在「取下一个节点前」检查截止时间，测试要触发它就得真等 90s。
-   * 做成可注入后，回归套件能用毫秒级确定性地验证「超时的节点保持未测、
-   * 绝不写成失败」这条契约，不必把「并发数 × 节点数」的算术巧合当前提
-   * （改一次并发度就让门禁失效，是很脆的测试）。
+   * 整批硬截止（毫秒）。**0 = 按批大小自动计算**（2026-10-22 起默认）；
+   * 只有回归测试才注入小值 —— 它要在毫秒级确定性地验证「超时的节点保持未测、
+   * 绝不写成失败」这条契约，不必把「并发数 × 节点数」的算术巧合当前提。
    */
-  batchDeadlineMs: number = BATCH_DEADLINE_MS;
+  batchDeadlineMs: number = 0;
   onResult: LatencyResultSink | null = null;
   onProgress: LatencyProgressSink | null = null;
 }
@@ -466,7 +476,7 @@ export class LatencyRun {
 
   constructor(api: ClashApiService | null, nodes: ProxyNode[], url: string, timeoutMs: number,
     force: boolean, onResult: LatencyResultSink | null, onProgress: LatencyProgressSink | null,
-    source: string = 'manual', batchDeadlineMs: number = BATCH_DEADLINE_MS) {
+    source: string = 'manual', batchDeadlineMs: number = 0) {
     this.api = api;
     this.nodes = nodes;
     this.url = url;
@@ -475,7 +485,9 @@ export class LatencyRun {
     this.source = source;
     this.onResult = onResult;
     this.onProgress = onProgress;
-    this.batchDeadlineMs = batchDeadlineMs;
+    // 0 = 按批大小自动算（大订阅不再被固定的 90s 砍掉队尾）；测试注入的小值照旧生效
+    this.batchDeadlineMs = batchDeadlineMs > 0
+      ? batchDeadlineMs : LatencyEngine.deadlineForBatch(nodes.length);
     this.progress.total = nodes.length;
     // ⚠ api === null ⇒ 没有内核通道 ⇒ 本批**不探测**（旧的离线直连兜底通道已下线：
     //   它测的是「服务器可达」而不是代理延迟，混进延迟列会把「服务器近」冒充
@@ -1040,7 +1052,7 @@ export class LatencyRun {
       // 自愈已尝试过（或本轮不满足自愈条件）仍然连续失联 → 通道确实不可用。
       // 此时**作废整批**：剩余节点保持「未测」，页面提示"内核不可用，本轮未测"。
       // 绝不把通道故障写进任何节点的结论里 —— 这是旧实现"内核一抖半张列表变红"的根因。
-      if (this.coreNotReadyStreak >= CORE_NOT_READY_ABORT_STREAK) {
+      if (this.coreNotReadyStreak >= abortStreakFor(this.nodes.length)) {
         this.progress.coreUnavailable = true;
         AppLogger.warn(TAG, `latency batch aborted: core/channel unavailable `
           + `streak=${this.coreNotReadyStreak} measured=${this.progress.measured} `
@@ -1154,6 +1166,20 @@ export class LatencyRun {
  */
 export class LatencyEngine {
   private static current: LatencyRun | null = null;
+
+  /**
+   * 按批大小算整批硬截止（2026-10-22：「600 节点订阅测几个就不测了」的根因）。
+   *
+   * 旧实现是固定 90s。600 个节点 / 在途 32 ≈ 19 波，每波最坏 5s ⇒ ≈ 95s 就把队尾
+   * 全部留成「未测」——用户看到的就是「测了几个就不测了」。现在按波数估算并留 20s
+   * 余量，下限仍是 90s、上限 15 分钟（防呆：别让一个坏批次把界面卡半小时）。
+   */
+  static deadlineForBatch(nodeCount: number): number {
+    const inflight = Math.max(1, LATENCY_INFLIGHT);
+    const waves = Math.ceil(Math.max(1, nodeCount) / inflight);
+    const estimated = waves * (LatencyPolicy.DEFAULT_TIMEOUT_MS + 1200) + 20000;
+    return Math.max(BATCH_DEADLINE_MS, Math.min(estimated, 900000));
+  }
 
 
   /**

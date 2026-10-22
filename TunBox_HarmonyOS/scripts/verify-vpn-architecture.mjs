@@ -491,8 +491,11 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
     };
     scan(join(etsRoot, 'pages'));
     ok('latency.group-endpoint-not-hand-built-in-pages', hits.length === 0, `hits=${JSON.stringify(hits)}`);
-    const subPage = readFileSync(join(etsRoot, 'pages/SubscriptionPage.ets'), 'utf8');
-    has('latency.group-test-single-entry', subPage, "testGroupDetailedResult('PROXY'");
+    // 唯一实现 2026-10-22 收敛到 BackgroundLatencyService.runKernelGroupTest（订阅页/静默批/大订阅共用）
+    const bgSrc = readFileSync(join(svcDir, 'BackgroundLatencyService.ets'), 'utf8');
+    has('latency.group-test-single-entry', bgSrc, "testGroupDetailedResult('PROXY'");
+    has('latency.group-test-from-page', readFileSync(join(etsRoot, 'pages/SubscriptionPage.ets'), 'utf8'),
+      'BackgroundLatencyService.runKernelGroupTest(');
     const nodePage = readFileSync(join(etsRoot, 'pages/NodeSelectionPage.ets'), 'utf8');
     notHas('latency.dead-page-no-group-test', nodePage, 'testGroupDetailedResult');
   }

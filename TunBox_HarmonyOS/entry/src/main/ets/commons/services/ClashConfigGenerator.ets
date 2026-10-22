@@ -441,6 +441,16 @@ export class ClashConfigGenerator {
     // App 侧再改名就会让订阅自带的 proxy-groups 成员（按原名引用）指向不存在的节点 →
     // 内核 `proxy not found` 整份拒载。跨 provider 的同名节点内核允许共存
     // （本机实测：两个 file provider 各有一个「香港01」，启动正常、无 duplicate 报错）。
+    // provider 覆盖的节点名：它们**不会**出现在 `proxies:` 段（名字所有权归 provider 文件），
+    // 因此任何组/规则都不许再按名引用它们 —— 订阅自带组（如「🔰 选择节点」）正是踩这个坑：
+    // 成员是节点名，而该节点已被 provider 覆盖 → 内核 `proxy group[0]: ... not found` 整份拒载
+    // （2026-10-22 真机实锤）。这里统一在发射侧过滤，并给这些组补 `use:`。
+    const coveredNames: Set<string> = new Set<string>();
+    for (const n of validNodes) {
+      if (n.subscriptionId.length > 0 && coveredSubIds.has(n.subscriptionId)) {
+        coveredNames.add(n.name);
+      }
+    }
     ClashConfigGenerator.ensureUniqueProxyNames(staticNodes);
     if (staticNodes.length === 0) {
       // 全部节点都由 provider 提供时必须写成空序列，`proxies:` 后面什么都没有会被解析成 null。
@@ -595,7 +605,16 @@ export class ClashConfigGenerator {
       }
     }
     for (const group of emittedGroups) {
-      const members = group.members.slice();
+      const declaredMembers = group.members.slice();
+      // 过滤掉 provider 覆盖的节点名：它们不在 `proxies:` 段里，按名引用会被内核判
+      // `proxy ... not found` 整份拒载（2026-10-22 真机）。
+      const members: string[] = [];
+      for (const m of declaredMembers) {
+        if (!coveredNames.has(m)) {
+          members.push(m);
+        }
+      }
+      const droppedByProvider = declaredMembers.length - members.length;
       const selected = selections.get(ClashConfigGenerator.proxyGroupKey(group));
       if (selected !== undefined && members.includes(selected)) {
         members.splice(members.indexOf(selected), 1);
@@ -622,9 +641,21 @@ export class ClashConfigGenerator {
           lines.push('    strategy: consistent-hashing');
         }
       }
-      lines.push('    proxies:');
-      for (const member of members) {
-        lines.push(`      - "${ClashConfigGenerator.escapeYaml(member)}"`);
+      // 该组原本按名引用了 provider 覆盖的节点 → 补 `use:` 让组仍有成员（否则组内为空、无出口）
+      const needUse = droppedByProvider > 0 && providerPlan.entries.length > 0;
+      if (members.length === 0) {
+        lines.push('    proxies: []');
+      } else {
+        lines.push('    proxies:');
+        for (const member of members) {
+          lines.push(`      - "${ClashConfigGenerator.escapeYaml(member)}"`);
+        }
+      }
+      if (needUse) {
+        lines.push('    use:');
+        for (const entry of providerPlan.entries) {
+          lines.push(`      - "${ClashConfigGenerator.escapeYaml(entry.providerName)}"`);
+        }
       }
     }
     if (emitSmart) {
@@ -2450,8 +2481,17 @@ export class ClashConfigGenerator {
    * 硬约束（缺一不可，任何一条不满足都只是「少一条 provider」，绝不产生悬空引用）：
    * 1) settings.useRawProviderConfig 为 true（开关关闭 → 直接返回空计划，输出与现状一致）；
    * 2) 该订阅的原文已成功落盘且文件此刻仍存在（RawSubscriptionStore.active 已校验）；
-   * 3) 该订阅此刻仍有节点在列表里（订阅被删/被隐藏后不再引用其 provider）。
-   * 差额（缺失文件 / 无对应节点）全部计入 lastProviderStats，由诊断面板展示。
+   * 3) 该订阅此刻仍有节点在列表里（订阅被删/被隐藏后不再引用其 provider）；
+   * 4) **该订阅的节点名与其它订阅/静态节点不冲突**（见下）。
+   *
+   * 为什么 4) 是硬约束（2026-10-22 定案）：provider 里的节点名由内核逐字采用，App **不能
+   * 改名**（改了就和文件里的名字对不上）。而 App 侧节点表、延迟表、`/proxies/{name}/delay`
+   * 全都按名字索引 —— 两份订阅各有一个「香港 01」时，命名空间就塌了：延迟读数互相覆盖、
+   * 单节点测速可能打到另一份订阅的同名节点。所以**只要该订阅有任何一个节点名与别的订阅
+   * 重名，它就整体退回静态发射**（静态路径会走 ensureUniqueProxyNames 去重改名），
+   * 宁可让这份订阅少一层「内核自己解析」，也不允许名字二义。
+   *
+   * 差额（缺失文件 / 无对应节点 / 重名回退）全部计入 lastProviderStats，由诊断面板展示。
    */
   static planRawProviders(settings: AppSettings, allNodes: ProxyNode[]): RawProviderPlan {
     const plan = new RawProviderPlan();
@@ -2468,6 +2508,31 @@ export class ClashConfigGenerator {
         liveSubscriptions.add(n.subscriptionId);
       }
     }
+    // 名字占用表：节点名 → 拥有它的订阅集合（空 subscriptionId 的手工节点也计入，
+    // 它们一定会静态发射，provider 侧撞上同样二义）。
+    const owners: Map<string, Set<string>> = new Map<string, Set<string>>();
+    for (const n of allNodes) {
+      if (n.name.length === 0) {
+        continue;
+      }
+      let set = owners.get(n.name);
+      if (set === undefined) {
+        set = new Set<string>();
+        owners.set(n.name, set);
+      }
+      set.add(n.subscriptionId);
+    }
+    // 每订阅是否有「跨订阅重名」的节点：有则该订阅不能走 provider
+    const conflictedSubs: Set<string> = new Set<string>();
+    for (const n of allNodes) {
+      if (n.name.length === 0 || n.subscriptionId.length === 0) {
+        continue;
+      }
+      const set = owners.get(n.name);
+      if (set !== undefined && set.size > 1) {
+        conflictedSubs.add(n.subscriptionId);
+      }
+    }
     const names: string[] = [];
     for (const entry of RawSubscriptionStore.active()) {
       plan.stats.candidates = plan.stats.candidates + 1;
@@ -2477,6 +2542,37 @@ export class ClashConfigGenerator {
       }
       if (!RawSubscriptionStore.has(entry.subscriptionId)) {
         plan.stats.missingFiles = plan.stats.missingFiles + 1;
+        continue;
+      }
+      if (conflictedSubs.has(entry.subscriptionId)) {
+        // 重名回退：该订阅整体静态发射（会被去重改名），provider 少一条但名字不二义
+        plan.stats.nameConflicts = plan.stats.nameConflicts + 1;
+        continue;
+      }
+      // 名字一致性硬约束：provider 里的节点名由内核**逐字采用**，App 的节点表/延迟表
+      // 却是按 App 侧名字索引的。两者只要有一个对不上，`/proxies/{name}/delay` 就 404
+      // → 界面报「未生效」（真机 2026-10-22：96 节点里 24 个 notInCore）。
+      // 名字来源：原文切片（RawBodyCache）。还没读到原文（冷启动首帧）也一律回退静态 ——
+      // 宁可这一次少一层内核解析，也不能让节点在测速里「消失」。
+      const body = RawBodyCache.get(entry.subscriptionId);
+      const rawNames: Set<string> = new Set<string>();
+      if (body.length > 0) {
+        const items: RawProxyItem[] = RawProxyYaml.extractProxies(body);
+        for (const it of items) {
+          rawNames.add(it.name);
+        }
+      }
+      let nameMismatch = rawNames.size === 0;
+      if (!nameMismatch) {
+        for (const n of allNodes) {
+          if (n.subscriptionId === entry.subscriptionId && !rawNames.has(n.name)) {
+            nameMismatch = true;
+            break;
+          }
+        }
+      }
+      if (nameMismatch) {
+        plan.stats.nameMismatch = plan.stats.nameMismatch + 1;
         continue;
       }
       plan.entries.push(entry);

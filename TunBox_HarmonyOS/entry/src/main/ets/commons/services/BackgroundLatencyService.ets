@@ -27,7 +27,13 @@
 import { AppLogger } from '../utils/AppLogger';
 import { ConnectionOrchestrator } from './ConnectionOrchestrator';
 import { LatencyLiveView } from './LatencyLiveView';
-import { LatencyEngine, LatencyProgress, LatencyRunOptions, LATENCY_TIMEOUT_MS } from './LatencyEngine';
+import {
+  GROUP_TEST_TIMEOUT_MS, LatencyEngine, LatencyProgress, LatencyRunOptions, LATENCY_TIMEOUT_MS
+} from './LatencyEngine';
+import { ClashApiService, GroupLatencyResult } from './ClashApiService';
+import { LatencyStoreBridge } from './LatencyStoreBridge';
+import { LatencyChannel, LatencyRecord, LatencyState } from './LatencyState';
+import { LatencyProbeKind } from '../latency/LatencyKinds';
 import { AppSettings } from '../models/AppSettings';
 import { ProxyNode } from '../models/ProxyNode';
 import { SettingsService } from './SettingsService';
@@ -37,6 +43,15 @@ import { effectiveTestUrl } from '../latency/LatencyProbe';
 const TAG = 'BackgroundLatency';
 /** 冷启动静默测速的延迟：让首屏渲染与订阅加载先完成，别和 UI 抢资源。 */
 const STARTUP_DELAY_MS = 1200;
+/**
+ * 超过这个节点数就走**内核组测**而不是逐节点 REST（2026-10-22 定案，120 起）。
+ *
+ * 依据：逐节点路径的瓶颈是客户端 HTTP 栈（同 host 连接数有限 + 在途闸门），
+ * 100 节点以内它是干净的（每节点独立 RTT/分类）；再往上就会把 controller 压到
+ * /version 都超时，被误判成「通道不可用」→ 整批中止（真机 547 节点：measured=2）。
+ * 内核组测由 Go 协程并发、核内 mBatch=50，同样节点数耗时是前者的几分之一。
+ */
+const KERNEL_GROUP_TEST_MIN_NODES = 120;
 
 export class BackgroundLatencyService {
   private static startupScheduled: boolean = false;
@@ -57,6 +72,95 @@ export class BackgroundLatencyService {
         AppLogger.warn(TAG, `startup latency failed: ${AppLogger.errText(e)}`);
       });
     }, Math.max(0, delayMs));
+  }
+
+  /**
+   * 内核组测（一次 `GET /group/PROXY/delay`，内核并发测完全部节点）+ 结果落库。
+   *
+   * 用途：大订阅（`KERNEL_GROUP_TEST_MIN_NODES` 以上）与订阅页「测全部」按钮共用这一条实现，
+   * 避免两处各自维护「504/通道故障/未生效」三套判定。
+   *
+   * 失败分类（C10/C10b，不得合并）：
+   *  · 504 = **通道正常、全部节点超时** → 有结论，落 TIMEOUT；`allTimedOut=true`；
+   *  · 401/403/404/传输异常 = **通道故障** → 本轮无结论，节点恢复「未测」，`coreUnavailable=true`；
+   *  · 结果集里没有、且**不在内核代理表** → 「未生效」（`SWITCH_FAILED`），与真超时分开。
+   *
+   * @param source 'auto'（静默批：失败显示中性未测）| 'manual'（用户手点：失败标红）
+   */
+  static async runKernelGroupTest(api: ClashApiService, nodes: ProxyNode[], url: string,
+    source: string): Promise<LatencyProgress> {
+    const progress = new LatencyProgress();
+    progress.total = nodes.length;
+    progress.channel = LatencyChannel.CORE;
+    progress.running = true;
+    for (const n of nodes) {
+      LatencyStoreBridge.markTesting(n.name);
+    }
+    LatencyStoreBridge.flushNow();
+
+    let res: GroupLatencyResult = new GroupLatencyResult();
+    try {
+      // expectedNodes：外层超时按「核内 50 并发 × 波数」估算，否则大订阅会被客户端自己掐断
+      res = await api.testGroupDetailedResult('PROXY', url, GROUP_TEST_TIMEOUT_MS, nodes.length);
+    } catch (e) {
+      AppLogger.warn(TAG, `kernel group test transport error: ${AppLogger.errText(e)}`);
+    }
+
+    if (!res.ok && !res.allTimedOut) {
+      // 通道故障：把本轮打的 TESTING 全部收回「未测」，绝不写节点结论
+      for (const n of nodes) {
+        if (LatencyStoreBridge.stateFor(n.name) === LatencyState.TESTING) {
+          LatencyStoreBridge.setRecord(LatencyRecord.untested(n.name));
+        }
+      }
+      LatencyStoreBridge.flushNow();
+      progress.coreUnavailable = true;
+      progress.finished = progress.total;
+      progress.running = false;
+      AppLogger.warn(TAG, `kernel group test channel failure: code=${res.httpCode} kind=${res.failKind}`);
+      return progress;
+    }
+
+    const delays: Map<string, number> = res.delays;
+    const failedNames: string[] = [];
+    for (const n of nodes) {
+      if (delays.get(n.name) === undefined) {
+        failedNames.push(n.name);
+      }
+    }
+    // 失败原因无法从组测响应里区分 → 用内核代理表分开「未生效」与「真超时」
+    let coreTable: Set<string> | null = null;
+    if (failedNames.length > 0) {
+      const names: string[] | null = await api.proxyTableNames();
+      coreTable = names === null ? null : new Set<string>(names);
+    }
+    for (const n of nodes) {
+      const delay: number | undefined = delays.get(n.name);
+      if (delay !== undefined && delay > 0) {
+        LatencyStoreBridge.setRecord(
+          LatencyRecord.measured(n.name, delay, LatencyChannel.CORE, Date.now()));
+        progress.measured = progress.measured + 1;
+      } else {
+        const gone: boolean = coreTable !== null && !coreTable.has(n.name);
+        const rec: LatencyRecord = LatencyRecord.failed(n.name,
+          gone ? LatencyState.FAILED : LatencyState.TIMEOUT, Date.now(), LatencyChannel.CORE,
+          gone ? LatencyProbeKind.SWITCH_FAILED : LatencyProbeKind.TIMEOUT);
+        rec.source = source;
+        rec.runId = 0;
+        LatencyStoreBridge.setRecord(rec);
+        if (gone) {
+          progress.failed = progress.failed + 1;
+        } else {
+          progress.timeout = progress.timeout + 1;
+        }
+      }
+      progress.finished = progress.finished + 1;
+    }
+    LatencyStoreBridge.flushNow();
+    progress.running = false;
+    AppLogger.info(TAG, `kernel group test done: total=${nodes.length} measured=${progress.measured} `
+      + `timeout=${progress.timeout} notInCore=${progress.failed} allTimedOut=${res.allTimedOut}`);
+    return progress;
   }
 
   /** 静默测试全部节点（跳过仍新鲜的结果） */
@@ -176,6 +280,19 @@ export class BackgroundLatencyService {
       const settings = await SettingsService.load();
       // 测速 URL：兜底 → 默认 https；用户自填值 → 原样保留（口径与页面一致）。
       const url: string = BackgroundLatencyService.resolveTestUrl(settings);
+
+      // ── 大订阅走内核组测（2026-10-22：「600 节点测几个就不测了」的根治）──────────
+      // 逐节点 REST 的瓶颈不在算法，而在**客户端 HTTP 栈**：547 个节点 × 在途 32 会把
+      // headless controller 压到 /version 探针都超时 → 客户端判「通道不可用」→ 整批中止
+      // （真机日志：`streak=9 measured=2 unavailable=true`）。
+      // 内核自己有组测（Go 协程并发、核内 mBatch=50、不经过客户端连接池），一次调用测完，
+      // 与三家的做法一致。小批次仍走逐节点（每节点有独立 RTT 读数与失败分类）。
+      if (api !== null && nodes.length >= KERNEL_GROUP_TEST_MIN_NODES) {
+        const progress = await BackgroundLatencyService.runKernelGroupTest(
+          api, nodes, url, 'auto');
+        LatencyLiveView.flushNow();
+        return progress;
+      }
 
       const opts = new LatencyRunOptions();
       opts.force = false;              // 静默批次只补缺失/过期结果

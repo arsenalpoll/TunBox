@@ -687,13 +687,19 @@ export class ClashApiService {
    * 分类口径见 {@link GroupLatencyResult} 的契约表。**本方法不抛异常**。
    */
   async testGroupDetailedResult(groupName: string, testUrl: string,
-    timeoutMs: number): Promise<GroupLatencyResult> {
+    timeoutMs: number, expectedNodes: number = 0): Promise<GroupLatencyResult> {
     const out: GroupLatencyResult = new GroupLatencyResult();
     const req = http.createHttp();
     this.inflight.add(req);
     try {
       // 组测是内核并发全测，App 只有一个请求；外层超时给整组留足预算 + 调度余量。
-      const outerTimeoutMs = timeoutMs + 5000;
+      //
+      // 2026-10-22（600 节点订阅「测几个又不测了」）：外层超时原来恒为 `timeoutMs + 5s`
+      // = 10s，而内核侧并发上限是 50（core `mBatch=50`）⇒ 600 个节点要 ≈ ceil(600/50)×5s
+      // = 60s。10s 到点 → 客户端断连 → 分类成 CORE_NOT_READY → 界面报「通道不可用」。
+      // 现在按 `expectedNodes` 估算波数并逐波加预算（上限 5 分钟）。
+      const waves = expectedNodes > 0 ? Math.ceil(expectedNodes / 50) : 1;
+      const outerTimeoutMs = Math.min(300000, timeoutMs + 5000 + (waves - 1) * timeoutMs);
       const resp = await req.request(
         `${this.baseUrl()}/group/${encodeURIComponent(groupName)}/delay?url=${encodeURIComponent(testUrl)}&timeout=${timeoutMs}`, {
         method: http.RequestMethod.GET,
